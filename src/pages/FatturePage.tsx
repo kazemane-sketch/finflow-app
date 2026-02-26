@@ -378,7 +378,41 @@ function InvoiceCard({
 }
 
 // ============================================================
-// INVOICE DETAIL VIEW
+// COLLAPSIBLE SECTION
+// ============================================================
+function Sec({ title, children, open: defaultOpen = true }: { title: string; children: React.ReactNode; open?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="mb-3 bg-white border rounded-lg overflow-hidden">
+      <div onClick={() => setOpen(!open)} className={`flex items-center cursor-pointer px-3 py-2.5 ${open ? 'bg-sky-50 border-b' : 'bg-gray-50'}`}>
+        <span className="text-xs font-bold text-sky-700 flex-1">{title}</span>
+        <span className={`text-gray-400 text-[10px] transition-transform ${open ? 'rotate-180' : ''}`}>▼</span>
+      </div>
+      {open && <div className="px-3 py-2.5">{children}</div>}
+    </div>
+  );
+}
+
+function Row({ l, v, accent, bold }: { l: string; v: string | undefined | null; accent?: boolean; bold?: boolean }) {
+  if (!v) return null;
+  return (
+    <div className="flex justify-between items-baseline py-0.5 border-b border-gray-100">
+      <span className="text-gray-500 text-xs min-w-[120px]">{l}</span>
+      <span className={`text-xs text-right max-w-[64%] break-words ${accent ? 'text-sky-700 font-bold' : bold ? 'font-bold' : ''}`}>{v}</span>
+    </div>
+  );
+}
+
+function TH({ children, align = 'right' }: { children: React.ReactNode; align?: string }) {
+  return <th className={`px-1.5 py-1.5 font-bold text-[10px] tracking-wide border-b-2 border-sky-200 bg-sky-50 whitespace-nowrap text-sky-700 ${align === 'left' ? 'text-left' : 'text-right'}`}>{children}</th>;
+}
+
+function TDc({ children, align = 'right', bold, color }: { children: React.ReactNode; align?: string; bold?: boolean; color?: string }) {
+  return <td className={`px-1.5 py-1.5 text-[11px] border-b border-gray-100 ${bold ? 'font-bold' : ''} ${color || ''} ${align === 'left' ? 'text-left' : 'text-right'}`}>{children}</td>;
+}
+
+// ============================================================
+// INVOICE DETAIL VIEW — FULL (re-parses raw_xml)
 // ============================================================
 function InvoiceDetail({
   invoice,
@@ -396,8 +430,23 @@ function InvoiceDetail({
   onReload: () => void;
 }) {
   const [editing, setEditing] = useState(false);
-  const nc = invoice.doc_type === 'TD04' || invoice.doc_type === 'TD05';
-  const cp = (invoice.counterparty || {}) as any;
+  const [showXml, setShowXml] = useState(false);
+  const [parsed, setParsed] = useState<any>(null);
+
+  // Re-parse raw_xml when detail loads
+  useEffect(() => {
+    if (detail?.raw_xml) {
+      try {
+        const p = reparseXml(detail.raw_xml);
+        setParsed(p);
+      } catch (e) {
+        console.warn('Errore re-parse XML:', e);
+        setParsed(null);
+      }
+    } else {
+      setParsed(null);
+    }
+  }, [detail?.raw_xml]);
 
   const handleSave = async (updates: InvoiceUpdate) => {
     await onEdit(updates);
@@ -405,121 +454,289 @@ function InvoiceDetail({
     onReload();
   };
 
+  if (loadingDetail) return <div className="text-center py-16 text-gray-400">Caricamento dettaglio...</div>;
+
+  const nc = invoice.doc_type === 'TD04' || invoice.doc_type === 'TD05';
+  const d = parsed; // reparseXml returns ParsedInvoice directly
+  const b = d?.bodies?.[0];
+  const cp = (invoice.counterparty || {}) as any;
+
   return (
-    <div className="p-5 overflow-y-auto h-full">
+    <div className="p-4 overflow-y-auto h-full">
       {/* Action buttons */}
-      <div className="flex justify-end gap-2 mb-4">
-        <button
-          onClick={() => setEditing(!editing)}
-          className={`px-3 py-1.5 text-xs font-semibold rounded-lg border ${editing ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-blue-600 border-blue-300 hover:bg-blue-50'}`}
-        >
+      <div className="flex justify-end gap-2 mb-3" data-noprint>
+        <button onClick={() => setShowXml(!showXml)}
+          className={`px-3 py-1.5 text-xs font-semibold rounded-lg border ${showXml ? 'bg-sky-600 text-white border-sky-600' : 'bg-white text-sky-600 border-sky-300 hover:bg-sky-50'}`}>
+          {showXml ? '✕ Chiudi XML' : '〈/〉 Vedi XML'}
+        </button>
+        <button onClick={() => setEditing(!editing)}
+          className={`px-3 py-1.5 text-xs font-semibold rounded-lg border ${editing ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-blue-600 border-blue-300 hover:bg-blue-50'}`}>
           {editing ? '✕ Chiudi Modifica' : '✏️ Modifica'}
         </button>
-        <button
-          onClick={onDelete}
-          className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-red-300 text-red-600 bg-white hover:bg-red-50"
-        >
+        <button onClick={onDelete}
+          className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-red-300 text-red-600 bg-white hover:bg-red-50">
           🗑 Elimina
         </button>
       </div>
 
-      {/* Edit form */}
-      {editing && (
-        <EditForm invoice={invoice} onSave={handleSave} onCancel={() => setEditing(false)} />
+      {/* XML viewer */}
+      {showXml && detail?.raw_xml && (
+        <div className="mb-3 bg-gray-900 rounded-lg overflow-hidden border">
+          <div className="flex justify-between items-center px-3 py-2 bg-gray-800">
+            <span className="text-sky-300 text-xs font-semibold">XML Sorgente — {Math.round(detail.raw_xml.length / 1024)} KB</span>
+            <button onClick={() => navigator.clipboard?.writeText(detail.raw_xml)} className="bg-gray-700 text-gray-300 border-none rounded px-2 py-1 text-[10px] cursor-pointer">📋 Copia</button>
+          </div>
+          <pre className="m-0 p-3 text-gray-300 text-[10px] font-mono overflow-x-auto max-h-80 overflow-y-auto whitespace-pre-wrap break-all leading-relaxed">{detail.raw_xml}</pre>
+        </div>
       )}
+
+      {/* Edit form */}
+      {editing && <EditForm invoice={invoice} onSave={handleSave} onCancel={() => setEditing(false)} />}
 
       {/* Header */}
       <div className="text-center mb-5 pb-4 border-b-2 border-sky-200">
         <h2 className="text-xl font-extrabold text-gray-900">
           {TIPO[invoice.doc_type] || invoice.doc_type} &nbsp; N. {invoice.number}
         </h2>
-        <div className="flex justify-center gap-4 mt-2 flex-wrap text-sm">
-          <span><span className="text-gray-500">Data: </span><span className="font-semibold">{fmtDate(invoice.date)}</span></span>
-          <span className={`px-2 py-0.5 rounded text-xs font-semibold ${STATUS_COLORS[invoice.payment_status] || 'bg-gray-100'}`}>
-            {STATUS_LABELS[invoice.payment_status] || invoice.payment_status}
-          </span>
-          <span className="text-gray-500 text-xs">File: {invoice.source_filename}</span>
+        <div className="flex justify-center gap-5 mt-2 flex-wrap">
+          <span><span className="text-gray-500 text-xs">Data: </span><span className="text-sm font-semibold">{fmtDate(invoice.date)}</span></span>
+          {d?.ver && <span><span className="text-gray-500 text-xs">Versione: </span><span className="text-xs font-semibold bg-sky-100 text-sky-700 px-1.5 py-0.5 rounded">{d.ver}</span></span>}
+          <span><span className="text-gray-500 text-xs">Metodo: </span><span className="text-xs font-semibold bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded">{invoice.parse_method}</span></span>
         </div>
       </div>
 
       {/* Da / Per */}
-      <div className="grid grid-cols-2 gap-4 mb-4">
-        <div className="bg-white border rounded-lg p-3">
-          <h4 className="text-xs font-bold text-sky-700 mb-2">Da (Fornitore):</h4>
-          <div className="space-y-1 text-xs">
-            <div className="flex justify-between"><span className="text-gray-500">Denominazione</span><span className="font-semibold text-sky-700 text-right max-w-[60%]">{cp?.denom}</span></div>
-            {cp?.piva && <div className="flex justify-between"><span className="text-gray-500">Partita IVA</span><span>{cp.piva}</span></div>}
-            {cp?.cf && <div className="flex justify-between"><span className="text-gray-500">Codice Fiscale</span><span>{cp.cf}</span></div>}
-            {cp?.sede && <div className="flex justify-between"><span className="text-gray-500">Sede</span><span className="text-right max-w-[60%]">{cp.sede}</span></div>}
-          </div>
-        </div>
-        <div className="bg-white border rounded-lg p-3">
-          <h4 className="text-xs font-bold text-sky-700 mb-2">Pagamento:</h4>
-          <div className="space-y-1 text-xs">
-            <div className="flex justify-between">
-              <span className="text-gray-500">Modalità</span>
-              <span>{invoice.payment_method ? `${invoice.payment_method} (${MP[invoice.payment_method] || ''})` : '—'}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-gray-500">Scadenza</span>
-              <span>{invoice.payment_due_date ? fmtDate(invoice.payment_due_date) : '—'}</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-gray-500">Totale</span>
-              <span className={`text-base font-extrabold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(invoice.total_amount)}</span>
-            </div>
-          </div>
-        </div>
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <Sec title="Da:">
+          <Row l="Denominazione" v={d?.ced?.denom || cp?.denom} accent />
+          <Row l="Partita IVA" v={d?.ced?.piva || cp?.piva} />
+          <Row l="Codice Fiscale" v={d?.ced?.cf || cp?.cf} />
+          <Row l="Regime Fiscale" v={d?.ced?.regime ? `${d.ced.regime} (${REG[d.ced.regime] || ''})` : ''} />
+          <Row l="Sede" v={d?.ced?.sede || cp?.sede} />
+          <Row l="Iscrizione REA" v={d?.ced?.reaNumero ? `${d.ced.reaUfficio} ${d.ced.reaNumero}` : ''} />
+          <Row l="Capitale Sociale" v={d?.ced?.capitale ? fmtEur(parseFloat(d.ced.capitale)) : ''} />
+          <Row l="In Liquidazione" v={d?.ced?.liquidazione === 'LN' ? 'LN (No)' : d?.ced?.liquidazione === 'LS' ? 'LS (Sì)' : d?.ced?.liquidazione} />
+          <Row l="Telefono" v={d?.ced?.tel} />
+          <Row l="Email" v={d?.ced?.email} />
+        </Sec>
+        <Sec title="Per:">
+          <Row l="Denominazione" v={d?.ces?.denom} accent />
+          <Row l="Partita IVA" v={d?.ces?.piva} />
+          <Row l="Codice Fiscale" v={d?.ces?.cf} />
+          <Row l="Sede" v={d?.ces?.sede} />
+        </Sec>
       </div>
 
-      {/* Note */}
-      {invoice.notes && (
-        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 mb-4">
-          <h4 className="text-xs font-bold text-yellow-800 mb-1">📝 Note / Causale</h4>
-          <p className="text-xs text-gray-700">{invoice.notes}</p>
-        </div>
+      {/* Riferimenti */}
+      {(b?.contratti?.length > 0 || b?.ordini?.length > 0 || b?.convenzioni?.length > 0) && (
+        <Sec title="Riferimenti">
+          {b.contratti?.map((c: any, i: number) => <Row key={`c${i}`} l="Rif. Contratto" v={[c.id, c.data ? fmtDate(c.data) : '', c.cig ? `CIG:${c.cig}` : '', c.cup ? `CUP:${c.cup}` : ''].filter(Boolean).join(' — ')} />)}
+          {b.ordini?.map((o: any, i: number) => <Row key={`o${i}`} l="Rif. Ordine" v={[o.id, o.data ? fmtDate(o.data) : '', o.cig ? `CIG:${o.cig}` : '', o.cup ? `CUP:${o.cup}` : ''].filter(Boolean).join(' — ')} />)}
+          {b.convenzioni?.map((c: any, i: number) => <Row key={`v${i}`} l="Rif. Convenzione" v={[c.id, c.data ? fmtDate(c.data) : ''].filter(Boolean).join(' — ')} />)}
+        </Sec>
       )}
 
-      {/* Righe dettaglio */}
-      {loadingDetail ? (
-        <div className="text-center py-8 text-gray-400 text-sm">Caricamento righe...</div>
-      ) : detail?.invoice_lines && detail.invoice_lines.length > 0 ? (
-        <div className="bg-white border rounded-lg overflow-hidden mb-4">
-          <h4 className="text-xs font-bold text-sky-700 px-3 py-2 bg-sky-50 border-b">Dettaglio Beni e Servizi</h4>
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="bg-sky-50/50">
-                  <th className="text-left px-2 py-1.5 font-semibold text-sky-700">#</th>
-                  <th className="text-left px-2 py-1.5 font-semibold text-sky-700">Descrizione</th>
-                  <th className="text-right px-2 py-1.5 font-semibold text-sky-700">Qtà</th>
-                  <th className="text-right px-2 py-1.5 font-semibold text-sky-700">Prezzo Unit.</th>
-                  <th className="text-right px-2 py-1.5 font-semibold text-sky-700">IVA %</th>
-                  <th className="text-right px-2 py-1.5 font-semibold text-sky-700">Totale</th>
+      {/* Causali */}
+      {b?.causali?.length > 0 && (
+        <Sec title="Causale (Note)">
+          {b.causali.map((c: string, i: number) => <div key={i} className="text-xs text-gray-700 py-0.5">{c}</div>)}
+        </Sec>
+      )}
+
+      {/* Beni/Servizi */}
+      <Sec title="Dettaglio Beni e Servizi">
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse">
+            <thead><tr>
+              <TH align="left">Descrizione</TH>
+              <TH>Quantità</TH>
+              <TH>Prezzo Unitario</TH>
+              <TH>Aliquota IVA</TH>
+              <TH>Prezzo Totale</TH>
+            </tr></thead>
+            <tbody>
+              {(b?.linee || detail?.invoice_lines || []).map((l: any, i: number) => (
+                <tr key={i}>
+                  <TDc align="left">{l.descrizione || l.description}</TDc>
+                  <TDc>{fmtNum(l.quantita || l.quantity || 1)}</TDc>
+                  <TDc>{fmtNum(l.prezzoUnitario || l.unit_price)}</TDc>
+                  <TDc>{fmtNum(l.aliquotaIVA || l.vat_rate)}%</TDc>
+                  <TDc bold>{fmtNum(l.prezzoTotale || l.total_price)}</TDc>
                 </tr>
-              </thead>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Sec>
+
+      {/* Riepilogo IVA */}
+      {b?.riepilogo?.length > 0 && (
+        <Sec title="Riepilogo IVA e Totali">
+          <table className="w-full border-collapse">
+            <thead><tr>
+              <TH align="left">Esigibilità IVA</TH>
+              <TH align="left">Aliquota IVA</TH>
+              <TH>Imposta</TH>
+              <TH>Imponibile</TH>
+            </tr></thead>
+            <tbody>
+              {b.riepilogo.map((r: any, i: number) => (
+                <tr key={i}>
+                  <TDc align="left">{r.esigibilita ? `${ESI[r.esigibilita] || r.esigibilita}` : ''}</TDc>
+                  <TDc align="left">
+                    {fmtNum(r.aliquota)}%
+                    {r.natura ? ` - ${r.natura} (${NAT[r.natura] || ''})` : ''}
+                    {r.rifNorm ? ` - ${r.rifNorm}` : ''}
+                  </TDc>
+                  <TDc bold>{fmtNum(r.imposta)}</TDc>
+                  <TDc bold>{fmtNum(r.imponibile)}</TDc>
+                </tr>
+              ))}
+              <tr className="border-t-2 border-sky-200">
+                <TDc align="left" bold>Totale</TDc>
+                <TDc></TDc>
+                <TDc bold color="text-sky-700">{fmtNum(b.riepilogo.reduce((s: number, r: any) => s + parseFloat(r.imposta || 0), 0))}</TDc>
+                <TDc bold color="text-sky-700">{fmtNum(b.riepilogo.reduce((s: number, r: any) => s + parseFloat(r.imponibile || 0), 0))}</TDc>
+              </tr>
+            </tbody>
+          </table>
+          {/* Totale Documento */}
+          <div className="mt-2 grid grid-cols-4 gap-2 bg-sky-50 p-2 rounded-lg text-xs">
+            <div><div className="text-sky-700 font-bold text-[10px]">Importo Bollo</div><div className="font-semibold">{b.bollo?.importo ? fmtEur(parseFloat(b.bollo.importo)) : ''}</div></div>
+            <div><div className="text-sky-700 font-bold text-[10px]">Sconto/Rincaro</div><div className="font-semibold">{b.arrotondamento || ''}</div></div>
+            <div><div className="text-sky-700 font-bold text-[10px]">Divisa</div><div className="font-semibold">{b.divisa}</div></div>
+            <div className="text-right"><div className="text-sky-700 font-bold text-[10px]">Totale Documento</div><div className={`text-lg font-extrabold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(parseFloat(b.totale))}</div></div>
+          </div>
+        </Sec>
+      )}
+
+      {/* Pagamento */}
+      <Sec title="Modalità Pagamento">
+        <table className="w-full border-collapse">
+          <thead><tr>
+            <TH align="left">Modalità Pagamento</TH>
+            <TH align="left">IBAN</TH>
+            <TH>Data Scadenza</TH>
+            <TH>Importo</TH>
+          </tr></thead>
+          <tbody>
+            {b?.pagamenti?.length > 0 ? b.pagamenti.map((p: any, i: number) => (
+              <tr key={i}>
+                <TDc align="left">
+                  {p.modalita ? `${p.modalita} (${MP[p.modalita] || ''})` : ''}
+                  {b.condPag ? ` - ${b.condPag} (${CP[b.condPag] || ''})` : ''}
+                </TDc>
+                <TDc align="left">{p.iban || ''}</TDc>
+                <TDc>{p.scadenza ? fmtDate(p.scadenza) : ''}</TDc>
+                <TDc bold>{p.importo ? fmtEur(parseFloat(p.importo)) : ''}</TDc>
+              </tr>
+            )) : (
+              <tr><TDc align="left" color="text-gray-400">Nessun dettaglio pagamento</TDc><TDc></TDc><TDc></TDc><TDc></TDc></tr>
+            )}
+          </tbody>
+        </table>
+      </Sec>
+
+      {/* DDT */}
+      {b?.ddt?.length > 0 && (
+        <Sec title="Documenti di Trasporto" open={false}>
+          {b.ddt.map((dd: any, i: number) => <div key={i}><Row l="DDT Numero" v={dd.numero} /><Row l="DDT Data" v={fmtDate(dd.data)} /></div>)}
+        </Sec>
+      )}
+
+      {/* Ritenuta */}
+      {b?.ritenuta?.importo && (
+        <Sec title="Ritenuta d'Acconto" open={false}>
+          <Row l="Tipo" v={b.ritenuta.tipo} />
+          <Row l="Importo" v={fmtEur(parseFloat(b.ritenuta.importo))} accent />
+          <Row l="Aliquota" v={b.ritenuta.aliquota ? `${fmtNum(parseFloat(b.ritenuta.aliquota))}%` : ''} />
+          <Row l="Causale Pag." v={b.ritenuta.causale} />
+        </Sec>
+      )}
+
+      {/* Cassa */}
+      {b?.cassa?.importo && (
+        <Sec title="Cassa Previdenziale" open={false}>
+          <Row l="Tipo Cassa" v={b.cassa.tipo} />
+          <Row l="Importo Contributo" v={fmtEur(parseFloat(b.cassa.importo))} accent />
+          <Row l="Aliquota Cassa" v={b.cassa.al ? `${fmtNum(parseFloat(b.cassa.al))}%` : ''} />
+        </Sec>
+      )}
+
+      {/* Allegati */}
+      {b?.allegati?.length > 0 && (
+        <Sec title="File Allegati">
+          <table className="w-full border-collapse">
+            <thead><tr>
+              <TH align="left">Nome File</TH>
+              <TH align="left">Formato</TH>
+              <TH align="left">Descrizione</TH>
+              <TH>Dimensione</TH>
+            </tr></thead>
+            <tbody>
+              {b.allegati.map((a: any, i: number) => (
+                <tr key={i}>
+                  <TDc align="left" color="text-sky-700">{a.nome}</TDc>
+                  <TDc align="left">{a.formato || '—'}</TDc>
+                  <TDc align="left">{a.descrizione || '—'}</TDc>
+                  <TDc>{a.sizeKB > 0 ? `${a.sizeKB} KB` : '—'}</TDc>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Sec>
+      )}
+
+      {/* Trasmissione */}
+      {d?.trasm && (
+        <Sec title="Trasmissione" open={false}>
+          <table className="w-full border-collapse">
+            <thead><tr>
+              <TH align="left">Codice Destinatario</TH>
+              <TH align="left">Progressivo Invio</TH>
+              <TH align="left">Telefono</TH>
+              <TH align="left">Email</TH>
+            </tr></thead>
+            <tbody><tr>
+              <TDc align="left">{d.trasm.codDest}</TDc>
+              <TDc align="left">{d.trasm.progressivo}</TDc>
+              <TDc align="left">{d.ced?.tel || '—'}</TDc>
+              <TDc align="left">{d.ced?.email || '—'}</TDc>
+            </tr></tbody>
+          </table>
+        </Sec>
+      )}
+
+      {/* Fallback: if no parsed data, show DB line items */}
+      {!b && detail?.invoice_lines && detail.invoice_lines.length > 0 && (
+        <Sec title="Dettaglio Beni e Servizi (da DB)">
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse">
+              <thead><tr>
+                <TH align="left">Descrizione</TH>
+                <TH>Qtà</TH>
+                <TH>Prezzo Unit.</TH>
+                <TH>IVA %</TH>
+                <TH>Totale</TH>
+              </tr></thead>
               <tbody>
                 {detail.invoice_lines.map((l, i) => (
-                  <tr key={l.id || i} className="border-t border-gray-100 hover:bg-gray-50">
-                    <td className="px-2 py-1.5 text-gray-400">{l.line_number || i + 1}</td>
-                    <td className="px-2 py-1.5 text-gray-700 max-w-xs">{l.description}</td>
-                    <td className="px-2 py-1.5 text-right">{fmtNum(l.quantity)}</td>
-                    <td className="px-2 py-1.5 text-right">{fmtNum(l.unit_price)}</td>
-                    <td className="px-2 py-1.5 text-right">{fmtNum(l.vat_rate)}%</td>
-                    <td className="px-2 py-1.5 text-right font-semibold">{fmtNum(l.total_price)}</td>
+                  <tr key={l.id || i}>
+                    <TDc align="left">{l.description}</TDc>
+                    <TDc>{fmtNum(l.quantity)}</TDc>
+                    <TDc>{fmtNum(l.unit_price)}</TDc>
+                    <TDc>{fmtNum(l.vat_rate)}%</TDc>
+                    <TDc bold>{fmtNum(l.total_price)}</TDc>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-        </div>
-      ) : (
-        <div className="text-center py-6 text-gray-400 text-xs">Nessuna riga dettaglio disponibile</div>
+        </Sec>
       )}
 
-      {/* Meta */}
-      <div className="text-center text-[10px] text-gray-400 mt-8">
-        ID: {invoice.id} — Metodo: {invoice.parse_method} — Hash: {invoice.xml_hash?.substring(0, 16)}...
+      <div className="text-center text-[10px] text-gray-400 mt-6 pb-4">
+        {invoice.source_filename} — Metodo: {invoice.parse_method} — Hash: {invoice.xml_hash?.substring(0, 16)}...
       </div>
     </div>
   );
@@ -657,7 +874,7 @@ export default function FatturePage() {
     setImportPhase('done');
     await reload();
     setTimeout(() => setImporting(false), 3000);
-  }, [companyId, ensureCompany, reload]);
+  }, [companyId, ensureCompany, refetchCompany, reload]);
 
   // ---- DELETE ----
   const handleDeleteConfirm = useCallback(async (_password: string) => {
