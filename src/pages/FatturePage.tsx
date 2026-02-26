@@ -15,7 +15,6 @@ import {
 } from '@/lib/invoiceSaver';
 import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
-import { supabase } from '@/integrations/supabase/client';
 
 // ============================================================
 // LOOKUPS
@@ -529,7 +528,7 @@ function InvoiceDetail({
 // MAIN PAGE
 // ============================================================
 export default function FatturePage() {
-  const { company, ensureCompany } = useCompany();
+  const { company, loading: companyLoading, ensureCompany, refetch: refetchCompany } = useCompany();
   const companyId = company?.id || null;
 
   // Data
@@ -619,13 +618,19 @@ export default function FatturePage() {
     }
 
     // Auto-create company from first invoice if needed
+    let cid = companyId;
     const firstOk = parsed.find(r => !r.err && r.data);
     if (firstOk) {
-      await ensureCompany(firstOk.data.ces);
+      try {
+        const ensuredId = await ensureCompany(firstOk.data.ces);
+        if (ensuredId) cid = ensuredId;
+        await refetchCompany();
+      } catch (e) {
+        console.error('Errore ensureCompany:', e);
+      }
     }
-
-    const cid = companyId || (await supabase.auth.getUser()).data.user?.id;
     if (!cid) {
+      console.error('Nessun company_id disponibile');
       setImporting(false);
       return;
     }
@@ -846,7 +851,7 @@ export default function FatturePage() {
 
           {/* List */}
           <div className="flex-1 overflow-y-auto">
-            {loadingList ? (
+            {loadingList || companyLoading ? (
               <div className="text-center py-8 text-gray-400 text-sm">Caricamento...</div>
             ) : filtered.length === 0 ? (
               <div className="text-center py-8 text-gray-400 text-sm">
