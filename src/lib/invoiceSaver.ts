@@ -1,5 +1,10 @@
 // src/lib/invoiceSaver.ts
 // Salvataggio, caricamento, eliminazione e modifica fatture su Supabase
+// Schema REALE: id, company_id, counterparty_id, counterparty(jsonb), direction, doc_type,
+// number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount,
+// stamp_amount, payment_method, payment_terms, payment_due_date, payment_status,
+// reconciliation_status, sdi_id, notes, raw_xml, xml_version, parse_method,
+// source_filename, import_batch_id, xml_hash, created_at, updated_at
 import { supabase } from '@/integrations/supabase/client';
 
 // ============================================================
@@ -8,24 +13,33 @@ import { supabase } from '@/integrations/supabase/client';
 export interface DBInvoice {
   id: string;
   company_id: string;
-  doc_type: string;
-  number: string;
-  date: string;
-  total_amount: number;
-  currency: string;
+  counterparty_id: string | null;
   counterparty: {
     denom: string;
     piva: string;
     cf: string;
     sede: string;
-  };
-  payment_status: string;
+  } | null;
+  direction: string;
+  doc_type: string;
+  number: string;
+  date: string;
+  currency: string;
+  total_amount: number;
+  taxable_amount: number | null;
+  tax_amount: number | null;
+  withholding_amount: number | null;
+  stamp_amount: number | null;
   payment_method: string;
+  payment_terms: string;
   payment_due_date: string | null;
+  payment_status: string;
+  reconciliation_status: string;
+  sdi_id: string;
+  notes: string;
   source_filename: string;
   parse_method: string;
-  notes: string;
-  xml_hash: string;
+  xml_hash: string | null;
   created_at: string;
 }
 
@@ -96,16 +110,31 @@ export async function saveInvoicesToDB(
         if (due < new Date()) paymentStatus = 'scaduta';
       }
 
+      // Calcola imponibile e imposta dai riepiloghi
+      let taxableAmount = 0;
+      let taxAmount = 0;
+      if (b.riepilogo) {
+        for (const rie of b.riepilogo) {
+          taxableAmount += parseFloat(rie.imponibile) || 0;
+          taxAmount += parseFloat(rie.imposta) || 0;
+        }
+      }
+
       // Insert fattura
       const { data: inv, error: invErr } = await supabase
         .from('invoices')
         .insert({
           company_id: companyId,
+          direction: 'passive',
           doc_type: b.tipo || 'TD01',
           number: b.numero || '',
           date: b.data || new Date().toISOString().split('T')[0],
-          total_amount: parseFloat(b.totale) || 0,
           currency: b.divisa || 'EUR',
+          total_amount: parseFloat(b.totale) || 0,
+          taxable_amount: taxableAmount || null,
+          tax_amount: taxAmount || null,
+          withholding_amount: b.ritenuta?.importo ? parseFloat(b.ritenuta.importo) : null,
+          stamp_amount: b.bollo?.importo ? parseFloat(b.bollo.importo) : null,
           counterparty: {
             denom: r.data.ced.denom,
             piva: r.data.ced.piva,
@@ -114,8 +143,10 @@ export async function saveInvoicesToDB(
           },
           payment_status: paymentStatus,
           payment_method: b.pagamenti?.[0]?.modalita || '',
+          payment_terms: b.condPag || '',
           payment_due_date: paymentDue,
           raw_xml: r.rawXml,
+          xml_version: r.data.ver || '',
           source_filename: r.fn,
           parse_method: r.method,
           notes: b.causali?.join(' | ') || '',
@@ -125,7 +156,6 @@ export async function saveInvoicesToDB(
         .single();
 
       if (invErr) {
-        // Deduplicazione: se xml_hash esiste già → duplicato
         if (invErr.code === '23505' || invErr.message?.includes('duplicate') || invErr.message?.includes('xml_hash')) {
           duplicates++;
           onProgress?.(i + 1, parsedResults.length, 'duplicate', r.fn);
@@ -174,7 +204,7 @@ export async function saveInvoicesToDB(
 export async function loadInvoices(companyId: string): Promise<DBInvoice[]> {
   const { data, error } = await supabase
     .from('invoices')
-    .select('id, company_id, doc_type, number, date, total_amount, currency, counterparty, payment_status, payment_method, payment_due_date, source_filename, parse_method, notes, xml_hash, created_at')
+    .select('id, company_id, counterparty_id, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, payment_status, reconciliation_status, sdi_id, notes, source_filename, parse_method, xml_hash, created_at')
     .eq('company_id', companyId)
     .order('date', { ascending: false });
 
@@ -210,11 +240,9 @@ export async function deleteInvoices(invoiceIds: string[]): Promise<{ deleted: n
   let deleted = 0;
   const errors: string[] = [];
 
-  // Elimina in batch da 50
   for (let i = 0; i < invoiceIds.length; i += 50) {
     const batch = invoiceIds.slice(i, i + 50);
 
-    // Prima elimina le righe dettaglio
     const { error: linesErr } = await supabase
       .from('invoice_lines')
       .delete()
@@ -224,7 +252,6 @@ export async function deleteInvoices(invoiceIds: string[]): Promise<{ deleted: n
       errors.push(`Errore eliminazione righe: ${linesErr.message}`);
     }
 
-    // Poi elimina le fatture
     const { error: invErr, count } = await supabase
       .from('invoices')
       .delete({ count: 'exact' })

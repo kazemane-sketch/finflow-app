@@ -337,7 +337,8 @@ function InvoiceCard({
   onCheck: () => void;
 }) {
   const nc = inv.doc_type === 'TD04' || inv.doc_type === 'TD05';
-  const cp = inv.counterparty as any;
+  const cp = (inv.counterparty || {}) as any;
+  const displayName = cp?.denom || inv.source_filename || 'Sconosciuto';
 
   return (
     <div
@@ -357,7 +358,7 @@ function InvoiceCard({
       <div className="flex-1 min-w-0" onClick={onSelect}>
         <div className="flex justify-between items-center">
           <span className="text-xs font-semibold text-gray-800 truncate max-w-[55%]">
-            {cp?.denom || 'Sconosciuto'}
+            {displayName}
           </span>
           <span className={`text-xs font-bold ${nc ? 'text-red-600' : 'text-green-700'}`}>
             {fmtEur(inv.total_amount)}
@@ -396,7 +397,7 @@ function InvoiceDetail({
 }) {
   const [editing, setEditing] = useState(false);
   const nc = invoice.doc_type === 'TD04' || invoice.doc_type === 'TD05';
-  const cp = invoice.counterparty as any;
+  const cp = (invoice.counterparty || {}) as any;
 
   const handleSave = async (updates: InvoiceUpdate) => {
     await onEdit(updates);
@@ -689,7 +690,7 @@ export default function FatturePage() {
     if (statusFilter !== 'all' && inv.payment_status !== statusFilter) return false;
     if (!query) return true;
     const s = query.toLowerCase();
-    const cp = inv.counterparty as any;
+    const cp = (inv.counterparty || {}) as any;
     return (
       (cp?.denom || '').toLowerCase().includes(s) ||
       inv.number.toLowerCase().includes(s) ||
@@ -733,7 +734,7 @@ export default function FatturePage() {
     daPagare: invoices.filter(i => i.payment_status === 'da_pagare').length,
     scadute: invoices.filter(i => i.payment_status === 'scaduta').length,
     pagate: invoices.filter(i => i.payment_status === 'pagata').length,
-    fornitori: new Set(invoices.map(i => (i.counterparty as any)?.denom)).size,
+    fornitori: new Set(invoices.map(i => (i.counterparty as any)?.denom || i.source_filename)).size,
   };
 
   const selectedInvoice = invoices.find(i => i.id === selectedId);
