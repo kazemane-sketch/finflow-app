@@ -235,14 +235,15 @@ function ImportProgress({ phase, current, total, logs }: { phase: 'reading' | 's
 // ============================================================
 function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck }: { inv: DBInvoice; selected: boolean; checked: boolean; selectMode: boolean; onSelect: () => void; onCheck: () => void }) {
   const nc = inv.doc_type === 'TD04' || inv.doc_type === 'TD05';
+  const isOut = inv.direction === 'out';
   const cp = (inv.counterparty || {}) as any;
   const displayName = cp?.denom || inv.source_filename || 'Sconosciuto';
   return (
-    <div className={`flex items-start gap-2 px-3 py-2.5 cursor-pointer border-b border-gray-100 transition-all ${checked ? 'bg-blue-50 border-l-4 border-l-blue-500' : selected ? 'bg-sky-50 border-l-4 border-l-sky-500' : 'border-l-4 border-l-transparent hover:bg-gray-50'}`}>
+    <div className={`flex items-start gap-2 px-3 py-2.5 cursor-pointer border-b border-gray-100 transition-all ${checked ? 'bg-blue-50 border-l-4 border-l-blue-500' : selected ? 'bg-sky-50 border-l-4 border-l-sky-500' : isOut ? 'border-l-4 border-l-emerald-400 hover:bg-gray-50' : 'border-l-4 border-l-transparent hover:bg-gray-50'}`}>
       {selectMode && <input type="checkbox" checked={checked} onChange={onCheck} className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />}
       <div className="flex-1 min-w-0" onClick={onSelect}>
-        <div className="flex justify-between items-center"><span className="text-xs font-semibold text-gray-800 truncate max-w-[55%]">{displayName}</span><span className={`text-xs font-bold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(inv.total_amount)}</span></div>
-        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className="flex gap-1">{nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}<span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></span></div>
+        <div className="flex justify-between items-center"><span className="text-xs font-semibold text-gray-800 truncate max-w-[55%]">{displayName}</span><span className={`text-xs font-bold ${nc ? 'text-red-600' : isOut ? 'text-emerald-600' : 'text-orange-600'}`}>{isOut ? '+' : ''}{fmtEur(inv.total_amount)}</span></div>
+        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className="flex gap-1">{isOut && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">Attiva</span>}{nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}<span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></span></div>
       </div>
     </div>
   );
@@ -547,6 +548,7 @@ export default function FatturePage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'overdue' | 'paid'>('all');
+  const [directionFilter, setDirectionFilter] = useState<'all' | 'in' | 'out'>('all');
   const [selectMode, setSelectMode] = useState(false);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [deleteModal, setDeleteModal] = useState<{ open: boolean; ids: string[] }>({ open: false, ids: [] });
@@ -581,7 +583,13 @@ export default function FatturePage() {
     }
     let cid = companyId;
     const firstOk = parsed.find(r => !r.err && r.data);
-    if (firstOk) { try { const eid = await ensureCompany(firstOk.data.ces); if (eid) cid = eid; await refetchCompany(); } catch {} }
+    if (!cid && firstOk) {
+      // Detect company: find the party that appears most as cedente OR cessionario
+      // For passive invoices, company = cessionario; for active, company = cedente
+      try { const eid = await ensureCompany(firstOk.data.ces); if (eid) cid = eid; await refetchCompany(); } catch {
+        try { const eid = await ensureCompany(firstOk.data.ced); if (eid) cid = eid; await refetchCompany(); } catch {}
+      }
+    }
     if (!cid) { setImporting(false); return; }
     const okParsed = parsed.filter(r => !r.err && r.data);
     setImportPhase('saving'); setImportCurrent(0); setImportTotal(okParsed.length);
@@ -604,6 +612,7 @@ export default function FatturePage() {
 
   const filtered = invoices.filter(inv => {
     if (statusFilter !== 'all' && inv.payment_status !== statusFilter) return false;
+    if (directionFilter !== 'all' && inv.direction !== directionFilter) return false;
     if (!query) return true;
     const s = query.toLowerCase(); const cp = (inv.counterparty || {}) as any;
     return (cp?.denom || '').toLowerCase().includes(s) || inv.number.toLowerCase().includes(s) || inv.source_filename.toLowerCase().includes(s);
@@ -653,6 +662,11 @@ export default function FatturePage() {
             <div className="flex gap-1">
               {(['all', 'pending', 'overdue', 'paid'] as const).map(s => (
                 <button key={s} onClick={() => setStatusFilter(s)} className={`flex-1 py-1 text-[10px] font-semibold rounded ${statusFilter === s ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>{s === 'all' ? 'Tutte' : STATUS_LABELS[s]}</button>
+              ))}
+            </div>
+            <div className="flex gap-1">
+              {([['all', 'Tutte'], ['in', '↓ Passive'], ['out', '↑ Attive']] as const).map(([k, label]) => (
+                <button key={k} onClick={() => setDirectionFilter(k)} className={`flex-1 py-1 text-[10px] font-semibold rounded ${directionFilter === k ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>{label}</button>
               ))}
             </div>
             <div className="flex items-center gap-2">

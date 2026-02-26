@@ -89,6 +89,14 @@ export async function saveInvoicesToDB(
   let duplicates = 0;
   const errors: { fn: string; err: string }[] = [];
 
+  // Fetch company PIVA/CF to auto-detect direction
+  let companyPiva = '';
+  let companyCf = '';
+  try {
+    const { data: comp } = await supabase.from('companies').select('vat_number, fiscal_code').eq('id', companyId).single();
+    if (comp) { companyPiva = (comp.vat_number || '').replace(/\s/g, ''); companyCf = (comp.fiscal_code || '').replace(/\s/g, ''); }
+  } catch {}
+
   for (let i = 0; i < parsedResults.length; i++) {
     const r = parsedResults[i];
     if (r.err || !r.data) {
@@ -110,7 +118,26 @@ export async function saveInvoicesToDB(
         if (due < new Date()) paymentStatus = 'overdue';
       }
 
-      // Calcola imponibile e imposta dai riepiloghi
+      // Estrai denom con fallback robusto (gestisce CDATA, Nome/Cognome, etc.)
+      const cedPiva = (r.data.ced.piva || '').replace(/\s/g, '');
+      const cedCf = (r.data.ced.cf || '').replace(/\s/g, '');
+      const cesPiva = (r.data.ces.piva || '').replace(/\s/g, '');
+      const cesCf = (r.data.ces.cf || '').replace(/\s/g, '');
+
+      // Auto-detect direction: if company is cedente → out (attiva), else → in (passiva)
+      const companyIsCedente = (companyPiva && cedPiva.includes(companyPiva.replace(/^IT/i, ''))) ||
+                               (companyCf && cedCf === companyCf);
+      const direction = companyIsCedente ? 'out' : 'in';
+
+      // Counterparty = the OTHER party (not the company)
+      const cpSource = companyIsCedente ? r.data.ces : r.data.ced;
+      const rawDenom = (cpSource.denom || '').replace(/<!\[CDATA\[|\]\]>/g, '').trim();
+      const counterpartyData = {
+        denom: rawDenom || r.fn.replace(/\.xml(\.p7m)?$/i, '').replace(/^IT\d+_/, ''),
+        piva: cpSource.piva,
+        cf: cpSource.cf,
+        sede: cpSource.sede,
+      };
       let taxableAmount = 0;
       let taxAmount = 0;
       if (b.riepilogo) {
@@ -125,7 +152,7 @@ export async function saveInvoicesToDB(
         .from('invoices')
         .insert({
           company_id: companyId,
-          direction: 'in',  // in=ricevuta, out=emessa
+          direction: direction,  // in=ricevuta(passiva), out=emessa(attiva)
           doc_type: b.tipo || 'TD01',
           number: b.numero || '',
           date: b.data || new Date().toISOString().split('T')[0],
@@ -135,12 +162,7 @@ export async function saveInvoicesToDB(
           tax_amount: taxAmount || null,
           withholding_amount: b.ritenuta?.importo ? parseFloat(b.ritenuta.importo) : null,
           stamp_amount: b.bollo?.importo ? parseFloat(b.bollo.importo) : null,
-          counterparty: {
-            denom: r.data.ced.denom,
-            piva: r.data.ced.piva,
-            cf: r.data.ced.cf,
-            sede: r.data.ced.sede,
-          },
+          counterparty: counterpartyData,
           payment_status: paymentStatus,
           payment_method: b.pagamenti?.[0]?.modalita || '',
           payment_terms: b.condPag || '',
