@@ -316,3 +316,72 @@ export async function verifyPassword(password: string): Promise<boolean> {
 
   return !error;
 }
+
+// ============================================================
+// FIX ALL — ri-estrae counterparty e direction dal raw_xml
+// Usa il parser reale, non regex SQL
+// ============================================================
+export async function fixAllCounterparties(
+  companyId: string,
+  onProgress?: (current: number, total: number) => void
+): Promise<{ fixed: number; errors: number }> {
+  // 1. Get company P.IVA
+  const { data: comp } = await supabase.from('companies').select('vat_number, fiscal_code').eq('id', companyId).single();
+  const companyPiva = (comp?.vat_number || '').replace(/\s/g, '').replace(/^IT/i, '');
+  const companyCf = (comp?.fiscal_code || '').replace(/\s/g, '');
+
+  // 2. Load all invoice IDs
+  const { data: allInvs } = await supabase
+    .from('invoices')
+    .select('id')
+    .eq('company_id', companyId)
+    .order('date', { ascending: false });
+
+  if (!allInvs?.length) return { fixed: 0, errors: 0 };
+
+  const { reparseXml } = await import('./invoiceParser');
+  let fixed = 0, errors = 0;
+
+  // 3. Process in batches of 20
+  for (let i = 0; i < allInvs.length; i += 20) {
+    const batchIds = allInvs.slice(i, i + 20).map(inv => inv.id);
+    const { data: batch } = await supabase
+      .from('invoices')
+      .select('id, raw_xml')
+      .in('id', batchIds);
+
+    if (!batch) continue;
+
+    for (const inv of batch) {
+      if (!inv.raw_xml) { errors++; continue; }
+      try {
+        const parsed = reparseXml(inv.raw_xml);
+        const cedPiva = (parsed.ced.piva || '').replace(/^IT/i, '');
+        const cedCf = parsed.ced.cf || '';
+
+        // Direction: if company is cedente → out (attiva)
+        const isOut = (companyPiva && cedPiva.includes(companyPiva)) ||
+                      (companyCf && cedCf === companyCf);
+        const direction = isOut ? 'out' : 'in';
+
+        // Counterparty = the OTHER party
+        const cp = isOut ? parsed.ces : parsed.ced;
+        const counterparty = {
+          denom: cp.denom || '',
+          piva: cp.piva || '',
+          cf: cp.cf || '',
+          sede: cp.sede || '',
+        };
+
+        await supabase.from('invoices').update({ direction, counterparty }).eq('id', inv.id);
+        fixed++;
+      } catch {
+        errors++;
+      }
+    }
+
+    onProgress?.(Math.min(i + 20, allInvs.length), allInvs.length);
+  }
+
+  return { fixed, errors };
+}

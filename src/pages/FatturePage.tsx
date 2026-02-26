@@ -4,7 +4,7 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { processInvoiceFile, TIPO, MP, REG } from '@/lib/invoiceParser';
 import {
   saveInvoicesToDB, loadInvoices, loadInvoiceDetail,
-  deleteInvoices, updateInvoice, verifyPassword,
+  deleteInvoices, updateInvoice, verifyPassword, fixAllCounterparties,
   type DBInvoice, type DBInvoiceDetail, type InvoiceUpdate,
 } from '@/lib/invoiceSaver';
 import { useCompany } from '@/hooks/useCompany';
@@ -235,15 +235,14 @@ function ImportProgress({ phase, current, total, logs }: { phase: 'reading' | 's
 // ============================================================
 function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck }: { inv: DBInvoice; selected: boolean; checked: boolean; selectMode: boolean; onSelect: () => void; onCheck: () => void }) {
   const nc = inv.doc_type === 'TD04' || inv.doc_type === 'TD05';
-  const isOut = inv.direction === 'out';
   const cp = (inv.counterparty || {}) as any;
   const displayName = cp?.denom || inv.source_filename || 'Sconosciuto';
   return (
-    <div className={`flex items-start gap-2 px-3 py-2.5 cursor-pointer border-b border-gray-100 transition-all ${checked ? 'bg-blue-50 border-l-4 border-l-blue-500' : selected ? 'bg-sky-50 border-l-4 border-l-sky-500' : isOut ? 'border-l-4 border-l-emerald-400 hover:bg-gray-50' : 'border-l-4 border-l-transparent hover:bg-gray-50'}`}>
+    <div className={`flex items-start gap-2 px-3 py-2.5 cursor-pointer border-b border-gray-100 transition-all ${checked ? 'bg-blue-50 border-l-4 border-l-blue-500' : selected ? 'bg-sky-50 border-l-4 border-l-sky-500' : 'border-l-4 border-l-transparent hover:bg-gray-50'}`}>
       {selectMode && <input type="checkbox" checked={checked} onChange={onCheck} className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />}
       <div className="flex-1 min-w-0" onClick={onSelect}>
-        <div className="flex justify-between items-center"><span className="text-xs font-semibold text-gray-800 truncate max-w-[55%]">{displayName}</span><span className={`text-xs font-bold ${nc ? 'text-red-600' : isOut ? 'text-emerald-600' : 'text-orange-600'}`}>{isOut ? '+' : ''}{fmtEur(inv.total_amount)}</span></div>
-        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className="flex gap-1">{isOut && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">Attiva</span>}{nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}<span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></span></div>
+        <div className="flex justify-between items-center"><span className="text-xs font-semibold text-gray-800 truncate max-w-[55%]">{displayName}</span><span className={`text-xs font-bold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(inv.total_amount)}</span></div>
+        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className="flex gap-1">{nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}<span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></span></div>
       </div>
     </div>
   );
@@ -548,10 +547,28 @@ export default function FatturePage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'overdue' | 'paid'>('all');
-  const [directionFilter, setDirectionFilter] = useState<'all' | 'in' | 'out'>('all');
+  const [directionFilter, setDirectionFilter] = useState<'all' | 'in' | 'out'>('in');
   const [selectMode, setSelectMode] = useState(false);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [deleteModal, setDeleteModal] = useState<{ open: boolean; ids: string[] }>({ open: false, ids: [] });
+  const [fixing, setFixing] = useState(false);
+  const [fixProgress, setFixProgress] = useState('');
+
+  const handleFixNames = useCallback(async () => {
+    if (!companyId || fixing) return;
+    setFixing(true); setFixProgress('Avvio...');
+    try {
+      const result = await fixAllCounterparties(companyId, (cur, tot) => {
+        setFixProgress(`${cur}/${tot}`);
+      });
+      setFixProgress(`✅ ${result.fixed} corrette, ${result.errors} errori`);
+      await reload();
+      setTimeout(() => { setFixing(false); setFixProgress(''); }, 3000);
+    } catch (e: any) {
+      setFixProgress(`❌ Errore: ${e.message}`);
+      setTimeout(() => { setFixing(false); setFixProgress(''); }, 4000);
+    }
+  }, [companyId, fixing, reload]);
 
   const reload = useCallback(async () => {
     if (!companyId) return;
@@ -625,13 +642,14 @@ export default function FatturePage() {
     setChecked(prev => { const n = new Set(prev); fids.forEach(id => allC ? n.delete(id) : n.add(id)); return n; });
   };
 
+  const dirFiltered = directionFilter === 'all' ? invoices : invoices.filter(i => i.direction === directionFilter);
   const stats = {
-    total: invoices.length,
-    totalAmount: invoices.reduce((s, i) => s + (i.doc_type === 'TD04' ? -1 : 1) * i.total_amount, 0),
-    daPagare: invoices.filter(i => i.payment_status === 'pending').length,
-    scadute: invoices.filter(i => i.payment_status === 'overdue').length,
-    pagate: invoices.filter(i => i.payment_status === 'paid').length,
-    fornitori: new Set(invoices.map(i => (i.counterparty as any)?.denom || i.source_filename)).size,
+    total: dirFiltered.length,
+    totalAmount: dirFiltered.reduce((s, i) => s + (i.doc_type === 'TD04' ? -1 : 1) * i.total_amount, 0),
+    daPagare: dirFiltered.filter(i => i.payment_status === 'pending').length,
+    scadute: dirFiltered.filter(i => i.payment_status === 'overdue').length,
+    pagate: dirFiltered.filter(i => i.payment_status === 'paid').length,
+    counterparties: new Set(dirFiltered.map(i => (i.counterparty as any)?.denom || i.source_filename)).size,
   };
   const selectedInvoice = invoices.find(i => i.id === selectedId);
   const allFilteredChecked = filtered.length > 0 && filtered.every(i => checked.has(i.id));
@@ -641,14 +659,15 @@ export default function FatturePage() {
       <ConfirmDeleteModal open={deleteModal.open} count={deleteModal.ids.length} onConfirm={handleDeleteConfirm} onCancel={() => setDeleteModal({ open: false, ids: [] })} />
       {/* Top bar */}
       <div className="flex items-center gap-3 px-4 py-2.5 bg-white border-b shadow-sm flex-shrink-0 flex-wrap print:hidden">
-        <h1 className="text-lg font-bold text-gray-800">📄 Fatture</h1><div className="flex-1" />
+        <h1 className="text-lg font-bold text-gray-800">📄 Fatture {directionFilter === 'out' ? 'Attive' : directionFilter === 'in' ? 'Passive' : ''}</h1><div className="flex-1" />
         <span className="text-xs px-2 py-1 bg-gray-100 rounded font-medium">{stats.total} fatture</span>
-        <span className="text-xs px-2 py-1 bg-yellow-100 text-yellow-800 rounded font-medium">{stats.daPagare} da pagare</span>
+        <span className="text-xs px-2 py-1 bg-yellow-100 text-yellow-800 rounded font-medium">{stats.daPagare} {directionFilter === 'out' ? 'da incassare' : 'da pagare'}</span>
         {stats.scadute > 0 && <span className="text-xs px-2 py-1 bg-red-100 text-red-800 rounded font-medium">{stats.scadute} scadute</span>}
-        <span className="text-xs px-2 py-1 bg-green-100 text-green-800 rounded font-medium">{stats.pagate} pagate</span>
-        <span className="text-xs px-2 py-1 bg-purple-100 text-purple-800 rounded font-medium">{stats.fornitori} fornitori</span>
+        <span className="text-xs px-2 py-1 bg-green-100 text-green-800 rounded font-medium">{stats.pagate} {directionFilter === 'out' ? 'incassate' : 'pagate'}</span>
+        <span className="text-xs px-2 py-1 bg-purple-100 text-purple-800 rounded font-medium">{stats.counterparties} {directionFilter === 'out' ? 'clienti' : 'fornitori'}</span>
         <span className="text-sm font-bold text-green-700">Totale: {fmtEur(stats.totalAmount)}</span>
         <button onClick={() => fileRef.current?.click()} className="px-3 py-1.5 text-xs font-semibold bg-sky-600 text-white rounded-lg hover:bg-sky-700">📥 Importa</button>
+        <button onClick={handleFixNames} disabled={fixing} className="px-3 py-1.5 text-xs font-semibold bg-amber-500 text-white rounded-lg hover:bg-amber-600 disabled:opacity-50">{fixing ? `🔄 ${fixProgress}` : '🔧 Fix Nomi'}</button>
         <input ref={fileRef} type="file" multiple accept=".xml,.p7m,.zip" onChange={e => e.target.files && handleImport(e.target.files)} className="hidden" />
       </div>
 
@@ -657,16 +676,22 @@ export default function FatturePage() {
       <div className="flex flex-1 overflow-hidden">
         {/* Sidebar */}
         <div className="w-80 border-r bg-white flex flex-col flex-shrink-0 print:hidden">
+          {/* Direction tabs — top level */}
+          <div className="flex border-b">
+            {([['in', 'Passive (Ricevute)'], ['out', 'Attive (Emesse)']] as const).map(([k, label]) => (
+              <button key={k} onClick={() => setDirectionFilter(k)} className={`flex-1 py-2.5 text-xs font-bold transition-all ${directionFilter === k ? (k === 'in' ? 'text-orange-700 border-b-2 border-orange-500 bg-orange-50' : 'text-emerald-700 border-b-2 border-emerald-500 bg-emerald-50') : 'text-gray-400 hover:text-gray-600 hover:bg-gray-50'}`}>
+                {label}
+                <span className={`ml-1.5 text-[10px] px-1.5 py-0.5 rounded-full ${directionFilter === k ? (k === 'in' ? 'bg-orange-200 text-orange-800' : 'bg-emerald-200 text-emerald-800') : 'bg-gray-100 text-gray-500'}`}>
+                  {invoices.filter(i => i.direction === k).length}
+                </span>
+              </button>
+            ))}
+          </div>
           <div className="p-2 border-b space-y-2">
-            <input value={query} onChange={e => setQuery(e.target.value)} placeholder="🔍 Cerca fornitore, numero..." className="w-full px-2.5 py-1.5 text-xs border rounded-lg bg-gray-50 outline-none focus:ring-1 focus:ring-sky-400" />
+            <input value={query} onChange={e => setQuery(e.target.value)} placeholder={directionFilter === 'out' ? '🔍 Cerca cliente, numero...' : '🔍 Cerca fornitore, numero...'} className="w-full px-2.5 py-1.5 text-xs border rounded-lg bg-gray-50 outline-none focus:ring-1 focus:ring-sky-400" />
             <div className="flex gap-1">
               {(['all', 'pending', 'overdue', 'paid'] as const).map(s => (
                 <button key={s} onClick={() => setStatusFilter(s)} className={`flex-1 py-1 text-[10px] font-semibold rounded ${statusFilter === s ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>{s === 'all' ? 'Tutte' : STATUS_LABELS[s]}</button>
-              ))}
-            </div>
-            <div className="flex gap-1">
-              {([['all', 'Tutte'], ['in', '↓ Passive'], ['out', '↑ Attive']] as const).map(([k, label]) => (
-                <button key={k} onClick={() => setDirectionFilter(k)} className={`flex-1 py-1 text-[10px] font-semibold rounded ${directionFilter === k ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>{label}</button>
               ))}
             </div>
             <div className="flex items-center gap-2">
