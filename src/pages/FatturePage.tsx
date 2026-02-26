@@ -213,12 +213,21 @@ function EditForm({ invoice, onSave, onCancel }: { invoice: DBInvoice; onSave: (
 // ============================================================
 interface ImportLog { fn: string; status: 'ok' | 'duplicate' | 'error_parse' | 'error_save'; message?: string | null; }
 function ImportProgress({ phase, current, total, logs }: { phase: 'reading' | 'saving' | 'done'; current: number; total: number; logs: ImportLog[] }) {
-  const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+  const pct = phase === 'saving' && total > 0 ? Math.round((current / total) * 100) : phase === 'done' ? 100 : 0;
   const okC = logs.filter(l => l.status === 'ok').length, dupC = logs.filter(l => l.status === 'duplicate').length, errC = logs.filter(l => l.status.startsWith('error')).length;
   return (
     <div className="bg-white border rounded-lg p-4 mb-4">
-      <div className="flex items-center justify-between mb-2"><span className="text-sm font-semibold text-gray-700">{phase === 'reading' ? '📖 Lettura file...' : phase === 'saving' ? '💾 Salvataggio...' : '✅ Completato'}</span><span className="text-sm text-gray-500">{current}/{total} ({pct}%)</span></div>
-      <div className="w-full bg-gray-200 rounded-full h-2 mb-3"><div className={`h-2 rounded-full transition-all duration-300 ${phase === 'done' ? 'bg-green-500' : 'bg-blue-500'}`} style={{ width: `${pct}%` }} /></div>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-sm font-semibold text-gray-700">{phase === 'reading' ? '📖 Lettura file...' : phase === 'saving' ? '💾 Salvataggio...' : '✅ Completato'}</span>
+        <span className="text-sm text-gray-500">{phase === 'reading' ? `${current} file letti` : `${current}/${total} (${pct}%)`}</span>
+      </div>
+      <div className="w-full bg-gray-200 rounded-full h-2 mb-3 overflow-hidden">
+        {phase === 'reading' ? (
+          <div className="h-2 rounded-full bg-blue-500 animate-pulse" style={{ width: '100%' }} />
+        ) : (
+          <div className={`h-2 rounded-full transition-all duration-300 ${phase === 'done' ? 'bg-green-500' : 'bg-blue-500'}`} style={{ width: `${pct}%` }} />
+        )}
+      </div>
       <div className="flex gap-4 text-xs"><span className="text-green-700">✓ {okC} importati</span><span className="text-yellow-700">⊘ {dupC} duplicati</span><span className="text-red-700">✕ {errC} errori</span></div>
       {errC > 0 && <div className="mt-3 max-h-40 overflow-y-auto">{logs.filter(l => l.status.startsWith('error')).map((l, i) => <div key={i} className="text-xs text-red-600 bg-red-50 rounded px-2 py-1 mb-1 font-mono truncate">✕ {l.fn}: {l.message}</div>)}</div>}
     </div>
@@ -237,7 +246,7 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck }: 
       {selectMode && <input type="checkbox" checked={checked} onChange={onCheck} className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />}
       <div className="flex-1 min-w-0" onClick={onSelect}>
         <div className="flex justify-between items-center"><span className="text-xs font-semibold text-gray-800 truncate max-w-[55%]">{displayName}</span><span className={`text-xs font-bold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(inv.total_amount)}</span></div>
-        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></div>
+        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className="flex gap-1">{nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}<span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></span></div>
       </div>
     </div>
   );
