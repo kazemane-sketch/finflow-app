@@ -554,6 +554,14 @@ export default function FatturePage() {
   const [fixing, setFixing] = useState(false);
   const [fixProgress, setFixProgress] = useState('');
 
+  const reload = useCallback(async () => {
+    if (!companyId) return;
+    setLoadingList(true);
+    try { setInvoices(await loadInvoices(companyId)); } catch (e) { console.error('Errore:', e); }
+    setLoadingList(false);
+  }, [companyId]);
+  useEffect(() => { reload(); }, [reload]);
+
   const handleFixNames = useCallback(async () => {
     if (!companyId || fixing) return;
     setFixing(true); setFixProgress('Avvio...');
@@ -569,14 +577,6 @@ export default function FatturePage() {
       setTimeout(() => { setFixing(false); setFixProgress(''); }, 4000);
     }
   }, [companyId, fixing, reload]);
-
-  const reload = useCallback(async () => {
-    if (!companyId) return;
-    setLoadingList(true);
-    try { setInvoices(await loadInvoices(companyId)); } catch (e) { console.error('Errore:', e); }
-    setLoadingList(false);
-  }, [companyId]);
-  useEffect(() => { reload(); }, [reload]);
 
   useEffect(() => {
     if (!selectedId) { setDetail(null); return; }
