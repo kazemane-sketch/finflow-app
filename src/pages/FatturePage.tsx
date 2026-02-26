@@ -403,11 +403,11 @@ function Row({ l, v, accent, bold }: { l: string; v: string | undefined | null; 
   );
 }
 
-function TH({ children, align = 'right' }: { children: React.ReactNode; align?: string }) {
+function TH({ children, align = 'right' }: { children?: React.ReactNode; align?: string }) {
   return <th className={`px-1.5 py-1.5 font-bold text-[10px] tracking-wide border-b-2 border-sky-200 bg-sky-50 whitespace-nowrap text-sky-700 ${align === 'left' ? 'text-left' : 'text-right'}`}>{children}</th>;
 }
 
-function TDc({ children, align = 'right', bold, color }: { children: React.ReactNode; align?: string; bold?: boolean; color?: string }) {
+function TDc({ children, align = 'right', bold, color }: { children?: React.ReactNode; align?: string; bold?: boolean; color?: string }) {
   return <td className={`px-1.5 py-1.5 text-[11px] border-b border-gray-100 ${bold ? 'font-bold' : ''} ${color || ''} ${align === 'left' ? 'text-left' : 'text-right'}`}>{children}</td>;
 }
 
