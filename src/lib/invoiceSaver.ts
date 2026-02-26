@@ -206,7 +206,8 @@ export async function loadInvoices(companyId: string): Promise<DBInvoice[]> {
     .from('invoices')
     .select('id, company_id, counterparty_id, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, payment_status, reconciliation_status, sdi_id, notes, source_filename, parse_method, xml_hash, created_at')
     .eq('company_id', companyId)
-    .order('date', { ascending: false });
+    .order('date', { ascending: false })
+    .range(0, 4999);
 
   if (error) throw new Error(error.message);
   return (data || []) as DBInvoice[];
