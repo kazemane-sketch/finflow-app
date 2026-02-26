@@ -25,8 +25,8 @@ const NAT: Record<string, string> = {
 const CPC: Record<string, string> = { TP01: 'A rate', TP02: 'Completo', TP03: 'Anticipo' };
 const ESI: Record<string, string> = { I: 'Immediata', D: 'Differita', S: 'Split payment' };
 const RIT: Record<string, string> = { RT01: 'Pers. fisiche', RT02: 'Pers. giuridiche', RT03: 'INPS', RT04: 'ENASARCO', RT05: 'ENPAM' };
-const STATUS_LABELS: Record<string, string> = { da_pagare: 'Da Pagare', scaduta: 'Scaduta', pagata: 'Pagata' };
-const STATUS_COLORS: Record<string, string> = { da_pagare: 'bg-yellow-100 text-yellow-800', scaduta: 'bg-red-100 text-red-800', pagata: 'bg-green-100 text-green-800' };
+const STATUS_LABELS: Record<string, string> = { pending: 'Da Pagare', overdue: 'Scaduta', paid: 'Pagata' };
+const STATUS_COLORS: Record<string, string> = { pending: 'bg-yellow-100 text-yellow-800', overdue: 'bg-red-100 text-red-800', paid: 'bg-green-100 text-green-800' };
 
 // ============================================================
 // INLINE XML PARSER — self-contained, no external deps
@@ -195,7 +195,7 @@ function EditForm({ invoice, onSave, onCancel }: { invoice: DBInvoice; onSave: (
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Numero</label><input value={form.number || ''} onChange={e => setForm({ ...form, number: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Data</label><input type="date" value={form.date || ''} onChange={e => setForm({ ...form, date: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Totale (€)</label><input type="number" step="0.01" value={form.total_amount ?? ''} onChange={e => setForm({ ...form, total_amount: parseFloat(e.target.value) || 0 })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
-        <div><label className="block text-xs font-medium text-gray-600 mb-1">Stato</label><select value={form.payment_status || 'da_pagare'} onChange={e => setForm({ ...form, payment_status: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"><option value="da_pagare">Da Pagare</option><option value="scaduta">Scaduta</option><option value="pagata">Pagata</option></select></div>
+        <div><label className="block text-xs font-medium text-gray-600 mb-1">Stato</label><select value={form.payment_status || 'pending'} onChange={e => setForm({ ...form, payment_status: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"><option value="pending">Da Pagare</option><option value="overdue">Scaduta</option><option value="paid">Pagata</option></select></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Scadenza</label><input type="date" value={form.payment_due_date || ''} onChange={e => setForm({ ...form, payment_due_date: e.target.value || null })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Modalità Pag.</label><select value={form.payment_method || ''} onChange={e => setForm({ ...form, payment_method: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"><option value="">—</option>{Object.entries(MP).map(([k, v]) => <option key={k} value={k}>{k} — {v}</option>)}</select></div>
       </div>
@@ -541,7 +541,7 @@ export default function FatturePage() {
   const [importLogs, setImportLogs] = useState<ImportLog[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'da_pagare' | 'scaduta' | 'pagata'>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'overdue' | 'paid'>('all');
   const [selectMode, setSelectMode] = useState(false);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [deleteModal, setDeleteModal] = useState<{ open: boolean; ids: string[] }>({ open: false, ids: [] });
@@ -611,9 +611,9 @@ export default function FatturePage() {
   const stats = {
     total: invoices.length,
     totalAmount: invoices.reduce((s, i) => s + (i.doc_type === 'TD04' ? -1 : 1) * i.total_amount, 0),
-    daPagare: invoices.filter(i => i.payment_status === 'da_pagare').length,
-    scadute: invoices.filter(i => i.payment_status === 'scaduta').length,
-    pagate: invoices.filter(i => i.payment_status === 'pagata').length,
+    daPagare: invoices.filter(i => i.payment_status === 'pending').length,
+    scadute: invoices.filter(i => i.payment_status === 'overdue').length,
+    pagate: invoices.filter(i => i.payment_status === 'paid').length,
     fornitori: new Set(invoices.map(i => (i.counterparty as any)?.denom || i.source_filename)).size,
   };
   const selectedInvoice = invoices.find(i => i.id === selectedId);
@@ -643,7 +643,7 @@ export default function FatturePage() {
           <div className="p-2 border-b space-y-2">
             <input value={query} onChange={e => setQuery(e.target.value)} placeholder="🔍 Cerca fornitore, numero..." className="w-full px-2.5 py-1.5 text-xs border rounded-lg bg-gray-50 outline-none focus:ring-1 focus:ring-sky-400" />
             <div className="flex gap-1">
-              {(['all', 'da_pagare', 'scaduta', 'pagata'] as const).map(s => (
+              {(['all', 'pending', 'overdue', 'paid'] as const).map(s => (
                 <button key={s} onClick={() => setStatusFilter(s)} className={`flex-1 py-1 text-[10px] font-semibold rounded ${statusFilter === s ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>{s === 'all' ? 'Tutte' : STATUS_LABELS[s]}</button>
               ))}
             </div>

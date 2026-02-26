@@ -102,12 +102,12 @@ export async function saveInvoicesToDB(
       const b = r.data.bodies[0];
       if (!b) throw new Error('Nessun body nella fattura');
 
-      // Determina stato pagamento
-      let paymentStatus = 'da_pagare';
+      // Determina stato pagamento (DB values: pending, overdue, paid, partial)
+      let paymentStatus = 'pending';
       const paymentDue = b.pagamenti?.[0]?.scadenza || null;
       if (paymentDue) {
         const due = new Date(paymentDue);
-        if (due < new Date()) paymentStatus = 'scaduta';
+        if (due < new Date()) paymentStatus = 'overdue';
       }
 
       // Calcola imponibile e imposta dai riepiloghi
@@ -125,7 +125,7 @@ export async function saveInvoicesToDB(
         .from('invoices')
         .insert({
           company_id: companyId,
-          direction: 'passive',
+          direction: 'in',  // in=ricevuta, out=emessa
           doc_type: b.tipo || 'TD01',
           number: b.numero || '',
           date: b.data || new Date().toISOString().split('T')[0],
