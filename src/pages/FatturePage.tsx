@@ -266,7 +266,7 @@ function EditForm({
 interface ImportLog {
   fn: string;
   status: 'ok' | 'duplicate' | 'error_parse' | 'error_save';
-  message?: string;
+  message?: string | null;
 }
 
 function ImportProgress({
@@ -529,7 +529,8 @@ function InvoiceDetail({
 // MAIN PAGE
 // ============================================================
 export default function FatturePage() {
-  const { companyId, ensureCompany } = useCompany();
+  const { company, ensureCompany } = useCompany();
+  const companyId = company?.id || null;
 
   // Data
   const [invoices, setInvoices] = useState<DBInvoice[]>([]);
