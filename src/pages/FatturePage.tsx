@@ -1,677 +1,890 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { processInvoiceFile, TIPO, MP, REG, type ParseResult, type ParsedInvoice, reparseXml } from '@/lib/invoiceParser'
-import { saveInvoicesToDB, loadInvoices, loadInvoiceDetail, type DBInvoice, type DBInvoiceDetail } from '@/lib/invoiceSaver'
-import { useCompany } from '@/hooks/useCompany'
-import { fmtNum, fmtEur, fmtDate } from '@/lib/utils'
+// src/pages/FatturePage.tsx — v3
+// Multi-select, eliminazione bulk/singola con popup password, modifica inline
+import { useState, useCallback, useRef, useEffect } from 'react';
+import { processInvoiceFile, TIPO, MP, REG, reparseXml } from '@/lib/invoiceParser';
 import {
-  Upload, FileText, Search, ChevronDown, ChevronRight,
-  CheckCircle2, Clock, AlertTriangle, CreditCard,
-  Database, FileCode, Package, Loader2, Copy, X,
-  AlertCircle, CheckCircle, XCircle, FileWarning,
-} from 'lucide-react'
-import { toast } from 'sonner'
+  saveInvoicesToDB,
+  loadInvoices,
+  loadInvoiceDetail,
+  deleteInvoices,
+  updateInvoice,
+  verifyPassword,
+  type DBInvoice,
+  type DBInvoiceDetail,
+  type InvoiceUpdate,
+} from '@/lib/invoiceSaver';
+import { useCompany } from '@/hooks/useCompany';
+import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
+import { supabase } from '@/integrations/supabase/client';
 
-const NAT: Record<string, string> = { N1: "Escl. art.15", N2: "Non soggette", "N2.1": "Non sogg. art.7", "N2.2": "Non sogg. altri", N3: "Non imponibili", "N3.1": "Esportaz.", "N3.2": "Cess. intra.", "N3.3": "S.Marino", "N3.4": "Op. assimilate", "N3.5": "Dich. intento", "N3.6": "Altre", N4: "Esenti", N5: "Margine", N6: "Reverse charge", "N6.1": "Rottami", "N6.2": "Oro", "N6.3": "Subapp. edil.", "N6.4": "Fabbricati", "N6.5": "Cellulari", "N6.6": "Elettronici", "N6.7": "Edile", "N6.8": "Energia", "N6.9": "RC altri", N7: "IVA in altro UE" }
-const ESI: Record<string, string> = { I: "Immediata", D: "Differita", S: "Split payment" }
-const CP: Record<string, string> = { TP01: "A rate", TP02: "Completo", TP03: "Anticipo" }
-const RIT: Record<string, string> = { RT01: "Pers. fisiche", RT02: "Pers. giuridiche", RT03: "INPS", RT04: "ENASARCO", RT05: "ENPAM" }
+// ============================================================
+// LOOKUPS
+// ============================================================
+const NAT: Record<string, string> = {
+  N1: 'Escl. art.15', N2: 'Non soggette', 'N2.1': 'Non sogg. art.7', 'N2.2': 'Non sogg. altri',
+  N3: 'Non imponibili', 'N3.1': 'Esportaz.', 'N3.2': 'Cess. intra.', 'N3.3': 'S.Marino',
+  'N3.4': 'Op. assimilate', 'N3.5': 'Dich. intento', 'N3.6': 'Altre', N4: 'Esenti',
+  N5: 'Margine', N6: 'Reverse charge', 'N6.1': 'Rottami', 'N6.2': 'Oro',
+  'N6.3': 'Subapp. edil.', 'N6.4': 'Fabbricati', 'N6.5': 'Cellulari',
+  'N6.6': 'Elettronici', 'N6.7': 'Edile', 'N6.8': 'Energia', 'N6.9': 'RC altri',
+  N7: 'IVA in altro UE',
+};
+const CP: Record<string, string> = { TP01: 'A rate', TP02: 'Completo', TP03: 'Anticipo' };
+const ESI: Record<string, string> = { I: 'Immediata', D: 'Differita', S: 'Split payment' };
+const STATUS_LABELS: Record<string, string> = {
+  da_pagare: 'Da Pagare',
+  scaduta: 'Scaduta',
+  pagata: 'Pagata',
+};
+const STATUS_COLORS: Record<string, string> = {
+  da_pagare: 'bg-yellow-100 text-yellow-800',
+  scaduta: 'bg-red-100 text-red-800',
+  pagata: 'bg-green-100 text-green-800',
+};
 
-const STATUS_MAP: Record<string, { label: string; color: string; icon: any }> = {
-  pending: { label: 'Da pagare', color: 'text-amber-600 bg-amber-50', icon: Clock },
-  paid: { label: 'Pagata', color: 'text-emerald-600 bg-emerald-50', icon: CheckCircle2 },
-  overdue: { label: 'Scaduta', color: 'text-red-600 bg-red-50', icon: AlertTriangle },
-  partial: { label: 'Parziale', color: 'text-blue-600 bg-blue-50', icon: CreditCard },
+// ============================================================
+// CONFIRM MODAL — richiede password per operazioni sensibili
+// ============================================================
+function ConfirmDeleteModal({
+  open,
+  count,
+  onConfirm,
+  onCancel,
+}: {
+  open: boolean;
+  count: number;
+  onConfirm: (password: string) => void;
+  onCancel: () => void;
+}) {
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (open) {
+      setPassword('');
+      setError('');
+      setTimeout(() => inputRef.current?.focus(), 100);
+    }
+  }, [open]);
+
+  if (!open) return null;
+
+  const handleConfirm = async () => {
+    if (!password.trim()) {
+      setError('Inserisci la password');
+      return;
+    }
+    setLoading(true);
+    setError('');
+    const ok = await verifyPassword(password);
+    setLoading(false);
+    if (ok) {
+      onConfirm(password);
+    } else {
+      setError('Password errata');
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onCancel}>
+      <div className="bg-white rounded-xl shadow-2xl p-6 max-w-md w-full mx-4" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center">
+            <span className="text-red-600 text-lg">🗑</span>
+          </div>
+          <div>
+            <h3 className="text-lg font-bold text-gray-900">Conferma Eliminazione</h3>
+            <p className="text-sm text-gray-500">
+              {count === 1 ? 'Stai per eliminare 1 fattura' : `Stai per eliminare ${count} fatture`}
+            </p>
+          </div>
+        </div>
+
+        <p className="text-sm text-gray-600 mb-4">
+          Questa azione è <span className="font-semibold text-red-600">irreversibile</span>. Le fatture e tutte le righe dettaglio associate verranno eliminate permanentemente. Inserisci la tua password per confermare.
+        </p>
+
+        <div className="mb-4">
+          <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
+          <input
+            ref={inputRef}
+            type="password"
+            value={password}
+            onChange={e => { setPassword(e.target.value); setError(''); }}
+            onKeyDown={e => e.key === 'Enter' && handleConfirm()}
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none"
+            placeholder="Inserisci la tua password"
+          />
+          {error && <p className="text-sm text-red-600 mt-1">{error}</p>}
+        </div>
+
+        <div className="flex justify-end gap-3">
+          <button onClick={onCancel} className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">
+            Annulla
+          </button>
+          <button
+            onClick={handleConfirm}
+            disabled={loading}
+            className="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-50"
+          >
+            {loading ? 'Verifica...' : `Elimina ${count} fattur${count === 1 ? 'a' : 'e'}`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
-interface ImportLogEntry {
-  fn: string
-  status: 'ok' | 'duplicate' | 'parse_error' | 'save_error'
-  error?: string
-  rawXml?: string
+// ============================================================
+// EDIT FORM — modifica inline fattura
+// ============================================================
+function EditForm({
+  invoice,
+  onSave,
+  onCancel,
+}: {
+  invoice: DBInvoice;
+  onSave: (updates: InvoiceUpdate) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [form, setForm] = useState<InvoiceUpdate>({
+    number: invoice.number,
+    date: invoice.date,
+    total_amount: invoice.total_amount,
+    payment_status: invoice.payment_status,
+    payment_due_date: invoice.payment_due_date || '',
+    payment_method: invoice.payment_method,
+    notes: invoice.notes,
+  });
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await onSave(form);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+      <h4 className="text-sm font-bold text-blue-800 mb-3">✏️ Modifica Fattura</h4>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="block text-xs font-medium text-gray-600 mb-1">Numero</label>
+          <input
+            value={form.number || ''}
+            onChange={e => setForm({ ...form, number: e.target.value })}
+            className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-gray-600 mb-1">Data</label>
+          <input
+            type="date"
+            value={form.date || ''}
+            onChange={e => setForm({ ...form, date: e.target.value })}
+            className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-gray-600 mb-1">Totale (€)</label>
+          <input
+            type="number"
+            step="0.01"
+            value={form.total_amount ?? ''}
+            onChange={e => setForm({ ...form, total_amount: parseFloat(e.target.value) || 0 })}
+            className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-gray-600 mb-1">Stato Pagamento</label>
+          <select
+            value={form.payment_status || 'da_pagare'}
+            onChange={e => setForm({ ...form, payment_status: e.target.value })}
+            className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"
+          >
+            <option value="da_pagare">Da Pagare</option>
+            <option value="scaduta">Scaduta</option>
+            <option value="pagata">Pagata</option>
+          </select>
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-gray-600 mb-1">Scadenza Pagamento</label>
+          <input
+            type="date"
+            value={form.payment_due_date || ''}
+            onChange={e => setForm({ ...form, payment_due_date: e.target.value || null })}
+            className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"
+          />
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-gray-600 mb-1">Modalità Pagamento</label>
+          <select
+            value={form.payment_method || ''}
+            onChange={e => setForm({ ...form, payment_method: e.target.value })}
+            className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"
+          >
+            <option value="">—</option>
+            {Object.entries(MP).map(([k, v]) => (
+              <option key={k} value={k}>{k} — {v}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <div className="mt-3">
+        <label className="block text-xs font-medium text-gray-600 mb-1">Note</label>
+        <textarea
+          value={form.notes || ''}
+          onChange={e => setForm({ ...form, notes: e.target.value })}
+          rows={2}
+          className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none resize-none"
+        />
+      </div>
+      <div className="flex justify-end gap-2 mt-3">
+        <button onClick={onCancel} className="px-3 py-1.5 text-xs font-medium text-gray-600 bg-gray-100 rounded hover:bg-gray-200">
+          Annulla
+        </button>
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="px-3 py-1.5 text-xs font-medium text-white bg-blue-600 rounded hover:bg-blue-700 disabled:opacity-50"
+        >
+          {saving ? 'Salvataggio...' : '💾 Salva Modifiche'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// IMPORT PROGRESS / LOG
+// ============================================================
+interface ImportLog {
+  fn: string;
+  status: 'ok' | 'duplicate' | 'error_parse' | 'error_save';
+  message?: string;
+}
+
+function ImportProgress({
+  phase,
+  current,
+  total,
+  logs,
+}: {
+  phase: 'reading' | 'saving' | 'done';
+  current: number;
+  total: number;
+  logs: ImportLog[];
+}) {
+  const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+  const okCount = logs.filter(l => l.status === 'ok').length;
+  const dupCount = logs.filter(l => l.status === 'duplicate').length;
+  const errCount = logs.filter(l => l.status.startsWith('error')).length;
+
+  return (
+    <div className="bg-white border rounded-lg p-4 mb-4">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-sm font-semibold text-gray-700">
+          {phase === 'reading' ? '📖 Lettura file...' : phase === 'saving' ? '💾 Salvataggio su DB...' : '✅ Import completato'}
+        </span>
+        <span className="text-sm text-gray-500">{current}/{total} ({pct}%)</span>
+      </div>
+      <div className="w-full bg-gray-200 rounded-full h-2 mb-3">
+        <div
+          className={`h-2 rounded-full transition-all duration-300 ${phase === 'done' ? 'bg-green-500' : 'bg-blue-500'}`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <div className="flex gap-4 text-xs">
+        <span className="text-green-700">✓ {okCount} importati</span>
+        <span className="text-yellow-700">⊘ {dupCount} duplicati</span>
+        <span className="text-red-700">✕ {errCount} errori</span>
+      </div>
+
+      {/* Error log */}
+      {errCount > 0 && (
+        <div className="mt-3 max-h-40 overflow-y-auto">
+          {logs.filter(l => l.status.startsWith('error')).map((l, i) => (
+            <div key={i} className="text-xs text-red-600 bg-red-50 rounded px-2 py-1 mb-1 font-mono truncate">
+              ✕ {l.fn}: {l.message}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// INVOICE SIDEBAR CARD
+// ============================================================
+function InvoiceCard({
+  inv,
+  selected,
+  checked,
+  selectMode,
+  onSelect,
+  onCheck,
+}: {
+  inv: DBInvoice;
+  selected: boolean;
+  checked: boolean;
+  selectMode: boolean;
+  onSelect: () => void;
+  onCheck: () => void;
+}) {
+  const nc = inv.doc_type === 'TD04' || inv.doc_type === 'TD05';
+  const cp = inv.counterparty as any;
+
+  return (
+    <div
+      className={`flex items-start gap-2 px-3 py-2.5 cursor-pointer border-b border-gray-100 transition-all ${
+        checked ? 'bg-blue-50 border-l-4 border-l-blue-500' : selected ? 'bg-sky-50 border-l-4 border-l-sky-500' : 'border-l-4 border-l-transparent hover:bg-gray-50'
+      }`}
+    >
+      {selectMode && (
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={onCheck}
+          className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0"
+          onClick={e => e.stopPropagation()}
+        />
+      )}
+      <div className="flex-1 min-w-0" onClick={onSelect}>
+        <div className="flex justify-between items-center">
+          <span className="text-xs font-semibold text-gray-800 truncate max-w-[55%]">
+            {cp?.denom || 'Sconosciuto'}
+          </span>
+          <span className={`text-xs font-bold ${nc ? 'text-red-600' : 'text-green-700'}`}>
+            {fmtEur(inv.total_amount)}
+          </span>
+        </div>
+        <div className="flex justify-between items-center mt-0.5">
+          <span className="text-[10px] text-gray-500">
+            n.{inv.number} — {fmtDate(inv.date)}
+          </span>
+          <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>
+            {STATUS_LABELS[inv.payment_status] || inv.payment_status}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// INVOICE DETAIL VIEW
+// ============================================================
+function InvoiceDetail({
+  invoice,
+  detail,
+  loadingDetail,
+  onEdit,
+  onDelete,
+  onReload,
+}: {
+  invoice: DBInvoice;
+  detail: DBInvoiceDetail | null;
+  loadingDetail: boolean;
+  onEdit: (updates: InvoiceUpdate) => Promise<void>;
+  onDelete: () => void;
+  onReload: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const nc = invoice.doc_type === 'TD04' || invoice.doc_type === 'TD05';
+  const cp = invoice.counterparty as any;
+
+  const handleSave = async (updates: InvoiceUpdate) => {
+    await onEdit(updates);
+    setEditing(false);
+    onReload();
+  };
+
+  return (
+    <div className="p-5 overflow-y-auto h-full">
+      {/* Action buttons */}
+      <div className="flex justify-end gap-2 mb-4">
+        <button
+          onClick={() => setEditing(!editing)}
+          className={`px-3 py-1.5 text-xs font-semibold rounded-lg border ${editing ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-blue-600 border-blue-300 hover:bg-blue-50'}`}
+        >
+          {editing ? '✕ Chiudi Modifica' : '✏️ Modifica'}
+        </button>
+        <button
+          onClick={onDelete}
+          className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-red-300 text-red-600 bg-white hover:bg-red-50"
+        >
+          🗑 Elimina
+        </button>
+      </div>
+
+      {/* Edit form */}
+      {editing && (
+        <EditForm invoice={invoice} onSave={handleSave} onCancel={() => setEditing(false)} />
+      )}
+
+      {/* Header */}
+      <div className="text-center mb-5 pb-4 border-b-2 border-sky-200">
+        <h2 className="text-xl font-extrabold text-gray-900">
+          {TIPO[invoice.doc_type] || invoice.doc_type} &nbsp; N. {invoice.number}
+        </h2>
+        <div className="flex justify-center gap-4 mt-2 flex-wrap text-sm">
+          <span><span className="text-gray-500">Data: </span><span className="font-semibold">{fmtDate(invoice.date)}</span></span>
+          <span className={`px-2 py-0.5 rounded text-xs font-semibold ${STATUS_COLORS[invoice.payment_status] || 'bg-gray-100'}`}>
+            {STATUS_LABELS[invoice.payment_status] || invoice.payment_status}
+          </span>
+          <span className="text-gray-500 text-xs">File: {invoice.source_filename}</span>
+        </div>
+      </div>
+
+      {/* Da / Per */}
+      <div className="grid grid-cols-2 gap-4 mb-4">
+        <div className="bg-white border rounded-lg p-3">
+          <h4 className="text-xs font-bold text-sky-700 mb-2">Da (Fornitore):</h4>
+          <div className="space-y-1 text-xs">
+            <div className="flex justify-between"><span className="text-gray-500">Denominazione</span><span className="font-semibold text-sky-700 text-right max-w-[60%]">{cp?.denom}</span></div>
+            {cp?.piva && <div className="flex justify-between"><span className="text-gray-500">Partita IVA</span><span>{cp.piva}</span></div>}
+            {cp?.cf && <div className="flex justify-between"><span className="text-gray-500">Codice Fiscale</span><span>{cp.cf}</span></div>}
+            {cp?.sede && <div className="flex justify-between"><span className="text-gray-500">Sede</span><span className="text-right max-w-[60%]">{cp.sede}</span></div>}
+          </div>
+        </div>
+        <div className="bg-white border rounded-lg p-3">
+          <h4 className="text-xs font-bold text-sky-700 mb-2">Pagamento:</h4>
+          <div className="space-y-1 text-xs">
+            <div className="flex justify-between">
+              <span className="text-gray-500">Modalità</span>
+              <span>{invoice.payment_method ? `${invoice.payment_method} (${MP[invoice.payment_method] || ''})` : '—'}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-500">Scadenza</span>
+              <span>{invoice.payment_due_date ? fmtDate(invoice.payment_due_date) : '—'}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-500">Totale</span>
+              <span className={`text-base font-extrabold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(invoice.total_amount)}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Note */}
+      {invoice.notes && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 mb-4">
+          <h4 className="text-xs font-bold text-yellow-800 mb-1">📝 Note / Causale</h4>
+          <p className="text-xs text-gray-700">{invoice.notes}</p>
+        </div>
+      )}
+
+      {/* Righe dettaglio */}
+      {loadingDetail ? (
+        <div className="text-center py-8 text-gray-400 text-sm">Caricamento righe...</div>
+      ) : detail?.invoice_lines && detail.invoice_lines.length > 0 ? (
+        <div className="bg-white border rounded-lg overflow-hidden mb-4">
+          <h4 className="text-xs font-bold text-sky-700 px-3 py-2 bg-sky-50 border-b">Dettaglio Beni e Servizi</h4>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-sky-50/50">
+                  <th className="text-left px-2 py-1.5 font-semibold text-sky-700">#</th>
+                  <th className="text-left px-2 py-1.5 font-semibold text-sky-700">Descrizione</th>
+                  <th className="text-right px-2 py-1.5 font-semibold text-sky-700">Qtà</th>
+                  <th className="text-right px-2 py-1.5 font-semibold text-sky-700">Prezzo Unit.</th>
+                  <th className="text-right px-2 py-1.5 font-semibold text-sky-700">IVA %</th>
+                  <th className="text-right px-2 py-1.5 font-semibold text-sky-700">Totale</th>
+                </tr>
+              </thead>
+              <tbody>
+                {detail.invoice_lines.map((l, i) => (
+                  <tr key={l.id || i} className="border-t border-gray-100 hover:bg-gray-50">
+                    <td className="px-2 py-1.5 text-gray-400">{l.line_number || i + 1}</td>
+                    <td className="px-2 py-1.5 text-gray-700 max-w-xs">{l.description}</td>
+                    <td className="px-2 py-1.5 text-right">{fmtNum(l.quantity)}</td>
+                    <td className="px-2 py-1.5 text-right">{fmtNum(l.unit_price)}</td>
+                    <td className="px-2 py-1.5 text-right">{fmtNum(l.vat_rate)}%</td>
+                    <td className="px-2 py-1.5 text-right font-semibold">{fmtNum(l.total_price)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <div className="text-center py-6 text-gray-400 text-xs">Nessuna riga dettaglio disponibile</div>
+      )}
+
+      {/* Meta */}
+      <div className="text-center text-[10px] text-gray-400 mt-8">
+        ID: {invoice.id} — Metodo: {invoice.parse_method} — Hash: {invoice.xml_hash?.substring(0, 16)}...
+      </div>
+    </div>
+  );
 }
 
 // ============================================================
 // MAIN PAGE
 // ============================================================
 export default function FatturePage() {
-  const { company, ensureCompany } = useCompany()
-  const [invoices, setInvoices] = useState<DBInvoice[]>([])
-  const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [detail, setDetail] = useState<DBInvoiceDetail | null>(null)
-  const [detailLoading, setDetailLoading] = useState(false)
-  const [loading, setLoading] = useState(true)
-  const [importing, setImporting] = useState(false)
-  const [search, setSearch] = useState('')
-  const [statusFilter, setStatusFilter] = useState<string>('all')
-  const ref = useRef<HTMLInputElement>(null)
+  const { companyId, ensureCompany } = useCompany();
 
-  // Import progress & log
-  const [progress, setProgress] = useState<{ current: number; total: number; phase: string } | null>(null)
-  const [importLog, setImportLog] = useState<ImportLogEntry[]>([])
-  const [showLog, setShowLog] = useState(false)
+  // Data
+  const [invoices, setInvoices] = useState<DBInvoice[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<DBInvoiceDetail | null>(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [loadingList, setLoadingList] = useState(false);
 
-  const fetchInvoices = useCallback(async () => {
-    if (!company) { setLoading(false); return }
+  // Import
+  const [importing, setImporting] = useState(false);
+  const [importPhase, setImportPhase] = useState<'reading' | 'saving' | 'done'>('reading');
+  const [importCurrent, setImportCurrent] = useState(0);
+  const [importTotal, setImportTotal] = useState(0);
+  const [importLogs, setImportLogs] = useState<ImportLog[]>([]);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  // Filters
+  const [query, setQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'da_pagare' | 'scaduta' | 'pagata'>('all');
+
+  // Multi-select
+  const [selectMode, setSelectMode] = useState(false);
+  const [checked, setChecked] = useState<Set<string>>(new Set());
+
+  // Delete modal
+  const [deleteModal, setDeleteModal] = useState<{ open: boolean; ids: string[] }>({ open: false, ids: [] });
+
+  // ---- LOAD INVOICES ----
+  const reload = useCallback(async () => {
+    if (!companyId) return;
+    setLoadingList(true);
     try {
-      const data = await loadInvoices(company.id)
-      setInvoices(data)
-    } catch (e: any) { console.error('Errore caricamento fatture:', e) }
-    setLoading(false)
-  }, [company])
-
-  useEffect(() => { fetchInvoices() }, [fetchInvoices])
+      const data = await loadInvoices(companyId);
+      setInvoices(data);
+    } catch (e) {
+      console.error('Errore caricamento fatture:', e);
+    }
+    setLoadingList(false);
+  }, [companyId]);
 
   useEffect(() => {
-    if (!selectedId) { setDetail(null); return }
-    setDetailLoading(true)
-    loadInvoiceDetail(selectedId).then(d => { setDetail(d); setDetailLoading(false) })
-  }, [selectedId])
+    reload();
+  }, [reload]);
 
-  // ============================================================
-  // IMPORT WITH PROGRESS
-  // ============================================================
-  const handleFiles = useCallback(async (files: FileList | File[]) => {
-    setImporting(true)
-    setShowLog(true)
-    setSelectedId(null)
-    const log: ImportLogEntry[] = []
-    const allResults: ParseResult[] = []
-    const fileArr = Array.from(files)
+  // ---- LOAD DETAIL ----
+  useEffect(() => {
+    if (!selectedId) { setDetail(null); return; }
+    let cancelled = false;
+    setLoadingDetail(true);
+    loadInvoiceDetail(selectedId).then(d => {
+      if (!cancelled) { setDetail(d); setLoadingDetail(false); }
+    });
+    return () => { cancelled = true; };
+  }, [selectedId]);
+
+  // ---- IMPORT ----
+  const handleImport = useCallback(async (files: FileList | File[]) => {
+    if (!files.length) return;
+    setImporting(true);
+    setImportPhase('reading');
+    setImportCurrent(0);
+    setImportTotal(0);
+    setImportLogs([]);
 
     // Phase 1: Parse files
-    let totalParsed = 0
+    const parsed: any[] = [];
+    const fileArr = Array.from(files);
+    let totalFiles = 0;
+
     for (const f of fileArr) {
-      setProgress({ current: totalParsed, total: 0, phase: `Lettura ${f.name}...` })
       try {
-        const results = await processInvoiceFile(f)
-        allResults.push(...results)
-        // Log parse errors immediately
+        const results = await processInvoiceFile(f);
+        totalFiles += results.length;
+        setImportTotal(totalFiles);
         for (const r of results) {
+          parsed.push(r);
+          setImportCurrent(parsed.length);
           if (r.err) {
-            log.push({ fn: r.fn, status: 'parse_error', error: r.err, rawXml: r.rawXml || undefined })
+            setImportLogs(prev => [...prev, { fn: r.fn, status: 'error_parse', message: r.err }]);
           }
         }
-        totalParsed += results.length
       } catch (e: any) {
-        log.push({ fn: f.name, status: 'parse_error', error: e.message })
-        totalParsed++
+        parsed.push({ fn: f.name, err: e.message });
+        setImportLogs(prev => [...prev, { fn: f.name, status: 'error_parse', message: e.message }]);
       }
-      setImportLog([...log])
     }
 
-    const okResults = allResults.filter(r => !r.err && r.data)
-    const totalToSave = okResults.length
-
-    if (totalToSave === 0) {
-      setProgress(null)
-      setImporting(false)
-      setImportLog([...log])
-      toast.error(`Nessuna fattura valida su ${allResults.length} file letti.`)
-      return
+    // Auto-create company from first invoice if needed
+    const firstOk = parsed.find(r => !r.err && r.data);
+    if (firstOk) {
+      await ensureCompany(firstOk.data.ces);
     }
 
-    // Phase 2: Save to DB one by one with progress
+    const cid = companyId || (await supabase.auth.getUser()).data.user?.id;
+    if (!cid) {
+      setImporting(false);
+      return;
+    }
+
+    // Phase 2: Save to DB
+    const okParsed = parsed.filter(r => !r.err && r.data);
+    setImportPhase('saving');
+    setImportCurrent(0);
+    setImportTotal(okParsed.length);
+
+    await saveInvoicesToDB(cid, okParsed, (current, total, status, filename) => {
+      setImportCurrent(current);
+      setImportTotal(total);
+      if (status === 'ok') {
+        setImportLogs(prev => [...prev, { fn: filename, status: 'ok' }]);
+      } else if (status === 'duplicate') {
+        setImportLogs(prev => [...prev, { fn: filename, status: 'duplicate' }]);
+      } else {
+        setImportLogs(prev => [...prev, { fn: filename, status: 'error_save', message: 'Errore salvataggio' }]);
+      }
+    });
+
+    setImportPhase('done');
+    await reload();
+    setTimeout(() => setImporting(false), 3000);
+  }, [companyId, ensureCompany, reload]);
+
+  // ---- DELETE ----
+  const handleDeleteConfirm = useCallback(async (_password: string) => {
+    const ids = deleteModal.ids;
+    setDeleteModal({ open: false, ids: [] });
+
     try {
-      const companyId = await ensureCompany(okResults[0].data.ces)
-
-      for (let i = 0; i < okResults.length; i++) {
-        const r = okResults[i]
-        setProgress({ current: i + 1, total: totalToSave, phase: `Salvando ${i + 1}/${totalToSave}` })
-
-        try {
-          const saveResults = await saveInvoicesToDB([r], companyId)
-          const sr = saveResults[0]
-          if (sr.success) {
-            if (sr.error?.includes('Duplicato')) {
-              log.push({ fn: r.fn, status: 'duplicate', error: 'Fattura già importata' })
-            } else {
-              log.push({ fn: r.fn, status: 'ok' })
-            }
-          } else {
-            log.push({ fn: r.fn, status: 'save_error', error: sr.error, rawXml: r.rawXml })
-          }
-        } catch (e: any) {
-          log.push({ fn: r.fn, status: 'save_error', error: e.message, rawXml: r.rawXml })
-        }
-
-        setImportLog([...log])
-      }
-    } catch (e: any) {
-      toast.error('Errore: ' + e.message)
+      const result = await deleteInvoices(ids);
+      console.log(`Eliminate ${result.deleted} fatture`, result.errors);
+    } catch (e) {
+      console.error('Errore eliminazione:', e);
     }
 
-    // Done
-    setProgress(null)
-    setImporting(false)
-    setImportLog([...log])
+    // Deselect and reload
+    setChecked(new Set());
+    setSelectMode(false);
+    if (ids.includes(selectedId || '')) setSelectedId(null);
+    await reload();
+  }, [deleteModal.ids, selectedId, reload]);
 
-    const saved = log.filter(l => l.status === 'ok').length
-    const dupes = log.filter(l => l.status === 'duplicate').length
-    const errors = log.filter(l => l.status === 'parse_error' || l.status === 'save_error').length
+  // ---- EDIT ----
+  const handleEdit = useCallback(async (updates: InvoiceUpdate) => {
+    if (!selectedId) return;
+    await updateInvoice(selectedId, updates);
+    await reload();
+  }, [selectedId, reload]);
 
-    if (saved > 0) toast.success(`${saved} fatture importate${dupes ? `, ${dupes} duplicati` : ''}${errors ? `, ${errors} errori` : ''}`)
-    else if (dupes > 0) toast.info(`${dupes} fatture già presenti${errors ? `, ${errors} errori` : ''}`)
-    else toast.error(`${errors} errori, nessuna fattura importata`)
-
-    await fetchInvoices()
-  }, [ensureCompany, fetchInvoices])
-
+  // ---- FILTERS ----
   const filtered = invoices.filter(inv => {
-    if (statusFilter !== 'all' && inv.payment_status !== statusFilter) return false
-    if (!search) return true
-    const s = search.toLowerCase()
-    return inv.counterparty?.name?.toLowerCase().includes(s) || inv.number?.toLowerCase().includes(s) || inv.source_filename?.toLowerCase().includes(s)
-  })
+    if (statusFilter !== 'all' && inv.payment_status !== statusFilter) return false;
+    if (!query) return true;
+    const s = query.toLowerCase();
+    const cp = inv.counterparty as any;
+    return (
+      (cp?.denom || '').toLowerCase().includes(s) ||
+      inv.number.toLowerCase().includes(s) ||
+      inv.source_filename.toLowerCase().includes(s)
+    );
+  });
 
+  // ---- MULTI-SELECT ----
+  const toggleCheck = (id: string) => {
+    setChecked(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const selectAll = () => {
+    const filteredIds = new Set(filtered.map(i => i.id));
+    const allChecked = filtered.every(i => checked.has(i.id));
+    if (allChecked) {
+      // Deselect all filtered
+      setChecked(prev => {
+        const next = new Set(prev);
+        filteredIds.forEach(id => next.delete(id));
+        return next;
+      });
+    } else {
+      // Select all filtered
+      setChecked(prev => {
+        const next = new Set(prev);
+        filteredIds.forEach(id => next.add(id));
+        return next;
+      });
+    }
+  };
+
+  // ---- STATS ----
   const stats = {
     total: invoices.length,
-    pending: invoices.filter(i => i.payment_status === 'pending').length,
-    overdue: invoices.filter(i => i.payment_status === 'overdue').length,
-    paid: invoices.filter(i => i.payment_status === 'paid').length,
     totalAmount: invoices.reduce((s, i) => s + (i.doc_type === 'TD04' ? -1 : 1) * i.total_amount, 0),
-  }
+    daPagare: invoices.filter(i => i.payment_status === 'da_pagare').length,
+    scadute: invoices.filter(i => i.payment_status === 'scaduta').length,
+    pagate: invoices.filter(i => i.payment_status === 'pagata').length,
+    fornitori: new Set(invoices.map(i => (i.counterparty as any)?.denom)).size,
+  };
 
+  const selectedInvoice = invoices.find(i => i.id === selectedId);
+  const allFilteredChecked = filtered.length > 0 && filtered.every(i => checked.has(i.id));
+
+  // ============================================================
+  // RENDER
+  // ============================================================
   return (
-    <div className="flex h-full">
-      {/* Sidebar */}
-      <div className="w-80 border-r flex flex-col shrink-0 bg-card">
-        <div className="px-4 py-3 border-b space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-bold">Fatture</h2>
-            <span className="text-xs font-bold text-emerald-700">{fmtEur(stats.totalAmount)}</span>
-          </div>
-          {invoices.length > 0 && (
+    <div className="h-full flex flex-col bg-gray-50">
+      {/* Delete Modal */}
+      <ConfirmDeleteModal
+        open={deleteModal.open}
+        count={deleteModal.ids.length}
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setDeleteModal({ open: false, ids: [] })}
+      />
+
+      {/* Top bar */}
+      <div className="flex items-center gap-3 px-4 py-2.5 bg-white border-b shadow-sm flex-shrink-0 flex-wrap">
+        <h1 className="text-lg font-bold text-gray-800">📄 Fatture</h1>
+        <div className="flex-1" />
+
+        {/* Stats badges */}
+        <span className="text-xs px-2 py-1 bg-gray-100 rounded font-medium">{stats.total} fatture</span>
+        <span className="text-xs px-2 py-1 bg-yellow-100 text-yellow-800 rounded font-medium">{stats.daPagare} da pagare</span>
+        {stats.scadute > 0 && (
+          <span className="text-xs px-2 py-1 bg-red-100 text-red-800 rounded font-medium">{stats.scadute} scadute</span>
+        )}
+        <span className="text-xs px-2 py-1 bg-green-100 text-green-800 rounded font-medium">{stats.pagate} pagate</span>
+        <span className="text-xs px-2 py-1 bg-purple-100 text-purple-800 rounded font-medium">{stats.fornitori} fornitori</span>
+        <span className="text-sm font-bold text-green-700">Totale: {fmtEur(stats.totalAmount)}</span>
+
+        {/* Import button */}
+        <button
+          onClick={() => fileRef.current?.click()}
+          className="px-3 py-1.5 text-xs font-semibold bg-sky-600 text-white rounded-lg hover:bg-sky-700"
+        >
+          📥 Importa
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          multiple
+          accept=".xml,.p7m,.zip"
+          onChange={e => e.target.files && handleImport(e.target.files)}
+          className="hidden"
+        />
+      </div>
+
+      {/* Import progress */}
+      {importing && (
+        <div className="px-4 pt-3">
+          <ImportProgress phase={importPhase} current={importCurrent} total={importTotal} logs={importLogs} />
+        </div>
+      )}
+
+      {/* Main area */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Sidebar */}
+        <div className="w-80 border-r bg-white flex flex-col flex-shrink-0">
+          {/* Search + filters */}
+          <div className="p-2 border-b space-y-2">
+            <input
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              placeholder="🔍 Cerca fornitore, numero..."
+              className="w-full px-2.5 py-1.5 text-xs border rounded-lg bg-gray-50 outline-none focus:ring-1 focus:ring-sky-400"
+            />
             <div className="flex gap-1">
-              {[
-                { key: 'all', label: `Tutte ${stats.total}` },
-                { key: 'pending', label: `⏳ ${stats.pending}` },
-                { key: 'overdue', label: `⚠ ${stats.overdue}` },
-                { key: 'paid', label: `✓ ${stats.paid}` },
-              ].map(f => (
-                <button key={f.key} onClick={() => setStatusFilter(f.key)}
-                  className={`flex-1 text-[10px] font-semibold py-1 rounded transition-all ${
-                    statusFilter === f.key ? 'ring-1 ring-primary bg-primary/10 text-primary' : 'bg-gray-50 text-gray-400 hover:bg-gray-100'
-                  }`}>{f.label}</button>
+              {(['all', 'da_pagare', 'scaduta', 'pagata'] as const).map(s => (
+                <button
+                  key={s}
+                  onClick={() => setStatusFilter(s)}
+                  className={`flex-1 py-1 text-[10px] font-semibold rounded ${
+                    statusFilter === s ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'
+                  }`}
+                >
+                  {s === 'all' ? 'Tutte' : STATUS_LABELS[s]}
+                </button>
               ))}
             </div>
-          )}
-          <div className="relative">
-            <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-muted-foreground" />
-            <Input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cerca fornitore, numero..." className="pl-8 h-8 text-xs" />
-          </div>
 
-          {/* Import button with progress */}
-          {progress ? (
-            <div className="space-y-1.5">
-              <div className="flex items-center gap-2 text-xs">
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-                <span className="font-medium text-primary">{progress.phase}</span>
-              </div>
-              {progress.total > 0 && (
-                <div className="w-full bg-gray-100 rounded-full h-1.5">
-                  <div className="bg-primary h-1.5 rounded-full transition-all" style={{ width: `${(progress.current / progress.total) * 100}%` }} />
-                </div>
-              )}
-            </div>
-          ) : (
-            <Button variant="outline" size="sm" className="w-full text-xs gap-1.5" onClick={() => ref.current?.click()} disabled={importing}>
-              <Upload className="h-3.5 w-3.5" /> Importa fatture XML/P7M
-            </Button>
-          )}
+            {/* Select mode controls */}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  setSelectMode(!selectMode);
+                  if (selectMode) setChecked(new Set());
+                }}
+                className={`px-2 py-1 text-[10px] font-semibold rounded ${
+                  selectMode ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                }`}
+              >
+                {selectMode ? '✕ Esci Selezione' : '☐ Seleziona'}
+              </button>
 
-          {/* Show log button */}
-          {importLog.length > 0 && !importing && (
-            <button onClick={() => { setShowLog(true); setSelectedId(null) }}
-              className="w-full text-[11px] text-left px-2 py-1.5 rounded bg-gray-50 hover:bg-gray-100 transition-colors">
-              📋 Log ultima importazione
-              <span className="float-right text-muted-foreground">
-                {importLog.filter(l => l.status === 'ok').length}✓
-                {importLog.filter(l => l.status === 'duplicate').length > 0 && ` ${importLog.filter(l => l.status === 'duplicate').length}⇌`}
-                {importLog.filter(l => l.status === 'parse_error' || l.status === 'save_error').length > 0 && ` ${importLog.filter(l => l.status === 'parse_error' || l.status === 'save_error').length}✕`}
-              </span>
-            </button>
-          )}
-
-          <input ref={ref} type="file" multiple accept=".xml,.p7m,.zip" onChange={e => { if (e.target.files) handleFiles(e.target.files); e.target.value = '' }} className="hidden" />
-        </div>
-        <div className="flex-1 overflow-y-auto">
-          {loading ? (
-            <div className="flex items-center justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
-          ) : filtered.length === 0 ? (
-            <div className="text-center py-12 px-4">
-              <FileText className="h-10 w-10 mx-auto mb-3 text-muted-foreground/30" />
-              <p className="text-sm text-muted-foreground">{invoices.length === 0 ? 'Nessuna fattura importata' : 'Nessun risultato'}</p>
-            </div>
-          ) : (
-            filtered.map(inv => <InvoiceCard key={inv.id} inv={inv} selected={selectedId === inv.id} onClick={() => { setSelectedId(inv.id); setShowLog(false) }} />)
-          )}
-        </div>
-      </div>
-
-      {/* Detail panel */}
-      <div className="flex-1 overflow-y-auto bg-background">
-        {showLog ? (
-          <ImportLogPanel log={importLog} importing={importing} progress={progress} onClose={() => setShowLog(false)} />
-        ) : detailLoading ? (
-          <div className="flex items-center justify-center h-full"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
-        ) : detail ? (
-          <FullInvoiceDetail inv={detail} onClose={() => setSelectedId(null)} />
-        ) : (
-          <div className="flex items-center justify-center h-full">
-            <div className="text-center max-w-md px-8">
-              <div className="inline-flex items-center justify-center w-20 h-20 rounded-2xl bg-gradient-to-br from-blue-50 to-indigo-50 mb-6">
-                <FileText className="h-10 w-10 text-blue-400" />
-              </div>
-              <h3 className="text-lg font-semibold mb-2">Fatture Elettroniche</h3>
-              <p className="text-sm text-muted-foreground mb-6">Importa file XML, P7M o ZIP per visualizzare e gestire le tue fatture.</p>
-              <Button onClick={() => ref.current?.click()} disabled={importing} className="gap-2">
-                <Upload className="h-4 w-4" /> Importa fatture
-              </Button>
-              <div className="flex items-center justify-center gap-6 mt-6 text-xs text-muted-foreground">
-                <span className="flex items-center gap-1"><FileCode className="h-3.5 w-3.5" /> XML</span>
-                <span className="flex items-center gap-1"><Package className="h-3.5 w-3.5" /> P7M</span>
-                <span className="flex items-center gap-1"><Database className="h-3.5 w-3.5" /> ZIP</span>
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-// ============================================================
-// IMPORT LOG PANEL
-// ============================================================
-function ImportLogPanel({ log, importing, progress, onClose }: {
-  log: ImportLogEntry[]; importing: boolean; progress: { current: number; total: number; phase: string } | null; onClose: () => void
-}) {
-  const [expandedError, setExpandedError] = useState<number | null>(null)
-  const okCount = log.filter(l => l.status === 'ok').length
-  const dupeCount = log.filter(l => l.status === 'duplicate').length
-  const errCount = log.filter(l => l.status === 'parse_error' || l.status === 'save_error').length
-
-  return (
-    <div className="p-6 max-w-4xl mx-auto">
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-bold">Log Importazione</h2>
-        <Button variant="ghost" size="sm" onClick={onClose} className="text-xs">✕ Chiudi</Button>
-      </div>
-
-      {/* Progress bar during import */}
-      {importing && progress && (
-        <div className="mb-4 p-3 rounded-lg bg-primary/5 border border-primary/20">
-          <div className="flex items-center gap-2 mb-2">
-            <Loader2 className="h-4 w-4 animate-spin text-primary" />
-            <span className="text-sm font-medium text-primary">{progress.phase}</span>
-          </div>
-          {progress.total > 0 && (
-            <div className="w-full bg-gray-200 rounded-full h-2">
-              <div className="bg-primary h-2 rounded-full transition-all duration-300" style={{ width: `${(progress.current / progress.total) * 100}%` }} />
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Summary */}
-      <div className="grid grid-cols-3 gap-3 mb-4">
-        <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-center">
-          <div className="text-2xl font-bold text-emerald-700">{okCount}</div>
-          <div className="text-[11px] text-emerald-600 font-medium">Importate</div>
-        </div>
-        <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-center">
-          <div className="text-2xl font-bold text-amber-700">{dupeCount}</div>
-          <div className="text-[11px] text-amber-600 font-medium">Duplicati</div>
-        </div>
-        <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-center">
-          <div className="text-2xl font-bold text-red-700">{errCount}</div>
-          <div className="text-[11px] text-red-600 font-medium">Errori</div>
-        </div>
-      </div>
-
-      {/* Log entries */}
-      <div className="rounded-lg border overflow-hidden">
-        <div className="max-h-[60vh] overflow-y-auto">
-          {log.map((entry, i) => (
-            <div key={i} className={`border-b last:border-0 ${entry.status === 'ok' ? '' : entry.status === 'duplicate' ? 'bg-amber-50/50' : 'bg-red-50/50'}`}>
-              <div className="flex items-center gap-2 px-3 py-2">
-                {entry.status === 'ok' && <CheckCircle className="h-4 w-4 text-emerald-500 shrink-0" />}
-                {entry.status === 'duplicate' && <AlertCircle className="h-4 w-4 text-amber-500 shrink-0" />}
-                {(entry.status === 'parse_error' || entry.status === 'save_error') && <XCircle className="h-4 w-4 text-red-500 shrink-0" />}
-                <span className="text-xs font-mono truncate flex-1">{entry.fn}</span>
-                <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${
-                  entry.status === 'ok' ? 'bg-emerald-100 text-emerald-700' :
-                  entry.status === 'duplicate' ? 'bg-amber-100 text-amber-700' :
-                  'bg-red-100 text-red-700'
-                }`}>
-                  {entry.status === 'ok' ? 'OK' : entry.status === 'duplicate' ? 'DUPLICATO' : entry.status === 'parse_error' ? 'ERRORE PARSING' : 'ERRORE SALVATAGGIO'}
-                </span>
-                {(entry.error || entry.rawXml) && (
-                  <button onClick={() => setExpandedError(expandedError === i ? null : i)} className="text-[10px] text-muted-foreground hover:text-foreground">
-                    {expandedError === i ? '▲' : '▼'}
+              {selectMode && (
+                <>
+                  <button onClick={selectAll} className="px-2 py-1 text-[10px] font-semibold bg-gray-100 text-gray-600 rounded hover:bg-gray-200">
+                    {allFilteredChecked ? 'Deseleziona tutte' : 'Seleziona tutte'}
                   </button>
-                )}
-              </div>
-              {expandedError === i && (
-                <div className="px-3 pb-2 space-y-1.5">
-                  {entry.error && (
-                    <div className="text-[11px] text-red-600 bg-red-50 p-2 rounded font-mono whitespace-pre-wrap break-all">{entry.error}</div>
+                  {checked.size > 0 && (
+                    <button
+                      onClick={() => setDeleteModal({ open: true, ids: Array.from(checked) })}
+                      className="px-2 py-1 text-[10px] font-semibold bg-red-600 text-white rounded hover:bg-red-700"
+                    >
+                      🗑 Elimina {checked.size}
+                    </button>
                   )}
-                  {entry.rawXml && (
-                    <div>
-                      <div className="flex items-center justify-between mb-1">
-                        <span className="text-[10px] text-muted-foreground">XML sorgente ({Math.round(entry.rawXml.length / 1024)} KB)</span>
-                        <button onClick={() => navigator.clipboard?.writeText(entry.rawXml!)} className="text-[10px] text-primary hover:underline">📋 Copia XML</button>
-                      </div>
-                      <pre className="text-[10px] bg-gray-900 text-gray-300 p-2 rounded max-h-32 overflow-auto whitespace-pre-wrap break-all font-mono">{entry.rawXml.substring(0, 2000)}{entry.rawXml.length > 2000 ? '\n... (troncato)' : ''}</pre>
-                    </div>
-                  )}
-                </div>
+                </>
               )}
             </div>
-          ))}
-        </div>
-      </div>
+          </div>
 
-      {!importing && log.length > 0 && (
-        <p className="text-[11px] text-muted-foreground text-center mt-3">
-          Totale: {log.length} file elaborati
-        </p>
-      )}
-    </div>
-  )
-}
-
-// ============================================================
-// SIDEBAR CARD
-// ============================================================
-function InvoiceCard({ inv, selected, onClick }: { inv: DBInvoice; selected: boolean; onClick: () => void }) {
-  const nc = inv.doc_type === 'TD04' || inv.doc_type === 'TD05'
-  const status = STATUS_MAP[inv.payment_status] || STATUS_MAP.pending
-  const StatusIcon = status.icon
-  return (
-    <div onClick={onClick} className={`px-4 py-3 border-b cursor-pointer transition-all ${selected ? 'bg-primary/5 border-l-2 border-l-primary' : 'hover:bg-accent/50'}`}>
-      <div className="flex justify-between items-start gap-2">
-        <span className="text-sm font-semibold truncate flex-1">{inv.counterparty?.name || '—'}</span>
-        <span className={`text-sm font-bold shrink-0 ${nc ? 'text-red-600' : 'text-emerald-700'}`}>{nc ? '-' : ''}{fmtEur(inv.total_amount)}</span>
-      </div>
-      <div className="flex justify-between items-center mt-1.5">
-        <span className="text-[11px] text-muted-foreground">n.{inv.number} — {fmtDate(inv.date)}</span>
-        <span className={`inline-flex items-center gap-0.5 text-[10px] font-semibold px-1.5 py-0.5 rounded ${status.color}`}>
-          <StatusIcon className="h-3 w-3" />{status.label}
-        </span>
-      </div>
-      <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded mt-1 inline-block ${nc ? 'bg-red-50 text-red-600' : 'bg-blue-50 text-blue-600'}`}>{TIPO[inv.doc_type] || inv.doc_type}</span>
-    </div>
-  )
-}
-
-// ============================================================
-// FULL DETAIL VIEW (re-parses raw_xml like fattura-v3)
-// ============================================================
-function FullInvoiceDetail({ inv, onClose }: { inv: DBInvoiceDetail; onClose: () => void }) {
-  const [showXml, setShowXml] = useState(false)
-  const parsed = useMemo<ParsedInvoice | null>(() => {
-    if (!inv.raw_xml) return null
-    try { return reparseXml(inv.raw_xml) } catch { return null }
-  }, [inv.raw_xml])
-
-  const d = parsed
-  const b = d?.bodies?.[0]
-  const nc = b?.tipo === 'TD04' || b?.tipo === 'TD05'
-  const hasContratti = (b?.contratti?.length ?? 0) > 0 || (b?.ordini?.length ?? 0) > 0
-  const status = STATUS_MAP[inv.payment_status] || STATUS_MAP.pending
-  const StatusIcon = status.icon
-
-  if (!d || !b) {
-    return (
-      <div className="p-6 max-w-4xl mx-auto">
-        <Button variant="ghost" size="sm" onClick={onClose} className="text-xs mb-4">← Lista</Button>
-        <div className="text-center py-8 text-muted-foreground">XML originale non disponibile.</div>
-      </div>
-    )
-  }
-
-  const xmlDataUrl = inv.raw_xml ? "data:text/xml;charset=utf-8," + encodeURIComponent(inv.raw_xml) : null
-  const xmlFileName = (inv.source_filename || 'fattura').replace(/\.p7m$/i, '').replace(/\.xml$/i, '') + '.xml'
-
-  return (
-    <div className="p-5 overflow-y-auto">
-      <div className="max-w-5xl mx-auto">
-        <div className="flex items-center justify-between mb-4">
-          <Button variant="ghost" size="sm" onClick={onClose} className="text-xs gap-1">← Lista</Button>
-          <div className="flex gap-2">
-            <Button variant={showXml ? 'default' : 'outline'} size="sm" className="text-xs gap-1" onClick={() => setShowXml(!showXml)}>
-              <FileCode className="h-3.5 w-3.5" />{showXml ? '✕ Chiudi XML' : '〈/〉 Vedi XML'}
-            </Button>
-            {xmlDataUrl && (
-              <a href={xmlDataUrl} download={xmlFileName} className="inline-flex items-center gap-1 border rounded-md px-3 py-1.5 text-xs font-medium hover:bg-accent transition-colors">⬇ Scarica XML</a>
+          {/* List */}
+          <div className="flex-1 overflow-y-auto">
+            {loadingList ? (
+              <div className="text-center py-8 text-gray-400 text-sm">Caricamento...</div>
+            ) : filtered.length === 0 ? (
+              <div className="text-center py-8 text-gray-400 text-sm">
+                {invoices.length === 0 ? 'Nessuna fattura importata' : 'Nessun risultato'}
+              </div>
+            ) : (
+              filtered.map(inv => (
+                <InvoiceCard
+                  key={inv.id}
+                  inv={inv}
+                  selected={selectedId === inv.id}
+                  checked={checked.has(inv.id)}
+                  selectMode={selectMode}
+                  onSelect={() => setSelectedId(inv.id)}
+                  onCheck={() => toggleCheck(inv.id)}
+                />
+              ))
             )}
           </div>
         </div>
 
-        {showXml && inv.raw_xml && (
-          <div className="mb-4 rounded-lg overflow-hidden border" style={{ background: '#1a1d24' }}>
-            <div className="flex items-center justify-between px-3 py-2" style={{ background: '#252830' }}>
-              <span className="text-xs font-medium" style={{ color: '#7eb8e0' }}>XML Sorgente — {Math.round(inv.raw_xml.length / 1024)} KB</span>
-              <button onClick={() => navigator.clipboard?.writeText(inv.raw_xml!)} className="text-[11px] px-2 py-1 rounded" style={{ background: '#3a3f4c', color: '#ccc' }}>📋 Copia</button>
+        {/* Detail */}
+        <div className="flex-1 overflow-y-auto bg-gray-50">
+          {selectedInvoice ? (
+            <InvoiceDetail
+              invoice={selectedInvoice}
+              detail={detail}
+              loadingDetail={loadingDetail}
+              onEdit={handleEdit}
+              onDelete={() => setDeleteModal({ open: true, ids: [selectedInvoice.id] })}
+              onReload={reload}
+            />
+          ) : (
+            <div className="flex items-center justify-center h-full text-gray-400 text-sm">
+              Seleziona una fattura dalla lista
             </div>
-            <pre className="p-3 text-[11px] overflow-auto max-h-96 whitespace-pre-wrap break-all leading-relaxed" style={{ color: '#c8ccd8', fontFamily: "'JetBrains Mono', monospace" }}>{inv.raw_xml}</pre>
-          </div>
-        )}
-
-        {/* Header */}
-        <div className="text-center mb-5 pb-4 border-b-2 border-blue-100">
-          <div className="flex items-center justify-center gap-2 mb-2">
-            <span className={`text-[11px] font-semibold px-2 py-1 rounded ${nc ? 'bg-red-50 text-red-600' : 'bg-blue-50 text-blue-600'}`}>{TIPO[b.tipo] || b.tipo}</span>
-            <span className={`inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-1 rounded ${status.color}`}><StatusIcon className="h-3 w-3" />{status.label}</span>
-          </div>
-          <h2 className="text-[22px] font-extrabold">{TIPO[b.tipo] || b.tipo} &nbsp; N. {b.numero}</h2>
-          <div className="flex items-center justify-center gap-5 mt-2 text-sm">
-            <span><span className="text-muted-foreground text-xs">Data: </span><strong>{fmtDate(b.data)}</strong></span>
-            <span className="px-2 py-0.5 rounded bg-primary/10 text-primary text-[11px] font-semibold">{d.ver}</span>
-            <span className="px-2 py-0.5 rounded bg-purple-50 text-purple-700 text-[11px] font-semibold">{inv.parse_method}</span>
-          </div>
-        </div>
-
-        {/* Da / Per */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-          <Sec title="Da:">
-            <Row l="Denominazione" v={d.ced.denom} accent />
-            <Row l="Partita IVA" v={d.ced.piva} />
-            <Row l="Codice Fiscale" v={d.ced.cf} />
-            <Row l="Regime Fiscale" v={d.ced.regime ? `${d.ced.regime} (${REG[d.ced.regime] || ''})` : ''} />
-            <Row l="Sede" v={d.ced.sede} />
-            <Row l="Iscrizione REA" v={d.ced.reaNumero ? `${d.ced.reaUfficio} ${d.ced.reaNumero}` : ''} />
-            <Row l="Capitale Sociale" v={d.ced.capitale ? fmtEur(d.ced.capitale) : ''} />
-            <Row l="In Liquidazione" v={d.ced.liquidazione === 'LN' ? 'LN (No)' : d.ced.liquidazione === 'LS' ? 'LS (Sì)' : d.ced.liquidazione} />
-            <Row l="Telefono" v={d.ced.tel} />
-            <Row l="Email" v={d.ced.email} />
-          </Sec>
-          <Sec title="Per:">
-            <Row l="Denominazione" v={d.ces.denom} accent />
-            <Row l="Partita IVA" v={d.ces.piva} />
-            <Row l="Codice Fiscale" v={d.ces.cf} />
-            <Row l="Sede" v={d.ces.sede} />
-          </Sec>
-        </div>
-
-        {hasContratti && (
-          <Sec title="Riferimenti">
-            {b.contratti.map((c, i) => <Row key={`c${i}`} l="Rif. Contratto" v={[c.id, c.data ? fmtDate(c.data) : '', c.cig ? `CIG:${c.cig}` : '', c.cup ? `CUP:${c.cup}` : ''].filter(Boolean).join(' — ')} />)}
-            {b.ordini.map((o, i) => <Row key={`o${i}`} l="Rif. Ordine" v={[o.id, o.data ? fmtDate(o.data) : '', o.cig ? `CIG:${o.cig}` : '', o.cup ? `CUP:${o.cup}` : ''].filter(Boolean).join(' — ')} />)}
-          </Sec>
-        )}
-
-        {b.causali?.length > 0 && (
-          <Sec title="Causale (Note)">
-            {b.causali.map((c, i) => <p key={i} className="text-xs py-0.5">{c}</p>)}
-          </Sec>
-        )}
-
-        {/* Beni e Servizi */}
-        <Sec title="Dettaglio Beni e Servizi">
-          <div className="overflow-x-auto -mx-4">
-            <table className="w-full text-[12px] min-w-[650px]">
-              <thead>
-                <tr className="border-b-2 border-primary/20 bg-primary/5">
-                  {b.linee?.some(l => l.codiceArticolo) && <th className="text-left px-3 py-2 font-semibold text-primary text-[11px]">Codice Articolo</th>}
-                  <th className="text-left px-3 py-2 font-semibold text-primary text-[11px]">Descrizione</th>
-                  <th className="text-right px-3 py-2 font-semibold text-primary text-[11px]">Quantità</th>
-                  <th className="text-right px-3 py-2 font-semibold text-primary text-[11px]">Prezzo Unitario</th>
-                  <th className="text-right px-3 py-2 font-semibold text-primary text-[11px]">Aliquota IVA</th>
-                  <th className="text-right px-3 py-2 font-semibold text-primary text-[11px]">Prezzo Totale</th>
-                </tr>
-              </thead>
-              <tbody>
-                {b.linee?.map((l, i) => (
-                  <tr key={i} className="border-b border-border/40 hover:bg-accent/20">
-                    {b.linee?.some(x => x.codiceArticolo) && <td className="px-3 py-1.5 text-left text-muted-foreground">{l.codiceArticolo || '—'}</td>}
-                    <td className="px-3 py-1.5 text-left">{l.descrizione}</td>
-                    <td className="px-3 py-1.5 text-right">{l.quantita ? fmtNum(l.quantita) : '1'}</td>
-                    <td className="px-3 py-1.5 text-right">{fmtNum(l.prezzoUnitario)}</td>
-                    <td className="px-3 py-1.5 text-right">{fmtNum(l.aliquotaIVA)}%</td>
-                    <td className="px-3 py-1.5 text-right font-semibold">{fmtNum(l.prezzoTotale)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Sec>
-
-        {/* Riepilogo IVA */}
-        <Sec title="Riepilogo IVA e Totali">
-          <table className="w-full text-[12px]">
-            <thead>
-              <tr className="border-b-2 border-primary/20 bg-primary/5">
-                <th className="text-left px-3 py-2 font-semibold text-primary text-[11px]">Esigibilità IVA</th>
-                <th className="text-left px-3 py-2 font-semibold text-primary text-[11px]">Aliquota IVA</th>
-                <th className="text-right px-3 py-2 font-semibold text-primary text-[11px]">Imposta</th>
-                <th className="text-right px-3 py-2 font-semibold text-primary text-[11px]">Imponibile</th>
-              </tr>
-            </thead>
-            <tbody>
-              {b.riepilogo?.map((r, i) => (
-                <tr key={i} className="border-b border-border/40">
-                  <td className="px-3 py-1.5 text-left">{r.esigibilita ? `${ESI[r.esigibilita] || r.esigibilita}` : ''}</td>
-                  <td className="px-3 py-1.5 text-left">{fmtNum(r.aliquota)}%{r.natura ? ` - ${r.natura} (${NAT[r.natura] || ''})` : ''}{r.rifNorm ? ` - ${r.rifNorm}` : ''}</td>
-                  <td className="px-3 py-1.5 text-right font-semibold">{fmtNum(r.imposta)}</td>
-                  <td className="px-3 py-1.5 text-right font-semibold">{fmtNum(r.imponibile)}</td>
-                </tr>
-              ))}
-              <tr className="border-t-2 border-primary/20">
-                <td className="px-3 py-1.5 text-left font-bold" colSpan={2}>Totale</td>
-                <td className="px-3 py-1.5 text-right font-bold text-primary">{fmtNum(b.riepilogo?.reduce((s, r) => s + parseFloat(r.imposta || '0'), 0))}</td>
-                <td className="px-3 py-1.5 text-right font-bold text-primary">{fmtNum(b.riepilogo?.reduce((s, r) => s + parseFloat(r.imponibile || '0'), 0))}</td>
-              </tr>
-            </tbody>
-          </table>
-          <div className="mt-3 grid grid-cols-4 gap-2 bg-primary/5 p-3 rounded-lg">
-            <div><div className="text-[10px] text-primary font-bold">Importo Bollo</div><div className="text-xs font-semibold">{b.bollo?.importo ? fmtEur(b.bollo.importo) : ''}</div></div>
-            <div><div className="text-[10px] text-primary font-bold">Sconto o Rincaro</div><div className="text-xs font-semibold">{b.arrotondamento || ''}</div></div>
-            <div><div className="text-[10px] text-primary font-bold">Divisa</div><div className="text-xs font-semibold">{b.divisa}</div></div>
-            <div className="text-right"><div className="text-[10px] text-primary font-bold">Totale Documento</div><div className={`text-xl font-extrabold ${nc ? 'text-red-600' : 'text-emerald-700'}`}>{fmtEur(b.totale)}</div></div>
-          </div>
-        </Sec>
-
-        {/* Pagamento */}
-        <Sec title="Modalità Pagamento">
-          <table className="w-full text-[12px]">
-            <thead><tr className="border-b-2 border-primary/20 bg-primary/5">
-              <th className="text-left px-3 py-2 font-semibold text-primary text-[11px]">Modalità</th>
-              <th className="text-left px-3 py-2 font-semibold text-primary text-[11px]">IBAN</th>
-              <th className="text-right px-3 py-2 font-semibold text-primary text-[11px]">Scadenza</th>
-              <th className="text-right px-3 py-2 font-semibold text-primary text-[11px]">Importo</th>
-            </tr></thead>
-            <tbody>
-              {b.pagamenti?.length > 0 ? b.pagamenti.map((p, i) => (
-                <tr key={i} className="border-b border-border/40">
-                  <td className="px-3 py-1.5 text-left">{p.modalita ? `${p.modalita} (${MP[p.modalita] || ''})` : ''}{b.condPag ? ` - ${b.condPag} (${CP[b.condPag] || ''})` : ''}</td>
-                  <td className="px-3 py-1.5 text-left">{p.iban || ''}</td>
-                  <td className="px-3 py-1.5 text-right">{fmtDate(p.scadenza)}</td>
-                  <td className="px-3 py-1.5 text-right font-bold">{fmtEur(p.importo)}</td>
-                </tr>
-              )) : <tr><td className="px-3 py-1.5 text-muted-foreground" colSpan={4}>Nessun dettaglio</td></tr>}
-            </tbody>
-          </table>
-        </Sec>
-
-        {b.ddt?.length > 0 && (
-          <Sec title="DDT" defaultOpen={false}>
-            {b.ddt.map((dd, i) => <div key={i}><Row l="Numero" v={dd.numero} /><Row l="Data" v={fmtDate(dd.data)} /></div>)}
-          </Sec>
-        )}
-        {b.ritenuta?.importo && (
-          <Sec title="Ritenuta d'Acconto" defaultOpen={false}>
-            <Row l="Tipo" v={RIT[b.ritenuta.tipo] || b.ritenuta.tipo} />
-            <Row l="Importo" v={fmtEur(b.ritenuta.importo)} accent />
-            <Row l="Aliquota" v={b.ritenuta.aliquota ? `${fmtNum(b.ritenuta.aliquota)}%` : ''} />
-          </Sec>
-        )}
-        {b.cassa?.importo && (
-          <Sec title="Cassa Previdenziale" defaultOpen={false}>
-            <Row l="Tipo" v={b.cassa.tipo} />
-            <Row l="Importo" v={fmtEur(b.cassa.importo)} accent />
-          </Sec>
-        )}
-        {b.allegati?.length > 0 && (
-          <Sec title="Allegati">
-            {b.allegati.map((a, i) => {
-              const mimeMap: Record<string, string> = { PDF: 'application/pdf', XML: 'text/xml', TXT: 'text/plain' }
-              const href = a.hasData ? `data:${mimeMap[(a.formato || '').toUpperCase()] || 'application/octet-stream'};base64,${a.b64}` : null
-              return (
-                <div key={i} className="flex items-center justify-between py-1.5 border-b border-border/30 last:border-0">
-                  <span className="text-xs font-medium text-primary">{a.nome}</span>
-                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                    <span>{a.formato}</span>
-                    <span>{a.sizeKB > 0 ? `${a.sizeKB} KB` : ''}</span>
-                    {href && <a href={href} download={a.nome} className="text-white bg-primary px-2 py-0.5 rounded text-[10px] font-semibold">⬇</a>}
-                  </div>
-                </div>
-              )
-            })}
-          </Sec>
-        )}
-
-        <Sec title="Trasmissione" defaultOpen={false}>
-          <Row l="Codice Destinatario" v={d.trasm.codDest} />
-          <Row l="Progressivo Invio" v={d.trasm.progressivo} />
-          <Row l="Telefono" v={d.ced.tel} />
-          <Row l="Email" v={d.ced.email} />
-        </Sec>
-
-        <div className="text-center text-[11px] text-muted-foreground mt-4 pb-4">
-          {inv.source_filename} — {inv.raw_xml ? `${Math.round(inv.raw_xml.length / 1024)} KB` : ''}
+          )}
         </div>
       </div>
     </div>
-  )
-}
-
-// ============================================================
-// SHARED UI
-// ============================================================
-function Sec({ title, children, defaultOpen = true }: { title: string; children: React.ReactNode; defaultOpen?: boolean }) {
-  const [open, setOpen] = useState(defaultOpen)
-  return (
-    <div className="mb-3 rounded-lg border overflow-hidden bg-card">
-      <button onClick={() => setOpen(!open)} className={`w-full flex items-center px-4 py-2.5 cursor-pointer transition-colors ${open ? 'bg-primary/5 border-b' : 'hover:bg-accent/30'}`}>
-        <span className="text-[13px] font-bold text-primary flex-1 text-left">{title}</span>
-        {open ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" /> : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />}
-      </button>
-      {open && <div className="p-4">{children}</div>}
-    </div>
-  )
-}
-
-function Row({ l, v, accent }: { l: string; v?: string | null | number; accent?: boolean }) {
-  if (!v && v !== 0) return null
-  return (
-    <div className="flex justify-between items-baseline py-1 border-b border-border/30 last:border-0">
-      <span className="text-xs text-muted-foreground min-w-[120px]">{l}</span>
-      <span className={`text-xs text-right max-w-[64%] break-words ${accent ? 'font-bold text-primary' : ''}`}>{String(v)}</span>
-    </div>
-  )
+  );
 }
