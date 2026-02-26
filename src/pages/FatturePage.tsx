@@ -213,20 +213,16 @@ function EditForm({ invoice, onSave, onCancel }: { invoice: DBInvoice; onSave: (
 // ============================================================
 interface ImportLog { fn: string; status: 'ok' | 'duplicate' | 'error_parse' | 'error_save'; message?: string | null; }
 function ImportProgress({ phase, current, total, logs }: { phase: 'reading' | 'saving' | 'done'; current: number; total: number; logs: ImportLog[] }) {
-  const pct = phase === 'saving' && total > 0 ? Math.round((current / total) * 100) : phase === 'done' ? 100 : 0;
+  const pct = total > 0 ? Math.round((current / total) * 100) : 0;
   const okC = logs.filter(l => l.status === 'ok').length, dupC = logs.filter(l => l.status === 'duplicate').length, errC = logs.filter(l => l.status.startsWith('error')).length;
   return (
     <div className="bg-white border rounded-lg p-4 mb-4">
       <div className="flex items-center justify-between mb-2">
         <span className="text-sm font-semibold text-gray-700">{phase === 'reading' ? '📖 Lettura file...' : phase === 'saving' ? '💾 Salvataggio...' : '✅ Completato'}</span>
-        <span className="text-sm text-gray-500">{phase === 'reading' ? `${current} file letti` : `${current}/${total} (${pct}%)`}</span>
+        <span className="text-sm text-gray-500">{current}/{total} ({pct}%)</span>
       </div>
       <div className="w-full bg-gray-200 rounded-full h-2 mb-3 overflow-hidden">
-        {phase === 'reading' ? (
-          <div className="h-2 rounded-full bg-blue-500 animate-pulse" style={{ width: '100%' }} />
-        ) : (
-          <div className={`h-2 rounded-full transition-all duration-300 ${phase === 'done' ? 'bg-green-500' : 'bg-blue-500'}`} style={{ width: `${pct}%` }} />
-        )}
+        <div className={`h-2 rounded-full transition-all duration-300 ${phase === 'done' ? 'bg-green-500' : 'bg-blue-500'}`} style={{ width: `${pct}%` }} />
       </div>
       <div className="flex gap-4 text-xs"><span className="text-green-700">✓ {okC} importati</span><span className="text-yellow-700">⊘ {dupC} duplicati</span><span className="text-red-700">✕ {errC} errori</span></div>
       {errC > 0 && <div className="mt-3 max-h-40 overflow-y-auto">{logs.filter(l => l.status.startsWith('error')).map((l, i) => <div key={i} className="text-xs text-red-600 bg-red-50 rounded px-2 py-1 mb-1 font-mono truncate">✕ {l.fn}: {l.message}</div>)}</div>}
@@ -572,13 +568,16 @@ export default function FatturePage() {
 
   const handleImport = useCallback(async (files: FileList | File[]) => {
     if (!files.length) return;
-    setImporting(true); setImportPhase('reading'); setImportCurrent(0); setImportTotal(0); setImportLogs([]);
-    const parsed: any[] = []; let totalFiles = 0;
-    for (const f of Array.from(files)) {
+    const fileArr = Array.from(files);
+    setImporting(true); setImportPhase('reading'); setImportCurrent(0); setImportTotal(fileArr.length); setImportLogs([]);
+    const parsed: any[] = [];
+    for (let fi = 0; fi < fileArr.length; fi++) {
+      const f = fileArr[fi];
       try {
-        const results = await processInvoiceFile(f); totalFiles += results.length; setImportTotal(totalFiles);
-        for (const r of results) { parsed.push(r); setImportCurrent(parsed.length); if (r.err) setImportLogs(prev => [...prev, { fn: r.fn, status: 'error_parse', message: r.err }]); }
+        const results = await processInvoiceFile(f);
+        for (const r of results) { parsed.push(r); if (r.err) setImportLogs(prev => [...prev, { fn: r.fn, status: 'error_parse', message: r.err }]); }
       } catch (e: any) { parsed.push({ fn: f.name, err: e.message }); setImportLogs(prev => [...prev, { fn: f.name, status: 'error_parse', message: e.message }]); }
+      setImportCurrent(fi + 1);
     }
     let cid = companyId;
     const firstOk = parsed.find(r => !r.err && r.data);
