@@ -1,6 +1,5 @@
 // ============================================================
 // ASN.1 DER PARSER — PKCS#7 constructed OCTET STRING
-// Extracted from fattura-v3.jsx
 // ============================================================
 
 function pLen(d: Uint8Array, o: number): { l: number; o: number } {
@@ -19,8 +18,7 @@ function exOct(d: Uint8Array, o: number, e: number): { c: Uint8Array[]; o: numbe
     const t = d[o];
     if (t === 0 && o + 1 < d.length && d[o + 1] === 0) { o += 2; break; }
     o++;
-    const { l, o: no } = pLen(d, o);
-    o = no;
+    const { l, o: no } = pLen(d, o); o = no;
     if (l === -1) { const i = exOct(d, o, e); r.push(...i.c); o = i.o; }
     else if (t === 0x04) { r.push(d.slice(o, o + l)); o += l; }
     else if (t === 0x24 || (t & 0x20)) { const i = exOct(d, o, o + l); r.push(...i.c); o += l; }
@@ -31,23 +29,21 @@ function exOct(d: Uint8Array, o: number, e: number): { c: Uint8Array[]; o: numbe
 
 function extractP7M(buf: ArrayBuffer): string {
   let d = new Uint8Array(buf);
-
   if (d[0] !== 0x30) {
     try {
       const text = new TextDecoder("ascii").decode(d).replace(/[\r\n\s]/g, "");
       if (/^[A-Za-z0-9+/]+=*$/.test(text.substring(0, 100))) {
         d = Uint8Array.from(atob(text), c => c.charCodeAt(0));
       }
-    } catch { /* not base64 */ }
+    } catch { }
     if (d[0] !== 0x30) {
       try {
         const text = new TextDecoder("ascii").decode(new Uint8Array(buf));
         const b64 = text.replace(/-----[^-]+-----/g, "").replace(/[\r\n\s]/g, "");
         d = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-      } catch { /* not PEM */ }
+      } catch { }
     }
   }
-
   const oid = [0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
   let oi = -1;
   for (let i = 0; i < Math.min(d.length, 2000); i++) {
@@ -61,15 +57,12 @@ function extractP7M(buf: ArrayBuffer): string {
   const ct = d[p]; p++;
   const cl = pLen(d, p); p = cl.o;
   let cb: Uint8Array;
-  if (ct === 0x04 && cl.l >= 0) {
-    cb = d.slice(p, p + cl.l);
-  } else {
+  if (ct === 0x04 && cl.l >= 0) { cb = d.slice(p, p + cl.l); }
+  else {
     const ep = cl.l === -1 ? d.length : p + cl.l;
     const r = exOct(d, p, ep);
-    let tl = 0;
-    for (const c of r.c) tl += c.length;
-    cb = new Uint8Array(tl);
-    let off = 0;
+    let tl = 0; for (const c of r.c) tl += c.length;
+    cb = new Uint8Array(tl); let off = 0;
     for (const c of r.c) { cb.set(c, off); off += c.length; }
   }
   const xml = new TextDecoder("utf-8").decode(cb).replace(/^[\ufeff\s]+/, "");
@@ -82,9 +75,9 @@ function byteScan(buf: ArrayBuffer): string {
   const dec = new TextDecoder("utf-8", { fatal: false });
   let s = -1;
   for (let i = 0; i < d.length - 5; i++)
-    if (d[i] === 0x3c && d[i + 1] === 0x3f && d[i + 2] === 0x78 && d[i + 3] === 0x6d && d[i + 4] === 0x6c) { s = i; break; }
+    if (d[i] === 0x3c && d[i+1] === 0x3f && d[i+2] === 0x78 && d[i+3] === 0x6d && d[i+4] === 0x6c) { s = i; break; }
   if (s < 0) for (let i = 0; i < d.length - 1; i++)
-    if (d[i] === 0x3c && ((d[i + 1] >= 0x41 && d[i + 1] <= 0x5a) || (d[i + 1] >= 0x61 && d[i + 1] <= 0x7a))) { s = i; break; }
+    if (d[i] === 0x3c && ((d[i+1] >= 0x41 && d[i+1] <= 0x5a) || (d[i+1] >= 0x61 && d[i+1] <= 0x7a))) { s = i; break; }
   if (s < 0) throw new Error("No XML (byte-scan)");
   const raw = dec.decode(d.slice(s));
   const m = raw.match(/<\/[\w]*:?FatturaElettronica>/);
@@ -100,65 +93,46 @@ function stripNS(x: string): string {
 // TYPES
 // ============================================================
 export interface InvoiceLine {
-  numero: string
-  codiceArticolo: string
-  descrizione: string
-  quantita: string
-  unitaMisura: string
-  prezzoUnitario: string
-  prezzoTotale: string
-  aliquotaIVA: string
-  natura: string
+  numero: string; codiceArticolo: string; descrizione: string; quantita: string;
+  unitaMisura: string; prezzoUnitario: string; prezzoTotale: string;
+  aliquotaIVA: string; natura: string;
 }
 
 export interface InvoicePayment {
-  modalita: string
-  scadenza: string
-  importo: string
-  iban: string
-  istituto: string
+  modalita: string; scadenza: string; importo: string; iban: string; istituto: string;
 }
 
 export interface InvoiceBody {
-  tipo: string
-  divisa: string
-  data: string
-  numero: string
-  totale: string
-  arrotondamento: string
-  causali: string[]
-  bollo: { virtuale: string; importo: string }
-  ritenuta: { tipo: string; importo: string; aliquota: string; causale: string }
-  cassa: { tipo: string; al: string; importo: string; imponibile: string; alIVA: string }
-  condPag: string
-  pagamenti: InvoicePayment[]
-  linee: InvoiceLine[]
-  riepilogo: { aliquota: string; natura: string; imponibile: string; imposta: string; esigibilita: string; rifNorm: string }[]
-  allegati: { nome: string; formato: string; descrizione: string; sizeKB: number; hasData: boolean; b64: string }[]
-  contratti: { id: string; data: string; cig: string; cup: string }[]
-  ordini: { id: string; data: string; cig: string; cup: string }[]
-  ddt: { numero: string; data: string }[]
+  tipo: string; divisa: string; data: string; numero: string; totale: string;
+  arrotondamento: string; causali: string[];
+  bollo: { virtuale: string; importo: string };
+  ritenuta: { tipo: string; importo: string; aliquota: string; causale: string };
+  cassa: { tipo: string; al: string; importo: string; imponibile: string; alIVA: string };
+  condPag: string;
+  pagamenti: InvoicePayment[];
+  linee: InvoiceLine[];
+  riepilogo: { aliquota: string; natura: string; imponibile: string; imposta: string; esigibilita: string; rifNorm: string }[];
+  allegati: { nome: string; formato: string; descrizione: string; sizeKB: number; hasData: boolean; b64: string }[];
+  contratti: { id: string; data: string; cig: string; cup: string }[];
+  ordini: { id: string; data: string; cig: string; cup: string }[];
+  convenzioni: { id: string; data: string }[];
+  ddt: { numero: string; data: string }[];
 }
 
 export interface ParsedInvoice {
-  ver: string
-  trasm: { idPaese: string; idCodice: string; progressivo: string; formato: string; codDest: string; pecDest: string }
-  ced: { denom: string; piva: string; cf: string; regime: string; sede: string; tel: string; email: string; reaNumero: string; reaUfficio: string; capitale: string; liquidazione: string }
-  ces: { denom: string; piva: string; cf: string; sede: string }
-  bodies: InvoiceBody[]
+  ver: string;
+  trasm: { idPaese: string; idCodice: string; progressivo: string; formato: string; codDest: string; pecDest: string };
+  ced: { denom: string; piva: string; cf: string; regime: string; sede: string; tel: string; fax: string; email: string; reaUfficio: string; reaNumero: string; capitale: string; socioUnico: string; liquidazione: string };
+  ces: { denom: string; piva: string; cf: string; sede: string };
+  bodies: InvoiceBody[];
 }
 
 export interface ParseResult {
-  fn: string
-  method: string
-  xmlLen: number
-  rawXml: string
-  data: ParsedInvoice
-  err: string | null
+  fn: string; method: string; xmlLen: number; rawXml: string; data: ParsedInvoice; err: string | null;
 }
 
 // ============================================================
-// PARSER
+// PARSER (complete, matching fattura-v3)
 // ============================================================
 function parseFattura(xmlStr: string): ParsedInvoice {
   const doc = new DOMParser().parseFromString(stripNS(xmlStr), "text/xml");
@@ -193,11 +167,12 @@ function parseFattura(xmlStr: string): ParsedInvoice {
     const contratti = gA(dgAll, "DatiContratto").map(c => ({
       id: g(c, "IdDocumento"), data: g(c, "Data"), cig: g(c, "CodiceCIG"), cup: g(c, "CodiceCUP"),
     }));
-
     const ordini = gA(dgAll, "DatiOrdineAcquisto").map(o => ({
       id: g(o, "IdDocumento"), data: g(o, "Data"), cig: g(o, "CodiceCIG"), cup: g(o, "CodiceCUP"),
     }));
-
+    const convenzioni = gA(dgAll, "DatiConvenzione").map(c => ({
+      id: g(c, "IdDocumento"), data: g(c, "Data"),
+    }));
     const ddt = gA(dgAll, "DatiDDT").map(d => ({
       numero: g(d, "NumeroDDT"), data: g(d, "DataDDT"),
     }));
@@ -236,12 +211,10 @@ function parseFattura(xmlStr: string): ParsedInvoice {
     const allegati = gA(body, "Allegati").map(a => {
       const b64 = a.querySelector("Attachment")?.textContent?.trim() || "";
       return {
-        nome: g(a, "NomeAttachment"),
-        formato: g(a, "FormatoAttachment"),
+        nome: g(a, "NomeAttachment"), formato: g(a, "FormatoAttachment"),
         descrizione: g(a, "DescrizioneAttachment"),
         sizeKB: b64 ? Math.round(b64.length * 3 / 4 / 1024) : 0,
-        hasData: b64.length > 0,
-        b64,
+        hasData: b64.length > 0, b64,
       };
     });
 
@@ -254,7 +227,7 @@ function parseFattura(xmlStr: string): ParsedInvoice {
       bollo: { virtuale: g(dg, "DatiBollo BolloVirtuale"), importo: g(dg, "DatiBollo ImportoBollo") },
       ritenuta: { tipo: g(dg, "DatiRitenuta TipoRitenuta"), importo: g(dg, "DatiRitenuta ImportoRitenuta"), aliquota: g(dg, "DatiRitenuta AliquotaRitenuta"), causale: g(dg, "DatiRitenuta CausalePagamento") },
       cassa: { tipo: g(dg, "DatiCassaPrevidenziale TipoCassa"), al: g(dg, "DatiCassaPrevidenziale AlCassa"), importo: g(dg, "DatiCassaPrevidenziale ImportoContributoCassa"), imponibile: g(dg, "DatiCassaPrevidenziale ImponibileCassa"), alIVA: g(dg, "DatiCassaPrevidenziale AliquotaIVA") },
-      contratti, ordini, ddt, condPag: g(pg, "CondizioniPagamento"),
+      contratti, ordini, convenzioni, ddt, condPag: g(pg, "CondizioniPagamento"),
       pagamenti, linee, riepilogo, allegati,
     } as InvoiceBody;
   });
@@ -273,10 +246,12 @@ function parseFattura(xmlStr: string): ParsedInvoice {
       regime: g(ced, "DatiAnagrafici RegimeFiscale"),
       sede: fAddr(ced?.querySelector("Sede")),
       tel: g(ced, "Contatti Telefono"),
+      fax: g(ced, "Contatti Fax"),
       email: g(ced, "Contatti Email"),
       reaUfficio: g(ced, "IscrizioneREA Ufficio"),
       reaNumero: g(ced, "IscrizioneREA NumeroREA"),
       capitale: g(ced, "IscrizioneREA CapitaleSociale"),
+      socioUnico: g(ced, "IscrizioneREA SocioUnico"),
       liquidazione: g(ced, "IscrizioneREA StatoLiquidazione"),
     },
     ces: {
@@ -331,7 +306,12 @@ export async function processInvoiceFile(file: File): Promise<ParseResult[]> {
   }
 }
 
+/** Re-parse raw XML string to get full ParsedInvoice (used for detail view from DB) */
+export function reparseXml(rawXml: string): ParsedInvoice {
+  return parseFattura(rawXml);
+}
+
 // Lookup tables
 export const TIPO: Record<string, string> = { TD01: "Fattura", TD02: "Acconto/Anticipo", TD03: "Acconto Parcella", TD04: "Nota di Credito", TD05: "Nota di Debito", TD06: "Parcella", TD07: "Fatt. semplificata", TD08: "NC semplificata", TD16: "Integr. RC interno", TD17: "Integr. servizi UE", TD18: "Integr. beni UE", TD19: "Integr. art.17", TD20: "Autofattura", TD24: "Fatt. differita", TD25: "Fatt. differita (b)", TD26: "Cess. ammortizzabili", TD27: "Autoconsumo", TD28: "Acq. San Marino" };
-export const MP: Record<string, string> = { MP01: "Contanti", MP02: "Assegno", MP03: "Assegno circ.", MP05: "Bonifico", MP08: "Carta", MP09: "RID", MP12: "RIBA", MP13: "MAV", MP19: "SEPA DD", MP20: "SEPA CORE", MP22: "Trattenuta", MP23: "PagoPA" };
-export const REG: Record<string, string> = { RF01: "Ordinario", RF02: "Minimi", RF04: "Agricoltura", RF18: "Altro", RF19: "Forfettario" };
+export const MP: Record<string, string> = { MP01: "Contanti", MP02: "Assegno", MP03: "Assegno circ.", MP05: "Bonifico", MP08: "Carta", MP09: "RID", MP10: "RID utenze", MP12: "RIBA", MP13: "MAV", MP14: "Quietanza erario", MP16: "Domic. bancaria", MP17: "Domic. postale", MP18: "Boll. postale", MP19: "SEPA DD", MP20: "SEPA CORE", MP21: "SEPA B2B", MP22: "Trattenuta", MP23: "PagoPA" };
+export const REG: Record<string, string> = { RF01: "Ordinario", RF02: "Minimi", RF04: "Agricoltura", RF05: "Sali/tabacchi", RF06: "Fiammiferi", RF07: "Editoria", RF11: "Agenzie viaggio", RF12: "Agriturismo", RF14: "Beni usati", RF15: "Aste", RF16: "IVA per cassa", RF17: "IVA cassa PA", RF18: "Altro", RF19: "Forfettario" };
