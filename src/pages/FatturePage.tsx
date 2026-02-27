@@ -69,6 +69,7 @@ function parseXmlDetail(xmlStr: string): any {
     return {
       tipo: g(dg, 'TipoDocumento'), divisa: g(dg, 'Divisa'), data: g(dg, 'Data'), numero: g(dg, 'Numero'),
       totale: g(dg, 'ImportoTotaleDocumento'), arrotondamento: g(dg, 'Arrotondamento'),
+      sconti: gA(dg, 'ScontoMaggiorazione').map(s => ({ tipo: g(s, 'Tipo'), percentuale: g(s, 'Percentuale'), importo: g(s, 'Importo') })),
       causali: gA(dg, 'Causale').map(c => c.textContent?.trim() || ''),
       bollo: { virtuale: g(dg, 'DatiBollo BolloVirtuale'), importo: g(dg, 'DatiBollo ImportoBollo') },
       ritenuta: { tipo: g(dg, 'DatiRitenuta TipoRitenuta'), importo: g(dg, 'DatiRitenuta ImportoRitenuta'), aliquota: g(dg, 'DatiRitenuta AliquotaRitenuta'), causale: g(dg, 'DatiRitenuta CausalePagamento') },
@@ -437,7 +438,15 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
           </table>
           <div className="mt-2 grid grid-cols-4 gap-2 bg-sky-50 p-2 rounded-lg text-xs">
             <div><div className="text-sky-700 font-bold text-[10px]">Importo Bollo</div><div className="font-semibold">{b.bollo?.importo ? fmtEur(safeFloat(b.bollo.importo)) : ''}</div></div>
-            <div><div className="text-sky-700 font-bold text-[10px]">Sconto/Rincaro</div><div className="font-semibold">{b.arrotondamento || ''}</div></div>
+            <div><div className="text-sky-700 font-bold text-[10px]">Sconto/Rincaro</div><div className="font-semibold">{
+              b.sconti?.length > 0
+                ? b.sconti.map((s: any, i: number) => {
+                    const tipo = s.tipo === 'SC' ? 'Sconto' : s.tipo === 'MG' ? 'Maggiorazione' : s.tipo;
+                    const val = s.importo ? fmtEur(-safeFloat(s.importo)) : s.percentuale ? `${s.percentuale}%` : '';
+                    return <span key={i} className={`${s.tipo === 'SC' ? 'text-red-600' : 'text-green-700'}`}>{tipo}: {val}</span>;
+                  })
+                : (b.arrotondamento || '')
+            }</div></div>
             <div><div className="text-sky-700 font-bold text-[10px]">Divisa</div><div className="font-semibold">{b.divisa}</div></div>
             <div className="text-right"><div className="text-sky-700 font-bold text-[10px]">Totale Documento</div><div className={`text-lg font-extrabold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(safeFloat(b.totale) || b.riepilogo?.reduce((s: number, r: any) => s + safeFloat(r.imponibile) + safeFloat(r.imposta), 0) || 0)}</div></div>
           </div>

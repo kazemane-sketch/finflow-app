@@ -147,6 +147,21 @@ export async function saveInvoicesToDB(
         }
       }
 
+      // Calcola sconto/maggiorazione totale
+      let scontoImporto = 0;
+      if (b.sconti?.length) {
+        for (const s of b.sconti) {
+          const imp = parseFloat(s.importo) || 0;
+          scontoImporto += s.tipo === 'SC' ? imp : -imp; // SC=sconto(sottrai), MG=maggiorazione(aggiungi)
+        }
+      }
+
+      // total_amount: usa ImportoTotaleDocumento se presente, altrimenti calcola
+      const totalFromXml = parseFloat(b.totale);
+      const totalAmount = !isNaN(totalFromXml) && b.totale !== ''
+        ? totalFromXml
+        : Math.max(0, taxableAmount + taxAmount - scontoImporto);
+
       // Insert fattura
       const { data: inv, error: invErr } = await supabase
         .from('invoices')
@@ -157,7 +172,7 @@ export async function saveInvoicesToDB(
           number: b.numero || '',
           date: b.data || new Date().toISOString().split('T')[0],
           currency: b.divisa || 'EUR',
-          total_amount: parseFloat(b.totale) || 0,
+          total_amount: totalAmount,
           taxable_amount: taxableAmount || null,
           tax_amount: taxAmount || null,
           withholding_amount: b.ritenuta?.importo ? parseFloat(b.ritenuta.importo) : null,
@@ -383,5 +398,70 @@ export async function fixAllCounterparties(
     onProgress?.(Math.min(i + 20, allInvs.length), allInvs.length);
   }
 
+  return { fixed, errors };
+}
+
+// ============================================================
+// FIX ALL TOTALS — ricalcola total_amount da raw_xml per
+// tutte le fatture con totale = 0 (es. fatture con sconto)
+// ============================================================
+export async function fixAllTotals(
+  companyId: string,
+  onProgress?: (current: number, total: number) => void
+): Promise<{ fixed: number; errors: number }> {
+  const { data: allInvs } = await supabase
+    .from('invoices')
+    .select('id')
+    .eq('company_id', companyId)
+    .eq('total_amount', 0);
+
+  if (!allInvs?.length) return { fixed: 0, errors: 0 };
+
+  const { reparseXml } = await import('./invoiceParser');
+  let fixed = 0, errors = 0;
+
+  for (let i = 0; i < allInvs.length; i += 20) {
+    const batchIds = allInvs.slice(i, i + 20).map(inv => inv.id);
+    const { data: batch } = await supabase
+      .from('invoices')
+      .select('id, raw_xml')
+      .in('id', batchIds);
+
+    if (!batch) continue;
+
+    for (const inv of batch) {
+      if (!inv.raw_xml) { errors++; continue; }
+      try {
+        const parsed = reparseXml(inv.raw_xml);
+        const b = parsed.bodies[0];
+        if (!b) { errors++; continue; }
+
+        let taxableAmount = 0, taxAmount = 0;
+        for (const r of b.riepilogo || []) {
+          taxableAmount += parseFloat(r.imponibile) || 0;
+          taxAmount += parseFloat(r.imposta) || 0;
+        }
+
+        let scontoImporto = 0;
+        for (const s of b.sconti || []) {
+          const imp = parseFloat(s.importo) || 0;
+          scontoImporto += s.tipo === 'SC' ? imp : -imp;
+        }
+
+        const totalFromXml = parseFloat(b.totale);
+        const totalAmount = !isNaN(totalFromXml) && b.totale !== ''
+          ? totalFromXml
+          : Math.max(0, taxableAmount + taxAmount - scontoImporto);
+
+        await supabase.from('invoices').update({
+          total_amount: totalAmount,
+          taxable_amount: taxableAmount || null,
+          tax_amount: taxAmount || null,
+        }).eq('id', inv.id);
+        fixed++;
+      } catch { errors++; }
+    }
+    onProgress?.(Math.min(i + 20, allInvs.length), allInvs.length);
+  }
   return { fixed, errors };
 }

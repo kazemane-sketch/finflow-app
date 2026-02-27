@@ -105,6 +105,7 @@ export interface InvoicePayment {
 export interface InvoiceBody {
   tipo: string; divisa: string; data: string; numero: string; totale: string;
   arrotondamento: string; causali: string[];
+  sconti: { tipo: string; percentuale: string; importo: string }[];
   bollo: { virtuale: string; importo: string };
   ritenuta: { tipo: string; importo: string; aliquota: string; causale: string };
   cassa: { tipo: string; al: string; importo: string; imponibile: string; alIVA: string };
@@ -224,6 +225,7 @@ function parseFattura(xmlStr: string): ParsedInvoice {
       totale: g(dg, "ImportoTotaleDocumento"),
       arrotondamento: g(dg, "Arrotondamento"),
       causali: gA(dg, "Causale").map(c => c.textContent?.trim() || ""),
+      sconti: gA(dg, "ScontoMaggiorazione").map(s => ({ tipo: g(s, "Tipo"), percentuale: g(s, "Percentuale"), importo: g(s, "Importo") })),
       bollo: { virtuale: g(dg, "DatiBollo BolloVirtuale"), importo: g(dg, "DatiBollo ImportoBollo") },
       ritenuta: { tipo: g(dg, "DatiRitenuta TipoRitenuta"), importo: g(dg, "DatiRitenuta ImportoRitenuta"), aliquota: g(dg, "DatiRitenuta AliquotaRitenuta"), causale: g(dg, "DatiRitenuta CausalePagamento") },
       cassa: { tipo: g(dg, "DatiCassaPrevidenziale TipoCassa"), al: g(dg, "DatiCassaPrevidenziale AlCassa"), importo: g(dg, "DatiCassaPrevidenziale ImportoContributoCassa"), imponibile: g(dg, "DatiCassaPrevidenziale ImponibileCassa"), alIVA: g(dg, "DatiCassaPrevidenziale AliquotaIVA") },
