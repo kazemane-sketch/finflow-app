@@ -1,12 +1,13 @@
-// src/pages/FatturePage.tsx — v4
-// Full detail view with inline XML parser, export XML/PDF, multi-select, delete, edit
+// src/pages/FatturePage.tsx — v5
+// Date filter + AI search (Haiku) + removed Fix Nomi
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { processInvoiceFile, TIPO, MP, REG } from '@/lib/invoiceParser';
 import {
   saveInvoicesToDB, loadInvoices, loadInvoiceDetail,
-  deleteInvoices, updateInvoice, verifyPassword, fixAllCounterparties,
+  deleteInvoices, updateInvoice, verifyPassword,
   type DBInvoice, type DBInvoiceDetail, type InvoiceUpdate,
 } from '@/lib/invoiceSaver';
+import { aiSearchInvoices, type AISearchResult } from '@/lib/aiSearch';
 import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
 
@@ -218,14 +219,12 @@ function ImportProgress({ phase, current, total, logs }: { phase: 'reading' | 's
   return (
     <div className="bg-white border rounded-lg p-4 mb-4">
       <div className="flex items-center justify-between mb-2">
-        <span className="text-sm font-semibold text-gray-700">{phase === 'reading' ? '📖 Lettura file...' : phase === 'saving' ? '💾 Salvataggio...' : '✅ Completato'}</span>
-        <span className="text-sm text-gray-500">{current}/{total} ({pct}%)</span>
+        <span className="text-sm font-semibold text-gray-700">{phase === 'reading' ? '📂 Lettura file...' : phase === 'saving' ? '💾 Salvataggio...' : '✅ Importazione completata'}</span>
+        <span className="text-xs text-gray-500">{current}/{total} — {pct}%</span>
       </div>
-      <div className="w-full bg-gray-200 rounded-full h-2 mb-3 overflow-hidden">
-        <div className={`h-2 rounded-full transition-all duration-300 ${phase === 'done' ? 'bg-green-500' : 'bg-blue-500'}`} style={{ width: `${pct}%` }} />
-      </div>
-      <div className="flex gap-4 text-xs"><span className="text-green-700">✓ {okC} importati</span><span className="text-yellow-700">⊘ {dupC} duplicati</span><span className="text-red-700">✕ {errC} errori</span></div>
-      {errC > 0 && <div className="mt-3 max-h-40 overflow-y-auto">{logs.filter(l => l.status.startsWith('error')).map((l, i) => <div key={i} className="text-xs text-red-600 bg-red-50 rounded px-2 py-1 mb-1 font-mono truncate">✕ {l.fn}: {l.message}</div>)}</div>}
+      <div className="w-full bg-gray-200 rounded-full h-2 mb-3"><div className={`h-2 rounded-full transition-all ${phase === 'done' ? 'bg-green-500' : 'bg-sky-500'}`} style={{ width: `${pct}%` }} /></div>
+      {(okC > 0 || dupC > 0 || errC > 0) && <div className="flex gap-2 text-xs"><span className="text-green-700">✓ {okC} salvate</span>{dupC > 0 && <span className="text-yellow-700">⚠ {dupC} duplicate</span>}{errC > 0 && <span className="text-red-700">✕ {errC} errori</span>}</div>}
+      {errC > 0 && <div className="mt-2 max-h-24 overflow-y-auto">{logs.filter(l => l.status.startsWith('error')).map((l, i) => <div key={i} className="text-[10px] text-red-600 truncate">✕ {l.fn}: {l.message}</div>)}</div>}
     </div>
   );
 }
@@ -551,8 +550,15 @@ export default function FatturePage() {
   const [selectMode, setSelectMode] = useState(false);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [deleteModal, setDeleteModal] = useState<{ open: boolean; ids: string[] }>({ open: false, ids: [] });
-  const [fixing, setFixing] = useState(false);
-  const [fixProgress, setFixProgress] = useState('');
+
+  // ── NEW: Date filter ──
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+
+  // ── NEW: AI search ──
+  const [aiResult, setAiResult] = useState<AISearchResult | null>(null);
+  const [aiSearching, setAiSearching] = useState(false);
+  const [aiError, setAiError] = useState('');
 
   const reload = useCallback(async () => {
     if (!companyId) return;
@@ -562,28 +568,38 @@ export default function FatturePage() {
   }, [companyId]);
   useEffect(() => { reload(); }, [reload]);
 
-  const handleFixNames = useCallback(async () => {
-    if (!companyId || fixing) return;
-    setFixing(true); setFixProgress('Avvio...');
-    try {
-      const result = await fixAllCounterparties(companyId, (cur, tot) => {
-        setFixProgress(`${cur}/${tot}`);
-      });
-      setFixProgress(`✅ ${result.fixed} corrette, ${result.errors} errori`);
-      await reload();
-      setTimeout(() => { setFixing(false); setFixProgress(''); }, 3000);
-    } catch (e: any) {
-      setFixProgress(`❌ Errore: ${e.message}`);
-      setTimeout(() => { setFixing(false); setFixProgress(''); }, 4000);
-    }
-  }, [companyId, fixing, reload]);
-
   useEffect(() => {
     if (!selectedId) { setDetail(null); return; }
     let c = false; setLoadingDetail(true);
     loadInvoiceDetail(selectedId).then(d => { if (!c) { setDetail(d); setLoadingDetail(false); } });
     return () => { c = true; };
   }, [selectedId]);
+
+  // ── AI Search handler ──
+  const handleAISearch = useCallback(async () => {
+    if (!query.trim() || !invoices.length) return;
+    setAiSearching(true); setAiError('');
+    try {
+      // Pass direction-filtered invoices to AI search
+      const dirInvoices = directionFilter === 'all' ? invoices : invoices.filter(i => i.direction === directionFilter);
+      const result = await aiSearchInvoices(query, dirInvoices);
+      setAiResult(result);
+    } catch (e: any) {
+      setAiError(e.message || 'Errore ricerca AI');
+      setAiResult(null);
+    }
+    setAiSearching(false);
+  }, [query, invoices, directionFilter]);
+
+  // Clear AI results when query changes (user is typing)
+  const handleQueryChange = (val: string) => {
+    setQuery(val);
+    if (aiResult) setAiResult(null);
+    if (aiError) setAiError('');
+  };
+
+  // Clear AI when direction changes
+  useEffect(() => { setAiResult(null); setAiError(''); }, [directionFilter]);
 
   const handleImport = useCallback(async (files: FileList | File[]) => {
     if (!files.length) return;
@@ -601,8 +617,6 @@ export default function FatturePage() {
     let cid = companyId;
     const firstOk = parsed.find(r => !r.err && r.data);
     if (!cid && firstOk) {
-      // Detect company: find the party that appears most as cedente OR cessionario
-      // For passive invoices, company = cessionario; for active, company = cedente
       try { const eid = await ensureCompany(firstOk.data.ces); if (eid) cid = eid; await refetchCompany(); } catch {
         try { const eid = await ensureCompany(firstOk.data.ced); if (eid) cid = eid; await refetchCompany(); } catch {}
       }
@@ -627,9 +641,18 @@ export default function FatturePage() {
 
   const handleEdit = useCallback(async (u: InvoiceUpdate) => { if (!selectedId) return; await updateInvoice(selectedId, u); await reload(); }, [selectedId, reload]);
 
+  // ── Filtering logic ──
   const filtered = invoices.filter(inv => {
-    if (statusFilter !== 'all' && inv.payment_status !== statusFilter) return false;
+    // Direction filter
     if (directionFilter !== 'all' && inv.direction !== directionFilter) return false;
+    // Status filter
+    if (statusFilter !== 'all' && inv.payment_status !== statusFilter) return false;
+    // Date filter
+    if (dateFrom && inv.date < dateFrom) return false;
+    if (dateTo && inv.date > dateTo) return false;
+    // AI search mode: filter by AI result IDs
+    if (aiResult) return aiResult.ids.includes(inv.id);
+    // Text search (instant, no AI)
     if (!query) return true;
     const s = query.toLowerCase(); const cp = (inv.counterparty || {}) as any;
     return (cp?.denom || '').toLowerCase().includes(s) || inv.number.toLowerCase().includes(s) || inv.source_filename.toLowerCase().includes(s);
@@ -642,17 +665,20 @@ export default function FatturePage() {
     setChecked(prev => { const n = new Set(prev); fids.forEach(id => allC ? n.delete(id) : n.add(id)); return n; });
   };
 
-  const dirFiltered = directionFilter === 'all' ? invoices : invoices.filter(i => i.direction === directionFilter);
+  // ── Stats: based on filtered results ──
   const stats = {
-    total: dirFiltered.length,
-    totalAmount: dirFiltered.reduce((s, i) => s + (i.doc_type === 'TD04' ? -1 : 1) * i.total_amount, 0),
-    daPagare: dirFiltered.filter(i => i.payment_status === 'pending').length,
-    scadute: dirFiltered.filter(i => i.payment_status === 'overdue').length,
-    pagate: dirFiltered.filter(i => i.payment_status === 'paid').length,
-    counterparties: new Set(dirFiltered.map(i => (i.counterparty as any)?.denom || i.source_filename)).size,
+    total: filtered.length,
+    totalAmount: filtered.reduce((s, i) => s + (i.doc_type === 'TD04' ? -1 : 1) * i.total_amount, 0),
+    daPagare: filtered.filter(i => i.payment_status === 'pending').length,
+    scadute: filtered.filter(i => i.payment_status === 'overdue').length,
+    pagate: filtered.filter(i => i.payment_status === 'paid').length,
+    counterparties: new Set(filtered.map(i => (i.counterparty as any)?.denom || i.source_filename)).size,
   };
   const selectedInvoice = invoices.find(i => i.id === selectedId);
   const allFilteredChecked = filtered.length > 0 && filtered.every(i => checked.has(i.id));
+
+  // Total for current direction (before other filters) for reference
+  const dirTotal = invoices.filter(i => directionFilter === 'all' || i.direction === directionFilter).length;
 
   return (
     <div className="h-full flex flex-col bg-gray-50">
@@ -660,14 +686,13 @@ export default function FatturePage() {
       {/* Top bar */}
       <div className="flex items-center gap-3 px-4 py-2.5 bg-white border-b shadow-sm flex-shrink-0 flex-wrap print:hidden">
         <h1 className="text-lg font-bold text-gray-800">📄 Fatture {directionFilter === 'out' ? 'Attive' : directionFilter === 'in' ? 'Passive' : ''}</h1><div className="flex-1" />
-        <span className="text-xs px-2 py-1 bg-gray-100 rounded font-medium">{stats.total} fatture</span>
+        <span className="text-xs px-2 py-1 bg-gray-100 rounded font-medium">{stats.total}{stats.total !== dirTotal ? `/${dirTotal}` : ''} fatture</span>
         <span className="text-xs px-2 py-1 bg-yellow-100 text-yellow-800 rounded font-medium">{stats.daPagare} {directionFilter === 'out' ? 'da incassare' : 'da pagare'}</span>
         {stats.scadute > 0 && <span className="text-xs px-2 py-1 bg-red-100 text-red-800 rounded font-medium">{stats.scadute} scadute</span>}
         <span className="text-xs px-2 py-1 bg-green-100 text-green-800 rounded font-medium">{stats.pagate} {directionFilter === 'out' ? 'incassate' : 'pagate'}</span>
         <span className="text-xs px-2 py-1 bg-purple-100 text-purple-800 rounded font-medium">{stats.counterparties} {directionFilter === 'out' ? 'clienti' : 'fornitori'}</span>
         <span className="text-sm font-bold text-green-700">Totale: {fmtEur(stats.totalAmount)}</span>
         <button onClick={() => fileRef.current?.click()} className="px-3 py-1.5 text-xs font-semibold bg-sky-600 text-white rounded-lg hover:bg-sky-700">📥 Importa</button>
-        <button onClick={handleFixNames} disabled={fixing} className="px-3 py-1.5 text-xs font-semibold bg-amber-500 text-white rounded-lg hover:bg-amber-600 disabled:opacity-50">{fixing ? `🔄 ${fixProgress}` : '🔧 Fix Nomi'}</button>
         <input ref={fileRef} type="file" multiple accept=".xml,.p7m,.zip" onChange={e => e.target.files && handleImport(e.target.files)} className="hidden" />
       </div>
 
@@ -676,7 +701,7 @@ export default function FatturePage() {
       <div className="flex flex-1 overflow-hidden">
         {/* Sidebar */}
         <div className="w-80 border-r bg-white flex flex-col flex-shrink-0 print:hidden">
-          {/* Direction tabs — top level */}
+          {/* Direction tabs */}
           <div className="flex border-b">
             {([['in', 'Passive (Ricevute)'], ['out', 'Attive (Emesse)']] as const).map(([k, label]) => (
               <button key={k} onClick={() => setDirectionFilter(k)} className={`flex-1 py-2.5 text-xs font-bold transition-all ${directionFilter === k ? (k === 'in' ? 'text-orange-700 border-b-2 border-orange-500 bg-orange-50' : 'text-emerald-700 border-b-2 border-emerald-500 bg-emerald-50') : 'text-gray-400 hover:text-gray-600 hover:bg-gray-50'}`}>
@@ -688,7 +713,53 @@ export default function FatturePage() {
             ))}
           </div>
           <div className="p-2 border-b space-y-2">
-            <input value={query} onChange={e => setQuery(e.target.value)} placeholder={directionFilter === 'out' ? '🔍 Cerca cliente, numero...' : '🔍 Cerca fornitore, numero...'} className="w-full px-2.5 py-1.5 text-xs border rounded-lg bg-gray-50 outline-none focus:ring-1 focus:ring-sky-400" />
+            {/* Search with AI button */}
+            <div className="flex gap-1">
+              <input
+                value={query}
+                onChange={e => handleQueryChange(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && query.trim()) handleAISearch(); }}
+                placeholder={directionFilter === 'out' ? '🔍 Cerca cliente, articolo...' : '🔍 Cerca fornitore, articolo...'}
+                className="flex-1 px-2.5 py-1.5 text-xs border rounded-lg bg-gray-50 outline-none focus:ring-1 focus:ring-sky-400"
+              />
+              <button
+                onClick={handleAISearch}
+                disabled={aiSearching || !query.trim()}
+                title="Ricerca AI — cerca anche per sinonimi e categorie"
+                className={`px-2 py-1.5 text-xs font-semibold rounded-lg border transition-all ${aiSearching ? 'bg-violet-100 text-violet-600 border-violet-300 animate-pulse' : aiResult ? 'bg-violet-600 text-white border-violet-600' : 'bg-white text-violet-600 border-violet-300 hover:bg-violet-50 disabled:opacity-40 disabled:cursor-not-allowed'}`}
+              >
+                {aiSearching ? '⏳' : '✨'}
+              </button>
+            </div>
+
+            {/* AI search result indicator */}
+            {aiResult && (
+              <div className="flex items-center gap-1.5 px-2 py-1 bg-violet-50 border border-violet-200 rounded-lg">
+                <span className="text-[10px] text-violet-700 font-semibold flex-1">
+                  ✨ AI: {aiResult.ids.length} risultat{aiResult.ids.length === 1 ? 'o' : 'i'} per "{query}"
+                </span>
+                <button onClick={() => { setAiResult(null); setQuery(''); }} className="text-violet-500 hover:text-violet-700 text-xs font-bold">✕</button>
+              </div>
+            )}
+            {aiError && (
+              <div className="flex items-center gap-1.5 px-2 py-1 bg-red-50 border border-red-200 rounded-lg">
+                <span className="text-[10px] text-red-600 flex-1">⚠ {aiError}</span>
+                <button onClick={() => setAiError('')} className="text-red-400 hover:text-red-600 text-xs font-bold">✕</button>
+              </div>
+            )}
+
+            {/* Date range filter */}
+            <div className="flex gap-1.5 items-center">
+              <label className="text-[10px] text-gray-500 font-medium w-6">Dal</label>
+              <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)} className="flex-1 px-1.5 py-1 text-[11px] border rounded bg-gray-50 outline-none focus:ring-1 focus:ring-sky-400" />
+              <label className="text-[10px] text-gray-500 font-medium w-5">Al</label>
+              <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)} className="flex-1 px-1.5 py-1 text-[11px] border rounded bg-gray-50 outline-none focus:ring-1 focus:ring-sky-400" />
+              {(dateFrom || dateTo) && (
+                <button onClick={() => { setDateFrom(''); setDateTo(''); }} className="text-gray-400 hover:text-gray-600 text-xs font-bold" title="Azzera date">✕</button>
+              )}
+            </div>
+
+            {/* Status filter */}
             <div className="flex gap-1">
               {(['all', 'pending', 'overdue', 'paid'] as const).map(s => (
                 <button key={s} onClick={() => setStatusFilter(s)} className={`flex-1 py-1 text-[10px] font-semibold rounded ${statusFilter === s ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>{s === 'all' ? 'Tutte' : STATUS_LABELS[s]}</button>
