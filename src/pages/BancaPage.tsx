@@ -51,8 +51,9 @@ function txTypeBadge(type?: string) {
 // ============================================================
 function ImportProgress({ progress, txCount }: { progress: BankParseProgress; txCount: number }) {
   const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0
-  const label = progress.phase === 'extracting' ? '📄 Lettura PDF...'
+  const label = progress.phase === 'uploading' ? '📤 Caricamento PDF...'
     : progress.phase === 'analyzing' ? '🤖 Analisi AI...'
+    : progress.phase === 'waiting' ? '⏳ Rate limit, attendo...'
     : progress.phase === 'saving' ? '💾 Salvataggio...'
     : '✅ Completato'
   return (
@@ -373,9 +374,9 @@ export default function BancaPage() {
       }
 
       const bankAccountId = await ensureBankAccount(companyId, {
-        iban: parseResult.iban,
-        bankName: parseResult.bankName || 'Monte dei Paschi',
-        accountHolder: parseResult.accountHolder,
+        iban: undefined,
+        bankName: 'Monte dei Paschi',
+        accountHolder: undefined,
       })
       const batchId = await createImportBatch(companyId, file.name)
 
