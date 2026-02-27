@@ -50,11 +50,37 @@ function txTypeBadge(type?: string) {
 // IMPORT PROGRESS
 // ============================================================
 function ImportProgress({ progress, txCount }: { progress: BankParseProgress; txCount: number }) {
-  const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0
+  const [animPct, setAnimPct] = useState(0)
+  const animRef = useRef<any>(null)
+
+  useEffect(() => {
+    clearInterval(animRef.current)
+    if (progress.phase === 'uploading') {
+      setAnimPct(3)
+    } else if (progress.phase === 'analyzing') {
+      if (progress.current > 0) {
+        // Progresso reale: movimenti trovati finora (stima su 200 max)
+        const est = Math.min(90, Math.round((progress.current / 200) * 85) + 5)
+        setAnimPct(est)
+      } else {
+        // Nessun dato ancora: animazione lenta fino a 25%
+        animRef.current = setInterval(() => {
+          setAnimPct(prev => prev < 25 ? prev + 0.3 : prev)
+        }, 400)
+      }
+    } else if (progress.phase === 'saving') {
+      setAnimPct(93)
+    } else if (progress.phase === 'done') {
+      setAnimPct(100)
+    }
+    return () => clearInterval(animRef.current)
+  }, [progress.phase, progress.current])
+
+  const pct = animPct
   const label = progress.phase === 'uploading' ? '📤 Caricamento PDF...'
-    : progress.phase === 'analyzing' ? '🤖 Analisi AI...'
+    : progress.phase === 'analyzing' ? '🤖 Gemini sta analizzando...'
     : progress.phase === 'waiting' ? '⏳ Rate limit, attendo...'
-    : progress.phase === 'saving' ? '💾 Salvataggio...'
+    : progress.phase === 'saving' ? '💾 Salvataggio movimenti...'
     : '✅ Completato'
   return (
     <div className="bg-white border rounded-lg p-4">

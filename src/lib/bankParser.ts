@@ -110,9 +110,9 @@ export async function parseBankPdf(
           if (event.type === 'progress') {
             onProgress?.({
               phase: 'analyzing',
-              current: event.chunk,
-              total: event.total,
-              message: `Analisi chunk ${event.chunk}/${event.total} · ${event.found} movimenti trovati...`,
+              current: event.found || 0,
+              total: 0,
+              message: event.message || (event.found > 0 ? `⚡ ${event.found} movimenti trovati...` : '🤖 Gemini sta analizzando il PDF...'),
             });
           } else if (event.type === 'waiting') {
             onProgress?.({
