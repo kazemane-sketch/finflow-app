@@ -448,7 +448,13 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
                 : (b.arrotondamento || '')
             }</div></div>
             <div><div className="text-sky-700 font-bold text-[10px]">Divisa</div><div className="font-semibold">{b.divisa}</div></div>
-            <div className="text-right"><div className="text-sky-700 font-bold text-[10px]">Totale Documento</div><div className={`text-lg font-extrabold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(safeFloat(b.totale) || b.riepilogo?.reduce((s: number, r: any) => s + safeFloat(r.imponibile) + safeFloat(r.imposta), 0) || 0)}</div></div>
+            <div className="text-right"><div className="text-sky-700 font-bold text-[10px]">Totale Documento</div><div className={`text-lg font-extrabold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur((() => {
+                const fromXml = safeFloat(b.totale);
+                if (fromXml !== 0) return fromXml;
+                const base = b.riepilogo?.reduce((s: number, r: any) => s + safeFloat(r.imponibile) + safeFloat(r.imposta), 0) || 0;
+                const sconto = b.sconti?.reduce((s: number, sc: any) => s + (sc.tipo === 'SC' ? safeFloat(sc.importo) : -safeFloat(sc.importo)), 0) || 0;
+                return Math.max(0, base - sconto);
+              })())}</div></div>
           </div>
         </Sec>
       )}
