@@ -55,7 +55,7 @@ function ImportProgress({ progress, txCount }: { progress: BankParseProgress; tx
     <div className="bg-white border rounded-lg p-4 mb-4">
       <div className="flex items-center justify-between mb-2">
         <span className="text-sm font-semibold text-gray-700">
-          {progress.phase === 'rendering' ? '🖼️ Rendering PDF...' :
+          {progress.phase === 'extracting' ? '📄 Lettura PDF...' :
            progress.phase === 'analyzing' ? '🤖 Analisi AI in corso...' :
            '✅ Completato'}
         </span>
