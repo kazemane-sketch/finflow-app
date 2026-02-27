@@ -30,6 +30,11 @@ const STATUS_LABELS: Record<string, string> = { pending: 'Da Pagare', overdue: '
 const STATUS_COLORS: Record<string, string> = { pending: 'bg-yellow-100 text-yellow-800', overdue: 'bg-red-100 text-red-800', paid: 'bg-green-100 text-green-800' };
 
 // ============================================================
+// SAFE NUMBER HELPER — evita NaN quando il campo XML è vuoto
+// ============================================================
+const safeFloat = (v: any): number => { const n = parseFloat(v); return isNaN(n) ? 0 : n; };
+
+// ============================================================
 // INLINE XML PARSER — self-contained, no external deps
 // ============================================================
 function stripNS(x: string) {
@@ -341,7 +346,7 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
           <Row l="Regime Fiscale" v={d?.ced?.regime ? `${d.ced.regime} (${REG[d.ced.regime] || ''})` : undefined} />
           <Row l="Sede" v={d?.ced?.sede || cp?.sede} />
           <Row l="Iscrizione REA" v={d?.ced?.reaNumero ? `${d.ced.reaUfficio} ${d.ced.reaNumero}` : undefined} />
-          <Row l="Capitale Sociale" v={d?.ced?.capitale ? fmtEur(parseFloat(d.ced.capitale)) : undefined} />
+          <Row l="Capitale Sociale" v={d?.ced?.capitale ? fmtEur(safeFloat(d.ced.capitale)) : undefined} />
           <Row l="In Liquidazione" v={d?.ced?.liquidazione === 'LN' ? 'LN (No)' : d?.ced?.liquidazione === 'LS' ? 'LS (Sì)' : d?.ced?.liquidazione || undefined} />
           <Row l="Telefono" v={d?.ced?.tel} />
           <Row l="Email" v={d?.ced?.email} />
@@ -383,10 +388,10 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
                 <tr key={i} className="border-b border-gray-100">
                   {b?.linee?.some((x: any) => x.codiceArticolo) && <td className="text-left px-1.5 py-1 text-gray-400">{l.codiceArticolo || '—'}</td>}
                   <td className="text-left px-1.5 py-1">{l.descrizione}</td>
-                  <td className="text-right px-1.5 py-1">{l.quantita ? fmtNum(parseFloat(l.quantita)) : '1'}</td>
-                  <td className="text-right px-1.5 py-1">{fmtNum(parseFloat(l.prezzoUnitario))}</td>
-                  <td className="text-right px-1.5 py-1">{fmtNum(parseFloat(l.aliquotaIVA))}%</td>
-                  <td className="text-right px-1.5 py-1 font-bold">{fmtNum(parseFloat(l.prezzoTotale))}</td>
+                  <td className="text-right px-1.5 py-1">{l.quantita ? fmtNum(safeFloat(l.quantita)) : '1'}</td>
+                  <td className="text-right px-1.5 py-1">{fmtNum(safeFloat(l.prezzoUnitario))}</td>
+                  <td className="text-right px-1.5 py-1">{fmtNum(safeFloat(l.aliquotaIVA))}%</td>
+                  <td className="text-right px-1.5 py-1 font-bold">{fmtNum(safeFloat(l.prezzoTotale))}</td>
                 </tr>
               ))}
               {/* Fallback: DB line items when XML not parsed */}
@@ -418,23 +423,23 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
               {b.riepilogo.map((r: any, i: number) => (
                 <tr key={i} className="border-b border-gray-100">
                   <td className="text-left px-1.5 py-1">{r.esigibilita ? `${ESI[r.esigibilita] || r.esigibilita}` : ''}</td>
-                  <td className="text-left px-1.5 py-1">{fmtNum(parseFloat(r.aliquota))}%{r.natura ? ` - ${r.natura} (${NAT[r.natura] || ''})` : ''}{r.rifNorm ? ` - ${r.rifNorm}` : ''}</td>
-                  <td className="text-right px-1.5 py-1 font-bold">{fmtNum(parseFloat(r.imposta))}</td>
-                  <td className="text-right px-1.5 py-1 font-bold">{fmtNum(parseFloat(r.imponibile))}</td>
+                  <td className="text-left px-1.5 py-1">{fmtNum(safeFloat(r.aliquota))}%{r.natura ? ` - ${r.natura} (${NAT[r.natura] || ''})` : ''}{r.rifNorm ? ` - ${r.rifNorm}` : ''}</td>
+                  <td className="text-right px-1.5 py-1 font-bold">{fmtNum(safeFloat(r.imposta))}</td>
+                  <td className="text-right px-1.5 py-1 font-bold">{fmtNum(safeFloat(r.imponibile))}</td>
                 </tr>
               ))}
               <tr className="border-t-2 border-sky-200">
                 <td className="text-left px-1.5 py-1 font-bold">Totale Imposta e Imponibile</td><td></td>
-                <td className="text-right px-1.5 py-1 font-bold text-sky-700">{fmtNum(b.riepilogo.reduce((s: number, r: any) => s + parseFloat(r.imposta || 0), 0))}</td>
-                <td className="text-right px-1.5 py-1 font-bold text-sky-700">{fmtNum(b.riepilogo.reduce((s: number, r: any) => s + parseFloat(r.imponibile || 0), 0))}</td>
+                <td className="text-right px-1.5 py-1 font-bold text-sky-700">{fmtNum(b.riepilogo.reduce((s: number, r: any) => s + safeFloat(r.imposta), 0))}</td>
+                <td className="text-right px-1.5 py-1 font-bold text-sky-700">{fmtNum(b.riepilogo.reduce((s: number, r: any) => s + safeFloat(r.imponibile), 0))}</td>
               </tr>
             </tbody>
           </table>
           <div className="mt-2 grid grid-cols-4 gap-2 bg-sky-50 p-2 rounded-lg text-xs">
-            <div><div className="text-sky-700 font-bold text-[10px]">Importo Bollo</div><div className="font-semibold">{b.bollo?.importo ? fmtEur(parseFloat(b.bollo.importo)) : ''}</div></div>
+            <div><div className="text-sky-700 font-bold text-[10px]">Importo Bollo</div><div className="font-semibold">{b.bollo?.importo ? fmtEur(safeFloat(b.bollo.importo)) : ''}</div></div>
             <div><div className="text-sky-700 font-bold text-[10px]">Sconto/Rincaro</div><div className="font-semibold">{b.arrotondamento || ''}</div></div>
             <div><div className="text-sky-700 font-bold text-[10px]">Divisa</div><div className="font-semibold">{b.divisa}</div></div>
-            <div className="text-right"><div className="text-sky-700 font-bold text-[10px]">Totale Documento</div><div className={`text-lg font-extrabold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(parseFloat(b.totale))}</div></div>
+            <div className="text-right"><div className="text-sky-700 font-bold text-[10px]">Totale Documento</div><div className={`text-lg font-extrabold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(safeFloat(b.totale) || b.riepilogo?.reduce((s: number, r: any) => s + safeFloat(r.imponibile) + safeFloat(r.imposta), 0) || 0)}</div></div>
           </div>
         </Sec>
       )}
@@ -454,7 +459,7 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
                 <td className="text-left px-1.5 py-1">{p.modalita ? `${p.modalita} (${MP[p.modalita] || ''})` : ''}{b.condPag ? ` - ${b.condPag} (${CPC[b.condPag] || ''})` : ''}</td>
                 <td className="text-left px-1.5 py-1">{p.iban || ''}</td>
                 <td className="text-right px-1.5 py-1">{p.scadenza ? fmtDate(p.scadenza) : ''}</td>
-                <td className="text-right px-1.5 py-1 font-bold">{p.importo ? fmtEur(parseFloat(p.importo)) : ''}</td>
+                <td className="text-right px-1.5 py-1 font-bold">{p.importo ? fmtEur(safeFloat(p.importo)) : ''}</td>
               </tr>
             )) : (
               <tr><td colSpan={4} className="text-left px-1.5 py-1 text-gray-400">
@@ -469,10 +474,10 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
       {b?.ddt?.length > 0 && <Sec title="Documenti di Trasporto" open={false}>{b.ddt.map((dd: any, i: number) => <div key={i}><Row l="DDT Numero" v={dd.numero} /><Row l="DDT Data" v={fmtDate(dd.data)} /></div>)}</Sec>}
 
       {/* Ritenuta */}
-      {b?.ritenuta?.importo && <Sec title="Ritenuta d'Acconto" open={false}><Row l="Tipo" v={RIT[b.ritenuta.tipo] || b.ritenuta.tipo} /><Row l="Importo" v={fmtEur(parseFloat(b.ritenuta.importo))} accent /><Row l="Aliquota" v={b.ritenuta.aliquota ? `${fmtNum(parseFloat(b.ritenuta.aliquota))}%` : undefined} /><Row l="Causale Pag." v={b.ritenuta.causale} /></Sec>}
+      {b?.ritenuta?.importo && <Sec title="Ritenuta d'Acconto" open={false}><Row l="Tipo" v={RIT[b.ritenuta.tipo] || b.ritenuta.tipo} /><Row l="Importo" v={fmtEur(safeFloat(b.ritenuta.importo))} accent /><Row l="Aliquota" v={b.ritenuta.aliquota ? `${fmtNum(safeFloat(b.ritenuta.aliquota))}%` : undefined} /><Row l="Causale Pag." v={b.ritenuta.causale} /></Sec>}
 
       {/* Cassa */}
-      {b?.cassa?.importo && <Sec title="Cassa Previdenziale" open={false}><Row l="Tipo Cassa" v={b.cassa.tipo} /><Row l="Importo Contributo" v={fmtEur(parseFloat(b.cassa.importo))} accent /><Row l="Aliquota" v={b.cassa.al ? `${fmtNum(parseFloat(b.cassa.al))}%` : undefined} /></Sec>}
+      {b?.cassa?.importo && <Sec title="Cassa Previdenziale" open={false}><Row l="Tipo Cassa" v={b.cassa.tipo} /><Row l="Importo Contributo" v={fmtEur(safeFloat(b.cassa.importo))} accent /><Row l="Aliquota" v={b.cassa.al ? `${fmtNum(safeFloat(b.cassa.al))}%` : undefined} /></Sec>}
 
       {/* Allegati */}
       {b?.allegati?.length > 0 && (
