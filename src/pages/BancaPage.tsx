@@ -14,6 +14,7 @@ import {
   deleteBankTransactions, deleteAllBankTransactions,
   type BankParseProgress,
 } from '@/lib/bankParser'
+import { SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 
 // ============================================================
 // UTILS
@@ -251,9 +252,6 @@ function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
 // ============================================================
 // AI SEARCH
 // ============================================================
-const SUPABASE_URL = 'https://xtuofcwvimaffcpqboou.supabase.co'
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh0dW9mY3d2aW1hZmZjcHFib291Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIwNjIyMTUsImV4cCI6MjA4NzYzODIxNX0.kShgRlGkLFkq08kW_Le5G8N0dVbidX08ho6WQ3n9kkw'
-
 async function askClaudeOnTransactions(query: string, transactions: any[]): Promise<string> {
   const response = await fetch(`${SUPABASE_URL}/functions/v1/bank-ai-search`, {
     method: 'POST',

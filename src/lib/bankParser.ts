@@ -3,9 +3,7 @@
 // Chunk da 10 pagine, SSE streaming per progress
 
 import { supabase } from '@/integrations/supabase/client';
-
-const SUPABASE_URL = 'https://xtuofcwvimaffcpqboou.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh0dW9mY3d2aW1hZmZjcHFib291Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIwNjIyMTUsImV4cCI6MjA4NzYzODIxNX0.kShgRlGkLFkq08kW_Le5G8N0dVbidX08ho6WQ3n9kkw';
+import { SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client';
 
 // ============================================================
 // TYPES
@@ -93,8 +91,14 @@ export async function parseBankPdf(
   }
 
   if (!response.ok) {
-    const err = await response.json().catch(() => ({})) as any;
-    throw new Error(err.error || `Errore server ${response.status}`);
+    const body = await response.text().catch(() => '');
+    let err: any = {};
+    try { err = body ? JSON.parse(body) : {}; } catch { /* non-json error */ }
+    const baseMsg = err.error || body || `Errore server ${response.status}`;
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(`Autenticazione Edge Function fallita (${response.status}). Verifica VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY in Vercel/Supabase.`);
+    }
+    throw new Error(baseMsg);
   }
 
   // Legge SSE streaming dalla edge function
