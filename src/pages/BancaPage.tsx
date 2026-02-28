@@ -14,7 +14,6 @@ import {
   deleteBankTransactions, deleteAllBankTransactions,
   type BankParseProgress,
 } from '@/lib/bankParser'
-import { startOfMonth, endOfMonth, subMonths } from 'date-fns'
 
 // ============================================================
 // UTILS
@@ -345,19 +344,31 @@ export default function BancaPage() {
   // Quick date filters
   const setQuickDate = (type: string) => {
     const now = new Date()
+    const y = now.getFullYear()
+    const m = now.getMonth()
+    // Helper: first day of month
+    const firstDay = (year: number, month: number) => new Date(year, month, 1)
+    // Helper: last day of month
+    const lastDay = (year: number, month: number) => new Date(year, month + 1, 0)
     switch (type) {
       case 'this_month':
-        setDateFrom(isoDate(startOfMonth(now)))
-        setDateTo(isoDate(endOfMonth(now)))
+        setDateFrom(isoDate(firstDay(y, m)))
+        setDateTo(isoDate(lastDay(y, m)))
         break
-      case 'last_month':
-        setDateFrom(isoDate(startOfMonth(subMonths(now, 1))))
-        setDateTo(isoDate(endOfMonth(subMonths(now, 1))))
+      case 'last_month': {
+        const lm = m === 0 ? 11 : m - 1
+        const ly = m === 0 ? y - 1 : y
+        setDateFrom(isoDate(firstDay(ly, lm)))
+        setDateTo(isoDate(lastDay(ly, lm)))
         break
-      case 'last_3':
-        setDateFrom(isoDate(startOfMonth(subMonths(now, 2))))
-        setDateTo(isoDate(endOfMonth(now)))
+      }
+      case 'last_3': {
+        const sm = ((m - 2) + 12) % 12
+        const sy = m < 2 ? y - 1 : y
+        setDateFrom(isoDate(firstDay(sy, sm)))
+        setDateTo(isoDate(lastDay(y, m)))
         break
+      }
       default:
         setDateFrom('')
         setDateTo('')
