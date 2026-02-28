@@ -430,17 +430,7 @@ export default function BancaPage() {
     if (fileRef.current) fileRef.current.value = ''
   }, [companyId, loadData])
 
-  const handleAiSearch = async () => {
-    if (!aiQuery.trim() || !hasApiKey) return
-    setAiLoading(true); setAiResult(null)
-    try {
-      const result = await askClaudeOnTransactions(aiQuery, filtered, getClaudeApiKey())
-      setAiResult(result)
-    } catch (e: any) { setAiResult('Errore: ' + e.message) }
-    setAiLoading(false)
-  }
-
-  // Filters
+  // Filters (defined before handleAiSearch so it can reference it)
   const filtered = transactions.filter(tx => {
     if (dirFilter === 'in' && tx.amount <= 0) return false
     if (dirFilter === 'out' && tx.amount >= 0) return false
@@ -456,6 +446,16 @@ export default function BancaPage() {
     }
     return true
   })
+
+  const handleAiSearch = async () => {
+    if (!aiQuery.trim() || !hasApiKey) return
+    setAiLoading(true); setAiResult(null)
+    try {
+      const result = await askClaudeOnTransactions(aiQuery, filtered, getClaudeApiKey())
+      setAiResult(result)
+    } catch (e: any) { setAiResult('Errore: ' + e.message) }
+    setAiLoading(false)
+  }
 
   // KPI su dati filtrati
   const totalIn = filtered.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0)
