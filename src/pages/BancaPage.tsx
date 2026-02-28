@@ -251,47 +251,26 @@ function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
 // ============================================================
 // AI SEARCH
 // ============================================================
-async function askClaudeOnTransactions(query: string, transactions: any[], apiKey: string): Promise<string> {
-  const sample = transactions.slice(0, 200).map(tx => ({
-    date: tx.date,
-    amount: tx.amount,
-    desc: (tx.description || '').substring(0, 80),
-    cp: tx.counterparty_name,
-    type: tx.transaction_type,
-    inv: tx.invoice_ref,
-    comm: tx.commission_amount,
-  }))
+const SUPABASE_URL = 'https://xtuofcwvimaffcpqboou.supabase.co'
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh0dW9mY3d2aW1hZmZjcHFib291Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIwNjIyMTUsImV4cCI6MjA4NzYzODIxNX0.kShgRlGkLFkq08kW_Le5G8N0dVbidX08ho6WQ3n9kkw'
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+async function askClaudeOnTransactions(query: string, transactions: any[]): Promise<string> {
+  const response = await fetch(`${SUPABASE_URL}/functions/v1/bank-ai-search`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true',
+      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+      'apikey': SUPABASE_ANON_KEY,
     },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1024,
-      messages: [{
-        role: 'user',
-        content: `Sei un assistente finanziario che analizza movimenti bancari italiani di un'azienda.
-Movimenti disponibili (max 200, formato compatto):
-${JSON.stringify(sample)}
-
-Domanda: "${query}"
-
-Rispondi in italiano in modo conciso e diretto. Se la domanda riguarda ricerche specifiche, elenca le date e gli importi corrispondenti. Se è un'analisi, calcola il totale o la risposta numerica.`,
-      }],
-    }),
+    body: JSON.stringify({ query, transactions }),
   })
 
   if (!response.ok) {
-    const err = await response.text()
-    throw new Error(`Claude API ${response.status}: ${err.substring(0, 100)}`)
+    const err = await response.json().catch(() => ({}))
+    throw new Error(err.error || `Errore server ${response.status}`)
   }
   const data = await response.json()
-  return data.content?.[0]?.text || 'Nessuna risposta'
+  return data.answer || 'Nessuna risposta'
 }
 
 // ============================================================
@@ -314,8 +293,7 @@ export default function BancaPage() {
   const [deleteModal, setDeleteModal] = useState<{ mode: 'selected' | 'all' } | null>(null)
   const [deleting, setDeleting] = useState(false)
 
-  // AI search
-  const [aiQuery, setAiQuery] = useState('')
+  // AI search (usa query come input unificato)
   const [aiResult, setAiResult] = useState<string | null>(null)
   const [aiLoading, setAiLoading] = useState(false)
 
@@ -326,7 +304,6 @@ export default function BancaPage() {
   const [importResult, setImportResult] = useState<{ saved: number; duplicates: number; errors: string[] } | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
-  const hasApiKey = !!getClaudeApiKey()
 
   const loadData = useCallback(async () => {
     if (!companyId) return
@@ -459,12 +436,18 @@ export default function BancaPage() {
   })
 
   const handleAiSearch = async () => {
-    if (!aiQuery.trim() || !hasApiKey) return
+    if (!query.trim()) return
     setAiLoading(true); setAiResult(null)
     try {
-      const result = await askClaudeOnTransactions(aiQuery, filtered, getClaudeApiKey())
+      const result = await askClaudeOnTransactions(query, filtered)
       setAiResult(result)
-    } catch (e: any) { setAiResult('Errore: ' + e.message) }
+    } catch (e: any) {
+      if (e.message.includes('401') || e.message.includes('authentication')) {
+        setAiResult('⚠️ Chiave API Claude non valida. Vai in Impostazioni e inserisci la chiave sk-ant-...')
+      } else {
+        setAiResult('Errore: ' + e.message)
+      }
+    }
     setAiLoading(false)
   }
 
@@ -497,22 +480,14 @@ export default function BancaPage() {
               <Button variant="outline" size="sm" onClick={loadData} disabled={loading}>
                 <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`} />Aggiorna
               </Button>
-              <Button size="sm" onClick={() => fileRef.current?.click()} disabled={importing || !companyId || !hasApiKey}>
+              <Button size="sm" onClick={() => fileRef.current?.click()} disabled={importing || !companyId}>
                 <Upload className="h-3.5 w-3.5 mr-1.5" />Importa PDF
               </Button>
               <input ref={fileRef} type="file" accept=".pdf" className="hidden" onChange={e => handleImport(e.target.files)} />
             </div>
           </div>
 
-          {!hasApiKey && (
-            <div className="flex items-start gap-3 p-3 bg-amber-50 border border-amber-200 rounded-lg">
-              <AlertCircle className="h-4 w-4 text-amber-600 flex-shrink-0 mt-0.5" />
-              <p className="text-sm text-amber-800">
-                Configura la <strong>chiave API Claude</strong> in{' '}
-                <a href="/impostazioni" className="underline">Impostazioni</a> per import PDF e ricerca AI.
-              </p>
-            </div>
-          )}
+
 
           {isMultiSelect && (
             <div className="flex items-center gap-3 p-3 bg-sky-50 border border-sky-200 rounded-lg">
@@ -600,14 +575,22 @@ export default function BancaPage() {
           {/* FILTERS */}
           {transactions.length > 0 && (
             <div className="space-y-2">
-              {/* Text + direction + type */}
+              {/* Barra unificata: digita = filtro, Invio = AI */}
               <div className="flex flex-wrap items-center gap-2">
                 <div className="relative flex-1 min-w-[180px]">
-                  <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-gray-400" />
-                  <input value={query} onChange={e => setQuery(e.target.value)}
-                    placeholder="Cerca descrizione, controparte, fattura..."
-                    className="w-full pl-8 pr-8 py-1.5 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500" />
-                  {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => setQuery('')}><X className="h-3.5 w-3.5" /></button>}
+                  {aiLoading
+                    ? <RefreshCw className="absolute left-2.5 top-2 h-3.5 w-3.5 text-purple-400 animate-spin" />
+                    : <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-gray-400" />}
+                  <input
+                    value={query}
+                    onChange={e => { setQuery(e.target.value); setAiResult(null) }}
+                    onKeyDown={e => e.key === 'Enter' && handleAiSearch()}
+                    placeholder="Cerca... · Premi Invio per ricerca AI 🤖"
+                    className={`w-full pl-8 pr-8 py-1.5 text-sm border rounded-md focus:outline-none focus:ring-2 ${
+                      aiResult ? 'border-purple-300 focus:ring-purple-400 bg-purple-50' : 'border-gray-200 focus:ring-sky-500'
+                    }`}
+                  />
+                  {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => { setQuery(''); setAiResult(null) }}><X className="h-3.5 w-3.5" /></button>}
                 </div>
                 {(['all', 'in', 'out'] as const).map(d => (
                   <button key={d} onClick={() => setDirFilter(d)}
@@ -651,38 +634,14 @@ export default function BancaPage() {
                 )}
               </div>
 
-              {/* AI Search */}
-              {hasApiKey && (
-                <div className="space-y-2">
-                  <div className="flex gap-2">
-                    <div className="relative flex-1">
-                      <Sparkles className="absolute left-2.5 top-2 h-3.5 w-3.5 text-purple-400" />
-                      <input
-                        value={aiQuery}
-                        onChange={e => setAiQuery(e.target.value)}
-                        onKeyDown={e => e.key === 'Enter' && handleAiSearch()}
-                        placeholder="Chiedi all'AI: 'Quanto ho pagato in F24?' · 'Totale bonifici Buzzi'"
-                        className="w-full pl-8 pr-3 py-1.5 text-sm border border-purple-200 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-400 bg-purple-50 placeholder-purple-300"
-                      />
-                    </div>
-                    <Button size="sm" variant="outline"
-                      className="border-purple-200 text-purple-700 hover:bg-purple-50"
-                      onClick={handleAiSearch}
-                      disabled={aiLoading || !aiQuery.trim()}>
-                      {aiLoading
-                        ? <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                        : <Sparkles className="h-3.5 w-3.5" />}
-                    </Button>
-                  </div>
-                  {aiResult && (
-                    <div className="flex items-start gap-2 p-3 bg-purple-50 border border-purple-100 rounded-lg">
-                      <Sparkles className="h-3.5 w-3.5 text-purple-500 flex-shrink-0 mt-0.5" />
-                      <p className="flex-1 text-xs text-purple-900 whitespace-pre-wrap">{aiResult}</p>
-                      <button onClick={() => setAiResult(null)} className="text-purple-300 hover:text-purple-500 flex-shrink-0">
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  )}
+              {/* AI result */}
+              {aiResult && (
+                <div className="flex items-start gap-2 p-3 bg-purple-50 border border-purple-100 rounded-lg">
+                  <Sparkles className="h-3.5 w-3.5 text-purple-500 flex-shrink-0 mt-0.5" />
+                  <p className="flex-1 text-xs text-purple-900 whitespace-pre-wrap">{aiResult}</p>
+                  <button onClick={() => setAiResult(null)} className="text-purple-300 hover:text-purple-500 flex-shrink-0">
+                    <X className="h-3.5 w-3.5" />
+                  </button>
                 </div>
               )}
             </div>
@@ -699,14 +658,9 @@ export default function BancaPage() {
                 <p className="text-sm text-muted-foreground mb-4 max-w-md mx-auto">
                   Carica il PDF dell'estratto conto MPS per importare automaticamente i movimenti.
                 </p>
-                {hasApiKey
-                  ? <Button onClick={() => fileRef.current?.click()}>
-                      <Upload className="h-4 w-4 mr-2" />Carica estratto conto PDF
-                    </Button>
-                  : <p className="text-sm text-amber-600 flex items-center justify-center gap-1.5">
-                      <Info className="h-4 w-4" />
-                      Prima configura la chiave API in <a href="/impostazioni" className="underline ml-1">Impostazioni</a>
-                    </p>}
+                <Button onClick={() => fileRef.current?.click()}>
+                  <Upload className="h-4 w-4 mr-2" />Carica estratto conto PDF
+                </Button>
               </CardContent>
             </Card>
           ) : (
