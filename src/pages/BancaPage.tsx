@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useCompany } from '@/hooks/useCompany'
+import { supabaseUrl, supabaseAnonKey } from '@/integrations/supabase/client'
 import {
   Upload, Landmark, RefreshCw, TrendingUp, TrendingDown,
   Search, X, CheckCircle, AlertCircle, Info,
@@ -251,16 +252,14 @@ function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
 // ============================================================
 // AI SEARCH
 // ============================================================
-const SUPABASE_URL = 'https://xtuofcwvimaffcpqboou.supabase.co'
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh0dW9mY3d2aW1hZmZjcHFib291Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIwNjIyMTUsImV4cCI6MjA4NzYzODIxNX0.kShgRlGkLFkq08kW_Le5G8N0dVbidX08ho6WQ3n9kkw'
 
 async function askClaudeOnTransactions(query: string, transactions: any[]): Promise<string> {
-  const response = await fetch(`${SUPABASE_URL}/functions/v1/bank-ai-search`, {
+  const response = await fetch(`${supabaseUrl}/functions/v1/bank-ai-search`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-      'apikey': SUPABASE_ANON_KEY,
+      'Authorization': `Bearer ${supabaseAnonKey}`,
+      'apikey': supabaseAnonKey,
     },
     body: JSON.stringify({ query, transactions }),
   })
@@ -387,7 +386,7 @@ export default function BancaPage() {
     if (!files?.length || !companyId) return
     const file = files[0]
     const apiKey = getClaudeApiKey()
-    if (!apiKey) { alert('Configura la chiave API Claude in Impostazioni.'); return }
+    if (!apiKey) { alert("Configura l'integrazione server-side in Supabase (segreto GEMINI_API_KEY)."); return }
     setImporting(true); setImportResult(null); setImportTxCount(0)
 
     try {
