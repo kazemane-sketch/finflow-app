@@ -63,7 +63,7 @@ export async function parseBankPdf(
     new Uint8Array(buffer).reduce((d, b) => d + String.fromCharCode(b), '')
   );
 
-  const WINDOW_CHUNKS = 3;
+  const WINDOW_CHUNKS = 1;
 
   async function parseWindowOnce(startChunk: number): Promise<any> {
     onProgress?.({

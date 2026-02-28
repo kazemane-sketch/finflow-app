@@ -11,7 +11,7 @@ const corsHeaders = {
 };
 
 const MODEL = Deno.env.get("GEMINI_MODEL") ?? "gemini-2.5-flash";
-const CHUNK_SIZE = Number(Deno.env.get("PDF_CHUNK_PAGES") ?? "2");
+const CHUNK_SIZE = Number(Deno.env.get("PDF_CHUNK_PAGES") ?? "1");
 const MAX_OUTPUT_TOKENS = Number(Deno.env.get("GEMINI_MAX_OUTPUT_TOKENS") ?? "32768");
 
 type Tx = {
@@ -273,7 +273,7 @@ Deno.serve(async (req) => {
     const body = await req.json().catch(() => ({}));
     const pdfBase64 = body?.pdfBase64;
     const reqStartChunk = Number(body?.startChunk ?? 0);
-    const reqMaxChunks = Number(body?.maxChunks ?? 3);
+    const reqMaxChunks = Number(body?.maxChunks ?? 1);
     if (!pdfBase64 || typeof pdfBase64 !== "string") {
       return new Response(JSON.stringify({ error: "Nessun PDF fornito" }), {
         status: 400,
@@ -294,7 +294,9 @@ Deno.serve(async (req) => {
     const { chunks, totalPages } = await splitPdfIntoChunks(pdfBase64, CHUNK_SIZE);
     const totalChunks = chunks.length;
     const startChunk = Number.isFinite(reqStartChunk) ? Math.max(0, Math.floor(reqStartChunk)) : 0;
-    const maxChunks = Number.isFinite(reqMaxChunks) ? Math.min(8, Math.max(1, Math.floor(reqMaxChunks))) : 3;
+    const requestedMaxChunks = Number.isFinite(reqMaxChunks) ? Math.max(1, Math.floor(reqMaxChunks)) : 1;
+    const hardCapByDocSize = totalChunks > 15 ? 1 : 2;
+    const maxChunks = Math.min(requestedMaxChunks, hardCapByDocSize);
     const endChunkExclusive = Math.min(totalChunks, startChunk + maxChunks);
 
     if (startChunk >= totalChunks) {
