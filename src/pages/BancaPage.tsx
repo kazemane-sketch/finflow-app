@@ -5,8 +5,8 @@ import { Button } from '@/components/ui/button'
 import { useCompany } from '@/hooks/useCompany'
 import {
   Upload, Landmark, RefreshCw, TrendingUp, TrendingDown,
-  Search, X, CheckCircle, AlertCircle, Info, ChevronRight,
-  Building2, Trash2, AlertTriangle,
+  Search, X, CheckCircle, AlertCircle, Info,
+  Building2, Trash2, AlertTriangle, Sparkles, CalendarDays,
 } from 'lucide-react'
 import {
   parseBankPdf, saveBankTransactions, ensureBankAccount, createImportBatch,
@@ -14,6 +14,7 @@ import {
   deleteBankTransactions, deleteAllBankTransactions,
   type BankParseProgress,
 } from '@/lib/bankParser'
+import { startOfMonth, endOfMonth, subMonths } from 'date-fns'
 
 // ============================================================
 // UTILS
@@ -45,6 +46,9 @@ function txTypeBadge(type?: string) {
   if (type === 'prelievo') return 'bg-orange-100 text-orange-700'
   return 'bg-gray-100 text-gray-600'
 }
+function isoDate(d: Date) {
+  return d.toISOString().split('T')[0]
+}
 
 // ============================================================
 // IMPORT PROGRESS
@@ -56,32 +60,31 @@ function ImportProgress({ progress, txCount }: { progress: BankParseProgress; tx
   useEffect(() => {
     clearInterval(animRef.current)
     if (progress.phase === 'uploading') {
-      setAnimPct(3)
-    } else if (progress.phase === 'analyzing') {
-      if (progress.current > 0) {
-        // Progresso reale: movimenti trovati finora (stima su 200 max)
-        const est = Math.min(90, Math.round((progress.current / 200) * 85) + 5)
-        setAnimPct(est)
-      } else {
-        // Nessun dato ancora: animazione lenta fino a 25%
-        animRef.current = setInterval(() => {
-          setAnimPct(prev => prev < 25 ? prev + 0.3 : prev)
-        }, 400)
-      }
+      setAnimPct(5)
+    } else if (progress.phase === 'analyzing' || progress.phase === 'waiting') {
+      setAnimPct(8)
+      animRef.current = setInterval(() => {
+        setAnimPct(prev => {
+          if (prev >= 88) { clearInterval(animRef.current); return 88 }
+          const step = prev < 40 ? 1.2 : prev < 70 ? 0.6 : 0.2
+          return prev + step
+        })
+      }, 800)
     } else if (progress.phase === 'saving') {
       setAnimPct(93)
     } else if (progress.phase === 'done') {
       setAnimPct(100)
     }
     return () => clearInterval(animRef.current)
-  }, [progress.phase, progress.current])
+  }, [progress.phase])
 
-  const pct = animPct
+  const pct = Math.round(animPct)
   const label = progress.phase === 'uploading' ? '📤 Caricamento PDF...'
     : progress.phase === 'analyzing' ? '🤖 Gemini sta analizzando...'
-    : progress.phase === 'waiting' ? '⏳ Rate limit, attendo...'
+    : progress.phase === 'waiting' ? '⏳ Attendo...'
     : progress.phase === 'saving' ? '💾 Salvataggio movimenti...'
     : '✅ Completato'
+
   return (
     <div className="bg-white border rounded-lg p-4">
       <div className="flex items-center justify-between mb-2">
@@ -101,13 +104,8 @@ function ImportProgress({ progress, txCount }: { progress: BankParseProgress; tx
 // ============================================================
 // DELETE CONFIRM MODAL
 // ============================================================
-function DeleteModal({
-  mode, count, onConfirm, onCancel
-}: {
-  mode: 'selected' | 'all';
-  count: number;
-  onConfirm: () => void;
-  onCancel: () => void;
+function DeleteModal({ mode, count, onConfirm, onCancel }: {
+  mode: 'selected' | 'all'; count: number; onConfirm: () => void; onCancel: () => void;
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
@@ -119,9 +117,7 @@ function DeleteModal({
           <div>
             <p className="font-semibold text-gray-900">Conferma eliminazione</p>
             <p className="text-sm text-gray-500">
-              {mode === 'all'
-                ? 'Eliminare TUTTI i movimenti del conto?'
-                : `Eliminare ${count} movement${count === 1 ? 'o' : 'i'} selezionat${count === 1 ? 'o' : 'i'}?`}
+              {mode === 'all' ? 'Eliminare TUTTI i movimenti del conto?' : `Eliminare ${count} movimento/i selezionato/i?`}
             </p>
           </div>
         </div>
@@ -129,8 +125,7 @@ function DeleteModal({
         <div className="flex gap-3 justify-end">
           <Button variant="outline" onClick={onCancel}>Annulla</Button>
           <Button variant="destructive" onClick={onConfirm}>
-            <Trash2 className="h-3.5 w-3.5 mr-1.5" />
-            Elimina
+            <Trash2 className="h-3.5 w-3.5 mr-1.5" />Elimina
           </Button>
         </div>
       </div>
@@ -141,25 +136,25 @@ function DeleteModal({
 // ============================================================
 // TRANSACTION ROW
 // ============================================================
-function TxRow({ tx, selected, onClick, onDoubleClick }: { tx: any; selected: boolean; onClick: () => void; onDoubleClick?: () => void }) {
+function TxRow({ tx, selected, onClick, onDoubleClick }: {
+  tx: any; selected: boolean; onClick: () => void; onDoubleClick?: () => void
+}) {
   const isIn = tx.amount > 0
+  const hasCommission = tx.commission_amount != null && tx.commission_amount !== 0
+  // Importo netto: rimuovo la commissione (negativa) dall'importo → tx.amount - tx.commission_amount
+  // Es: amount=-700.20, commission=-0.20 → netto = -700.20 - (-0.20) = -700.00
+  const netAmount = hasCommission ? tx.amount - tx.commission_amount : null
+
   return (
     <div
       onClick={onClick}
       onDoubleClick={onDoubleClick}
       className={`flex items-center gap-3 px-4 py-3 cursor-pointer border-b border-gray-100 transition-all select-none
-        ${selected
-          ? 'bg-sky-50 border-l-[3px] border-l-sky-500'
-          : 'hover:bg-gray-50 border-l-[3px] border-l-transparent'
-        }`}
+        ${selected ? 'bg-sky-50 border-l-[3px] border-l-sky-500' : 'hover:bg-gray-50 border-l-[3px] border-l-transparent'}`}
     >
-      <div className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center
-        ${isIn ? 'bg-emerald-100' : 'bg-red-100'}`}>
-        {isIn
-          ? <TrendingUp className="h-4 w-4 text-emerald-600" />
-          : <TrendingDown className="h-4 w-4 text-red-600" />}
+      <div className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${isIn ? 'bg-emerald-100' : 'bg-red-100'}`}>
+        {isIn ? <TrendingUp className="h-4 w-4 text-emerald-600" /> : <TrendingDown className="h-4 w-4 text-red-600" />}
       </div>
-
       <div className="flex-1 min-w-0">
         <p className="text-xs font-semibold text-gray-800 truncate">
           {tx.counterparty_name || tx.description?.substring(0, 60) || '—'}
@@ -167,30 +162,24 @@ function TxRow({ tx, selected, onClick, onDoubleClick }: { tx: any; selected: bo
         <div className="flex items-center gap-2 mt-0.5">
           <span className="text-[10px] text-gray-400">{fmtDate(tx.date)}</span>
           {tx.invoice_ref && (
-            <span className="text-[9px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-medium">
-              FAT {tx.invoice_ref}
-            </span>
+            <span className="text-[9px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-medium">FAT {tx.invoice_ref}</span>
           )}
-          {tx.commission_amount != null && tx.commission_amount !== 0 && (
+          {hasCommission && (
             <span className="text-[9px] bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-medium">
               comm. {fmtEur(tx.commission_amount)}
             </span>
           )}
         </div>
       </div>
-
       <span className={`hidden sm:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full flex-shrink-0 ${txTypeBadge(tx.transaction_type)}`}>
         {txTypeLabel(tx.transaction_type)}
       </span>
-
       <div className="text-right flex-shrink-0">
         <p className={`text-sm font-bold ${isIn ? 'text-emerald-700' : 'text-red-700'}`}>
           {isIn ? '+' : ''}{fmtEur(tx.amount)}
         </p>
-        {tx.commission_amount != null && tx.commission_amount !== 0 && (
-          <p className="text-[10px] text-gray-400">
-            netto {fmtEur(tx.amount - Math.abs(tx.commission_amount))}
-          </p>
+        {netAmount != null && (
+          <p className="text-[10px] text-gray-400">netto {fmtEur(netAmount)}</p>
         )}
       </div>
     </div>
@@ -204,7 +193,9 @@ function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
   if (!tx) return null
   const isIn = tx.amount > 0
   const hasCommission = tx.commission_amount != null && tx.commission_amount !== 0
-  const netAmount = hasCommission ? tx.amount - Math.abs(tx.commission_amount) : tx.amount
+  // Importo netto corretto: toglie la commissione dall'importo totale
+  // commission è negativo → amount - commission = amount + abs(commission)
+  const netAmount = hasCommission ? tx.amount - tx.commission_amount : tx.amount
 
   const Row = ({ l, v, mono }: { l: string; v?: any; mono?: boolean }) => {
     if (v == null || v === '' || v === '—') return null
@@ -218,15 +209,12 @@ function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
 
   return (
     <div className="h-full flex flex-col bg-white">
-      {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b flex-shrink-0">
         <span className="text-sm font-semibold">Dettaglio movimento</span>
         <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1">
           <X className="h-4 w-4" />
         </button>
       </div>
-
-      {/* Amount hero */}
       <div className={`px-4 py-4 flex-shrink-0 ${isIn ? 'bg-emerald-50' : 'bg-red-50'}`}>
         <p className={`text-2xl font-bold ${isIn ? 'text-emerald-700' : 'text-red-700'}`}>
           {isIn ? '+' : ''}{fmtEur(tx.amount)}
@@ -234,9 +222,7 @@ function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
         {hasCommission && (
           <div className="mt-1.5 space-y-0.5">
             <p className="text-xs text-orange-600">Commissione: {fmtEur(tx.commission_amount)}</p>
-            <p className="text-xs font-semibold text-gray-700">
-              Importo netto (per matching): {fmtEur(netAmount)}
-            </p>
+            <p className="text-xs font-semibold text-gray-700">Importo netto: {fmtEur(netAmount)}</p>
           </div>
         )}
         <div className="flex items-center gap-2 mt-2">
@@ -246,9 +232,8 @@ function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
           </span>
         </div>
       </div>
-
-      {/* Fields */}
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+        <Row l="Data accredito" v={tx.date ? fmtDate(tx.date) : null} />
         <Row l="Data valuta" v={tx.value_date ? fmtDate(tx.value_date) : null} />
         <Row l="Controparte" v={tx.counterparty_name} />
         <Row l="IBAN / Conto controparte" v={tx.counterparty_account} />
@@ -257,19 +242,57 @@ function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
         <Row l="Rif. fattura" v={tx.invoice_ref} />
         <Row l="ID flusso CBI" v={tx.cbi_flow_id} />
         <Row l="Filiale disponente" v={tx.branch} />
-        <Row l="Codice categoria (CS)" v={tx.category_code} />
         <Row l="Riferimento" v={tx.reference} />
         <Row l="Stato riconciliazione" v={tx.reconciliation_status} />
-
-        {tx.raw_text && tx.raw_text !== tx.description && (
-          <div>
-            <p className="text-[10px] text-gray-400 uppercase tracking-wide mb-1">Testo originale completo</p>
-            <p className="text-[10px] text-gray-500 font-mono bg-gray-50 p-2 rounded break-words whitespace-pre-wrap">{tx.raw_text}</p>
-          </div>
-        )}
       </div>
     </div>
   )
+}
+
+// ============================================================
+// AI SEARCH
+// ============================================================
+async function askClaudeOnTransactions(query: string, transactions: any[], apiKey: string): Promise<string> {
+  const sample = transactions.slice(0, 200).map(tx => ({
+    date: tx.date,
+    amount: tx.amount,
+    desc: (tx.description || '').substring(0, 80),
+    cp: tx.counterparty_name,
+    type: tx.transaction_type,
+    inv: tx.invoice_ref,
+    comm: tx.commission_amount,
+  }))
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1024,
+      messages: [{
+        role: 'user',
+        content: `Sei un assistente finanziario che analizza movimenti bancari italiani di un'azienda.
+Movimenti disponibili (max 200, formato compatto):
+${JSON.stringify(sample)}
+
+Domanda: "${query}"
+
+Rispondi in italiano in modo conciso e diretto. Se la domanda riguarda ricerche specifiche, elenca le date e gli importi corrispondenti. Se è un'analisi, calcola il totale o la risposta numerica.`,
+      }],
+    }),
+  })
+
+  if (!response.ok) {
+    const err = await response.text()
+    throw new Error(`Claude API ${response.status}: ${err.substring(0, 100)}`)
+  }
+  const data = await response.json()
+  return data.content?.[0]?.text || 'Nessuna risposta'
 }
 
 // ============================================================
@@ -282,13 +305,20 @@ export default function BancaPage() {
   const [transactions, setTransactions] = useState<any[]>([])
   const [bankAccounts, setBankAccounts] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
-  const [selectedTx, setSelectedTx] = useState<any>(null)         // detail panel
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set()) // multi-select
+  const [selectedTx, setSelectedTx] = useState<any>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [query, setQuery] = useState('')
   const [dirFilter, setDirFilter] = useState<'all' | 'in' | 'out'>('all')
   const [typeFilter, setTypeFilter] = useState<string>('all')
+  const [dateFrom, setDateFrom] = useState<string>('')
+  const [dateTo, setDateTo] = useState<string>('')
   const [deleteModal, setDeleteModal] = useState<{ mode: 'selected' | 'all' } | null>(null)
   const [deleting, setDeleting] = useState(false)
+
+  // AI search
+  const [aiQuery, setAiQuery] = useState('')
+  const [aiResult, setAiResult] = useState<string | null>(null)
+  const [aiLoading, setAiLoading] = useState(false)
 
   // Import
   const [importing, setImporting] = useState(false)
@@ -312,128 +342,111 @@ export default function BancaPage() {
 
   useEffect(() => { loadData() }, [loadData])
 
-  // Row click — toggle selection
+  // Quick date filters
+  const setQuickDate = (type: string) => {
+    const now = new Date()
+    switch (type) {
+      case 'this_month':
+        setDateFrom(isoDate(startOfMonth(now)))
+        setDateTo(isoDate(endOfMonth(now)))
+        break
+      case 'last_month':
+        setDateFrom(isoDate(startOfMonth(subMonths(now, 1))))
+        setDateTo(isoDate(endOfMonth(subMonths(now, 1))))
+        break
+      case 'last_3':
+        setDateFrom(isoDate(startOfMonth(subMonths(now, 2))))
+        setDateTo(isoDate(endOfMonth(now)))
+        break
+      default:
+        setDateFrom('')
+        setDateTo('')
+    }
+  }
+
   const handleRowClick = (tx: any) => {
-    // Se già selezionato per detail → deseleziona
-    if (selectedTx?.id === tx.id && selectedIds.size === 0) {
-      setSelectedTx(null)
-      return
-    }
-    // Se in modalità multi-select (selectedIds > 0) → aggiungi/rimuovi
+    if (selectedTx?.id === tx.id && selectedIds.size === 0) { setSelectedTx(null); return }
     if (selectedIds.size > 0) {
-      setSelectedIds(prev => {
-        const next = new Set(prev)
-        next.has(tx.id) ? next.delete(tx.id) : next.add(tx.id)
-        return next
-      })
+      setSelectedIds(prev => { const n = new Set(prev); n.has(tx.id) ? n.delete(tx.id) : n.add(tx.id); return n })
       return
     }
-    // Altrimenti → apri detail
     setSelectedTx(tx)
   }
 
-  // Long press / double click → entra in multi-select
   const handleRowDoubleClick = (tx: any) => {
     setSelectedTx(null)
-    setSelectedIds(prev => {
-      const next = new Set(prev)
-      next.has(tx.id) ? next.delete(tx.id) : next.add(tx.id)
-      return next
-    })
+    setSelectedIds(prev => { const n = new Set(prev); n.has(tx.id) ? n.delete(tx.id) : n.add(tx.id); return n })
   }
 
-  const clearSelection = () => {
-    setSelectedIds(new Set())
-    setSelectedTx(null)
-  }
+  const clearSelection = () => { setSelectedIds(new Set()); setSelectedTx(null) }
 
-  // Delete
   const handleDelete = async () => {
     if (!deleteModal || !companyId) return
     setDeleting(true)
     try {
       if (deleteModal.mode === 'selected') {
         await deleteBankTransactions(Array.from(selectedIds))
-        setSelectedIds(new Set())
-        setSelectedTx(null)
+        setSelectedIds(new Set()); setSelectedTx(null)
       } else {
-        await deleteAllBankTransactions(companyId)
-        setSelectedTx(null)
+        await deleteAllBankTransactions(companyId); setSelectedTx(null)
       }
       await loadData()
-    } catch (e: any) {
-      alert('Errore eliminazione: ' + e.message)
-    }
-    setDeleting(false)
-    setDeleteModal(null)
+    } catch (e: any) { alert('Errore eliminazione: ' + e.message) }
+    setDeleting(false); setDeleteModal(null)
   }
 
-  // Import
   const handleImport = useCallback(async (files: FileList | null) => {
     if (!files?.length || !companyId) return
     const file = files[0]
     const apiKey = getClaudeApiKey()
-    if (!apiKey) {
-      alert('Configura la chiave API Claude in Impostazioni.')
-      return
-    }
-    setImporting(true)
-    setImportResult(null)
-    setImportTxCount(0)
-    let parsedCount = 0
+    if (!apiKey) { alert('Configura la chiave API Claude in Impostazioni.'); return }
+    setImporting(true); setImportResult(null); setImportTxCount(0)
 
     try {
-      const parseResult = await parseBankPdf(file, apiKey, (p) => {
-        setImportProgress(p)
-        if (p.phase === 'done') parsedCount = parseInt(p.message.match(/\d+/)?.[0] || '0')
-      })
-
+      const parseResult = await parseBankPdf(file, apiKey, (p) => { setImportProgress(p) })
       setImportTxCount(parseResult.transactions.length)
 
       if (parseResult.transactions.length === 0) {
-        setImportResult({
-          saved: 0, duplicates: 0,
-          errors: ['Nessun movimento trovato.', ...parseResult.errors],
-        })
-        setImporting(false)
-        return
+        setImportResult({ saved: 0, duplicates: 0, errors: ['Nessun movimento trovato.', ...parseResult.errors] })
+        setImporting(false); return
       }
 
-      const bankAccountId = await ensureBankAccount(companyId, {
-        iban: undefined,
-        bankName: 'Monte dei Paschi',
-        accountHolder: undefined,
-      })
+      const bankAccountId = await ensureBankAccount(companyId, { iban: undefined, bankName: 'Monte dei Paschi', accountHolder: undefined })
       const batchId = await createImportBatch(companyId, file.name)
-
       setImportProgress({ phase: 'saving', current: 0, total: parseResult.transactions.length, message: 'Salvataggio...' })
 
       const saveResult = await saveBankTransactions(
         companyId, bankAccountId, parseResult.transactions, batchId,
         (cur, tot) => setImportProgress({ phase: 'saving', current: cur, total: tot, message: `Salvataggio ${cur}/${tot}...` })
       )
-
       await updateImportBatch(batchId, {
-        total: parseResult.transactions.length,
-        success: saveResult.saved,
-        errors: saveResult.errors.length,
-        error_details: saveResult.errors.length ? saveResult.errors : null,
+        total: parseResult.transactions.length, success: saveResult.saved,
+        errors: saveResult.errors.length, error_details: saveResult.errors.length ? saveResult.errors : null,
       })
-
       setImportResult({ ...saveResult, errors: [...saveResult.errors, ...parseResult.errors] })
       await loadData()
-    } catch (e: any) {
-      setImportResult({ saved: 0, duplicates: 0, errors: [e.message] })
-    }
+    } catch (e: any) { setImportResult({ saved: 0, duplicates: 0, errors: [e.message] }) }
     setImporting(false)
     if (fileRef.current) fileRef.current.value = ''
   }, [companyId, loadData])
+
+  const handleAiSearch = async () => {
+    if (!aiQuery.trim() || !hasApiKey) return
+    setAiLoading(true); setAiResult(null)
+    try {
+      const result = await askClaudeOnTransactions(aiQuery, filtered, getClaudeApiKey())
+      setAiResult(result)
+    } catch (e: any) { setAiResult('Errore: ' + e.message) }
+    setAiLoading(false)
+  }
 
   // Filters
   const filtered = transactions.filter(tx => {
     if (dirFilter === 'in' && tx.amount <= 0) return false
     if (dirFilter === 'out' && tx.amount >= 0) return false
     if (typeFilter !== 'all' && tx.transaction_type !== typeFilter) return false
+    if (dateFrom && tx.date < dateFrom) return false
+    if (dateTo && tx.date > dateTo) return false
     if (query) {
       const q = query.toLowerCase()
       return (tx.description?.toLowerCase().includes(q)) ||
@@ -444,18 +457,16 @@ export default function BancaPage() {
     return true
   })
 
-  // KPIs
-  const totalIn = transactions.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0)
-  const totalOut = transactions.filter(t => t.amount < 0).reduce((s, t) => s + Math.abs(t.amount), 0)
+  // KPI su dati filtrati
+  const totalIn = filtered.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0)
+  const totalOut = filtered.filter(t => t.amount < 0).reduce((s, t) => s + Math.abs(t.amount), 0)
   const latestBalance = transactions[0]?.balance
-
   const uniqueTypes = [...new Set(transactions.map(t => t.transaction_type).filter(Boolean))]
-
   const isMultiSelect = selectedIds.size > 0
+  const hasDateFilter = !!(dateFrom || dateTo)
 
   return (
     <div className="flex h-full overflow-hidden">
-      {/* LEFT PANEL */}
       <div className="flex flex-col flex-1 overflow-hidden min-w-0">
         <div className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-4">
 
@@ -467,76 +478,63 @@ export default function BancaPage() {
             </div>
             <div className="flex items-center gap-2 flex-wrap">
               {transactions.length > 0 && (
-                <Button
-                  variant="outline" size="sm"
-                  className="text-red-600 border-red-200 hover:bg-red-50"
-                  onClick={() => setDeleteModal({ mode: 'all' })}
-                >
-                  <Trash2 className="h-3.5 w-3.5 mr-1.5" />
-                  Svuota tutto
+                <Button variant="outline" size="sm" className="text-red-600 border-red-200 hover:bg-red-50"
+                  onClick={() => setDeleteModal({ mode: 'all' })}>
+                  <Trash2 className="h-3.5 w-3.5 mr-1.5" />Svuota tutto
                 </Button>
               )}
               <Button variant="outline" size="sm" onClick={loadData} disabled={loading}>
-                <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`} />
-                Aggiorna
+                <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`} />Aggiorna
               </Button>
-              <Button size="sm" onClick={() => fileRef.current?.click()}
-                disabled={importing || !companyId || !hasApiKey}>
-                <Upload className="h-3.5 w-3.5 mr-1.5" />
-                Importa PDF
+              <Button size="sm" onClick={() => fileRef.current?.click()} disabled={importing || !companyId || !hasApiKey}>
+                <Upload className="h-3.5 w-3.5 mr-1.5" />Importa PDF
               </Button>
-              <input ref={fileRef} type="file" accept=".pdf" className="hidden"
-                onChange={e => handleImport(e.target.files)} />
+              <input ref={fileRef} type="file" accept=".pdf" className="hidden" onChange={e => handleImport(e.target.files)} />
             </div>
           </div>
 
-          {/* API Key warning */}
           {!hasApiKey && (
             <div className="flex items-start gap-3 p-3 bg-amber-50 border border-amber-200 rounded-lg">
               <AlertCircle className="h-4 w-4 text-amber-600 flex-shrink-0 mt-0.5" />
               <p className="text-sm text-amber-800">
                 Configura la <strong>chiave API Claude</strong> in{' '}
-                <a href="/impostazioni" className="underline">Impostazioni</a> per abilitare l'import.
+                <a href="/impostazioni" className="underline">Impostazioni</a> per import PDF e ricerca AI.
               </p>
             </div>
           )}
 
-          {/* Multi-select toolbar */}
           {isMultiSelect && (
             <div className="flex items-center gap-3 p-3 bg-sky-50 border border-sky-200 rounded-lg">
-              <span className="text-sm font-medium text-sky-800">
-                {selectedIds.size} movimento/i selezionati
-              </span>
-              <Button variant="destructive" size="sm"
-                onClick={() => setDeleteModal({ mode: 'selected' })}>
-                <Trash2 className="h-3.5 w-3.5 mr-1.5" />
-                Elimina selezionati
+              <span className="text-sm font-medium text-sky-800">{selectedIds.size} movimento/i selezionati</span>
+              <Button variant="destructive" size="sm" onClick={() => setDeleteModal({ mode: 'selected' })}>
+                <Trash2 className="h-3.5 w-3.5 mr-1.5" />Elimina selezionati
               </Button>
-              <Button variant="outline" size="sm" onClick={clearSelection}>
-                Deseleziona tutto
-              </Button>
+              <Button variant="outline" size="sm" onClick={clearSelection}>Deseleziona tutto</Button>
             </div>
           )}
 
-          {/* Hint multi-select */}
           {transactions.length > 0 && !isMultiSelect && (
             <p className="text-[11px] text-gray-400">
               💡 Clicca su un movimento per i dettagli · Doppio click per selezionare più movimenti da eliminare
             </p>
           )}
 
-          {/* KPIs */}
+          {/* KPI aggiornati con filtri */}
           {transactions.length > 0 && (
             <div className="grid grid-cols-3 gap-3">
               <Card>
                 <CardContent className="p-3">
-                  <p className="text-[10px] text-muted-foreground uppercase">Entrate</p>
+                  <p className="text-[10px] text-muted-foreground uppercase">
+                    Entrate{hasDateFilter ? ' (periodo)' : ''}
+                  </p>
                   <p className="text-lg font-bold text-emerald-700">{fmtEur(totalIn)}</p>
                 </CardContent>
               </Card>
               <Card>
                 <CardContent className="p-3">
-                  <p className="text-[10px] text-muted-foreground uppercase">Uscite</p>
+                  <p className="text-[10px] text-muted-foreground uppercase">
+                    Uscite{hasDateFilter ? ' (periodo)' : ''}
+                  </p>
                   <p className="text-lg font-bold text-red-700">{fmtEur(totalOut)}</p>
                 </CardContent>
               </Card>
@@ -549,12 +547,8 @@ export default function BancaPage() {
             </div>
           )}
 
-          {/* Import progress */}
-          {importing && importProgress && (
-            <ImportProgress progress={importProgress} txCount={importTxCount} />
-          )}
+          {importing && importProgress && <ImportProgress progress={importProgress} txCount={importTxCount} />}
 
-          {/* Import result */}
           {importResult && !importing && (
             <div className={`flex items-start gap-3 p-3 rounded-lg border ${
               importResult.errors.filter(e => !e.startsWith('Batch')).length > 0 && importResult.saved === 0
@@ -580,7 +574,6 @@ export default function BancaPage() {
             </div>
           )}
 
-          {/* Bank accounts */}
           {bankAccounts.length > 0 && (
             <div className="flex flex-wrap gap-2">
               {bankAccounts.map(acc => (
@@ -593,30 +586,93 @@ export default function BancaPage() {
             </div>
           )}
 
-          {/* Filters */}
+          {/* FILTERS */}
           {transactions.length > 0 && (
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="relative flex-1 min-w-[180px]">
-                <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-gray-400" />
-                <input value={query} onChange={e => setQuery(e.target.value)}
-                  placeholder="Cerca descrizione, controparte, fattura..."
-                  className="w-full pl-8 pr-8 py-1.5 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500" />
-                {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => setQuery('')}>
-                  <X className="h-3.5 w-3.5" /></button>}
+            <div className="space-y-2">
+              {/* Text + direction + type */}
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="relative flex-1 min-w-[180px]">
+                  <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-gray-400" />
+                  <input value={query} onChange={e => setQuery(e.target.value)}
+                    placeholder="Cerca descrizione, controparte, fattura..."
+                    className="w-full pl-8 pr-8 py-1.5 text-sm border border-gray-200 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500" />
+                  {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => setQuery('')}><X className="h-3.5 w-3.5" /></button>}
+                </div>
+                {(['all', 'in', 'out'] as const).map(d => (
+                  <button key={d} onClick={() => setDirFilter(d)}
+                    className={`px-2.5 py-1.5 text-xs rounded-md font-medium border transition-all ${
+                      dirFilter === d ? 'bg-sky-600 text-white border-sky-600' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}>
+                    {d === 'all' ? 'Tutti' : d === 'in' ? '↑ Entrate' : '↓ Uscite'}
+                  </button>
+                ))}
+                {uniqueTypes.length > 1 && (
+                  <select value={typeFilter} onChange={e => setTypeFilter(e.target.value)}
+                    className="px-2.5 py-1.5 text-xs border border-gray-200 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-sky-500">
+                    <option value="all">Tutti i tipi</option>
+                    {uniqueTypes.map(t => <option key={t} value={t}>{txTypeLabel(t)}</option>)}
+                  </select>
+                )}
               </div>
-              {(['all', 'in', 'out'] as const).map(d => (
-                <button key={d} onClick={() => setDirFilter(d)}
-                  className={`px-2.5 py-1.5 text-xs rounded-md font-medium border transition-all ${
-                    dirFilter === d ? 'bg-sky-600 text-white border-sky-600' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}>
-                  {d === 'all' ? 'Tutti' : d === 'in' ? '↑ Entrate' : '↓ Uscite'}
-                </button>
-              ))}
-              {uniqueTypes.length > 1 && (
-                <select value={typeFilter} onChange={e => setTypeFilter(e.target.value)}
-                  className="px-2.5 py-1.5 text-xs border border-gray-200 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-sky-500">
-                  <option value="all">Tutti i tipi</option>
-                  {uniqueTypes.map(t => <option key={t} value={t}>{txTypeLabel(t)}</option>)}
-                </select>
+
+              {/* Date filters compatti */}
+              <div className="flex flex-wrap items-center gap-2">
+                <CalendarDays className="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
+                <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)}
+                  className="px-2 py-1 text-xs border border-gray-200 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500" />
+                <span className="text-xs text-gray-400">→</span>
+                <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)}
+                  className="px-2 py-1 text-xs border border-gray-200 rounded-md focus:outline-none focus:ring-2 focus:ring-sky-500" />
+                {[
+                  { label: 'Questo mese', v: 'this_month' },
+                  { label: 'Mese scorso', v: 'last_month' },
+                  { label: '3 mesi', v: 'last_3' },
+                  { label: 'Tutto', v: 'all' },
+                ].map(q => (
+                  <button key={q.v} onClick={() => setQuickDate(q.v)}
+                    className="px-2.5 py-1 text-xs rounded-md border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 transition-all">
+                    {q.label}
+                  </button>
+                ))}
+                {hasDateFilter && (
+                  <button onClick={() => setQuickDate('all')} className="text-xs text-sky-600 hover:underline">
+                    ✕ Reset date
+                  </button>
+                )}
+              </div>
+
+              {/* AI Search */}
+              {hasApiKey && (
+                <div className="space-y-2">
+                  <div className="flex gap-2">
+                    <div className="relative flex-1">
+                      <Sparkles className="absolute left-2.5 top-2 h-3.5 w-3.5 text-purple-400" />
+                      <input
+                        value={aiQuery}
+                        onChange={e => setAiQuery(e.target.value)}
+                        onKeyDown={e => e.key === 'Enter' && handleAiSearch()}
+                        placeholder="Chiedi all'AI: 'Quanto ho pagato in F24?' · 'Totale bonifici Buzzi'"
+                        className="w-full pl-8 pr-3 py-1.5 text-sm border border-purple-200 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-400 bg-purple-50 placeholder-purple-300"
+                      />
+                    </div>
+                    <Button size="sm" variant="outline"
+                      className="border-purple-200 text-purple-700 hover:bg-purple-50"
+                      onClick={handleAiSearch}
+                      disabled={aiLoading || !aiQuery.trim()}>
+                      {aiLoading
+                        ? <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                        : <Sparkles className="h-3.5 w-3.5" />}
+                    </Button>
+                  </div>
+                  {aiResult && (
+                    <div className="flex items-start gap-2 p-3 bg-purple-50 border border-purple-100 rounded-lg">
+                      <Sparkles className="h-3.5 w-3.5 text-purple-500 flex-shrink-0 mt-0.5" />
+                      <p className="flex-1 text-xs text-purple-900 whitespace-pre-wrap">{aiResult}</p>
+                      <button onClick={() => setAiResult(null)} className="text-purple-300 hover:text-purple-500 flex-shrink-0">
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           )}
@@ -654,8 +710,7 @@ export default function BancaPage() {
                   ? <p className="text-sm text-gray-400 text-center py-10">Nessun risultato</p>
                   : filtered.map(tx => (
                     <TxRow
-                      key={tx.id}
-                      tx={tx}
+                      key={tx.id} tx={tx}
                       selected={selectedIds.has(tx.id) || (!isMultiSelect && selectedTx?.id === tx.id)}
                       onClick={() => handleRowClick(tx)}
                       onDoubleClick={() => handleRowDoubleClick(tx)}
@@ -674,14 +729,9 @@ export default function BancaPage() {
         </div>
       )}
 
-      {/* DELETE MODAL */}
       {deleteModal && (
-        <DeleteModal
-          mode={deleteModal.mode}
-          count={selectedIds.size}
-          onConfirm={handleDelete}
-          onCancel={() => !deleting && setDeleteModal(null)}
-        />
+        <DeleteModal mode={deleteModal.mode} count={selectedIds.size}
+          onConfirm={handleDelete} onCancel={() => !deleting && setDeleteModal(null)} />
       )}
     </div>
   )
