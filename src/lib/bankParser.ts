@@ -1,6 +1,6 @@
 // src/lib/bankParser.ts
-// Invia il PDF completo all'edge function che usa Gemini Files API
-// Nessun chunk, nessuna estrazione testo, nessun timeout
+// Invia il PDF completo all'edge function che usa Gemini 2.0 Flash
+// Chunk da 10 pagine, SSE streaming per progress
 
 import { supabase } from '@/integrations/supabase/client';
 
@@ -19,10 +19,8 @@ export interface BankTransaction {
   balance?: number;
   description: string;
   counterparty_name?: string;
-  counterparty_account?: string;
+  category_code?: string;
   transaction_type?: string;
-  cbi_flow_id?: string;
-  branch?: string;
   reference?: string;
   invoice_ref?: string;
   raw_text: string;
@@ -48,7 +46,7 @@ export interface BankParseProgress {
   message: string;
 }
 
-// Stub — chiave è server-side
+// Stub — chiave è server-side in Supabase Edge Function secrets
 export function getClaudeApiKey(): string { return 'server-side'; }
 export function setClaudeApiKey(_key: string): void {}
 
@@ -70,7 +68,7 @@ export async function parseBankPdf(
 
   onProgress?.({ phase: 'analyzing', current: 0, total: 1, message: '📤 Upload su Gemini Files API...' });
 
-  // Timeout 5 minuti — Gemini Files API è veloce ma il PDF può essere grande
+  // Timeout 5 minuti
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5 * 60 * 1000);
 
@@ -125,20 +123,28 @@ export async function parseBankPdf(
               total: 0,
               message: event.message || '🤖 Gemini sta analizzando il PDF...',
             });
+          } else if (event.type === 'waiting') {
+            onProgress?.({
+              phase: 'waiting',
+              current: event.found || 0,
+              total: 0,
+              message: event.message || `⏳ Attendo ${event.waitSec || 30}s per rate limit...`,
+            });
           } else if (event.type === 'done') {
             finalData = event;
           }
-        } catch { /* skip */ }
+        } catch { /* skip malformed SSE */ }
       }
     }
   }
 
-  if (!finalData) throw new Error('Nessuna risposta dalla edge function. Verifica che sia deployata su Supabase.');
+  if (!finalData) throw new Error('Nessuna risposta dalla edge function. Verifica che GEMINI_API_KEY sia configurata in Supabase > Edge Functions > Secrets.');
 
   const result: BankParseResult = {
     transactions: [],
     pagesProcessed: finalData.count || 0,
     errors: [],
+    failedChunks: finalData.failedChunks,
   };
 
   for (const t of (finalData.transactions || [])) {
@@ -157,10 +163,8 @@ export async function parseBankPdf(
       balance: t.balance != null ? parseFloat(String(t.balance)) : undefined,
       description: String(t.description || '').trim(),
       counterparty_name: t.counterparty_name || undefined,
-      counterparty_account: t.counterparty_account || undefined,
+      category_code: t.category_code || undefined,
       transaction_type: t.transaction_type || 'altro',
-      cbi_flow_id: t.cbi_flow_id || undefined,
-      branch: t.branch || undefined,
       reference: t.reference || undefined,
       invoice_ref: t.invoice_ref || undefined,
       raw_text: String(t.raw_text || t.description || '').trim(),
@@ -177,6 +181,10 @@ export async function parseBankPdf(
       return true;
     })
     .sort((a, b) => b.date.localeCompare(a.date));
+
+  if (finalData.failedChunks?.length > 0) {
+    result.errors.push(`${finalData.failedChunks.length} blocchi di pagine non processati (chunk ${finalData.failedChunks.join(', ')})`);
+  }
 
   onProgress?.({
     phase: 'done',
@@ -211,7 +219,7 @@ async function hashTx(t: BankTransaction): Promise<string> {
 }
 
 // ============================================================
-// SAVE / LOAD / DELETE
+// SAVE — solo colonne che esistono nella tabella bank_transactions
 // ============================================================
 export interface SaveBankResult { saved: number; duplicates: number; errors: string[] }
 
@@ -238,10 +246,8 @@ export async function saveBankTransactions(
       commission_amount: t.commission_amount ?? null,
       description: t.description,
       counterparty_name: t.counterparty_name || null,
-      counterparty_account: t.counterparty_account || null,
+      category_code: t.category_code || null,
       transaction_type: t.transaction_type || 'altro',
-      cbi_flow_id: t.cbi_flow_id || null,
-      branch: t.branch || null,
       reference: t.reference || null,
       invoice_ref: t.invoice_ref || null,
       raw_text: t.raw_text,
