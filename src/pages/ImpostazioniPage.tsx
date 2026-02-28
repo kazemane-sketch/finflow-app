@@ -28,7 +28,7 @@ function BankAccountModal({
     name: account?.name || '',
     iban: account?.iban || '',
     bank_name: account?.bank_name || '',
-    account_holder: account?.account_holder || '',
+
   })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -45,7 +45,6 @@ function BankAccountModal({
             name: form.name.trim(),
             iban: form.iban.trim() || null,
             bank_name: form.bank_name.trim() || null,
-            account_holder: form.account_holder.trim() || null,
           })
           .eq('id', account.id)
         if (err) throw err
@@ -57,7 +56,6 @@ function BankAccountModal({
             name: form.name.trim(),
             iban: form.iban.trim() || null,
             bank_name: form.bank_name.trim() || null,
-            account_holder: form.account_holder.trim() || null,
           })
         if (err) throw err
       }
@@ -91,11 +89,7 @@ function BankAccountModal({
             <Input value={form.bank_name} onChange={e => setForm(f => ({ ...f, bank_name: e.target.value }))}
               placeholder="Es. Monte dei Paschi di Siena" className="mt-1" />
           </div>
-          <div>
-            <Label className="text-xs">Intestatario</Label>
-            <Input value={form.account_holder} onChange={e => setForm(f => ({ ...f, account_holder: e.target.value }))}
-              placeholder="Es. Caveco S.r.l." className="mt-1" />
-          </div>
+
           {error && <p className="text-xs text-red-600">{error}</p>}
         </div>
         <div className="flex gap-2 justify-end mt-5">
@@ -293,7 +287,7 @@ export default function ImpostazioniPage() {
                       <div className="flex items-center gap-3 mt-0.5 flex-wrap">
                         {acc.bank_name && <span className="text-xs text-gray-500">{acc.bank_name}</span>}
                         {acc.iban && <span className="text-[10px] font-mono text-gray-400">{acc.iban}</span>}
-                        {acc.account_holder && <span className="text-xs text-gray-400 italic">{acc.account_holder}</span>}
+                        
                       </div>
                     </div>
                     <div className="flex gap-1 flex-shrink-0">
