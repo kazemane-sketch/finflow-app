@@ -272,6 +272,8 @@ Deno.serve(async (req) => {
   try {
     const body = await req.json().catch(() => ({}));
     const pdfBase64 = body?.pdfBase64;
+    const reqStartChunk = Number(body?.startChunk ?? 0);
+    const reqMaxChunks = Number(body?.maxChunks ?? 6);
     if (!pdfBase64 || typeof pdfBase64 !== "string") {
       return new Response(JSON.stringify({ error: "Nessun PDF fornito" }), {
         status: 400,
@@ -290,6 +292,35 @@ Deno.serve(async (req) => {
     }
 
     const { chunks, totalPages } = await splitPdfIntoChunks(pdfBase64, CHUNK_SIZE);
+    const totalChunks = chunks.length;
+    const startChunk = Number.isFinite(reqStartChunk) ? Math.max(0, Math.floor(reqStartChunk)) : 0;
+    const maxChunks = Number.isFinite(reqMaxChunks) ? Math.min(12, Math.max(1, Math.floor(reqMaxChunks))) : 6;
+    const endChunkExclusive = Math.min(totalChunks, startChunk + maxChunks);
+
+    if (startChunk >= totalChunks) {
+      const emptyDone = new ReadableStream<Uint8Array>({
+        start(controller) {
+          sseData(controller, {
+            type: "done",
+            transactions: [],
+            count: 0,
+            totalChunks,
+            startChunk,
+            endChunk: startChunk,
+            hasMore: false,
+          });
+          controller.close();
+        },
+      });
+      return new Response(emptyDone, {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive",
+        },
+      });
+    }
 
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
@@ -297,18 +328,18 @@ Deno.serve(async (req) => {
         const warnings: string[] = [];
         let allTransactions: Tx[] = [];
 
-        for (let i = 0; i < chunks.length; i++) {
+        for (let i = startChunk; i < endChunkExclusive; i++) {
           const fromPage = i * CHUNK_SIZE + 1;
           const toPage = Math.min((i + 1) * CHUNK_SIZE, totalPages);
 
           sseData(controller, {
             type: "progress",
             chunk: i + 1,
-            total: chunks.length,
+            total: totalChunks,
             found: allTransactions.length,
             message: `🤖 Analisi pagine ${fromPage}-${toPage}...`,
           });
-          console.log(`Processing chunk ${i + 1}/${chunks.length} (pages ${fromPage}-${toPage})...`);
+          console.log(`Processing chunk ${i + 1}/${totalChunks} (pages ${fromPage}-${toPage})...`);
 
           let ok = false;
           for (let attempt = 1; attempt <= 3; attempt++) {
@@ -358,10 +389,11 @@ Deno.serve(async (req) => {
             // no-op: chunk segnato come failed
           }
 
-          if (i < chunks.length - 1) await delay(1200);
+          if (i < endChunkExclusive - 1) await delay(1200);
         }
 
         allTransactions = dedupeTx(allTransactions);
+        const hasMore = endChunkExclusive < totalChunks;
 
         console.log(`Total: ${allTransactions.length} transactions, ${failedChunks.length} failed chunks`);
         sseData(controller, {
@@ -370,6 +402,11 @@ Deno.serve(async (req) => {
           count: allTransactions.length,
           failedChunks: failedChunks.length ? failedChunks : undefined,
           warnings: warnings.length ? warnings : undefined,
+          totalChunks,
+          startChunk,
+          endChunk: endChunkExclusive,
+          hasMore,
+          nextStartChunk: hasMore ? endChunkExclusive : undefined,
         });
         controller.close();
       },

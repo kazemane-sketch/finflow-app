@@ -56,7 +56,6 @@ export async function parseBankPdf(
   _apiKey: string,
   onProgress?: (p: BankParseProgress) => void
 ): Promise<BankParseResult> {
-
   onProgress?.({ phase: 'uploading', current: 0, total: 1, message: 'Lettura PDF...' });
 
   const buffer = await file.arrayBuffer();
@@ -64,120 +63,162 @@ export async function parseBankPdf(
     new Uint8Array(buffer).reduce((d, b) => d + String.fromCharCode(b), '')
   );
 
-  onProgress?.({ phase: 'analyzing', current: 0, total: 1, message: '📤 Upload su Gemini Files API...' });
+  const WINDOW_CHUNKS = 6;
 
-  // Timeout 5 minuti
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5 * 60 * 1000);
-
-  let response: Response;
-  try {
-    response = await fetch(`${SUPABASE_URL}/functions/v1/parse-bank-pdf`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-        'apikey': SUPABASE_ANON_KEY,
-      },
-      body: JSON.stringify({ pdfBase64: base64 }),
-      signal: controller.signal,
+  async function parseWindow(startChunk: number): Promise<any> {
+    onProgress?.({
+      phase: 'analyzing',
+      current: startChunk,
+      total: 0,
+      message: `🤖 Analisi movimenti (chunk da ${startChunk + 1})...`,
     });
-  } catch (e: any) {
-    clearTimeout(timeout);
-    if (e.name === 'AbortError') throw new Error('Timeout: il PDF potrebbe essere troppo grande. Prova con un estratto conto più corto.');
-    throw new Error('Errore di rete: ' + e.message);
-  } finally {
-    clearTimeout(timeout);
-  }
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    let err: any = {};
-    try { err = body ? JSON.parse(body) : {}; } catch { /* non-json error */ }
-    const baseMsg = err.error || body || `Errore server ${response.status}`;
-    if (response.status === 401 || response.status === 403) {
-      throw new Error(`Autenticazione Edge Function fallita (${response.status}). Verifica VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY in Vercel/Supabase.`);
-    }
-    throw new Error(baseMsg);
-  }
+    // Timeout per singola finestra: 8 minuti
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8 * 60 * 1000);
 
-  // Legge SSE streaming dalla edge function
-  const reader = response.body?.getReader();
-  const decoder = new TextDecoder();
-  let buf = '';
-  let finalData: any = null;
-  const handleSseBlock = (block: string) => {
-    const dataLine = block
-      .replace(/\r/g, '')
-      .split('\n')
-      .filter(line => line.startsWith('data:'))
-      .map(line => line.replace(/^data:\s?/, ''))
-      .join('\n')
-      .trim();
-    if (!dataLine) return;
-
+    let response: Response;
     try {
-      const event = JSON.parse(dataLine);
-      if (event.type === 'progress') {
-        onProgress?.({
-          phase: 'analyzing',
-          current: event.found || 0,
-          total: 0,
-          message: event.message || '🤖 Gemini sta analizzando il PDF...',
-        });
-      } else if (event.type === 'waiting') {
-        onProgress?.({
-          phase: 'waiting',
-          current: event.found || 0,
-          total: 0,
-          message: event.message || `⏳ Attendo ${event.waitSec || 30}s per rate limit...`,
-        });
-      } else if (event.type === 'done') {
-        finalData = event;
+      response = await fetch(`${SUPABASE_URL}/functions/v1/parse-bank-pdf`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+          'apikey': SUPABASE_ANON_KEY,
+        },
+        body: JSON.stringify({ pdfBase64: base64, startChunk, maxChunks: WINDOW_CHUNKS }),
+        signal: controller.signal,
+      });
+    } catch (e: any) {
+      clearTimeout(timeout);
+      if (e.name === 'AbortError') {
+        throw new Error('Timeout durante l\'import (finestra chunk). Riprova o riduci dimensione estratto conto.');
       }
-    } catch {
-      // skip malformed SSE blocks
+      throw new Error('Errore di rete: ' + e.message);
+    } finally {
+      clearTimeout(timeout);
     }
-  };
 
-  const drainSseBuffer = (force = false) => {
-    if (force) {
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      let err: any = {};
+      try { err = body ? JSON.parse(body) : {}; } catch { /* non-json error */ }
+      const baseMsg = err.error || body || `Errore server ${response.status}`;
+      if (response.status === 401 || response.status === 403) {
+        throw new Error(`Autenticazione Edge Function fallita (${response.status}). Verifica VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY in Vercel/Supabase.`);
+      }
+      throw new Error(baseMsg);
+    }
+
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let finalData: any = null;
+
+    const handleSseBlock = (block: string) => {
+      const dataLine = block
+        .replace(/\r/g, '')
+        .split('\n')
+        .filter(line => line.startsWith('data:'))
+        .map(line => line.replace(/^data:\s?/, ''))
+        .join('\n')
+        .trim();
+      if (!dataLine) return;
+
+      try {
+        const event = JSON.parse(dataLine);
+        if (event.type === 'progress') {
+          onProgress?.({
+            phase: 'analyzing',
+            current: event.chunk || 0,
+            total: event.total || 0,
+            message: event.message || '🤖 Gemini sta analizzando il PDF...',
+          });
+        } else if (event.type === 'waiting') {
+          onProgress?.({
+            phase: 'waiting',
+            current: event.chunk || 0,
+            total: event.total || 0,
+            message: event.message || `⏳ Attendo ${event.waitSec || 30}s per rate limit...`,
+          });
+        } else if (event.type === 'done') {
+          finalData = event;
+        }
+      } catch {
+        // skip malformed SSE blocks
+      }
+    };
+
+    const drainSseBuffer = (force = false) => {
+      if (force) {
+        const chunks = buf.split(/\r?\n\r?\n/);
+        for (const chunk of chunks) handleSseBlock(chunk);
+        buf = '';
+        return;
+      }
       const chunks = buf.split(/\r?\n\r?\n/);
+      buf = chunks.pop() || '';
       for (const chunk of chunks) handleSseBlock(chunk);
-      buf = '';
-      return;
+    };
+
+    if (!reader) throw new Error('La edge function ha risposto senza stream SSE.');
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (value) buf += decoder.decode(value, { stream: !done });
+      drainSseBuffer(false);
+      if (done) break;
     }
 
-    const chunks = buf.split(/\r?\n\r?\n/);
-    buf = chunks.pop() || '';
-    for (const chunk of chunks) handleSseBlock(chunk);
-  };
+    const trailing = decoder.decode();
+    if (trailing) buf += trailing;
+    drainSseBuffer(true);
 
-  if (!reader) {
-    throw new Error('La edge function ha risposto senza stream SSE.');
+    if (!finalData) {
+      throw new Error('Nessun evento finale dalla edge function. Controlla i log di parse-bank-pdf in Supabase e verifica GEMINI_API_KEY.');
+    }
+    return finalData;
   }
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (value) buf += decoder.decode(value, { stream: !done });
-    drainSseBuffer(false);
-    if (done) break;
+  const allTxRaw: any[] = [];
+  const allFailedChunks = new Set<number>();
+  const allErrors: string[] = [];
+  let totalChunks = 0;
+  let startChunk = 0;
+  let completed = false;
+
+  for (let step = 0; step < 200; step++) {
+    const finalData = await parseWindow(startChunk);
+
+    for (const t of (finalData.transactions || [])) allTxRaw.push(t);
+    for (const c of (finalData.failedChunks || [])) allFailedChunks.add(Number(c));
+    for (const w of (finalData.warnings || [])) {
+      if (typeof w === 'string' && w.trim()) allErrors.push(w);
+    }
+
+    totalChunks = Number(finalData.totalChunks || totalChunks || 0);
+    const hasMore = !!finalData.hasMore;
+    const nextStart = Number(finalData.nextStartChunk);
+
+    if (!hasMore) {
+      completed = true;
+      break;
+    }
+    if (!Number.isFinite(nextStart) || nextStart <= startChunk) {
+      throw new Error('Cursor chunk non valido dalla edge function (nextStartChunk).');
+    }
+    startChunk = nextStart;
   }
-
-  const trailing = decoder.decode();
-  if (trailing) buf += trailing;
-  drainSseBuffer(true);
-
-  if (!finalData) throw new Error('Nessun evento finale dalla edge function. Controlla i log di parse-bank-pdf in Supabase e verifica GEMINI_API_KEY.');
+  if (!completed) throw new Error('Import interrotto: superato limite interno di finestre chunk.');
 
   const result: BankParseResult = {
     transactions: [],
-    pagesProcessed: finalData.count || 0,
-    errors: [],
-    failedChunks: finalData.failedChunks,
+    pagesProcessed: allTxRaw.length,
+    errors: allErrors,
+    failedChunks: Array.from(allFailedChunks).sort((a, b) => a - b),
   };
 
-  for (const t of (finalData.transactions || [])) {
+  for (const t of allTxRaw) {
     if (!t?.date || t?.amount == null) continue;
     const amount = parseFloat(String(t.amount)) || 0;
     const commission = t.commission != null && t.commission !== 0
@@ -201,7 +242,6 @@ export async function parseBankPdf(
     });
   }
 
-  // Deduplica + ordina per data (più recente prima)
   const seen = new Set<string>();
   result.transactions = result.transactions
     .filter(t => {
@@ -212,8 +252,8 @@ export async function parseBankPdf(
     })
     .sort((a, b) => b.date.localeCompare(a.date));
 
-  if (finalData.failedChunks?.length > 0) {
-    result.errors.push(`${finalData.failedChunks.length} blocchi di pagine non processati (chunk ${finalData.failedChunks.join(', ')})`);
+  if (result.failedChunks && result.failedChunks.length > 0) {
+    result.errors.push(`${result.failedChunks.length} blocchi di pagine non processati (chunk ${result.failedChunks.join(', ')})`);
   }
   if (result.transactions.length === 0) {
     result.errors.push('La edge function ha risposto ma non ha estratto movimenti (JSON Gemini vuoto/troncato o formato inatteso).');
@@ -223,7 +263,7 @@ export async function parseBankPdf(
     phase: 'done',
     current: result.transactions.length,
     total: result.transactions.length,
-    message: `✓ ${result.transactions.length} movimenti estratti`,
+    message: `✓ ${result.transactions.length} movimenti estratti${totalChunks ? ` (${totalChunks} chunk)` : ''}`,
   });
 
   return result;
