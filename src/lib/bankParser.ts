@@ -63,9 +63,9 @@ export async function parseBankPdf(
     new Uint8Array(buffer).reduce((d, b) => d + String.fromCharCode(b), '')
   );
 
-  const WINDOW_CHUNKS = 6;
+  const WINDOW_CHUNKS = 3;
 
-  async function parseWindow(startChunk: number): Promise<any> {
+  async function parseWindowOnce(startChunk: number): Promise<any> {
     onProgress?.({
       phase: 'analyzing',
       current: startChunk,
@@ -175,9 +175,34 @@ export async function parseBankPdf(
     drainSseBuffer(true);
 
     if (!finalData) {
-      throw new Error('Nessun evento finale dalla edge function. Controlla i log di parse-bank-pdf in Supabase e verifica GEMINI_API_KEY.');
+        throw new Error('Nessun evento finale dalla edge function (possibile shutdown runtime).');
     }
     return finalData;
+  }
+
+  async function parseWindow(startChunk: number): Promise<any> {
+    let lastError: any = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        return await parseWindowOnce(startChunk);
+      } catch (e: any) {
+        lastError = e;
+        const msg = String(e?.message || e || '');
+        const retryable =
+          msg.includes('Nessun evento finale') ||
+          msg.includes('Timeout durante l\'import') ||
+          msg.includes('Errore di rete');
+        if (!retryable || attempt === 3) break;
+        onProgress?.({
+          phase: 'waiting',
+          current: startChunk,
+          total: 0,
+          message: `⏳ Retry finestra chunk ${startChunk + 1} (tentativo ${attempt + 1}/3)...`,
+        });
+        await new Promise(r => setTimeout(r, attempt * 1500));
+      }
+    }
+    throw lastError || new Error('Errore sconosciuto durante parse finestra chunk');
   }
 
   const allTxRaw: any[] = [];

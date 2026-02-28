@@ -273,7 +273,7 @@ Deno.serve(async (req) => {
     const body = await req.json().catch(() => ({}));
     const pdfBase64 = body?.pdfBase64;
     const reqStartChunk = Number(body?.startChunk ?? 0);
-    const reqMaxChunks = Number(body?.maxChunks ?? 6);
+    const reqMaxChunks = Number(body?.maxChunks ?? 3);
     if (!pdfBase64 || typeof pdfBase64 !== "string") {
       return new Response(JSON.stringify({ error: "Nessun PDF fornito" }), {
         status: 400,
@@ -294,7 +294,7 @@ Deno.serve(async (req) => {
     const { chunks, totalPages } = await splitPdfIntoChunks(pdfBase64, CHUNK_SIZE);
     const totalChunks = chunks.length;
     const startChunk = Number.isFinite(reqStartChunk) ? Math.max(0, Math.floor(reqStartChunk)) : 0;
-    const maxChunks = Number.isFinite(reqMaxChunks) ? Math.min(12, Math.max(1, Math.floor(reqMaxChunks))) : 6;
+    const maxChunks = Number.isFinite(reqMaxChunks) ? Math.min(8, Math.max(1, Math.floor(reqMaxChunks))) : 3;
     const endChunkExclusive = Math.min(totalChunks, startChunk + maxChunks);
 
     if (startChunk >= totalChunks) {
@@ -389,7 +389,7 @@ Deno.serve(async (req) => {
             // no-op: chunk segnato come failed
           }
 
-          if (i < endChunkExclusive - 1) await delay(1200);
+          if (i < endChunkExclusive - 1) await delay(250);
         }
 
         allTransactions = dedupeTx(allTransactions);
