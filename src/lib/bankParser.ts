@@ -2,10 +2,8 @@
 // Invia il PDF completo all'edge function che usa Gemini 2.0 Flash
 // Chunk da 10 pagine, SSE streaming per progress
 
-import { supabase } from '@/integrations/supabase/client';
+import { supabase, supabaseUrl, supabaseAnonKey } from '@/integrations/supabase/client';
 
-const SUPABASE_URL = 'https://xtuofcwvimaffcpqboou.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh0dW9mY3d2aW1hZmZjcHFib291Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIwNjIyMTUsImV4cCI6MjA4NzYzODIxNX0.kShgRlGkLFkq08kW_Le5G8N0dVbidX08ho6WQ3n9kkw';
 
 // ============================================================
 // TYPES
@@ -74,12 +72,12 @@ export async function parseBankPdf(
 
   let response: Response;
   try {
-    response = await fetch(`${SUPABASE_URL}/functions/v1/parse-bank-pdf`, {
+    response = await fetch(`${supabaseUrl}/functions/v1/parse-bank-pdf`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${supabaseAnonKey}`,
+        'apikey': supabaseAnonKey,
       },
       body: JSON.stringify({ pdfBase64: base64 }),
       signal: controller.signal,
