@@ -1,15 +1,11 @@
 // src/lib/bankParser.ts
-// STRATEGIA:
-// 1. Carica pdf-lib nel browser per dividere il PDF in chunk da 20 pagine
-// 2. Manda ogni chunk (base64) all'edge function Gemini — ogni chunk < 10 secondi
-// 3. Raccoglie tutti i risultati e salva su Supabase
+// Invia il PDF completo all'edge function che usa Gemini Files API
+// Nessun chunk, nessuna estrazione testo, nessun timeout
 
 import { supabase } from '@/integrations/supabase/client';
 
 const SUPABASE_URL = 'https://xtuofcwvimaffcpqboou.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh0dW9mY3d2aW1hZmZjcHFib291Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIwNjIyMTUsImV4cCI6MjA4NzYzODIxNX0.kShgRlGkLFkq08kW_Le5G8N0dVbidX08ho6WQ3n9kkw';
-
-const PAGES_PER_CHUNK = 20;
 
 // ============================================================
 // TYPES
@@ -52,84 +48,58 @@ export interface BankParseProgress {
   message: string;
 }
 
-// Stub — chiave Claude è server-side
+// Stub — chiave è server-side
 export function getClaudeApiKey(): string { return 'server-side'; }
 export function setClaudeApiKey(_key: string): void {}
 
 // ============================================================
-// Carica pdf-lib dinamicamente
+// MAIN PARSER — invia PDF base64 all'edge function
 // ============================================================
-async function loadPdfLib(): Promise<any> {
-  if ((window as any).PDFLib) return (window as any).PDFLib;
-  await new Promise<void>((resolve, reject) => {
-    const script = document.createElement('script');
-    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js';
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error('Impossibile caricare pdf-lib'));
-    document.head.appendChild(script);
-  });
-  return (window as any).PDFLib;
-}
+export async function parseBankPdf(
+  file: File,
+  _apiKey: string,
+  onProgress?: (p: BankParseProgress) => void
+): Promise<BankParseResult> {
 
-// ============================================================
-// Divide PDF in chunk da N pagine → array di base64
-// ============================================================
-async function splitPdfIntoChunks(
-  pdfBytes: ArrayBuffer,
-  pagesPerChunk: number,
-  onProgress?: (chunk: number, total: number) => void
-): Promise<{ base64: string; startPage: number; endPage: number }[]> {
-  const PDFLib = await loadPdfLib();
-  const srcDoc = await PDFLib.PDFDocument.load(pdfBytes);
-  const totalPages = srcDoc.getPageCount();
-  const totalChunks = Math.ceil(totalPages / pagesPerChunk);
-  const chunks: { base64: string; startPage: number; endPage: number }[] = [];
+  onProgress?.({ phase: 'uploading', current: 0, total: 1, message: 'Lettura PDF...' });
 
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * pagesPerChunk;
-    const end = Math.min(start + pagesPerChunk, totalPages);
+  const buffer = await file.arrayBuffer();
+  const base64 = btoa(
+    new Uint8Array(buffer).reduce((d, b) => d + String.fromCharCode(b), '')
+  );
 
-    const chunkDoc = await PDFLib.PDFDocument.create();
-    const pageIndices = Array.from({ length: end - start }, (_, k) => start + k);
-    const copiedPages = await chunkDoc.copyPages(srcDoc, pageIndices);
-    copiedPages.forEach((p: any) => chunkDoc.addPage(p));
+  onProgress?.({ phase: 'analyzing', current: 0, total: 1, message: '📤 Upload su Gemini Files API...' });
 
-    const chunkBytes = await chunkDoc.save();
-    const base64 = btoa(
-      new Uint8Array(chunkBytes).reduce((d, b) => d + String.fromCharCode(b), '')
-    );
+  // Timeout 5 minuti — Gemini Files API è veloce ma il PDF può essere grande
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5 * 60 * 1000);
 
-    chunks.push({ base64, startPage: start + 1, endPage: end });
-    onProgress?.(i + 1, totalChunks);
+  let response: Response;
+  try {
+    response = await fetch(`${SUPABASE_URL}/functions/v1/parse-bank-pdf`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'apikey': SUPABASE_ANON_KEY,
+      },
+      body: JSON.stringify({ pdfBase64: base64 }),
+      signal: controller.signal,
+    });
+  } catch (e: any) {
+    clearTimeout(timeout);
+    if (e.name === 'AbortError') throw new Error('Timeout: il PDF potrebbe essere troppo grande. Prova con un estratto conto più corto.');
+    throw new Error('Errore di rete: ' + e.message);
+  } finally {
+    clearTimeout(timeout);
   }
-
-  return chunks;
-}
-
-// ============================================================
-// Manda un chunk PDF all'edge function Gemini
-// ============================================================
-async function analyzeChunkWithGemini(
-  base64: string,
-  startPage: number,
-  endPage: number
-): Promise<{ transactions: BankTransaction[]; accountInfo?: any }> {
-  const response = await fetch(`${SUPABASE_URL}/functions/v1/parse-bank-pdf`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-      'apikey': SUPABASE_ANON_KEY,
-    },
-    body: JSON.stringify({ pdfBase64: base64 }),
-  });
 
   if (!response.ok) {
     const err = await response.json().catch(() => ({})) as any;
     throw new Error(err.error || `Errore server ${response.status}`);
   }
 
-  // Legge la risposta SSE e aspetta il messaggio "done"
+  // Legge SSE streaming dalla edge function
   const reader = response.body?.getReader();
   const decoder = new TextDecoder();
   let buf = '';
@@ -142,130 +112,59 @@ async function analyzeChunkWithGemini(
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n\n');
       buf = lines.pop() || '';
+
       for (const line of lines) {
         const dataLine = line.replace(/^data: /, '').trim();
         if (!dataLine) continue;
         try {
           const event = JSON.parse(dataLine);
-          if (event.type === 'done') finalData = event;
+          if (event.type === 'progress') {
+            onProgress?.({
+              phase: 'analyzing',
+              current: event.found || 0,
+              total: 0,
+              message: event.message || '🤖 Gemini sta analizzando il PDF...',
+            });
+          } else if (event.type === 'done') {
+            finalData = event;
+          }
         } catch { /* skip */ }
       }
     }
   }
 
-  if (!finalData) throw new Error(`Nessuna risposta per pagine ${startPage}-${endPage}`);
+  if (!finalData) throw new Error('Nessuna risposta dalla edge function. Verifica che sia deployata su Supabase.');
 
-  const transactions: BankTransaction[] = (finalData.transactions || [])
-    .filter((t: any) => t?.date && t?.amount != null)
-    .map((t: any) => {
-      const amount = parseFloat(String(t.amount)) || 0;
-      const commission = t.commission != null ? -Math.abs(parseFloat(String(t.commission))) : undefined;
-      return {
-        date: parseItalianDate(t.date),
-        value_date: t.value_date ? parseItalianDate(t.value_date) : undefined,
-        amount,
-        commission_amount: commission,
-        net_amount: commission ? amount - Math.abs(commission) : amount,
-        balance: t.balance != null ? parseFloat(String(t.balance)) : undefined,
-        description: String(t.description || '').trim(),
-        counterparty_name: t.counterparty_name || undefined,
-        counterparty_account: t.counterparty_account || undefined,
-        transaction_type: t.transaction_type || 'altro',
-        cbi_flow_id: t.cbi_flow_id || undefined,
-        branch: t.branch || undefined,
-        reference: t.reference || undefined,
-        invoice_ref: t.invoice_ref || undefined,
-        raw_text: String(t.raw_text || t.description || '').trim(),
-      } as BankTransaction;
+  const result: BankParseResult = {
+    transactions: [],
+    pagesProcessed: finalData.count || 0,
+    errors: [],
+  };
+
+  for (const t of (finalData.transactions || [])) {
+    if (!t?.date || t?.amount == null) continue;
+    const amount = parseFloat(String(t.amount)) || 0;
+    const commission = t.commission != null && t.commission !== 0
+      ? -Math.abs(parseFloat(String(t.commission)))
+      : undefined;
+
+    result.transactions.push({
+      date: parseItalianDate(t.date),
+      value_date: t.value_date ? parseItalianDate(t.value_date) : undefined,
+      amount,
+      commission_amount: commission,
+      net_amount: commission ? amount - Math.abs(commission) : amount,
+      balance: t.balance != null ? parseFloat(String(t.balance)) : undefined,
+      description: String(t.description || '').trim(),
+      counterparty_name: t.counterparty_name || undefined,
+      counterparty_account: t.counterparty_account || undefined,
+      transaction_type: t.transaction_type || 'altro',
+      cbi_flow_id: t.cbi_flow_id || undefined,
+      branch: t.branch || undefined,
+      reference: t.reference || undefined,
+      invoice_ref: t.invoice_ref || undefined,
+      raw_text: String(t.raw_text || t.description || '').trim(),
     });
-
-  return { transactions, accountInfo: finalData.account_info || null };
-}
-
-function parseItalianDate(d: string): string {
-  if (!d) return '';
-  if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
-  const p = d.split(/[\/\-]/);
-  if (p.length === 3) {
-    const [a, b, c] = p;
-    if (c.length === 4) return `${c}-${b.padStart(2, '0')}-${a.padStart(2, '0')}`;
-    if (a.length === 4) return `${a}-${b.padStart(2, '0')}-${c.padStart(2, '0')}`;
-  }
-  return d;
-}
-
-// ============================================================
-// MAIN PARSER
-// ============================================================
-export async function parseBankPdf(
-  file: File,
-  _apiKey: string,
-  onProgress?: (p: BankParseProgress) => void
-): Promise<BankParseResult> {
-  const result: BankParseResult = { transactions: [], pagesProcessed: 0, errors: [] };
-
-  // FASE 1: leggi il PDF e dividilo in chunk
-  onProgress?.({ phase: 'uploading', current: 0, total: 1, message: 'Lettura PDF...' });
-
-  const pdfBytes = await file.arrayBuffer();
-
-  onProgress?.({ phase: 'extracting', current: 0, total: 1, message: 'Divisione PDF in chunk...' });
-
-  let chunks: { base64: string; startPage: number; endPage: number }[];
-  try {
-    chunks = await splitPdfIntoChunks(pdfBytes, PAGES_PER_CHUNK, (done, total) => {
-      onProgress?.({
-        phase: 'extracting',
-        current: done,
-        total,
-        message: `Preparazione chunk ${done}/${total}...`,
-      });
-    });
-  } catch (e: any) {
-    throw new Error('Errore lettura PDF: ' + e.message);
-  }
-
-  const totalChunks = chunks.length;
-  const totalPages = chunks[chunks.length - 1]?.endPage || 0;
-  result.pagesProcessed = totalPages;
-
-  const allAccountInfos: any[] = [];
-  const failedChunks: number[] = [];
-
-  // FASE 2: manda ogni chunk a Gemini
-  for (let i = 0; i < chunks.length; i++) {
-    const { base64, startPage, endPage } = chunks[i];
-
-    onProgress?.({
-      phase: 'analyzing',
-      current: i + 1,
-      total: totalChunks,
-      message: `Gemini analizza pag. ${startPage}-${endPage} (${i + 1}/${totalChunks})...`,
-    });
-
-    try {
-      const { transactions, accountInfo } = await analyzeChunkWithGemini(base64, startPage, endPage);
-      result.transactions.push(...transactions);
-      if (accountInfo) allAccountInfos.push(accountInfo);
-    } catch (e: any) {
-      result.errors.push(`Chunk ${i + 1} (pag. ${startPage}-${endPage}): ${e.message}`);
-      failedChunks.push(i + 1);
-      console.error(`Chunk ${i + 1} failed:`, e);
-    }
-  }
-
-  if (failedChunks.length > 0) result.failedChunks = failedChunks;
-
-  // Info conto
-  const info = allAccountInfos.find(a => a);
-  if (info) {
-    result.accountHolder = info.holder || undefined;
-    result.iban = info.iban || undefined;
-    result.bankName = info.bank_name || undefined;
-    if (info.period_from && info.period_to)
-      result.statementPeriod = { from: info.period_from, to: info.period_to };
-    if (info.opening_balance != null) result.openingBalance = parseFloat(info.opening_balance);
-    if (info.closing_balance != null) result.closingBalance = parseFloat(info.closing_balance);
   }
 
   // Deduplica + ordina per data (più recente prima)
@@ -283,10 +182,22 @@ export async function parseBankPdf(
     phase: 'done',
     current: result.transactions.length,
     total: result.transactions.length,
-    message: `✓ ${result.transactions.length} movimenti estratti da ${totalPages} pagine`,
+    message: `✓ ${result.transactions.length} movimenti estratti`,
   });
 
   return result;
+}
+
+function parseItalianDate(d: string): string {
+  if (!d) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
+  const p = d.split(/[\/\-]/);
+  if (p.length === 3) {
+    const [a, b, c] = p;
+    if (c.length === 4) return `${c}-${b.padStart(2, '0')}-${a.padStart(2, '0')}`;
+    if (a.length === 4) return `${a}-${b.padStart(2, '0')}-${c.padStart(2, '0')}`;
+  }
+  return d;
 }
 
 // ============================================================
