@@ -215,6 +215,9 @@ export async function parseBankPdf(
   if (finalData.failedChunks?.length > 0) {
     result.errors.push(`${finalData.failedChunks.length} blocchi di pagine non processati (chunk ${finalData.failedChunks.join(', ')})`);
   }
+  if (result.transactions.length === 0) {
+    result.errors.push('La edge function ha risposto ma non ha estratto movimenti (JSON Gemini vuoto/troncato o formato inatteso).');
+  }
 
   onProgress?.({
     phase: 'done',

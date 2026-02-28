@@ -393,7 +393,10 @@ export default function BancaPage() {
       setImportTxCount(parseResult.transactions.length)
 
       if (parseResult.transactions.length === 0) {
-        setImportResult({ saved: 0, duplicates: 0, errors: ['Nessun movimento trovato.', ...parseResult.errors] })
+        const errs = parseResult.errors.length > 0
+          ? parseResult.errors
+          : ['Nessun movimento trovato.']
+        setImportResult({ saved: 0, duplicates: 0, errors: errs })
         setImporting(false); return
       }
 
