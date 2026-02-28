@@ -106,43 +106,69 @@ export async function parseBankPdf(
   const decoder = new TextDecoder();
   let buf = '';
   let finalData: any = null;
+  const handleSseBlock = (block: string) => {
+    const dataLine = block
+      .replace(/\r/g, '')
+      .split('\n')
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.replace(/^data:\s?/, ''))
+      .join('\n')
+      .trim();
+    if (!dataLine) return;
 
-  if (reader) {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n\n');
-      buf = lines.pop() || '';
-
-      for (const line of lines) {
-        const dataLine = line.replace(/^data: /, '').trim();
-        if (!dataLine) continue;
-        try {
-          const event = JSON.parse(dataLine);
-          if (event.type === 'progress') {
-            onProgress?.({
-              phase: 'analyzing',
-              current: event.found || 0,
-              total: 0,
-              message: event.message || '🤖 Gemini sta analizzando il PDF...',
-            });
-          } else if (event.type === 'waiting') {
-            onProgress?.({
-              phase: 'waiting',
-              current: event.found || 0,
-              total: 0,
-              message: event.message || `⏳ Attendo ${event.waitSec || 30}s per rate limit...`,
-            });
-          } else if (event.type === 'done') {
-            finalData = event;
-          }
-        } catch { /* skip malformed SSE */ }
+    try {
+      const event = JSON.parse(dataLine);
+      if (event.type === 'progress') {
+        onProgress?.({
+          phase: 'analyzing',
+          current: event.found || 0,
+          total: 0,
+          message: event.message || '🤖 Gemini sta analizzando il PDF...',
+        });
+      } else if (event.type === 'waiting') {
+        onProgress?.({
+          phase: 'waiting',
+          current: event.found || 0,
+          total: 0,
+          message: event.message || `⏳ Attendo ${event.waitSec || 30}s per rate limit...`,
+        });
+      } else if (event.type === 'done') {
+        finalData = event;
       }
+    } catch {
+      // skip malformed SSE blocks
     }
+  };
+
+  const drainSseBuffer = (force = false) => {
+    if (force) {
+      const chunks = buf.split(/\r?\n\r?\n/);
+      for (const chunk of chunks) handleSseBlock(chunk);
+      buf = '';
+      return;
+    }
+
+    const chunks = buf.split(/\r?\n\r?\n/);
+    buf = chunks.pop() || '';
+    for (const chunk of chunks) handleSseBlock(chunk);
+  };
+
+  if (!reader) {
+    throw new Error('La edge function ha risposto senza stream SSE.');
   }
 
-  if (!finalData) throw new Error('Nessuna risposta dalla edge function. Verifica che GEMINI_API_KEY sia configurata in Supabase > Edge Functions > Secrets.');
+  while (true) {
+    const { done, value } = await reader.read();
+    if (value) buf += decoder.decode(value, { stream: !done });
+    drainSseBuffer(false);
+    if (done) break;
+  }
+
+  const trailing = decoder.decode();
+  if (trailing) buf += trailing;
+  drainSseBuffer(true);
+
+  if (!finalData) throw new Error('Nessun evento finale dalla edge function. Controlla i log di parse-bank-pdf in Supabase e verifica GEMINI_API_KEY.');
 
   const result: BankParseResult = {
     transactions: [],
