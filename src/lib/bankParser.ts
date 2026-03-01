@@ -54,6 +54,7 @@ export function setClaudeApiKey(_key: string): void {}
 export async function parseBankPdf(
   file: File,
   _apiKey: string,
+  companyId: string | null,
   onProgress?: (p: BankParseProgress) => void
 ): Promise<BankParseResult> {
   onProgress?.({ phase: 'uploading', current: 0, total: 1, message: 'Lettura PDF...' });
@@ -79,14 +80,14 @@ export async function parseBankPdf(
 
     let response: Response;
     try {
-      response = await fetch(`${SUPABASE_URL}/functions/v1/parse-bank-pdf`, {
+      response = await fetch(`${SUPABASE_URL}/functions/v1/parse-bank-pdf-router`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
           'apikey': SUPABASE_ANON_KEY,
         },
-        body: JSON.stringify({ pdfBase64: base64, startChunk, maxChunks: WINDOW_CHUNKS }),
+        body: JSON.stringify({ pdfBase64: base64, companyId, startChunk, maxChunks: WINDOW_CHUNKS }),
         signal: controller.signal,
       });
     } catch (e: any) {

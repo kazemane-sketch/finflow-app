@@ -389,7 +389,7 @@ export default function BancaPage() {
     setImporting(true); setImportResult(null); setImportTxCount(0)
 
     try {
-      const parseResult = await parseBankPdf(file, apiKey, (p) => { setImportProgress(p) })
+      const parseResult = await parseBankPdf(file, apiKey, companyId, (p) => { setImportProgress(p) })
       setImportTxCount(parseResult.transactions.length)
 
       if (parseResult.transactions.length === 0) {
