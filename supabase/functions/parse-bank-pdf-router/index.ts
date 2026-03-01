@@ -59,17 +59,19 @@ Deno.serve(async (req) => {
     const forwardAuthorization = incomingAuthorization || (serviceRoleKey ? `Bearer ${serviceRoleKey}` : "");
     const forwardApiKey = incomingApiKey || serviceRoleKey || "";
 
-    if (!forwardAuthorization || !forwardApiKey) {
-      return json({ error: "Credenziali di forwarding mancanti (Authorization/apikey)" }, 401);
+    if (!forwardAuthorization) {
+      return json({ error: "Credenziali di forwarding mancanti (Authorization)" }, 401);
     }
+
+    const upstreamHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Authorization": forwardAuthorization,
+    };
+    if (forwardApiKey) upstreamHeaders.apikey = forwardApiKey;
 
     const upstream = await fetch(`${supabaseUrl}/functions/v1/${targetFn}`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": forwardAuthorization,
-        "apikey": forwardApiKey,
-      },
+      headers: upstreamHeaders,
       body: JSON.stringify(payload),
     });
 

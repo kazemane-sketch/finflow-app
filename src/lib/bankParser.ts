@@ -85,7 +85,6 @@ export async function parseBankPdf(
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-          'apikey': SUPABASE_ANON_KEY,
         },
         body: JSON.stringify({ pdfBase64: base64, companyId, startChunk, maxChunks: WINDOW_CHUNKS }),
         signal: controller.signal,
