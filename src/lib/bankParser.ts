@@ -22,6 +22,8 @@ export interface BankTransaction {
   reference?: string;
   invoice_ref?: string;
   raw_text: string;
+  amount_text?: string;
+  amount_sign_explicit?: 'minus' | 'plus_or_none' | 'unknown';
   posting_side?: 'dare' | 'avere' | 'unknown';
   direction?: 'in' | 'out';
   direction_source?: 'side_rule' | 'semantic_rule' | 'amount_fallback' | 'manual';
@@ -86,6 +88,13 @@ function normalizeDirectionSource(v: unknown): 'side_rule' | 'semantic_rule' | '
   if (s === 'semantic_rule') return 'semantic_rule';
   if (s === 'manual') return 'manual';
   return 'amount_fallback';
+}
+
+function normalizeAmountSignExplicit(v: unknown): 'minus' | 'plus_or_none' | 'unknown' {
+  const s = String(v ?? '').trim().toLowerCase();
+  if (s === 'minus') return 'minus';
+  if (s === 'plus_or_none') return 'plus_or_none';
+  return 'unknown';
 }
 
 // Stub — chiave è server-side in Supabase Edge Function secrets
@@ -350,6 +359,8 @@ export async function parseBankPdf(
       reference: t.reference || undefined,
       invoice_ref: t.invoice_ref || undefined,
       raw_text: String(t.raw_text || t.description || '').trim(),
+      amount_text: t.amount_text ? String(t.amount_text).trim() : undefined,
+      amount_sign_explicit: normalizeAmountSignExplicit(t.amount_sign_explicit),
       posting_side: normalizePostingSide(t.posting_side),
       direction,
       direction_source: normalizeDirectionSource(t.direction_source),

@@ -17,6 +17,7 @@ const MAX_OUTPUT_TOKENS = Number(Deno.env.get("GEMINI_MAX_OUTPUT_TOKENS") ?? "32
 type PostingSide = "dare" | "avere" | "unknown";
 type Direction = "in" | "out";
 type DirectionSource = "side_rule" | "semantic_rule" | "amount_fallback" | "manual";
+type AmountSignExplicit = "minus" | "plus_or_none" | "unknown";
 
 type Tx = {
   date: string;
@@ -30,6 +31,8 @@ type Tx = {
   invoice_ref: string | null;
   category_code: string | null;
   raw_text: string | null;
+  amount_text: string | null;
+  amount_sign_explicit: AmountSignExplicit;
   posting_side: PostingSide;
   direction: Direction;
   direction_source: DirectionSource;
@@ -55,6 +58,8 @@ type DirectionInference = {
   needsReview: boolean;
   reason: string;
 };
+
+type SideSource = "explicit" | "inferred" | "unknown";
 
 const OUT_KEYWORDS: SemanticKeyword[] = [
   { needle: "vostra disposizione a favore", weight: 2.8 },
@@ -99,6 +104,7 @@ Formato richiesto:
       "date": "DD/MM/YYYY",
       "value_date": "DD/MM/YYYY oppure null",
       "amount": numero assoluto o con segno,
+      "amount_text": "importo come appare nel PDF (es. 3.671,98 oppure -3.671,98 oppure (3.671,98))",
       "commission": numero positivo oppure null,
       "description": "causale completa",
       "counterparty_name": "nome controparte oppure null",
@@ -116,11 +122,11 @@ Formato richiesto:
 Regole importanti:
 - Includi TUTTI i movimenti presenti nel chunk.
 - Determina posting_side dalla colonna del movimento: DARE o AVERE, se visibile.
-- Matrice contabile:
-  - DARE +positivo => out
-  - DARE -negativo => in
-  - AVERE +positivo => in
-  - AVERE -negativo => out
+- Matrice contabile con segno esplicito su amount_text:
+  - DARE + (o senza segno) => out
+  - DARE - (oppure in parentesi) => in
+  - AVERE + (o senza segno) => in
+  - AVERE - (oppure in parentesi) => out
 - Se posting_side non è determinabile metti "unknown".
 - Se non trovi movimenti, restituisci {"transactions":[]}.`;
 
@@ -186,6 +192,14 @@ function roundConfidence(v: number): number {
   return Math.round(bounded * 100) / 100;
 }
 
+function detectExplicitAmountSign(amountTextRaw: string | null): AmountSignExplicit {
+  if (!amountTextRaw) return "unknown";
+  const s = amountTextRaw.trim();
+  if (!s) return "unknown";
+  if (/^[\s]*-/.test(s) || /^[\s]*\(/.test(s)) return "minus";
+  return "plus_or_none";
+}
+
 function normalizePostingSide(v: unknown): PostingSide {
   const s = normalizeText(v);
   if (!s) return "unknown";
@@ -224,6 +238,23 @@ function normalizeDirection(v: unknown): Direction | null {
   if (s === "in" || s.includes("entrata") || s.includes("accredito")) return "in";
   if (s === "out" || s.includes("uscita") || s.includes("addebito")) return "out";
   return null;
+}
+
+function expectedDirectionFromType(txType: string): Direction | null {
+  switch (txType) {
+    case "bonifico_in":
+    case "stipendio":
+      return "in";
+    case "bonifico_out":
+    case "sdd":
+    case "pos":
+    case "prelievo":
+    case "commissione":
+    case "f24":
+      return "out";
+    default:
+      return null;
+  }
 }
 
 function scoreKeywords(text: string, rules: SemanticKeyword[]): { score: number; hits: string[] } {
@@ -282,74 +313,116 @@ function inferDirectionFromSemantic(text: string, llmDirection: Direction | null
   };
 }
 
+function withTypeConflictGuard(decision: DirectionInference, txType: string): DirectionInference {
+  const expected = expectedDirectionFromType(txType);
+  if (!expected || expected === decision.direction) return decision;
+  return {
+    ...decision,
+    confidence: roundConfidence(Math.min(decision.confidence, 0.69)),
+    needsReview: true,
+    reason: `${decision.reason}; conflitto con transaction_type=${txType} (review)`,
+  };
+}
+
 function resolveDirection(
-  signedAmount: number,
   postingSide: PostingSide,
+  sideSource: SideSource,
+  amountSignExplicit: AmountSignExplicit,
   llmDirection: Direction | null,
   semanticText: string,
+  txType: string,
 ): DirectionInference {
   if (postingSide !== "unknown") {
-    const direction = postingSide === "dare"
-      ? (signedAmount >= 0 ? "out" : "in")
-      : (signedAmount >= 0 ? "in" : "out");
+    const explicitMinus = amountSignExplicit === "minus";
+    const direction: Direction = postingSide === "dare"
+      ? (explicitMinus ? "in" : "out")
+      : (explicitMinus ? "out" : "in");
+    const signKnown = amountSignExplicit !== "unknown";
+    const highConfidence = sideSource === "explicit" && signKnown;
+    const baseReason = explicitMinus
+      ? `Regola ${postingSide.toUpperCase()} + segno esplicito '-' => ${direction === "in" ? "entrata" : "uscita"}`
+      : `Regola ${postingSide.toUpperCase()} + importo senza segno esplicito => ${direction === "in" ? "entrata" : "uscita"}`;
+    const reason = sideSource === "inferred"
+      ? `${baseReason} (colonna ${postingSide.toUpperCase()} inferita da testo)`
+      : sideSource === "unknown"
+      ? `${baseReason} (colonna non esplicita)`
+      : baseReason;
 
-    return {
+    return withTypeConflictGuard({
       direction,
       source: "side_rule",
-      confidence: 0.99,
-      needsReview: false,
-      reason: `Regola ${postingSide.toUpperCase()} applicata`,
-    };
+      confidence: highConfidence ? 0.95 : 0.78,
+      needsReview: !highConfidence || sideSource !== "explicit",
+      reason,
+    }, txType);
   }
 
   const semantic = inferDirectionFromSemantic(semanticText, llmDirection);
   if (semantic) {
-    return {
+    return withTypeConflictGuard({
       ...semantic,
       confidence: roundConfidence(semantic.confidence),
       needsReview: semantic.confidence < 0.7,
-    };
+    }, txType);
   }
 
   if (llmDirection) {
-    return {
+    return withTypeConflictGuard({
       direction: llmDirection,
       source: "semantic_rule",
       confidence: 0.66,
       needsReview: true,
       reason: "Direzione LLM usata senza indicatori DARE/AVERE",
-    };
+    }, txType);
   }
 
-  return {
-    direction: signedAmount >= 0 ? "in" : "out",
+  return withTypeConflictGuard({
+    direction: "in",
     source: "amount_fallback",
     confidence: 0.5,
     needsReview: true,
-    reason: "Fallback da segno importo (posting_side sconosciuto)",
-  };
+    reason: "Fallback conservativo: posting_side sconosciuto, importo assunto positivo",
+  }, txType);
 }
 
 function sanitizeTx(x: any): Tx | null {
   const date = clip(x?.date, 20);
-  const originalAmount = toNumber(x?.amount);
-  if (!date || originalAmount == null) return null;
+  const amountText = clip(x?.amount_text, 80);
+  const amountNumericSource = amountText ?? x?.amount;
+  const amountNum = toNumber(amountNumericSource);
+  if (!date || amountNum == null) return null;
 
   const description = clip(x?.description, 600) ?? "";
   const rawText = clip(x?.raw_text, 4000) ?? null;
   const reference = clip(x?.reference, 120);
   const categoryCode = clip(x?.category_code, 40);
+  const txType = normType(x?.transaction_type);
 
   const semanticText = normalizeText([description, rawText ?? "", reference ?? "", categoryCode ?? ""].join(" "));
-  let postingSide = normalizePostingSide(x?.posting_side);
+  const rawPostingSide = normalizePostingSide(x?.posting_side);
+  let postingSide = rawPostingSide;
+  let sideSource: SideSource = rawPostingSide !== "unknown" ? "explicit" : "unknown";
   if (postingSide === "unknown") {
-    postingSide = inferPostingSideFromText(semanticText);
+    const inferred = inferPostingSideFromText(semanticText);
+    if (inferred !== "unknown") {
+      postingSide = inferred;
+      sideSource = "inferred";
+    }
   }
 
+  const amountTextRaw = amountText ?? (typeof x?.amount === "string" ? String(x.amount).trim() : null);
+  const amountSignExplicit = detectExplicitAmountSign(amountTextRaw);
   const llmDirection = normalizeDirection(x?.direction);
-  const directionDecision = resolveDirection(originalAmount, postingSide, llmDirection, semanticText);
+  const directionDecision = resolveDirection(
+    postingSide,
+    sideSource,
+    amountSignExplicit,
+    llmDirection,
+    semanticText,
+    txType,
+  );
 
-  const amountAbs = Math.abs(originalAmount);
+  const amountAbs = Math.abs(amountNum);
   const normalizedAmount = directionDecision.direction === "in" ? amountAbs : -amountAbs;
 
   const commissionRaw = toNumber(x?.commission);
@@ -362,11 +435,13 @@ function sanitizeTx(x: any): Tx | null {
     commission,
     description,
     counterparty_name: clip(x?.counterparty_name, 180),
-    transaction_type: normType(x?.transaction_type),
+    transaction_type: txType,
     reference,
     invoice_ref: clip(x?.invoice_ref, 80),
     category_code: categoryCode,
     raw_text: rawText,
+    amount_text: amountText ?? (typeof x?.amount === "string" ? clip(x?.amount, 80) : null),
+    amount_sign_explicit: amountSignExplicit,
     posting_side: postingSide,
     direction: directionDecision.direction,
     direction_source: directionDecision.source,
