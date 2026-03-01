@@ -26,12 +26,12 @@ Deno.serve(async (req) => {
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL");
     const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-    if (!supabaseUrl || !serviceRoleKey) {
-      return json({ error: "SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY non configurata" }, 500);
+    if (!supabaseUrl) {
+      return json({ error: "SUPABASE_URL non configurata" }, 500);
     }
 
     let engine: "legacy" | "ocr" = "legacy";
-    if (companyId) {
+    if (companyId && serviceRoleKey) {
       const admin = createClient(supabaseUrl, serviceRoleKey, {
         auth: { persistSession: false, autoRefreshToken: false },
       });
@@ -47,17 +47,28 @@ Deno.serve(async (req) => {
       } else if (data?.engine === "ocr") {
         engine = "ocr";
       }
+    } else if (companyId && !serviceRoleKey) {
+      console.warn("SUPABASE_SERVICE_ROLE_KEY mancante: fallback engine=legacy");
     }
 
     const targetFn = engine === "ocr" ? "parse-bank-pdf-ocr" : "parse-bank-pdf";
     console.log(`engine_selected=${engine} company_id=${companyId ?? "n/a"} target=${targetFn}`);
 
+    const incomingAuthorization = req.headers.get("Authorization") ?? req.headers.get("authorization");
+    const incomingApiKey = req.headers.get("apikey");
+    const forwardAuthorization = incomingAuthorization || (serviceRoleKey ? `Bearer ${serviceRoleKey}` : "");
+    const forwardApiKey = incomingApiKey || serviceRoleKey || "";
+
+    if (!forwardAuthorization || !forwardApiKey) {
+      return json({ error: "Credenziali di forwarding mancanti (Authorization/apikey)" }, 401);
+    }
+
     const upstream = await fetch(`${supabaseUrl}/functions/v1/${targetFn}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${serviceRoleKey}`,
-        "apikey": serviceRoleKey,
+        "Authorization": forwardAuthorization,
+        "apikey": forwardApiKey,
       },
       body: JSON.stringify(payload),
     });
@@ -81,6 +92,7 @@ Deno.serve(async (req) => {
         "Cache-Control": upstream.headers.get("cache-control") || "no-cache",
         "Connection": "keep-alive",
         "X-Bank-Engine": engine,
+        "X-Bank-Target-Function": targetFn,
       },
     });
   } catch (e) {
