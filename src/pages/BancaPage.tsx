@@ -1,5 +1,5 @@
 // src/pages/BancaPage.tsx
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, type MouseEvent } from 'react'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useCompany } from '@/hooks/useCompany'
@@ -11,7 +11,7 @@ import {
 import {
   parseBankPdf, saveBankTransactions, ensureBankAccount, createImportBatch,
   updateImportBatch, loadBankTransactions, loadBankAccounts, getClaudeApiKey,
-  deleteBankTransactions, deleteAllBankTransactions,
+  deleteBankTransactions, deleteAllBankTransactions, updateBankTransactionDirection,
   type BankImportStats, type BankParseProgress,
 } from '@/lib/bankParser'
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
@@ -45,6 +45,23 @@ function txTypeBadge(type?: string) {
   if (type === 'pos') return 'bg-amber-100 text-amber-700'
   if (type === 'prelievo') return 'bg-orange-100 text-orange-700'
   return 'bg-gray-100 text-gray-600'
+}
+
+function txDirection(tx: any): 'in' | 'out' {
+  if (tx?.direction === 'in' || tx?.direction === 'out') return tx.direction
+  return Number(tx?.amount || 0) >= 0 ? 'in' : 'out'
+}
+
+function txDirectionSourceLabel(source?: string) {
+  if (source === 'side_rule') return 'Regola DARE/AVERE'
+  if (source === 'semantic_rule') return 'Regola semantica'
+  if (source === 'manual') return 'Correzione manuale'
+  return 'Fallback importo'
+}
+
+function txDirectionConfidenceLabel(conf?: number) {
+  if (conf == null || Number.isNaN(Number(conf))) return '—'
+  return `${Math.round(Number(conf) * 100)}%`
 }
 function isoDate(d: Date) {
   return d.toISOString().split('T')[0]
@@ -137,13 +154,16 @@ function DeleteModal({ mode, count, onConfirm, onCancel }: {
 // TRANSACTION ROW
 // ============================================================
 function TxRow({ tx, selected, onClick, onDoubleClick }: {
-  tx: any; selected: boolean; onClick: () => void; onDoubleClick?: () => void
+  tx: any; selected: boolean; onClick: (e: MouseEvent<HTMLDivElement>) => void; onDoubleClick?: (e: MouseEvent<HTMLDivElement>) => void
 }) {
-  const isIn = tx.amount > 0
+  const direction = txDirection(tx)
+  const isIn = direction === 'in'
+  const rawAmount = Number(tx.amount || 0)
+  const signedAmount = isIn ? Math.abs(rawAmount) : -Math.abs(rawAmount)
   const hasCommission = tx.commission_amount != null && tx.commission_amount !== 0
   // Importo netto: rimuovo la commissione (negativa) dall'importo → tx.amount - tx.commission_amount
   // Es: amount=-700.20, commission=-0.20 → netto = -700.20 - (-0.20) = -700.00
-  const netAmount = hasCommission ? tx.amount - tx.commission_amount : null
+  const netAmount = hasCommission ? signedAmount - Number(tx.commission_amount || 0) : null
 
   return (
     <div
@@ -174,9 +194,14 @@ function TxRow({ tx, selected, onClick, onDoubleClick }: {
       <span className={`hidden sm:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full flex-shrink-0 ${txTypeBadge(tx.transaction_type)}`}>
         {txTypeLabel(tx.transaction_type)}
       </span>
+      {tx.direction_needs_review && (
+        <span className="hidden md:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 flex-shrink-0">
+          Da verificare
+        </span>
+      )}
       <div className="text-right flex-shrink-0">
         <p className={`text-sm font-bold ${isIn ? 'text-emerald-700' : 'text-red-700'}`}>
-          {isIn ? '+' : ''}{fmtEur(tx.amount)}
+          {isIn ? '+' : '-'}{fmtEur(Math.abs(signedAmount))}
         </p>
         {netAmount != null && (
           <p className="text-[10px] text-gray-400">netto {fmtEur(netAmount)}</p>
@@ -189,13 +214,34 @@ function TxRow({ tx, selected, onClick, onDoubleClick }: {
 // ============================================================
 // DETAIL PANEL
 // ============================================================
-function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
+function TxDetail({
+  tx,
+  onClose,
+  directionEditMode,
+  directionDraft,
+  directionSaving,
+  onDirectionDraftChange,
+  onDirectionSave,
+  onEnableDirectionEdit,
+}: {
+  tx: any;
+  onClose: () => void;
+  directionEditMode: boolean;
+  directionDraft: 'in' | 'out';
+  directionSaving: boolean;
+  onDirectionDraftChange: (d: 'in' | 'out') => void;
+  onDirectionSave: () => void;
+  onEnableDirectionEdit: () => void;
+}) {
   if (!tx) return null
-  const isIn = tx.amount > 0
+  const currentDirection = txDirection(tx)
+  const isIn = currentDirection === 'in'
+  const rawAmount = Number(tx.amount || 0)
+  const signedAmount = isIn ? Math.abs(rawAmount) : -Math.abs(rawAmount)
   const hasCommission = tx.commission_amount != null && tx.commission_amount !== 0
   // Importo netto corretto: toglie la commissione dall'importo totale
   // commission è negativo → amount - commission = amount + abs(commission)
-  const netAmount = hasCommission ? tx.amount - tx.commission_amount : tx.amount
+  const netAmount = hasCommission ? signedAmount - Number(tx.commission_amount || 0) : signedAmount
 
   const Row = ({ l, v, mono }: { l: string; v?: any; mono?: boolean }) => {
     if (v == null || v === '' || v === '—') return null
@@ -217,7 +263,7 @@ function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
       </div>
       <div className={`px-4 py-4 flex-shrink-0 ${isIn ? 'bg-emerald-50' : 'bg-red-50'}`}>
         <p className={`text-2xl font-bold ${isIn ? 'text-emerald-700' : 'text-red-700'}`}>
-          {isIn ? '+' : ''}{fmtEur(tx.amount)}
+          {isIn ? '+' : '-'}{fmtEur(Math.abs(signedAmount))}
         </p>
         {hasCommission && (
           <div className="mt-1.5 space-y-0.5">
@@ -230,9 +276,18 @@ function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
           <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${txTypeBadge(tx.transaction_type)}`}>
             {txTypeLabel(tx.transaction_type)}
           </span>
+          {tx.direction_needs_review && (
+            <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">
+              Da verificare
+            </span>
+          )}
         </div>
       </div>
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+        <Row l="Direzione" v={currentDirection === 'in' ? 'Entrata' : 'Uscita'} />
+        <Row l="Origine decisione" v={txDirectionSourceLabel(tx.direction_source)} />
+        <Row l="Confidenza" v={txDirectionConfidenceLabel(tx.direction_confidence)} />
+        <Row l="Motivo" v={tx.direction_reason} />
         <Row l="Data accredito" v={tx.date ? fmtDate(tx.date) : null} />
         <Row l="Data valuta" v={tx.value_date ? fmtDate(tx.value_date) : null} />
         <Row l="Controparte" v={tx.counterparty_name} />
@@ -244,6 +299,42 @@ function TxDetail({ tx, onClose }: { tx: any; onClose: () => void }) {
         <Row l="Filiale disponente" v={tx.branch} />
         <Row l="Riferimento" v={tx.reference} />
         <Row l="Stato riconciliazione" v={tx.reconciliation_status} />
+      </div>
+      <div className="border-t px-4 py-3 bg-gray-50">
+        {!directionEditMode ? (
+          <Button size="sm" variant="outline" onClick={onEnableDirectionEdit} className="w-full">
+            Correggi direzione
+          </Button>
+        ) : (
+          <div className="space-y-2">
+            <p className="text-xs font-medium text-gray-700">Correzione manuale direzione</p>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => onDirectionDraftChange('in')}
+                className={`text-xs px-2 py-1.5 rounded border font-medium ${
+                  directionDraft === 'in'
+                    ? 'bg-emerald-600 border-emerald-600 text-white'
+                    : 'bg-white border-gray-200 text-gray-700'
+                }`}
+              >
+                Segna Entrata
+              </button>
+              <button
+                onClick={() => onDirectionDraftChange('out')}
+                className={`text-xs px-2 py-1.5 rounded border font-medium ${
+                  directionDraft === 'out'
+                    ? 'bg-red-600 border-red-600 text-white'
+                    : 'bg-white border-gray-200 text-gray-700'
+                }`}
+              >
+                Segna Uscita
+              </button>
+            </div>
+            <Button size="sm" onClick={onDirectionSave} disabled={directionSaving} className="w-full">
+              {directionSaving ? 'Salvataggio...' : 'Conferma'}
+            </Button>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -284,12 +375,15 @@ export default function BancaPage() {
   const [selectedTx, setSelectedTx] = useState<any>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [query, setQuery] = useState('')
-  const [dirFilter, setDirFilter] = useState<'all' | 'in' | 'out'>('all')
+  const [dirFilter, setDirFilter] = useState<'all' | 'in' | 'out' | 'review'>('all')
   const [typeFilter, setTypeFilter] = useState<string>('all')
   const [dateFrom, setDateFrom] = useState<string>('')
   const [dateTo, setDateTo] = useState<string>('')
   const [deleteModal, setDeleteModal] = useState<{ mode: 'selected' | 'all' } | null>(null)
   const [deleting, setDeleting] = useState(false)
+  const [directionEditMode, setDirectionEditMode] = useState(false)
+  const [directionDraft, setDirectionDraft] = useState<'in' | 'out'>('in')
+  const [directionSaving, setDirectionSaving] = useState(false)
 
   // AI search (usa query come input unificato)
   const [aiResult, setAiResult] = useState<string | null>(null)
@@ -356,21 +450,44 @@ export default function BancaPage() {
     }
   }
 
-  const handleRowClick = (tx: any) => {
-    if (selectedTx?.id === tx.id && selectedIds.size === 0) { setSelectedTx(null); return }
+  const handleRowClick = (tx: any, e: MouseEvent<HTMLDivElement>) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey) {
+      setSelectedTx(null)
+      setDirectionEditMode(false)
+      setSelectedIds(prev => {
+        const n = new Set(prev)
+        n.has(tx.id) ? n.delete(tx.id) : n.add(tx.id)
+        return n
+      })
+      return
+    }
+
+    if (selectedTx?.id === tx.id && selectedIds.size === 0) {
+      setSelectedTx(null)
+      setDirectionEditMode(false)
+      return
+    }
     if (selectedIds.size > 0) {
-      setSelectedIds(prev => { const n = new Set(prev); n.has(tx.id) ? n.delete(tx.id) : n.add(tx.id); return n })
+      setSelectedIds(prev => {
+        const n = new Set(prev)
+        n.has(tx.id) ? n.delete(tx.id) : n.add(tx.id)
+        return n
+      })
       return
     }
     setSelectedTx(tx)
+    setDirectionDraft(txDirection(tx))
+    setDirectionEditMode(false)
   }
 
   const handleRowDoubleClick = (tx: any) => {
-    setSelectedTx(null)
-    setSelectedIds(prev => { const n = new Set(prev); n.has(tx.id) ? n.delete(tx.id) : n.add(tx.id); return n })
+    setSelectedIds(new Set())
+    setSelectedTx(tx)
+    setDirectionDraft(txDirection(tx))
+    setDirectionEditMode(true)
   }
 
-  const clearSelection = () => { setSelectedIds(new Set()); setSelectedTx(null) }
+  const clearSelection = () => { setSelectedIds(new Set()); setSelectedTx(null); setDirectionEditMode(false) }
 
   const handleDelete = async () => {
     if (!deleteModal || !companyId) return
@@ -385,6 +502,49 @@ export default function BancaPage() {
       await loadData()
     } catch (e: any) { alert('Errore eliminazione: ' + e.message) }
     setDeleting(false); setDeleteModal(null)
+  }
+
+  const handleSaveDirection = async () => {
+    if (!selectedTx?.id || !companyId) return
+    setDirectionSaving(true)
+    try {
+      await updateBankTransactionDirection(companyId, selectedTx.id, directionDraft)
+      const updatedAt = new Date().toISOString()
+      setTransactions(prev => prev.map(tx => {
+        if (tx.id !== selectedTx.id) return tx
+        const amountAbs = Math.abs(Number(tx.amount || 0))
+        const signedAmount = directionDraft === 'in' ? amountAbs : -amountAbs
+        return {
+          ...tx,
+          amount: signedAmount,
+          direction: directionDraft,
+          direction_source: 'manual',
+          direction_confidence: 1,
+          direction_needs_review: false,
+          direction_reason: 'Correzione manuale utente',
+          direction_updated_at: updatedAt,
+        }
+      }))
+      setSelectedTx((prev: any) => {
+        if (!prev) return prev
+        const amountAbs = Math.abs(Number(prev.amount || 0))
+        const signedAmount = directionDraft === 'in' ? amountAbs : -amountAbs
+        return {
+          ...prev,
+          amount: signedAmount,
+          direction: directionDraft,
+          direction_source: 'manual',
+          direction_confidence: 1,
+          direction_needs_review: false,
+          direction_reason: 'Correzione manuale utente',
+          direction_updated_at: updatedAt,
+        }
+      })
+      setDirectionEditMode(false)
+    } catch (e: any) {
+      alert('Errore aggiornamento direzione: ' + e.message)
+    }
+    setDirectionSaving(false)
   }
 
   const handleImport = useCallback(async (files: FileList | null) => {
@@ -467,8 +627,10 @@ export default function BancaPage() {
 
   // Filters (defined before handleAiSearch so it can reference it)
   const filtered = transactions.filter(tx => {
-    if (dirFilter === 'in' && tx.amount <= 0) return false
-    if (dirFilter === 'out' && tx.amount >= 0) return false
+    const direction = txDirection(tx)
+    if (dirFilter === 'in' && direction !== 'in') return false
+    if (dirFilter === 'out' && direction !== 'out') return false
+    if (dirFilter === 'review' && !tx.direction_needs_review) return false
     if (typeFilter !== 'all' && tx.transaction_type !== typeFilter) return false
     if (dateFrom && tx.date < dateFrom) return false
     if (dateTo && tx.date > dateTo) return false
@@ -499,8 +661,12 @@ export default function BancaPage() {
   }
 
   // KPI su dati filtrati
-  const totalIn = filtered.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0)
-  const totalOut = filtered.filter(t => t.amount < 0).reduce((s, t) => s + Math.abs(t.amount), 0)
+  const totalIn = filtered
+    .filter(t => txDirection(t) === 'in')
+    .reduce((s, t) => s + Math.abs(Number(t.amount || 0)), 0)
+  const totalOut = filtered
+    .filter(t => txDirection(t) === 'out')
+    .reduce((s, t) => s + Math.abs(Number(t.amount || 0)), 0)
   const latestBalance = transactions[0]?.balance
   const uniqueTypes = [...new Set(transactions.map(t => t.transaction_type).filter(Boolean))]
   const isMultiSelect = selectedIds.size > 0
@@ -548,7 +714,7 @@ export default function BancaPage() {
 
           {transactions.length > 0 && !isMultiSelect && (
             <p className="text-[11px] text-gray-400">
-              💡 Clicca su un movimento per i dettagli · Doppio click per selezionare più movimenti da eliminare
+              💡 Clicca su un movimento per i dettagli · Doppio click per correzione direzione · Ctrl/Cmd+click per selezione multipla
             </p>
           )}
 
@@ -651,11 +817,11 @@ export default function BancaPage() {
                   />
                   {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => { setQuery(''); setAiResult(null) }}><X className="h-3.5 w-3.5" /></button>}
                 </div>
-                {(['all', 'in', 'out'] as const).map(d => (
+                {(['all', 'in', 'out', 'review'] as const).map(d => (
                   <button key={d} onClick={() => setDirFilter(d)}
                     className={`px-2.5 py-1.5 text-xs rounded-md font-medium border transition-all ${
                       dirFilter === d ? 'bg-sky-600 text-white border-sky-600' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}>
-                    {d === 'all' ? 'Tutti' : d === 'in' ? '↑ Entrate' : '↓ Uscite'}
+                    {d === 'all' ? 'Tutti' : d === 'in' ? '↑ Entrate' : d === 'out' ? '↓ Uscite' : 'Da verificare'}
                   </button>
                 ))}
                 {uniqueTypes.length > 1 && (
@@ -736,7 +902,7 @@ export default function BancaPage() {
                     <TxRow
                       key={tx.id} tx={tx}
                       selected={selectedIds.has(tx.id) || (!isMultiSelect && selectedTx?.id === tx.id)}
-                      onClick={() => handleRowClick(tx)}
+                      onClick={(e) => handleRowClick(tx, e)}
                       onDoubleClick={() => handleRowDoubleClick(tx)}
                     />
                   ))}
@@ -749,7 +915,19 @@ export default function BancaPage() {
       {/* RIGHT DETAIL PANEL */}
       {selectedTx && !isMultiSelect && (
         <div className="hidden lg:block w-72 xl:w-80 flex-shrink-0 overflow-hidden border-l h-full">
-          <TxDetail tx={selectedTx} onClose={() => setSelectedTx(null)} />
+          <TxDetail
+            tx={selectedTx}
+            onClose={() => { setSelectedTx(null); setDirectionEditMode(false) }}
+            directionEditMode={directionEditMode}
+            directionDraft={directionDraft}
+            directionSaving={directionSaving}
+            onDirectionDraftChange={setDirectionDraft}
+            onDirectionSave={handleSaveDirection}
+            onEnableDirectionEdit={() => {
+              setDirectionDraft(txDirection(selectedTx))
+              setDirectionEditMode(true)
+            }}
+          />
         </div>
       )}
 

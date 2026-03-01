@@ -22,6 +22,14 @@ export interface BankTransaction {
   reference?: string;
   invoice_ref?: string;
   raw_text: string;
+  posting_side?: 'dare' | 'avere' | 'unknown';
+  direction?: 'in' | 'out';
+  direction_source?: 'side_rule' | 'semantic_rule' | 'amount_fallback' | 'manual';
+  direction_confidence?: number;
+  direction_needs_review?: boolean;
+  direction_reason?: string;
+  direction_updated_at?: string;
+  direction_updated_by?: string;
 }
 
 export interface BankImportStats {
@@ -55,6 +63,29 @@ export interface BankParseProgress {
   current: number;
   total: number;
   message: string;
+}
+
+function normalizeDirection(v: unknown): 'in' | 'out' | null {
+  const s = String(v ?? '').trim().toLowerCase();
+  if (!s) return null;
+  if (s === 'in' || s.includes('entrata') || s.includes('accredito')) return 'in';
+  if (s === 'out' || s.includes('uscita') || s.includes('addebito')) return 'out';
+  return null;
+}
+
+function normalizePostingSide(v: unknown): 'dare' | 'avere' | 'unknown' {
+  const s = String(v ?? '').trim().toLowerCase();
+  if (s === 'dare') return 'dare';
+  if (s === 'avere') return 'avere';
+  return 'unknown';
+}
+
+function normalizeDirectionSource(v: unknown): 'side_rule' | 'semantic_rule' | 'amount_fallback' | 'manual' {
+  const s = String(v ?? '').trim().toLowerCase();
+  if (s === 'side_rule') return 'side_rule';
+  if (s === 'semantic_rule') return 'semantic_rule';
+  if (s === 'manual') return 'manual';
+  return 'amount_fallback';
 }
 
 // Stub — chiave è server-side in Supabase Edge Function secrets
@@ -284,10 +315,26 @@ export async function parseBankPdf(
       droppedMissingRequiredCountClient++;
       continue;
     }
-    const amount = parseFloat(String(t.amount)) || 0;
+    const parsedAmount = parseFloat(String(t.amount));
+    if (!Number.isFinite(parsedAmount)) {
+      droppedMissingRequiredCountClient++;
+      continue;
+    }
+    const direction = normalizeDirection(t.direction) || (parsedAmount >= 0 ? 'in' : 'out');
+    const amountAbs = Math.abs(parsedAmount);
+    const amount = direction === 'in' ? amountAbs : -amountAbs;
     const commission = t.commission != null && t.commission !== 0
       ? -Math.abs(parseFloat(String(t.commission)))
       : undefined;
+    const confParsed = parseFloat(String(t.direction_confidence ?? '0.5'));
+    const directionConfidence = Number.isFinite(confParsed)
+      ? Math.min(1, Math.max(0, Math.round(confParsed * 100) / 100))
+      : 0.5;
+    const directionNeedsReview = Boolean(
+      t.direction_needs_review === true ||
+      t.direction_needs_review === 'true' ||
+      (t.direction_needs_review == null && directionConfidence < 0.7),
+    );
 
     result.transactions.push({
       date: parseItalianDate(t.date),
@@ -303,6 +350,12 @@ export async function parseBankPdf(
       reference: t.reference || undefined,
       invoice_ref: t.invoice_ref || undefined,
       raw_text: String(t.raw_text || t.description || '').trim(),
+      posting_side: normalizePostingSide(t.posting_side),
+      direction,
+      direction_source: normalizeDirectionSource(t.direction_source),
+      direction_confidence: directionConfidence,
+      direction_needs_review: directionNeedsReview,
+      direction_reason: String(t.direction_reason || '').trim() || undefined,
     });
   }
 
@@ -380,6 +433,12 @@ export async function saveBankTransactions(
   for (let i = 0; i < transactions.length; i += CHUNK) {
     const chunk = transactions.slice(i, i + CHUNK);
     const rows = await Promise.all(chunk.map(async t => ({
+      direction: t.direction || (t.amount >= 0 ? 'in' : 'out'),
+      direction_source: t.direction_source || 'amount_fallback',
+      direction_confidence: t.direction_confidence ?? 0.5,
+      direction_needs_review: t.direction_needs_review ?? false,
+      direction_reason: t.direction_reason || null,
+      posting_side: t.posting_side || 'unknown',
       company_id: companyId,
       bank_account_id: bankAccountId,
       import_batch_id: importBatchId,
@@ -485,4 +544,42 @@ export async function deleteAllBankTransactions(companyId: string): Promise<numb
     .delete({ count: 'exact' }).eq('company_id', companyId);
   if (error) throw new Error(error.message);
   return count || 0;
+}
+
+export async function updateBankTransactionDirection(
+  companyId: string,
+  txId: string,
+  direction: 'in' | 'out',
+  reason = 'Correzione manuale utente'
+): Promise<void> {
+  const { data: authData } = await supabase.auth.getUser();
+  const userId = authData?.user?.id || null;
+
+  const { data: current, error: loadError } = await supabase
+    .from('bank_transactions')
+    .select('amount')
+    .eq('id', txId)
+    .eq('company_id', companyId)
+    .single();
+  if (loadError) throw new Error(loadError.message);
+
+  const currentAmount = Number(current?.amount ?? 0);
+  const amountAbs = Math.abs(currentAmount);
+  const signedAmount = direction === 'in' ? amountAbs : -amountAbs;
+
+  const { error } = await supabase
+    .from('bank_transactions')
+    .update({
+      amount: signedAmount,
+      direction,
+      direction_source: 'manual',
+      direction_confidence: 1,
+      direction_needs_review: false,
+      direction_reason: reason,
+      direction_updated_at: new Date().toISOString(),
+      direction_updated_by: userId,
+    })
+    .eq('id', txId)
+    .eq('company_id', companyId);
+  if (error) throw new Error(error.message);
 }

@@ -14,6 +14,10 @@ const MODEL = Deno.env.get("GEMINI_MODEL") ?? "gemini-2.5-flash";
 const CHUNK_SIZE = Number(Deno.env.get("PDF_CHUNK_PAGES") ?? "1");
 const MAX_OUTPUT_TOKENS = Number(Deno.env.get("GEMINI_MAX_OUTPUT_TOKENS") ?? "32768");
 
+type PostingSide = "dare" | "avere" | "unknown";
+type Direction = "in" | "out";
+type DirectionSource = "side_rule" | "semantic_rule" | "amount_fallback" | "manual";
+
 type Tx = {
   date: string;
   value_date: string | null;
@@ -26,6 +30,12 @@ type Tx = {
   invoice_ref: string | null;
   category_code: string | null;
   raw_text: string | null;
+  posting_side: PostingSide;
+  direction: Direction;
+  direction_source: DirectionSource;
+  direction_confidence: number;
+  direction_needs_review: boolean;
+  direction_reason: string;
 };
 
 type GeminiChunkResult = {
@@ -35,6 +45,48 @@ type GeminiChunkResult = {
   rawParsedCount: number;
   droppedMissingRequiredCount: number;
 };
+
+type SemanticKeyword = { needle: string; weight: number };
+
+type DirectionInference = {
+  direction: Direction;
+  source: DirectionSource;
+  confidence: number;
+  needsReview: boolean;
+  reason: string;
+};
+
+const OUT_KEYWORDS: SemanticKeyword[] = [
+  { needle: "vostra disposizione a favore", weight: 2.8 },
+  { needle: "bonifico a favore", weight: 2.4 },
+  { needle: "addebito", weight: 2.3 },
+  { needle: "effetti ritirati pagati", weight: 2.7 },
+  { needle: "effetti ritirati", weight: 1.8 },
+  { needle: "f24", weight: 2.4 },
+  { needle: "commissioni", weight: 1.7 },
+  { needle: "commissione", weight: 1.6 },
+  { needle: "rid", weight: 1.8 },
+  { needle: "sdd", weight: 1.8 },
+  { needle: "prelievo", weight: 2.2 },
+  { needle: "pagamento", weight: 1.4 },
+  { needle: "assegno", weight: 1.5 },
+  { needle: "giroconto", weight: 1.2 },
+  { needle: "disposizione filiale disponente", weight: 2.0 },
+];
+
+const IN_KEYWORDS: SemanticKeyword[] = [
+  { needle: "a vostro favore", weight: 2.8 },
+  { needle: "bonifico a vostro favore", weight: 2.8 },
+  { needle: "accredito", weight: 2.2 },
+  { needle: "stipendio", weight: 2.2 },
+  { needle: "interessi a credito", weight: 2.6 },
+  { needle: "interessi creditori", weight: 2.2 },
+  { needle: "incasso", weight: 1.8 },
+  { needle: "versamento", weight: 1.8 },
+  { needle: "rimborso", weight: 1.5 },
+  { needle: "riaccredito", weight: 2.2 },
+  { needle: "saldo a credito", weight: 2.0 },
+];
 
 const PROMPT = `Sei un parser contabile italiano.
 Estrai i movimenti bancari presenti nel PDF (estratto conto MPS o simile).
@@ -46,7 +98,7 @@ Formato richiesto:
     {
       "date": "DD/MM/YYYY",
       "value_date": "DD/MM/YYYY oppure null",
-      "amount": numero (negativo=uscita, positivo=entrata),
+      "amount": numero assoluto o con segno,
       "commission": numero positivo oppure null,
       "description": "causale completa",
       "counterparty_name": "nome controparte oppure null",
@@ -54,14 +106,22 @@ Formato richiesto:
       "reference": "CRO/TRN/rif oppure null",
       "invoice_ref": "numero fattura se presente, altrimenti null",
       "category_code": "codice causale se presente, altrimenti null",
-      "raw_text": "estratto testo max 180 caratteri, oppure null"
+      "raw_text": "testo integrale movimento (non troncare)",
+      "posting_side": "dare|avere|unknown",
+      "direction": "in|out"
     }
   ]
 }
 
-Regole:
+Regole importanti:
 - Includi TUTTI i movimenti presenti nel chunk.
-- Non inventare dati mancanti.
+- Determina posting_side dalla colonna del movimento: DARE o AVERE, se visibile.
+- Matrice contabile:
+  - DARE +positivo => out
+  - DARE -negativo => in
+  - AVERE +positivo => in
+  - AVERE -negativo => out
+- Se posting_side non è determinabile metti "unknown".
 - Se non trovi movimenti, restituisci {"transactions":[]}.`;
 
 function sseData(controller: ReadableStreamDefaultController<Uint8Array>, data: unknown) {
@@ -112,25 +172,207 @@ function normType(v: unknown): string {
   return allowed.has(t) ? t : "altro";
 }
 
+function normalizeText(v: unknown): string {
+  return String(v ?? "")
+    .toLowerCase()
+    .replace(/[\n\r\t]+/g, " ")
+    .replace(/[^a-z0-9àèéìòù\s./-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function roundConfidence(v: number): number {
+  const bounded = Math.min(1, Math.max(0, v));
+  return Math.round(bounded * 100) / 100;
+}
+
+function normalizePostingSide(v: unknown): PostingSide {
+  const s = normalizeText(v);
+  if (!s) return "unknown";
+
+  if (
+    s === "d" ||
+    s === "dare" ||
+    s.includes("mov dare") ||
+    s.includes("movimento dare") ||
+    s.includes("colonna dare")
+  ) return "dare";
+
+  if (
+    s === "a" ||
+    s === "avere" ||
+    s.includes("mov avere") ||
+    s.includes("movimento avere") ||
+    s.includes("colonna avere")
+  ) return "avere";
+
+  return "unknown";
+}
+
+function inferPostingSideFromText(text: string): PostingSide {
+  const hasDare = /\bmov\.?\s*dare\b|\bmovimento\s*dare\b|\bdare\b/.test(text);
+  const hasAvere = /\bmov\.?\s*avere\b|\bmovimento\s*avere\b|\bavere\b/.test(text);
+
+  if (hasDare && !hasAvere) return "dare";
+  if (hasAvere && !hasDare) return "avere";
+  return "unknown";
+}
+
+function normalizeDirection(v: unknown): Direction | null {
+  const s = normalizeText(v);
+  if (!s) return null;
+  if (s === "in" || s.includes("entrata") || s.includes("accredito")) return "in";
+  if (s === "out" || s.includes("uscita") || s.includes("addebito")) return "out";
+  return null;
+}
+
+function scoreKeywords(text: string, rules: SemanticKeyword[]): { score: number; hits: string[] } {
+  let score = 0;
+  const hits: string[] = [];
+  for (const rule of rules) {
+    if (text.includes(rule.needle)) {
+      score += rule.weight;
+      hits.push(rule.needle);
+    }
+  }
+  return { score, hits };
+}
+
+function inferDirectionFromSemantic(text: string, llmDirection: Direction | null): DirectionInference | null {
+  if (!text) return null;
+
+  const inScore = scoreKeywords(text, IN_KEYWORDS);
+  const outScore = scoreKeywords(text, OUT_KEYWORDS);
+
+  let totalIn = inScore.score;
+  let totalOut = outScore.score;
+
+  if (llmDirection === "in") totalIn += 0.8;
+  if (llmDirection === "out") totalOut += 0.8;
+
+  if (totalIn === 0 && totalOut === 0) return null;
+
+  if (totalIn === totalOut) {
+    if (!llmDirection) return null;
+    return {
+      direction: llmDirection,
+      source: "semantic_rule",
+      confidence: 0.68,
+      needsReview: true,
+      reason: `Segnali semantici in parita, uso direzione LLM (${llmDirection})`,
+    };
+  }
+
+  const direction: Direction = totalOut > totalIn ? "out" : "in";
+  const diff = Math.abs(totalOut - totalIn);
+
+  let confidence = diff >= 2 ? 0.9 : diff >= 1 ? 0.8 : 0.72;
+  if (llmDirection && llmDirection === direction) confidence += 0.06;
+  if (llmDirection && llmDirection !== direction) confidence -= 0.08;
+
+  const hits = direction === "out" ? outScore.hits : inScore.hits;
+  const hitLabel = hits.length > 0 ? hits.slice(0, 3).join(", ") : "llm";
+
+  return {
+    direction,
+    source: "semantic_rule",
+    confidence: roundConfidence(confidence),
+    needsReview: roundConfidence(confidence) < 0.7,
+    reason: `Regola semantica: ${hitLabel}`,
+  };
+}
+
+function resolveDirection(
+  signedAmount: number,
+  postingSide: PostingSide,
+  llmDirection: Direction | null,
+  semanticText: string,
+): DirectionInference {
+  if (postingSide !== "unknown") {
+    const direction = postingSide === "dare"
+      ? (signedAmount >= 0 ? "out" : "in")
+      : (signedAmount >= 0 ? "in" : "out");
+
+    return {
+      direction,
+      source: "side_rule",
+      confidence: 0.99,
+      needsReview: false,
+      reason: `Regola ${postingSide.toUpperCase()} applicata`,
+    };
+  }
+
+  const semantic = inferDirectionFromSemantic(semanticText, llmDirection);
+  if (semantic) {
+    return {
+      ...semantic,
+      confidence: roundConfidence(semantic.confidence),
+      needsReview: semantic.confidence < 0.7,
+    };
+  }
+
+  if (llmDirection) {
+    return {
+      direction: llmDirection,
+      source: "semantic_rule",
+      confidence: 0.66,
+      needsReview: true,
+      reason: "Direzione LLM usata senza indicatori DARE/AVERE",
+    };
+  }
+
+  return {
+    direction: signedAmount >= 0 ? "in" : "out",
+    source: "amount_fallback",
+    confidence: 0.5,
+    needsReview: true,
+    reason: "Fallback da segno importo (posting_side sconosciuto)",
+  };
+}
+
 function sanitizeTx(x: any): Tx | null {
   const date = clip(x?.date, 20);
-  const amount = toNumber(x?.amount);
-  if (!date || amount == null) return null;
+  const originalAmount = toNumber(x?.amount);
+  if (!date || originalAmount == null) return null;
+
+  const description = clip(x?.description, 600) ?? "";
+  const rawText = clip(x?.raw_text, 4000) ?? null;
+  const reference = clip(x?.reference, 120);
+  const categoryCode = clip(x?.category_code, 40);
+
+  const semanticText = normalizeText([description, rawText ?? "", reference ?? "", categoryCode ?? ""].join(" "));
+  let postingSide = normalizePostingSide(x?.posting_side);
+  if (postingSide === "unknown") {
+    postingSide = inferPostingSideFromText(semanticText);
+  }
+
+  const llmDirection = normalizeDirection(x?.direction);
+  const directionDecision = resolveDirection(originalAmount, postingSide, llmDirection, semanticText);
+
+  const amountAbs = Math.abs(originalAmount);
+  const normalizedAmount = directionDecision.direction === "in" ? amountAbs : -amountAbs;
+
   const commissionRaw = toNumber(x?.commission);
   const commission = commissionRaw == null ? null : Math.abs(commissionRaw);
 
   return {
     date,
     value_date: clip(x?.value_date, 20),
-    amount,
+    amount: normalizedAmount,
     commission,
-    description: clip(x?.description, 400) ?? "",
+    description,
     counterparty_name: clip(x?.counterparty_name, 180),
     transaction_type: normType(x?.transaction_type),
-    reference: clip(x?.reference, 120),
+    reference,
     invoice_ref: clip(x?.invoice_ref, 80),
-    category_code: clip(x?.category_code, 40),
-    raw_text: clip(x?.raw_text, 180),
+    category_code: categoryCode,
+    raw_text: rawText,
+    posting_side: postingSide,
+    direction: directionDecision.direction,
+    direction_source: directionDecision.source,
+    direction_confidence: roundConfidence(directionDecision.confidence),
+    direction_needs_review: directionDecision.needsReview,
+    direction_reason: clip(directionDecision.reason, 240) || "Direzione determinata automaticamente",
   };
 }
 
