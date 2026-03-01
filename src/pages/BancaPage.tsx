@@ -12,7 +12,7 @@ import {
   parseBankPdf, saveBankTransactions, ensureBankAccount, createImportBatch,
   updateImportBatch, loadBankTransactions, loadBankAccounts, getClaudeApiKey,
   deleteBankTransactions, deleteAllBankTransactions,
-  type BankParseProgress,
+  type BankImportStats, type BankParseProgress,
 } from '@/lib/bankParser'
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 
@@ -299,7 +299,13 @@ export default function BancaPage() {
   const [importing, setImporting] = useState(false)
   const [importProgress, setImportProgress] = useState<BankParseProgress | null>(null)
   const [importTxCount, setImportTxCount] = useState(0)
-  const [importResult, setImportResult] = useState<{ saved: number; duplicates: number; errors: string[] } | null>(null)
+  const [importResult, setImportResult] = useState<{
+    saved: number;
+    duplicates: number;
+    dedup_db_count: number;
+    errors: string[];
+    stats: BankImportStats;
+  } | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
 
@@ -391,30 +397,70 @@ export default function BancaPage() {
     try {
       const parseResult = await parseBankPdf(file, apiKey, companyId, (p) => { setImportProgress(p) })
       setImportTxCount(parseResult.transactions.length)
+      const batchId = await createImportBatch(companyId, file.name)
 
       if (parseResult.transactions.length === 0) {
         const errs = parseResult.errors.length > 0
           ? parseResult.errors
           : ['Nessun movimento trovato.']
-        setImportResult({ saved: 0, duplicates: 0, errors: errs })
+        const finalStats: BankImportStats = {
+          ...parseResult.stats,
+          dedup_db_count: 0,
+          saved_count: 0,
+        }
+        await updateImportBatch(batchId, {
+          total: 0,
+          success: 0,
+          errors: errs.length,
+          error_details: {
+            stats: finalStats,
+            failed_chunks: parseResult.failedChunks || [],
+            warnings: parseResult.warnings || [],
+            errors: errs,
+          },
+        })
+        setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: errs, stats: finalStats })
         setImporting(false); return
       }
 
       const bankAccountId = await ensureBankAccount(companyId, { iban: undefined, bankName: 'Monte dei Paschi', accountHolder: undefined })
-      const batchId = await createImportBatch(companyId, file.name)
       setImportProgress({ phase: 'saving', current: 0, total: parseResult.transactions.length, message: 'Salvataggio...' })
 
       const saveResult = await saveBankTransactions(
         companyId, bankAccountId, parseResult.transactions, batchId,
         (cur, tot) => setImportProgress({ phase: 'saving', current: cur, total: tot, message: `Salvataggio ${cur}/${tot}...` })
       )
+      const finalStats: BankImportStats = {
+        ...parseResult.stats,
+        dedup_db_count: saveResult.dedup_db_count,
+        saved_count: saveResult.saved,
+      }
+      const mergedErrors = [...saveResult.errors, ...parseResult.errors]
       await updateImportBatch(batchId, {
         total: parseResult.transactions.length, success: saveResult.saved,
-        errors: saveResult.errors.length, error_details: saveResult.errors.length ? saveResult.errors : null,
+        errors: mergedErrors.length,
+        error_details: {
+          stats: finalStats,
+          failed_chunks: parseResult.failedChunks || [],
+          warnings: parseResult.warnings || [],
+          errors: mergedErrors,
+        },
       })
-      setImportResult({ ...saveResult, errors: [...saveResult.errors, ...parseResult.errors] })
+      setImportResult({ ...saveResult, errors: mergedErrors, stats: finalStats })
       await loadData()
-    } catch (e: any) { setImportResult({ saved: 0, duplicates: 0, errors: [e.message] }) }
+    } catch (e: any) {
+      const emptyStats: BankImportStats = {
+        raw_parsed_count: 0,
+        dropped_missing_required_count: 0,
+        dedup_edge_count: 0,
+        dedup_client_count: 0,
+        dedup_db_count: 0,
+        saved_count: 0,
+        failed_chunks_count: 0,
+        warnings_count: 0,
+      }
+      setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], stats: emptyStats })
+    }
     setImporting(false)
     if (fileRef.current) fileRef.current.value = ''
   }, [companyId, loadData])
@@ -546,8 +592,20 @@ export default function BancaPage() {
               <div className="flex-1 min-w-0">
                 <p className="text-sm font-medium">
                   {importResult.saved > 0 ? `✓ ${importResult.saved} movimenti importati` : 'Import fallito'}
-                  {importResult.duplicates > 0 && ` · ${importResult.duplicates} duplicati ignorati`}
+                  {importResult.dedup_db_count > 0 && ` · ${importResult.dedup_db_count} duplicati DB ignorati`}
                 </p>
+                <div className="text-xs text-gray-600 mt-1">
+                  Estratti: {importResult.stats.raw_parsed_count} ·
+                  Scartati (campi obbligatori): {importResult.stats.dropped_missing_required_count} ·
+                  Deduplica edge/client: {importResult.stats.dedup_edge_count + importResult.stats.dedup_client_count} ·
+                  Deduplica DB: {importResult.stats.dedup_db_count} ·
+                  Salvati: {importResult.stats.saved_count}
+                </div>
+                {(importResult.stats.failed_chunks_count > 0 || importResult.stats.warnings_count > 0) && (
+                  <div className="text-xs text-amber-700 mt-1">
+                    Chunk falliti: {importResult.stats.failed_chunks_count} · Warning: {importResult.stats.warnings_count}
+                  </div>
+                )}
                 {importResult.errors.length > 0 && (
                   <ul className="text-xs text-red-700 mt-1 space-y-0.5">
                     {importResult.errors.slice(0, 4).map((e, i) => <li key={i}>• {e}</li>)}

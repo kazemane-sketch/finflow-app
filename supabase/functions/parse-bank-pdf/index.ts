@@ -32,6 +32,8 @@ type GeminiChunkResult = {
   txns: Tx[];
   finishReason: string;
   rawLength: number;
+  rawParsedCount: number;
+  droppedMissingRequiredCount: number;
 };
 
 const PROMPT = `Sei un parser contabile italiano.
@@ -184,18 +186,6 @@ function tryParseAnyJson(text: string): any[] {
   return [];
 }
 
-function dedupeTx(items: Tx[]): Tx[] {
-  const seen = new Set<string>();
-  const out: Tx[] = [];
-  for (const t of items) {
-    const key = `${t.date}|${t.amount}|${(t.description ?? "").slice(0, 60)}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(t);
-  }
-  return out;
-}
-
 async function splitPdfIntoChunks(pdfBase64: string, chunkSize = CHUNK_SIZE): Promise<{ chunks: string[]; totalPages: number }> {
   const pdfBytes = Uint8Array.from(atob(pdfBase64), (c) => c.charCodeAt(0));
   const pdfDoc = await PDFDocument.load(pdfBytes);
@@ -258,12 +248,25 @@ async function processChunkWithGemini(apiKey: string, chunkBase64: string): Prom
     .trim();
 
   console.log(`Gemini chunk: ${rawText.length} chars, finishReason: ${finishReason}`);
-  if (!rawText) return { txns: [], finishReason, rawLength: 0 };
+  if (!rawText) {
+    return {
+      txns: [],
+      finishReason,
+      rawLength: 0,
+      rawParsedCount: 0,
+      droppedMissingRequiredCount: 0,
+    };
+  }
 
   const parsed = tryParseAnyJson(rawText);
   const sanitized = parsed.map(sanitizeTx).filter(Boolean) as Tx[];
-  const txns = dedupeTx(sanitized);
-  return { txns, finishReason, rawLength: rawText.length };
+  return {
+    txns: sanitized,
+    finishReason,
+    rawLength: rawText.length,
+    rawParsedCount: parsed.length,
+    droppedMissingRequiredCount: Math.max(0, parsed.length - sanitized.length),
+  };
 }
 
 Deno.serve(async (req) => {
@@ -306,6 +309,16 @@ Deno.serve(async (req) => {
             type: "done",
             transactions: [],
             count: 0,
+            stats: {
+              raw_parsed_count: 0,
+              dropped_missing_required_count: 0,
+              dedup_edge_count: 0,
+              dedup_client_count: 0,
+              dedup_db_count: 0,
+              saved_count: 0,
+              failed_chunks_count: 0,
+              warnings_count: 0,
+            },
             totalChunks,
             startChunk,
             endChunk: startChunk,
@@ -329,6 +342,8 @@ Deno.serve(async (req) => {
         const failedChunks: number[] = [];
         const warnings: string[] = [];
         let allTransactions: Tx[] = [];
+        let rawParsedCount = 0;
+        let droppedMissingRequiredCount = 0;
 
         for (let i = startChunk; i < endChunkExclusive; i++) {
           const fromPage = i * CHUNK_SIZE + 1;
@@ -350,6 +365,8 @@ Deno.serve(async (req) => {
               if (out.finishReason === "MAX_TOKENS") {
                 warnings.push(`Chunk ${i + 1}: output troncato (MAX_TOKENS).`);
               }
+              rawParsedCount += out.rawParsedCount;
+              droppedMissingRequiredCount += out.droppedMissingRequiredCount;
               allTransactions = allTransactions.concat(out.txns);
               console.log(
                 `Chunk ${i + 1}: ${out.txns.length} transactions (finishReason=${out.finishReason}, chars=${out.rawLength})`,
@@ -394,7 +411,6 @@ Deno.serve(async (req) => {
           if (i < endChunkExclusive - 1) await delay(250);
         }
 
-        allTransactions = dedupeTx(allTransactions);
         const hasMore = endChunkExclusive < totalChunks;
 
         console.log(`Total: ${allTransactions.length} transactions, ${failedChunks.length} failed chunks`);
@@ -402,6 +418,16 @@ Deno.serve(async (req) => {
           type: "done",
           transactions: allTransactions,
           count: allTransactions.length,
+          stats: {
+            raw_parsed_count: rawParsedCount,
+            dropped_missing_required_count: droppedMissingRequiredCount,
+            dedup_edge_count: 0,
+            dedup_client_count: 0,
+            dedup_db_count: 0,
+            saved_count: 0,
+            failed_chunks_count: failedChunks.length,
+            warnings_count: warnings.length,
+          },
           failedChunks: failedChunks.length ? failedChunks : undefined,
           warnings: warnings.length ? warnings : undefined,
           totalChunks,

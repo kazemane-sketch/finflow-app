@@ -24,6 +24,17 @@ export interface BankTransaction {
   raw_text: string;
 }
 
+export interface BankImportStats {
+  raw_parsed_count: number;
+  dropped_missing_required_count: number;
+  dedup_edge_count: number;
+  dedup_client_count: number;
+  dedup_db_count: number;
+  saved_count: number;
+  failed_chunks_count: number;
+  warnings_count: number;
+}
+
 export interface BankParseResult {
   transactions: BankTransaction[];
   accountHolder?: string;
@@ -35,6 +46,8 @@ export interface BankParseResult {
   pagesProcessed: number;
   errors: string[];
   failedChunks?: number[];
+  warnings?: string[];
+  stats: BankImportStats;
 }
 
 export interface BankParseProgress {
@@ -208,6 +221,10 @@ export async function parseBankPdf(
   const allTxRaw: any[] = [];
   const allFailedChunks = new Set<number>();
   const allErrors: string[] = [];
+  const allWarnings: string[] = [];
+  let rawParsedCount = 0;
+  let droppedMissingRequiredCountEdge = 0;
+  let dedupEdgeCount = 0;
   let totalChunks = 0;
   let startChunk = 0;
   let completed = false;
@@ -218,8 +235,15 @@ export async function parseBankPdf(
     for (const t of (finalData.transactions || [])) allTxRaw.push(t);
     for (const c of (finalData.failedChunks || [])) allFailedChunks.add(Number(c));
     for (const w of (finalData.warnings || [])) {
-      if (typeof w === 'string' && w.trim()) allErrors.push(w);
+      if (typeof w === 'string' && w.trim()) {
+        allWarnings.push(w);
+        allErrors.push(w);
+      }
     }
+    const stats = finalData?.stats || {};
+    rawParsedCount += Number(stats.raw_parsed_count || 0);
+    droppedMissingRequiredCountEdge += Number(stats.dropped_missing_required_count || 0);
+    dedupEdgeCount += Number(stats.dedup_edge_count || 0);
 
     totalChunks = Number(finalData.totalChunks || totalChunks || 0);
     const hasMore = !!finalData.hasMore;
@@ -241,10 +265,25 @@ export async function parseBankPdf(
     pagesProcessed: allTxRaw.length,
     errors: allErrors,
     failedChunks: Array.from(allFailedChunks).sort((a, b) => a - b),
+    warnings: allWarnings,
+    stats: {
+      raw_parsed_count: rawParsedCount,
+      dropped_missing_required_count: droppedMissingRequiredCountEdge,
+      dedup_edge_count: dedupEdgeCount,
+      dedup_client_count: 0,
+      dedup_db_count: 0,
+      saved_count: 0,
+      failed_chunks_count: allFailedChunks.size,
+      warnings_count: allWarnings.length,
+    },
   };
 
+  let droppedMissingRequiredCountClient = 0;
   for (const t of allTxRaw) {
-    if (!t?.date || t?.amount == null) continue;
+    if (!t?.date || t?.amount == null) {
+      droppedMissingRequiredCountClient++;
+      continue;
+    }
     const amount = parseFloat(String(t.amount)) || 0;
     const commission = t.commission != null && t.commission !== 0
       ? -Math.abs(parseFloat(String(t.commission)))
@@ -267,15 +306,8 @@ export async function parseBankPdf(
     });
   }
 
-  const seen = new Set<string>();
-  result.transactions = result.transactions
-    .filter(t => {
-      const k = `${t.date}|${t.amount}|${t.description.substring(0, 60)}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    })
-    .sort((a, b) => b.date.localeCompare(a.date));
+  result.transactions = result.transactions.sort((a, b) => b.date.localeCompare(a.date));
+  result.stats.dropped_missing_required_count += droppedMissingRequiredCountClient;
 
   if (result.failedChunks && result.failedChunks.length > 0) {
     result.errors.push(`${result.failedChunks.length} blocchi di pagine non processati (chunk ${result.failedChunks.join(', ')})`);
@@ -310,7 +342,20 @@ function parseItalianDate(d: string): string {
 // HASH deduplicazione
 // ============================================================
 async function hashTx(t: BankTransaction): Promise<string> {
-  const s = `${t.date}|${t.amount}|${t.description.substring(0, 80)}`;
+  const normalize = (v: unknown) =>
+    String(v ?? '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, ' ');
+  const amountNorm = Number.isFinite(Number(t.amount)) ? Number(t.amount).toFixed(2) : '0.00';
+  const s = [
+    normalize(t.date),
+    normalize(t.value_date || ''),
+    amountNorm,
+    normalize(t.reference || ''),
+    normalize(t.description || ''),
+    normalize(t.raw_text || ''),
+  ].join('|');
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return Array.from(new Uint8Array(buf))
     .map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 32);
@@ -319,7 +364,7 @@ async function hashTx(t: BankTransaction): Promise<string> {
 // ============================================================
 // SAVE — solo colonne che esistono nella tabella bank_transactions
 // ============================================================
-export interface SaveBankResult { saved: number; duplicates: number; errors: string[] }
+export interface SaveBankResult { saved: number; duplicates: number; dedup_db_count: number; errors: string[] }
 
 export async function saveBankTransactions(
   companyId: string,
@@ -365,7 +410,7 @@ export async function saveBankTransactions(
     }
     onProgress?.(Math.min(i + CHUNK, transactions.length), transactions.length);
   }
-  return { saved, duplicates, errors };
+  return { saved, duplicates, dedup_db_count: duplicates, errors };
 }
 
 export async function ensureBankAccount(
