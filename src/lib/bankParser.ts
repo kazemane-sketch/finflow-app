@@ -38,6 +38,9 @@ export interface BankTransaction {
   counterparty_source?: 'regex' | 'heuristic' | 'llm' | 'parser_seed' | 'unknown';
   counterparty_confidence?: number;
   counterparty_needs_review?: boolean;
+  raw_integrity?: 'complete' | 'suspect';
+  raw_integrity_reason?: string;
+  start_page?: number;
 }
 
 export interface BankStatement {
@@ -67,6 +70,9 @@ export interface BankImportStats {
   counterparty_llm_resolved_count: number;
   counterparty_review_count: number;
   llm_batch_fail_count: number;
+  raw_integrity_suspect_count: number;
+  raw_overlap_resolved_count: number;
+  raw_overlap_failed_count: number;
 }
 
 export interface BankParseResult {
@@ -261,6 +267,9 @@ function mapRawTx(raw: any): BankTransaction | null {
     counterparty_source: normalizeCounterpartySource(raw.counterparty_source),
     counterparty_confidence: cpConfidence,
     counterparty_needs_review: counterpartyNeedsReview,
+    raw_integrity: String(raw.raw_integrity || '').toLowerCase() === 'suspect' ? 'suspect' : 'complete',
+    raw_integrity_reason: raw.raw_integrity_reason ? String(raw.raw_integrity_reason).trim() : undefined,
+    start_page: Number.isFinite(Number(raw.start_page)) ? Math.floor(Number(raw.start_page)) : undefined,
   };
 }
 
@@ -445,6 +454,9 @@ export async function parseBankPdf(
   let counterpartyLlmResolvedCount = 0;
   let counterpartyReviewCount = 0;
   let llmBatchFailCount = 0;
+  let rawIntegritySuspectCount = 0;
+  let rawOverlapResolvedCount = 0;
+  let rawOverlapFailedCount = 0;
   let statementOpeningBalance: number | undefined;
   let statementClosingBalance: number | undefined;
   let statementClosingDate: string | undefined;
@@ -479,6 +491,9 @@ export async function parseBankPdf(
     counterpartyLlmResolvedCount += Number(stats.counterparty_llm_resolved_count || 0);
     counterpartyReviewCount += Number(stats.counterparty_review_count || 0);
     llmBatchFailCount += Number(stats.llm_batch_fail_count || 0);
+    rawIntegritySuspectCount += Number(stats.raw_integrity_suspect_count || 0);
+    rawOverlapResolvedCount += Number(stats.raw_overlap_resolved_count || 0);
+    rawOverlapFailedCount += Number(stats.raw_overlap_failed_count || 0);
 
     const statement = finalData?.statement || {};
     const openingRaw = Number(statement.openingBalance);
@@ -550,6 +565,9 @@ export async function parseBankPdf(
       counterparty_llm_resolved_count: counterpartyLlmResolvedCount,
       counterparty_review_count: counterpartyReviewCount,
       llm_batch_fail_count: llmBatchFailCount,
+      raw_integrity_suspect_count: rawIntegritySuspectCount,
+      raw_overlap_resolved_count: rawOverlapResolvedCount,
+      raw_overlap_failed_count: rawOverlapFailedCount,
     },
   };
 

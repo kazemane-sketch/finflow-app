@@ -358,6 +358,25 @@ def is_statement_noise_line(text: str) -> bool:
     return False
 
 
+def has_statement_marker(text: str) -> bool:
+    l = normalize_space(text).lower()
+    if not l:
+        return False
+    if "movimenti con data contabile" in l:
+        return True
+    if "stampa del " in l:
+        return True
+    if re.search(r"(^|\s)(abi|cab|iban)\s*:", l):
+        return True
+    if "data cont." in l and "mov. dare" in l:
+        return True
+    if "descrizione operazioni" in l:
+        return True
+    if PAGE_NUMBER_RE.match(l):
+        return True
+    return False
+
+
 def build_lines(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not words:
         return []
@@ -536,11 +555,20 @@ def parse_pdf_transactions(
 
         raw_lines_source = current_row.pop("raw_lines", [])
         raw_lines = [line for line in raw_lines_source if not is_statement_noise_line(line)]
+        raw_integrity = "complete"
+        raw_integrity_reason = None
         if not raw_lines:
-            raw_lines = raw_lines_source
+            raw_integrity = "suspect"
+            raw_integrity_reason = "raw_text_noise_only"
         raw_text_multiline = normalize_multiline(raw_lines)
         raw_text_flat = normalize_space(raw_text_multiline)
+        if raw_text_multiline and has_statement_marker(raw_text_multiline):
+            raw_integrity = "suspect"
+            raw_integrity_reason = "raw_text_contains_statement_markers"
+
         current_row["raw_text"] = raw_text_multiline
+        current_row["raw_integrity"] = raw_integrity
+        current_row["raw_integrity_reason"] = raw_integrity_reason
 
         if not current_row.get("description"):
             current_row["description"] = normalize_space(raw_lines[0]) if raw_lines else raw_text_flat[:300]
@@ -575,8 +603,21 @@ def parse_pdf_transactions(
             or float(current_row.get("column_confidence", 0.0)) < 0.80
             or current_row.get("amount_abs") is None
             or not current_row.get("date")
+            or raw_integrity == "suspect"
         )
         current_row["qc_needs_review"] = needs_review
+
+        if raw_integrity == "suspect" and raw_integrity_reason == "raw_text_noise_only":
+            parse_errors += 1
+            anomalies.append(
+                {
+                    "type": "raw_text_noise_only",
+                    "page": current_row.get("start_page") or current_row.get("page"),
+                    "description": current_row.get("description", "")[:120],
+                }
+            )
+            current_row = None
+            return
 
         if not current_row.get("date") or current_row.get("amount_abs") is None:
             parse_errors += 1
@@ -717,6 +758,7 @@ def parse_pdf_transactions(
                         "raw_text": "",
                         "reference": extract_reference(text),
                         "category_code": category_code,
+                        "start_page": page_no,
                         "page": page_no,
                         "bbox": line_bbox(line),
                         "column_confidence": float(column_model["confidence"]) if posting_side != "unknown" else 0.40,
@@ -731,8 +773,8 @@ def parse_pdf_transactions(
                     current_row["raw_lines"].append(text)
                     current_row["bbox"] = merge_bbox(current_row["bbox"], line_bbox(line))
 
-            # Isola le transazioni per pagina ed evita contaminazione con header/footer pagina successiva.
-            finalize_current_row()
+    # Finalizza l'ultima transazione rimasta aperta dopo l'ultima pagina del range.
+    finalize_current_row()
 
     # Dedup diagnostic only on transactions.
     seen: set[str] = set()

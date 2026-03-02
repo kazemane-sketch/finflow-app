@@ -884,6 +884,9 @@ export default function BancaPage() {
         counterparty_llm_resolved_count: 0,
         counterparty_review_count: 0,
         llm_batch_fail_count: 0,
+        raw_integrity_suspect_count: 0,
+        raw_overlap_resolved_count: 0,
+        raw_overlap_failed_count: 0,
       }
       setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], warnings: [], stats: emptyStats })
     } finally {
@@ -948,6 +951,9 @@ export default function BancaPage() {
         counterparty_llm_resolved_count: 0,
         counterparty_review_count: 0,
         llm_batch_fail_count: 0,
+        raw_integrity_suspect_count: 0,
+        raw_overlap_resolved_count: 0,
+        raw_overlap_failed_count: 0,
       }
       setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], warnings: [], stats: emptyStats })
     }
@@ -1153,6 +1159,15 @@ export default function BancaPage() {
                     LLM risolti: {importResult.stats.counterparty_llm_resolved_count} ·
                     Da verificare: {importResult.stats.counterparty_review_count} ·
                     LLM batch fail: {importResult.stats.llm_batch_fail_count}
+                  </div>
+                )}
+                {(importResult.stats.raw_integrity_suspect_count > 0 ||
+                  importResult.stats.raw_overlap_resolved_count > 0 ||
+                  importResult.stats.raw_overlap_failed_count > 0) && (
+                  <div className="text-xs text-gray-600 mt-1">
+                    Raw suspect: {importResult.stats.raw_integrity_suspect_count} ·
+                    Overlap risolti: {importResult.stats.raw_overlap_resolved_count} ·
+                    Overlap falliti: {importResult.stats.raw_overlap_failed_count}
                   </div>
                 )}
                 {(importResult.stats.failed_chunks_count > 0 || importResult.stats.warnings_count > 0) && (

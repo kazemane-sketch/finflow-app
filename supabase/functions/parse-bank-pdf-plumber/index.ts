@@ -21,6 +21,7 @@ type DirectionSource = "side_rule" | "semantic_rule" | "amount_fallback" | "manu
 type AmountSignExplicit = "minus" | "plus_or_none" | "unknown";
 type CounterpartySource = "regex" | "heuristic" | "llm" | "parser_seed" | "unknown";
 type DescriptionSource = "llm" | "parser_fallback";
+type RawIntegrity = "complete" | "suspect";
 
 type Tx = {
   date: string;
@@ -49,6 +50,9 @@ type Tx = {
   counterparty_needs_review: boolean;
   parser_description: string;
   parser_counterparty_name: string | null;
+  raw_integrity: RawIntegrity;
+  raw_integrity_reason: string | null;
+  start_page: number | null;
   summary_reason?: string | null;
 };
 
@@ -77,6 +81,10 @@ type ParserTx = {
   column_confidence?: unknown;
   qc_needs_review?: unknown;
   row_reason?: unknown;
+  raw_integrity?: unknown;
+  raw_integrity_reason?: unknown;
+  start_page?: unknown;
+  page?: unknown;
 };
 
 type ParserSummaryRow = ParserTx;
@@ -337,6 +345,11 @@ function normalizePostingSide(v: unknown): PostingSide {
   return "unknown";
 }
 
+function normalizeRawIntegrity(v: unknown): RawIntegrity {
+  const s = normalizeText(v);
+  return s === "suspect" ? "suspect" : "complete";
+}
+
 function normType(v: unknown): string {
   const allowed = new Set([
     "bonifico_in",
@@ -453,9 +466,14 @@ function mapParserTx(item: ParserTx): Tx | null {
 
   const parserDescriptionRaw = clip(item?.description, 600) ?? "";
   const parserDescription = cleanParserFallbackDescription(parserDescriptionRaw);
-  const rawText = clip(item?.raw_text, 5000) ?? parserDescriptionRaw;
+  const rawTextInput = typeof item?.raw_text === "string" ? item.raw_text.trim() : "";
+  const rawText = rawTextInput || parserDescriptionRaw;
   const reference = clip(item?.reference, 120);
   const categoryCode = clip(item?.category_code, 40);
+  const rawIntegrity = normalizeRawIntegrity(item?.raw_integrity);
+  const rawIntegrityReason = clip(item?.raw_integrity_reason, 160);
+  const startPageRaw = toNumber(item?.start_page) ?? toNumber(item?.page);
+  const startPage = startPageRaw != null && Number.isFinite(startPageRaw) ? Math.floor(startPageRaw) : null;
 
   let decision: DirectionDecision;
   if (postingSide === "dare") {
@@ -560,6 +578,9 @@ function mapParserTx(item: ParserTx): Tx | null {
     counterparty_needs_review: counterpartyNeedsReview,
     parser_description: parserDescription,
     parser_counterparty_name: counterpartyInvalid ? null : parserCounterparty,
+    raw_integrity: rawIntegrity,
+    raw_integrity_reason: rawIntegrityReason,
+    start_page: startPage,
     summary_reason: clip(item?.row_reason, 120),
   };
 }
@@ -946,6 +967,9 @@ Deno.serve(async (req) => {
               counterparty_llm_resolved_count: 0,
               counterparty_review_count: 0,
               llm_batch_fail_count: 0,
+              raw_integrity_suspect_count: 0,
+              raw_overlap_resolved_count: 0,
+              raw_overlap_failed_count: 0,
             },
             summaryCandidates: [],
             statement: {
@@ -994,6 +1018,9 @@ Deno.serve(async (req) => {
         let counterpartyLlmResolvedCount = 0;
         let counterpartyReviewCount = 0;
         let llmBatchFailCount = 0;
+        let rawIntegritySuspectCount = 0;
+        let rawOverlapResolvedCount = 0;
+        let rawOverlapFailedCount = 0;
         let statementOpeningBalance: number | null = null;
         let statementClosingBalance: number | null = null;
         let statementClosingDate: string | null = null;
@@ -1001,28 +1028,72 @@ Deno.serve(async (req) => {
         for (let i = startChunk; i < endChunkExclusive; i++) {
           const fromPage = i * CHUNK_SIZE + 1;
           const toPage = Math.min((i + 1) * CHUNK_SIZE, totalPages);
+          const parserEndPage = i < totalChunks - 1 ? Math.min(toPage + 1, totalPages) : toPage;
+          const overlapEnabled = parserEndPage > toPage;
 
           sseData(controller, {
             type: "progress",
             chunk: i + 1,
             total: totalChunks,
             found: allTransactions.length,
-            message: `🐍 Parsing pagine ${fromPage}-${toPage} con pdfplumber...`,
+            message: overlapEnabled
+              ? `🐍 Parsing pagine ${fromPage}-${toPage} (+ overlap ${parserEndPage}) con pdfplumber...`
+              : `🐍 Parsing pagine ${fromPage}-${toPage} con pdfplumber...`,
           });
 
           let ok = false;
           for (let attempt = 1; attempt <= 3; attempt++) {
             try {
-              const parsed = await callParser(parserUrl, parserToken, pdfBase64, fromPage, toPage);
-              const parserTx = Array.isArray(parsed.transactions) ? parsed.transactions : [];
-              const parserSummaryRows = Array.isArray(parsed.summary_rows) ? parsed.summary_rows : [];
+              const parsed = await callParser(parserUrl, parserToken, pdfBase64, fromPage, parserEndPage);
+              const parserTxAll = Array.isArray(parsed.transactions) ? parsed.transactions : [];
+              const parserSummaryRowsAll = Array.isArray(parsed.summary_rows) ? parsed.summary_rows : [];
+
+              const parserTx = parserTxAll.filter((row) => {
+                const rowStart = toNumber(row?.start_page) ?? toNumber(row?.page);
+                if (rowStart == null || !Number.isFinite(rowStart)) return true;
+                return rowStart >= fromPage && rowStart <= toPage;
+              });
+              const parserSummaryRows = parserSummaryRowsAll.filter((row) => {
+                const rowStart = toNumber(row?.start_page) ?? toNumber(row?.page);
+                if (rowStart == null || !Number.isFinite(rowStart)) return true;
+                return rowStart >= fromPage && rowStart <= toPage;
+              });
+
               const mapped = parserTx.map(mapParserTx).filter(Boolean) as Tx[];
               const mappedSummary = parserSummaryRows.map(mapParserTx).filter(Boolean) as Tx[];
+              const suspectMapped = mapped.filter((tx) => tx.raw_integrity === "suspect");
 
-              const rowsDetected = Number(parsed?.stats?.rows_detected || parserTx.length || 0);
-              const chunkUnknownSide = Number(parsed?.stats?.rows_unknown_side || 0);
+              if (suspectMapped.length > 0) {
+                rawIntegritySuspectCount += suspectMapped.length;
+                const overlapSuspects = suspectMapped.filter((tx) =>
+                  overlapEnabled && tx.start_page != null && tx.start_page === toPage
+                );
+                rawOverlapFailedCount += overlapSuspects.length;
+                const reasons = Array.from(new Set(
+                  suspectMapped
+                    .map((tx) => tx.raw_integrity_reason)
+                    .filter((x): x is string => !!x),
+                ));
+                throw new Error(
+                  `raw integrity suspect: ${suspectMapped.length} tx` +
+                    (reasons.length ? ` (${reasons.join(", ")})` : ""),
+                );
+              }
+
+              if (overlapEnabled) {
+                const overlapResolved = mapped.filter((tx) =>
+                  tx.start_page != null &&
+                  tx.start_page === toPage &&
+                  typeof tx.raw_text === "string" &&
+                  tx.raw_text.includes("\n")
+                ).length;
+                rawOverlapResolvedCount += overlapResolved;
+              }
+
+              const rowsDetected = parserTx.length;
+              const chunkUnknownSide = parserTx.filter((row) => normalizePostingSide(row?.posting_side) === "unknown").length;
               const chunkParseErrors = Number(parsed?.stats?.parse_errors || 0);
-              const chunkSummaryRows = Number(parsed?.stats?.summary_rows_detected || parserSummaryRows.length || 0);
+              const chunkSummaryRows = parserSummaryRows.length;
               const chunkQcFail = Number(parsed?.quality?.qc_fail_count || 0);
               const ledgerMatch = parsed?.quality?.ledger_match;
               const openingBalance = toNumber(parsed?.statement?.opening_balance);
@@ -1138,6 +1209,9 @@ Deno.serve(async (req) => {
             counterparty_llm_resolved_count: counterpartyLlmResolvedCount,
             counterparty_review_count: counterpartyReviewCount,
             llm_batch_fail_count: llmBatchFailCount,
+            raw_integrity_suspect_count: rawIntegritySuspectCount,
+            raw_overlap_resolved_count: rawOverlapResolvedCount,
+            raw_overlap_failed_count: rawOverlapFailedCount,
           },
           summaryCandidates: allSummaryCandidates,
           statement: {
