@@ -73,6 +73,8 @@ const ROLE_BADGE: Record<CounterpartyRole, string> = {
   both: 'bg-violet-100 text-violet-800',
 }
 
+const MONTH_LABELS_EN = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
 type VatMode = 'IT' | 'INT'
 
 function sanitizeVatInput(value: string): string {
@@ -103,6 +105,16 @@ function buildVatForSave(mode: VatMode, value: string): string | null {
   }
 
   return compact
+}
+
+function formatMonthKey(monthKey: string): string {
+  const match = /^(\d{4})-(\d{2})$/.exec(monthKey)
+  if (!match) return monthKey
+
+  const monthIndex = Number(match[2]) - 1
+  if (monthIndex < 0 || monthIndex > 11) return monthKey
+
+  return `${MONTH_LABELS_EN[monthIndex]}-${match[1].slice(2)}`
 }
 
 function CounterpartyCreateModal({
@@ -445,6 +457,15 @@ export default function ContropartiPage() {
     }))
     return buildCounterpartyAnalytics(rows, counterparties)
   }, [linkedInvoices, counterparties])
+
+  const trendChartData = useMemo(
+    () =>
+      analytics.trend.map((item) => ({
+        ...item,
+        monthLabel: formatMonthKey(item.month),
+      })),
+    [analytics.trend],
+  )
 
   const analyticsMonths = useMemo(() => {
     const months = new Set<string>()
@@ -812,7 +833,7 @@ export default function ContropartiPage() {
           </CardContent>
         </Card>
 
-        <div className="space-y-4">
+        <div className="space-y-4 min-w-0">
           {!focused || !draft ? (
             <Card>
               <CardContent className="p-10 text-center text-gray-500">Doppio clic su una controparte per aprire il dettaglio</CardContent>
@@ -930,7 +951,7 @@ export default function ContropartiPage() {
             </Card>
           )}
 
-          <Card>
+          <Card className="min-w-0">
             <CardHeader>
               <CardTitle className="text-base">Analytics controparti</CardTitle>
             </CardHeader>
@@ -984,14 +1005,14 @@ export default function ContropartiPage() {
                 </div>
               </div>
 
-              <div className="h-64 border rounded-lg p-2">
-                {analytics.trend.length === 0 ? (
+              <div className="h-64 border rounded-lg p-2 overflow-hidden">
+                {trendChartData.length === 0 ? (
                   <div className="h-full flex items-center justify-center text-sm text-gray-500">Nessun dato nel periodo</div>
                 ) : (
                   <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={analytics.trend}>
+                    <BarChart data={trendChartData}>
                       <CartesianGrid strokeDasharray="3 3" />
-                      <XAxis dataKey="month" />
+                      <XAxis dataKey="monthLabel" />
                       <YAxis />
                       <Tooltip formatter={(v: any) => fmtEur(Number(v || 0))} />
                       <Legend />
@@ -1011,7 +1032,7 @@ export default function ContropartiPage() {
                       <th className="text-right px-3 py-2">Passive</th>
                       <th className="text-right px-3 py-2">Totale</th>
                       {analyticsMonths.map((month) => (
-                        <th key={month} className="text-right px-3 py-2">{month}</th>
+                        <th key={month} className="text-right px-3 py-2">{formatMonthKey(month)}</th>
                       ))}
                     </tr>
                   </thead>
