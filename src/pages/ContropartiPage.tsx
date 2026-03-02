@@ -565,12 +565,7 @@ export default function ContropartiPage() {
 
   const onRowDoubleClick = (id: string) => {
     setFocusedId(id)
-    setSelectedIds((prev) => {
-      if (prev.has(id)) return prev
-      const next = new Set(prev)
-      next.add(id)
-      return next
-    })
+    setSelectedIds(new Set([id]))
   }
 
   const saveFocused = async () => {
@@ -783,6 +778,16 @@ export default function ContropartiPage() {
               >
                 <CheckCircle className="h-3.5 w-3.5 mr-1.5" />Verifica selezionate
               </Button>
+              {selectedIds.size > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={clearSelection}
+                >
+                  Deseleziona selezionate
+                </Button>
+              )}
               <span className="text-xs text-sky-800 ml-auto">{selectedIds.size} selezionate</span>
             </div>
 
