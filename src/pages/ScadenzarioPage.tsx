@@ -6,20 +6,19 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { CalendarClock, Receipt, ArrowDownLeft, ArrowUpRight, Search, Filter } from 'lucide-react'
+import { toast } from 'sonner'
 import { useCompany } from '@/hooks/useCompany'
 import { supabase } from '@/integrations/supabase/client'
 import { fmtDate, fmtEur } from '@/lib/utils'
 import {
   buildAging,
-  buildScadenzarioKpis,
   listScadenzarioRows,
   rebuildInstallmentsFull,
-  recordInstallmentPayment,
+  settleInstallment,
   touchOverdueInstallments,
   type AgingResult,
   type InstallmentStatus,
   type ScadenzarioFilters,
-  type ScadenzarioKpis,
   type ScadenzarioRow,
 } from '@/lib/scadenzario'
 
@@ -98,12 +97,20 @@ function moneyColor(type: ScadenzarioRow['type']): string {
   return type === 'incasso' ? 'text-emerald-700' : 'text-red-700'
 }
 
+function round2(v: number): number {
+  return Math.round(Number(v || 0) * 100) / 100
+}
+
+function isApproxEqual(a: number, b: number, epsilon = 0.01): boolean {
+  return Math.abs(round2(a) - round2(b)) <= epsilon
+}
+
 export default function ScadenzarioPage() {
   const { company } = useCompany()
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
 
-  const [activeTab, setActiveTab] = useState<'all' | 'incassi' | 'pagamenti'>('all')
+  const [activeTab, setActiveTab] = useState<'all' | 'incassi' | 'pagamenti' | 'iva'>('all')
   const [periodPreset, setPeriodPreset] = useState<ScadenzarioFilters['periodPreset']>('next_30')
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
@@ -117,13 +124,6 @@ export default function ScadenzarioPage() {
   const [error, setError] = useState<string | null>(null)
   const [backfillTried, setBackfillTried] = useState(false)
   const [rows, setRows] = useState<ScadenzarioRow[]>([])
-  const [kpis, setKpis] = useState<ScadenzarioKpis>({
-    da_incassare: 0,
-    da_pagare: 0,
-    scaduto_clienti: 0,
-    scaduto_fornitori: 0,
-    eventi_iva: 0,
-  })
   const [aging, setAging] = useState<AgingResult | null>(null)
   const [showAging, setShowAging] = useState(true)
 
@@ -170,6 +170,7 @@ export default function ScadenzarioPage() {
     if (tab === 'all') setActiveTab('all')
     if (tab === 'incassi') setActiveTab('incassi')
     if (tab === 'pagamenti') setActiveTab('pagamenti')
+    if (tab === 'iva') setActiveTab('iva')
 
     const period = String(searchParams.get('period') || '').toLowerCase()
     if (period === 'next_7') setPeriodPreset('next_7')
@@ -208,7 +209,6 @@ export default function ScadenzarioPage() {
   const loadRows = useCallback(async () => {
     if (!company?.id) {
       setRows([])
-      setKpis({ da_incassare: 0, da_pagare: 0, scaduto_clienti: 0, scaduto_fornitori: 0, eventi_iva: 0 })
       setAging(null)
       return
     }
@@ -243,13 +243,8 @@ export default function ScadenzarioPage() {
         setBackfillTried(true)
       }
 
-      const [scadenzarioRows, nextKpis] = await Promise.all([
-        listScadenzarioRows(company.id, filters),
-        buildScadenzarioKpis(company.id, 30),
-      ])
-
+      const scadenzarioRows = await listScadenzarioRows(company.id, filters)
       setRows(scadenzarioRows)
-      setKpis(nextKpis)
 
       if (activeTab === 'incassi' || activeTab === 'pagamenti') {
         const nextAging = await buildAging(company.id, activeTab, {
@@ -298,11 +293,13 @@ export default function ScadenzarioPage() {
   const today = new Date().toISOString().slice(0, 10)
 
   const openPaymentModal = (row: ScadenzarioRow) => {
+    const netSuggested = round2(Math.max(row.nc_net_amount || Math.max(row.remaining_amount, 0), 0))
+    const isZeroNetCase = row.type === 'pagamento' && !row.is_credit_note && row.nc_available_amount > 0.01 && netSuggested <= 0.01
     setPaymentModal({
       open: true,
       row,
       paymentDate: today,
-      amount: String(row.remaining_amount || row.amount || 0),
+      amount: String(isZeroNetCase ? 0 : (row.remaining_amount || row.amount || 0)),
       saving: false,
       error: null,
     })
@@ -310,20 +307,44 @@ export default function ScadenzarioPage() {
 
   const submitPayment = async () => {
     if (!paymentModal.row || paymentModal.row.kind !== 'installment') return
+    if (!company?.id) return
 
-    const amount = Number(paymentModal.amount)
-    if (!Number.isFinite(amount) || amount <= 0) {
+    const row = paymentModal.row
+    const remaining = round2(Math.max(row.remaining_amount, 0))
+    const netSuggested = round2(Math.max(row.nc_net_amount || remaining, 0))
+    const hasNcHint = row.type === 'pagamento' && !row.is_credit_note && (row.nc_available_amount || 0) > 0
+    const isZeroNetCase = hasNcHint && netSuggested <= 0.01
+
+    const amount = isZeroNetCase ? 0 : Number(paymentModal.amount)
+    if (!Number.isFinite(amount) || amount < 0) {
+      setPaymentModal((prev) => ({ ...prev, error: 'Importo pagamento non valido' }))
+      return
+    }
+    if (!isZeroNetCase && amount <= 0) {
       setPaymentModal((prev) => ({ ...prev, error: 'Importo pagamento non valido' }))
       return
     }
 
+    const mode: 'cash' | 'net' = hasNcHint && (isZeroNetCase || isApproxEqual(amount, netSuggested))
+      ? 'net'
+      : 'cash'
+
     setPaymentModal((prev) => ({ ...prev, saving: true, error: null }))
     try {
-      await recordInstallmentPayment({
-        installmentId: paymentModal.row.id,
+      const result = await settleInstallment({
+        companyId: company.id,
+        installmentId: row.id,
         paymentDate: paymentModal.paymentDate,
-        amount,
+        cashAmount: round2(amount),
+        mode,
       })
+
+      if (result.mode === 'net') {
+        toast.success(`Compensazione NC applicata: usato ${fmtEur(result.credit_used)} · cassa ${fmtEur(result.cash_paid)} · credito residuo ${fmtEur(result.credit_residual)}`)
+      } else {
+        toast.success(`${row.type === 'incasso' ? 'Incasso' : 'Pagamento'} registrato`)
+      }
+
       setPaymentModal({
         open: false,
         row: null,
@@ -387,7 +408,127 @@ export default function ScadenzarioPage() {
     return out
   }, [rows, today, sortBy])
 
+  const summary = useMemo(() => {
+    const horizon = new Date(`${today}T00:00:00`)
+    horizon.setDate(horizon.getDate() + 30)
+    const horizonIso = horizon.toISOString().slice(0, 10)
+
+    let within30Incassi = 0
+    let within30Pagamenti = 0
+    let overdueIncassi = 0
+    let overduePagamenti = 0
+    let totalIncassiOpen = 0
+    let totalPagamentiOpen = 0
+    let ncAvailable = 0
+
+    let ivaDue30 = 0
+    let ivaCredit30 = 0
+    let ivaOverdueDue = 0
+    let ivaNetOpen = 0
+
+    for (const row of rows) {
+      const rem = round2(row.remaining_amount)
+      if (Math.abs(rem) <= 0.01) continue
+
+      const dueDate = row.due_date
+      const isWithin30 = dueDate >= today && dueDate <= horizonIso
+      const isOverdue = dueDate < today
+
+      if (row.type === 'incasso') {
+        totalIncassiOpen = round2(totalIncassiOpen + rem)
+        if (isWithin30) within30Incassi = round2(within30Incassi + rem)
+        if (isOverdue) overdueIncassi = round2(overdueIncassi + rem)
+        continue
+      }
+
+      if (row.type === 'pagamento') {
+        totalPagamentiOpen = round2(totalPagamentiOpen + rem)
+        if (isWithin30) within30Pagamenti = round2(within30Pagamenti + rem)
+        if (isOverdue) overduePagamenti = round2(overduePagamenti + rem)
+        if (row.is_credit_note) ncAvailable = round2(ncAvailable + Math.abs(Math.min(rem, 0)))
+        continue
+      }
+
+      // IVA rows (positive = debito, negative = credito)
+      ivaNetOpen = round2(ivaNetOpen + rem)
+      if (isWithin30) {
+        if (rem > 0) ivaDue30 = round2(ivaDue30 + rem)
+        else ivaCredit30 = round2(ivaCredit30 + Math.abs(rem))
+      }
+      if (isOverdue && rem > 0) ivaOverdueDue = round2(ivaOverdueDue + rem)
+    }
+
+    return {
+      within30Incassi: Math.max(within30Incassi, 0),
+      within30PagamentiNet: Math.max(round2(within30Pagamenti + ivaDue30 - ivaCredit30), 0),
+      overdueIncassi: Math.max(overdueIncassi, 0),
+      overduePagamenti: Math.max(overduePagamenti, 0),
+      totalIncassiOpen: round2(totalIncassiOpen),
+      totalPagamentiOpenNet: Math.max(round2(totalPagamentiOpen + ivaNetOpen), 0),
+      ncAvailable: Math.max(ncAvailable, 0),
+      ivaDue30: Math.max(ivaDue30, 0),
+      ivaCredit30: Math.max(ivaCredit30, 0),
+      ivaOverdueDue: Math.max(ivaOverdueDue, 0),
+      ivaNetOpen: round2(ivaNetOpen),
+    }
+  }, [rows, today])
+
+  const widgetCards = useMemo(() => {
+    if (activeTab === 'incassi') {
+      return [
+        { label: 'Da incassare (30gg)', value: summary.within30Incassi, valueClass: 'text-emerald-800', labelClass: 'text-emerald-700' },
+        { label: 'Scaduto clienti', value: summary.overdueIncassi, valueClass: 'text-amber-800', labelClass: 'text-amber-700' },
+        { label: 'Totale aperto clienti', value: summary.totalIncassiOpen, valueClass: 'text-sky-800', labelClass: 'text-sky-700' },
+        { label: 'NC clienti aperte', value: 0, valueClass: 'text-indigo-800', labelClass: 'text-indigo-700' },
+      ] as const
+    }
+
+    if (activeTab === 'pagamenti') {
+      return [
+        { label: 'Da pagare (30gg)', value: summary.within30PagamentiNet, valueClass: 'text-red-800', labelClass: 'text-red-700' },
+        { label: 'Scaduto fornitori', value: summary.overduePagamenti, valueClass: 'text-orange-800', labelClass: 'text-orange-700' },
+        { label: 'NC disponibili', value: summary.ncAvailable, valueClass: 'text-indigo-800', labelClass: 'text-indigo-700' },
+        { label: 'Netto uscite aperte', value: summary.totalPagamentiOpenNet, valueClass: 'text-rose-800', labelClass: 'text-rose-700' },
+      ] as const
+    }
+
+    if (activeTab === 'iva') {
+      return [
+        { label: 'IVA da versare (30gg)', value: summary.ivaDue30, valueClass: 'text-red-800', labelClass: 'text-red-700' },
+        { label: 'IVA a credito (30gg)', value: summary.ivaCredit30, valueClass: 'text-emerald-800', labelClass: 'text-emerald-700' },
+        { label: 'IVA scaduta', value: summary.ivaOverdueDue, valueClass: 'text-amber-800', labelClass: 'text-amber-700' },
+        { label: 'Saldo IVA aperto', value: summary.ivaNetOpen, valueClass: summary.ivaNetOpen >= 0 ? 'text-orange-800' : 'text-emerald-800', labelClass: 'text-orange-700' },
+      ] as const
+    }
+
+    return [
+      { label: 'Da incassare (30gg)', value: summary.within30Incassi, valueClass: 'text-emerald-800', labelClass: 'text-emerald-700' },
+      { label: 'Da pagare (30gg)', value: summary.within30PagamentiNet, valueClass: 'text-red-800', labelClass: 'text-red-700' },
+      { label: 'Scaduto clienti', value: summary.overdueIncassi, valueClass: 'text-amber-800', labelClass: 'text-amber-700' },
+      { label: 'Scaduto fornitori', value: summary.overduePagamenti, valueClass: 'text-orange-800', labelClass: 'text-orange-700' },
+    ] as const
+  }, [activeTab, summary])
+
   const canShowAging = activeTab === 'incassi' || activeTab === 'pagamenti'
+  const paymentPreview = useMemo(() => {
+    const row = paymentModal.row
+    if (!row) return null
+
+    const remaining = round2(Math.max(row.remaining_amount, 0))
+    const ncAvailable = round2(Math.max(row.nc_available_amount || 0, 0))
+    const canNet = row.kind === 'installment' && row.type === 'pagamento' && !row.is_credit_note && ncAvailable > 0.01
+    const net = canNet ? round2(Math.max(remaining - ncAvailable, 0)) : remaining
+    const residual = canNet ? round2(Math.max(ncAvailable - remaining, 0)) : 0
+
+    return {
+      canNet,
+      remaining,
+      ncAvailable,
+      net,
+      residual,
+      isZeroNetCase: canNet && net <= 0.01,
+    }
+  }, [paymentModal.row])
 
   return (
     <div className="p-6 space-y-6">
@@ -403,33 +544,14 @@ export default function ScadenzarioPage() {
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
-        <Card>
-          <CardContent className="p-4">
-            <p className="text-xs uppercase text-emerald-700">Da incassare (30gg)</p>
-            <p className="text-2xl font-bold text-emerald-800 mt-1">{fmtEur(kpis.da_incassare)}</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <p className="text-xs uppercase text-red-700">Da pagare (30gg)</p>
-            <p className="text-2xl font-bold text-red-800 mt-1">{fmtEur(kpis.da_pagare)}</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <p className="text-xs uppercase text-amber-700">Scaduto clienti</p>
-            <p className="text-2xl font-bold text-amber-800 mt-1">{fmtEur(kpis.scaduto_clienti)}</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4">
-            <p className="text-xs uppercase text-orange-700">Scaduto fornitori</p>
-            <p className="text-2xl font-bold text-orange-800 mt-1">{fmtEur(kpis.scaduto_fornitori)}</p>
-          </CardContent>
-        </Card>
+        {widgetCards.map((card) => (
+          <Card key={card.label}>
+            <CardContent className="p-4">
+              <p className={`text-xs uppercase ${card.labelClass}`}>{card.label}</p>
+              <p className={`text-2xl font-bold mt-1 ${card.valueClass}`}>{fmtEur(card.value)}</p>
+            </CardContent>
+          </Card>
+        ))}
       </div>
 
       <Card>
@@ -439,11 +561,12 @@ export default function ScadenzarioPage() {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as 'all' | 'incassi' | 'pagamenti')}>
+          <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as 'all' | 'incassi' | 'pagamenti' | 'iva')}>
             <TabsList>
               <TabsTrigger value="all">Tutte</TabsTrigger>
               <TabsTrigger value="incassi">Incassi</TabsTrigger>
               <TabsTrigger value="pagamenti">Pagamenti</TabsTrigger>
+              <TabsTrigger value="iva">IVA</TabsTrigger>
             </TabsList>
             <TabsContent value={activeTab} className="mt-4 space-y-4">
               <div className="border rounded-lg p-3 bg-gray-50/50 space-y-3">
@@ -581,10 +704,17 @@ export default function ScadenzarioPage() {
                                 </div>
                               </td>
                               <td className="px-3 py-2">
-                                <span className={`inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full font-medium ${rowTypeBadge(row.type)}`}>
-                                  {rowTypeIcon(row.type)}
-                                  {rowTypeLabel(row.type)}
-                                </span>
+                                <div className="flex items-center gap-1.5">
+                                  <span className={`inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full font-medium ${rowTypeBadge(row.type)}`}>
+                                    {rowTypeIcon(row.type)}
+                                    {rowTypeLabel(row.type)}
+                                  </span>
+                                  {row.is_credit_note && (
+                                    <span className="inline-flex items-center text-[10px] px-1.5 py-0.5 rounded-full font-medium bg-indigo-100 text-indigo-700">
+                                      NC
+                                    </span>
+                                  )}
+                                </div>
                               </td>
                               <td className="px-3 py-2">
                                 {row.counterparty_link ? (
@@ -615,7 +745,14 @@ export default function ScadenzarioPage() {
                                 </button>
                               </td>
                               <td className="px-3 py-2 text-gray-600">{row.installment_label || ''}</td>
-                              <td className={`px-3 py-2 text-right font-semibold ${moneyColor(row.type)}`}>{fmtEur(row.amount)}</td>
+                              <td className={`px-3 py-2 text-right font-semibold ${moneyColor(row.type)}`}>
+                                <div>{fmtEur(row.amount)}</div>
+                                {row.kind === 'installment' && row.type === 'pagamento' && !row.is_credit_note && row.nc_available_amount > 0.01 && (
+                                  <div className="mt-1 text-[11px] font-normal text-indigo-700">
+                                    NC disponibili {fmtEur(row.nc_available_amount)} · Netto {fmtEur(row.nc_net_amount)}
+                                  </div>
+                                )}
+                              </td>
                               <td className="px-3 py-2">
                                 <span className={`text-[11px] px-2 py-1 rounded-full font-medium ${rowStatusBadge(row.status)}`}>
                                   {row.status_label}
@@ -626,7 +763,7 @@ export default function ScadenzarioPage() {
                               </td>
                               <td className="px-3 py-2">
                                 <div className="flex justify-end gap-2">
-                                  {row.kind === 'installment' && row.status !== 'paid' && (
+                                  {row.kind === 'installment' && row.status !== 'paid' && !row.is_credit_note && (
                                     <Button
                                       size="sm"
                                       variant="outline"
@@ -638,7 +775,7 @@ export default function ScadenzarioPage() {
                                       {row.type === 'incasso' ? 'Segna incassato' : 'Segna pagato'}
                                     </Button>
                                   )}
-                                  {row.kind === 'installment' && row.type === 'incasso' && row.status === 'overdue' && (
+                                  {row.kind === 'installment' && row.type === 'incasso' && row.status === 'overdue' && !row.is_credit_note && (
                                     <Button
                                       size="sm"
                                       variant="outline"
@@ -752,6 +889,14 @@ export default function ScadenzarioPage() {
             <h3 className="text-base font-semibold mb-3">{paymentModal.row.type === 'incasso' ? 'Registra incasso' : 'Registra pagamento'}</h3>
             <p className="text-sm text-gray-600 mb-4">{paymentModal.row.reference} - residuo {fmtEur(paymentModal.row.remaining_amount)}</p>
             <div className="space-y-3">
+              {paymentPreview?.canNet && (
+                <div className="text-xs rounded-md border border-indigo-200 bg-indigo-50 px-2.5 py-2 text-indigo-800">
+                  NC disponibile {fmtEur(paymentPreview.ncAvailable)} · Netto da saldare {fmtEur(paymentPreview.net)}
+                  {paymentPreview.residual > 0.01 && (
+                    <span> · Credito residuo dopo compensazione {fmtEur(paymentPreview.residual)}</span>
+                  )}
+                </div>
+              )}
               <div>
                 <Label className="text-xs">Data</Label>
                 <Input
@@ -761,23 +906,25 @@ export default function ScadenzarioPage() {
                   className="mt-1"
                 />
               </div>
-              <div>
-                <Label className="text-xs">Importo</Label>
-                <Input
-                  type="number"
-                  step="0.01"
-                  min={0}
-                  value={paymentModal.amount}
-                  onChange={(e) => setPaymentModal((prev) => ({ ...prev, amount: e.target.value }))}
-                  className="mt-1"
-                />
-              </div>
+              {!paymentPreview?.isZeroNetCase && (
+                <div>
+                  <Label className="text-xs">Importo</Label>
+                  <Input
+                    type="number"
+                    step="0.01"
+                    min={0}
+                    value={paymentModal.amount}
+                    onChange={(e) => setPaymentModal((prev) => ({ ...prev, amount: e.target.value }))}
+                    className="mt-1"
+                  />
+                </div>
+              )}
               {paymentModal.error && <p className="text-xs text-red-600">{paymentModal.error}</p>}
             </div>
             <div className="mt-5 flex justify-end gap-2">
               <Button variant="outline" onClick={() => setPaymentModal((prev) => ({ ...prev, open: false }))}>Annulla</Button>
               <Button onClick={submitPayment} disabled={paymentModal.saving}>
-                {paymentModal.saving ? 'Salvataggio...' : 'Conferma'}
+                {paymentModal.saving ? 'Salvataggio...' : paymentPreview?.isZeroNetCase ? 'Compensa con NC' : 'Conferma'}
               </Button>
             </div>
           </div>

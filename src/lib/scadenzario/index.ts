@@ -16,6 +16,7 @@ export interface InvoiceInstallment {
   company_id: string
   invoice_id: string
   counterparty_id: string | null
+  is_credit_note: boolean
   direction: InstallmentDirection
   installment_no: number
   installment_total: number
@@ -44,8 +45,27 @@ export interface RecordInstallmentPaymentInput {
   amount: number
 }
 
+export interface SettleInstallmentInput {
+  companyId: string
+  installmentId: string
+  paymentDate: string
+  cashAmount: number
+  mode: 'cash' | 'net'
+}
+
+export interface SettleInstallmentResult {
+  mode: 'cash' | 'net'
+  debit_open: number
+  credit_available: number
+  credit_used: number
+  cash_paid: number
+  credit_residual: number
+  affected_installments: number
+  affected_invoices: number
+}
+
 export interface ScadenzarioFilters {
-  mode?: 'all' | 'incassi' | 'pagamenti'
+  mode?: 'all' | 'incassi' | 'pagamenti' | 'iva'
   periodPreset?: 'next_7' | 'next_30' | 'next_90' | 'this_month' | 'next_month' | 'custom' | 'all'
   dateFrom?: string | null
   dateTo?: string | null
@@ -59,6 +79,9 @@ export interface ScadenzarioFilters {
 export interface ScadenzarioRow {
   id: string
   kind: 'installment' | 'vat'
+  invoice_id: string | null
+  invoice_doc_type: string | null
+  is_credit_note: boolean
   due_date: string
   type: 'incasso' | 'pagamento' | 'iva'
   direction: InstallmentDirection | null
@@ -74,6 +97,9 @@ export interface ScadenzarioRow {
   status_label: string
   is_estimated: boolean
   estimate_source: InstallmentEstimateSource | null
+  nc_available_amount: number
+  nc_net_amount: number
+  nc_residual_after_compensation_preview: number
   days: number
   notes: string | null
 }
@@ -107,9 +133,24 @@ export interface InstallmentConsistencyAnomaly {
   invoice_id: string
   invoice_number: string
   invoice_date: string
+  doc_type: string
   total_amount: number
   installments_total: number
   delta: number
+}
+
+export interface ScadenzarioAuditTotals {
+  invoices_count: number
+  invoices_covered: number
+  missing_count: number
+  orphan_count: number
+  duplicate_count: number
+  fatture_incassi_netto: number
+  fatture_uscite_netto: number
+  scadenzario_incassi_netto: number
+  scadenzario_uscite_netto: number
+  delta_incassi: number
+  delta_uscite: number
 }
 
 interface InvoiceForInstallments {
@@ -136,6 +177,7 @@ interface CounterpartyFallbackRow {
 
 interface BuildInstallmentRow {
   invoice_id: string
+  is_credit_note: boolean
   counterparty_id: string | null
   direction: InstallmentDirection
   installment_no: number
@@ -172,6 +214,7 @@ interface ListInstallmentJoinRow {
   id: string
   invoice_id: string
   counterparty_id: string | null
+  is_credit_note: boolean
   direction: InstallmentDirection
   installment_no: number
   installment_total: number
@@ -202,6 +245,13 @@ interface ListInstallmentJoinRow {
     id: string
     name: string
   }> | null
+}
+
+interface NcAvailableRow {
+  counterparty_id: string | null
+  amount_due: number
+  paid_amount: number
+  is_credit_note?: boolean | null
 }
 
 function toIsoDate(d: Date): string {
@@ -235,6 +285,32 @@ function ensurePositiveAmount(v: unknown): number {
   return round2(Math.max(0, Math.abs(ensureAmount(v))))
 }
 
+function isCreditNoteDocType(docType: unknown): boolean {
+  const doc = String(docType || '').toUpperCase()
+  return doc === 'TD04' || doc === 'TD08'
+}
+
+function computeOpenAbs(amountDue: number, paidAmount: number): number {
+  return round2(Math.max(0, Math.abs(Number(amountDue || 0)) - Number(paidAmount || 0)))
+}
+
+function computeOpenSigned(amountDue: number, paidAmount: number): number {
+  const openAbs = computeOpenAbs(amountDue, paidAmount)
+  return Number(amountDue || 0) < 0 ? -openAbs : openAbs
+}
+
+function computeStatusFromAmounts(amountDue: number, paidAmount: number, dueDate: string, today: string): InstallmentStatus {
+  const openAbs = computeOpenAbs(amountDue, paidAmount)
+  if (openAbs <= 0.01) return 'paid'
+  if (Number(paidAmount || 0) > 0) return 'partial'
+  return dueDate < today ? 'overdue' : 'pending'
+}
+
+function signedInvoiceTotal(docType: unknown, totalAmount: unknown): number {
+  const totalAbs = ensurePositiveAmount(totalAmount)
+  return isCreditNoteDocType(docType) ? -totalAbs : totalAbs
+}
+
 function ensureIsoDate(v: unknown): string | null {
   const s = String(v || '').trim()
   if (!s) return null
@@ -266,6 +342,9 @@ function mapVatStatusToInstallment(status: string): InstallmentStatus | null {
   if (status === 'paid') return 'paid'
   if (status === 'overdue') return 'overdue'
   if (status === 'to_pay') return 'pending'
+  if (status === 'credit') return 'pending'
+  if (status === 'under_threshold') return 'pending'
+  if (status === 'draft') return 'pending'
   return null
 }
 
@@ -287,7 +366,7 @@ function deriveInvoicePaymentStatus(rows: BuildInstallmentRow[], today: string):
 
   const withRemaining = rows.map((row) => ({
     ...row,
-    remaining: round2(Math.max(0, row.amount_due - row.paid_amount)),
+    remaining: computeOpenAbs(row.amount_due, row.paid_amount),
   }))
 
   if (withRemaining.every((row) => row.remaining <= 0.01)) return 'paid'
@@ -457,6 +536,7 @@ function buildInstallmentsForInvoice(
 ): InstallmentBuildOutput {
   const today = todayIso()
   const fallback = computeFallbackDays(invoice.direction, context, invoice.counterparty_id)
+  const isCreditNote = isCreditNoteDocType(invoice.doc_type)
 
   const parsedPayments = extractParsedPayments(parsedInvoice)
   const targetTotal = ensurePositiveAmount(invoice.total_amount)
@@ -501,28 +581,24 @@ function buildInstallmentsForInvoice(
 
   const rows: BuildInstallmentRow[] = draftRows.map((draft, idx) => {
     const installmentNo = idx + 1
-    const amountDue = normalizedAmounts[idx] || 0
+    const amountDueAbs = normalizedAmounts[idx] || 0
+    const amountDue = isCreditNote ? -amountDueAbs : amountDueAbs
 
     const prev = existingByNo.get(installmentNo)
-    const preservedPaid = prev ? round2(Math.max(0, Math.min(amountDue, Number(prev.paid_amount || 0)))) : 0
+    const preservedPaid = prev ? round2(Math.max(0, Math.min(amountDueAbs, Number(prev.paid_amount || 0)))) : 0
     const preservedDate = prev?.last_payment_date || null
 
-    let paidAmount = invoice.payment_status === 'paid' ? amountDue : preservedPaid
+    let paidAmount = invoice.payment_status === 'paid' ? amountDueAbs : preservedPaid
     let lastPaymentDate = invoice.payment_status === 'paid' ? (invoice.paid_date || today) : preservedDate
 
-    let status: InstallmentStatus
-    if (paidAmount >= amountDue - 0.01) {
-      status = 'paid'
-    } else if (paidAmount > 0) {
+    let status = computeStatusFromAmounts(amountDue, paidAmount, draft.due_date, today)
+    if (!prev && invoice.payment_status === 'partial' && status === 'pending') {
       status = 'partial'
-    } else if (!prev && invoice.payment_status === 'partial') {
-      status = 'partial'
-    } else {
-      status = draft.due_date < today ? 'overdue' : 'pending'
     }
 
     return {
       invoice_id: invoice.id,
+      is_credit_note: isCreditNote,
       counterparty_id: invoice.counterparty_id,
       direction: invoice.direction,
       installment_no: installmentNo,
@@ -554,7 +630,7 @@ async function updateInvoicePaymentSnapshot(
   const status = deriveInvoicePaymentStatus(rows, today)
 
   const openRows = rows
-    .filter((row) => round2(Math.max(0, row.amount_due - row.paid_amount)) > 0.01)
+    .filter((row) => computeOpenAbs(row.amount_due, row.paid_amount) > 0.01)
     .sort((a, b) => a.due_date.localeCompare(b.due_date))
 
   const paymentDueDate = openRows[0]?.due_date || rows.slice().sort((a, b) => a.due_date.localeCompare(b.due_date))[rows.length - 1]?.due_date || null
@@ -682,6 +758,7 @@ export async function syncInstallmentsForInvoicesBatch(
       rowsToInsert.push({
         company_id: companyId,
         invoice_id: row.invoice_id,
+        is_credit_note: row.is_credit_note,
         counterparty_id: row.counterparty_id,
         direction: row.direction,
         installment_no: row.installment_no,
@@ -794,7 +871,7 @@ export async function touchOverdueInstallments(companyId: string): Promise<numbe
 export async function listInstallmentsForInvoice(companyId: string, invoiceId: string): Promise<InvoiceInstallment[]> {
   const { data, error } = await supabase
     .from('invoice_installments')
-    .select('id, company_id, invoice_id, counterparty_id, direction, installment_no, installment_total, due_date, amount_due, paid_amount, last_payment_date, status, is_estimated, estimate_source, estimate_days, notes, created_at, updated_at')
+    .select('id, company_id, invoice_id, counterparty_id, is_credit_note, direction, installment_no, installment_total, due_date, amount_due, paid_amount, last_payment_date, status, is_estimated, estimate_source, estimate_days, notes, created_at, updated_at')
     .eq('company_id', companyId)
     .eq('invoice_id', invoiceId)
     .order('installment_no', { ascending: true })
@@ -803,92 +880,88 @@ export async function listInstallmentsForInvoice(companyId: string, invoiceId: s
   return (data || []) as InvoiceInstallment[]
 }
 
-export async function recordInstallmentPayment(input: RecordInstallmentPaymentInput): Promise<InvoiceInstallment> {
-  const amount = round2(Math.max(0, Number(input.amount || 0)))
-  if (!amount) throw new Error('Importo pagamento non valido')
-
+export async function settleInstallment(input: SettleInstallmentInput): Promise<SettleInstallmentResult> {
   const paymentDate = ensureIsoDate(input.paymentDate)
   if (!paymentDate) throw new Error('Data pagamento non valida')
 
+  const cashAmount = round2(Math.max(0, Number(input.cashAmount || 0)))
+  const mode = input.mode === 'net' ? 'net' : 'cash'
+
+  const { data, error } = await supabase.rpc('scadenzario_settle_installment', {
+    p_company_id: input.companyId,
+    p_installment_id: input.installmentId,
+    p_payment_date: paymentDate,
+    p_cash_amount: cashAmount,
+    p_mode: mode,
+  })
+
+  if (error) throw new Error(error.message)
+  const row = Array.isArray(data) ? data[0] : data
+  if (!row) throw new Error('Risposta vuota da scadenzario_settle_installment')
+
+  return {
+    mode: String(row.mode || mode) as 'cash' | 'net',
+    debit_open: ensureAmount(row.debit_open),
+    credit_available: ensureAmount(row.credit_available),
+    credit_used: ensureAmount(row.credit_used),
+    cash_paid: ensureAmount(row.cash_paid),
+    credit_residual: ensureAmount(row.credit_residual),
+    affected_installments: Number(row.affected_installments || 0),
+    affected_invoices: Number(row.affected_invoices || 0),
+  }
+}
+
+export async function recordInstallmentPayment(input: RecordInstallmentPaymentInput): Promise<InvoiceInstallment> {
   const { data: installment, error: loadErr } = await supabase
     .from('invoice_installments')
-    .select('id, company_id, invoice_id, counterparty_id, direction, installment_no, installment_total, due_date, amount_due, paid_amount, last_payment_date, status, is_estimated, estimate_source, estimate_days, notes, created_at, updated_at')
+    .select('id, company_id, invoice_id, counterparty_id, is_credit_note, direction, installment_no, installment_total, due_date, amount_due, paid_amount, last_payment_date, status, is_estimated, estimate_source, estimate_days, notes, created_at, updated_at')
     .eq('id', input.installmentId)
     .single()
 
   if (loadErr) throw new Error(loadErr.message)
 
   const current = installment as InvoiceInstallment
-  const nextPaidAmount = round2(Math.min(Number(current.amount_due || 0), Number(current.paid_amount || 0) + amount))
-  const remaining = round2(Math.max(0, Number(current.amount_due || 0) - nextPaidAmount))
+  const amount = round2(Math.max(0, Number(input.amount || 0)))
+  if (!amount) throw new Error('Importo pagamento non valido')
 
-  const today = todayIso()
-  const nextStatus: InstallmentStatus = remaining <= 0.01
-    ? 'paid'
-    : nextPaidAmount > 0
-      ? 'partial'
-      : current.due_date < today
-        ? 'overdue'
-        : 'pending'
+  await settleInstallment({
+    companyId: current.company_id,
+    installmentId: current.id,
+    paymentDate: input.paymentDate,
+    cashAmount: amount,
+    mode: 'cash',
+  })
 
-  const { data: updated, error: updateErr } = await supabase
+  const { data: updated, error: updatedErr } = await supabase
     .from('invoice_installments')
-    .update({
-      paid_amount: nextPaidAmount,
-      last_payment_date: paymentDate,
-      status: nextStatus,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', input.installmentId)
-    .select('id, company_id, invoice_id, counterparty_id, direction, installment_no, installment_total, due_date, amount_due, paid_amount, last_payment_date, status, is_estimated, estimate_source, estimate_days, notes, created_at, updated_at')
+    .select('id, company_id, invoice_id, counterparty_id, is_credit_note, direction, installment_no, installment_total, due_date, amount_due, paid_amount, last_payment_date, status, is_estimated, estimate_source, estimate_days, notes, created_at, updated_at')
+    .eq('id', current.id)
     .single()
 
-  if (updateErr) throw new Error(updateErr.message)
-
-  const { data: invoiceInstallments, error: invoiceInstallmentsErr } = await supabase
-    .from('invoice_installments')
-    .select('invoice_id, installment_no, installment_total, due_date, amount_due, paid_amount, last_payment_date, status, direction, counterparty_id, is_estimated, estimate_source, estimate_days, notes')
-    .eq('company_id', current.company_id)
-    .eq('invoice_id', current.invoice_id)
-    .order('installment_no', { ascending: true })
-
-  if (invoiceInstallmentsErr) throw new Error(invoiceInstallmentsErr.message)
-
-  const rebuiltRows: BuildInstallmentRow[] = (invoiceInstallments || []).map((row: any) => ({
-    invoice_id: String(row.invoice_id),
-    counterparty_id: row.counterparty_id ? String(row.counterparty_id) : null,
-    direction: String(row.direction) as InstallmentDirection,
-    installment_no: Number(row.installment_no),
-    installment_total: Number(row.installment_total),
-    due_date: String(row.due_date),
-    amount_due: ensureAmount(row.amount_due),
-    paid_amount: ensureAmount(row.paid_amount),
-    last_payment_date: row.last_payment_date ? String(row.last_payment_date) : null,
-    status: String(row.status) as InstallmentStatus,
-    is_estimated: Boolean(row.is_estimated),
-    estimate_source: (row.estimate_source || null) as InstallmentEstimateSource | null,
-    estimate_days: row.estimate_days == null ? null : Number(row.estimate_days),
-    notes: row.notes ? String(row.notes) : null,
-  }))
-
-  await updateInvoicePaymentSnapshot(current.company_id, current.invoice_id, rebuiltRows)
-
+  if (updatedErr) throw new Error(updatedErr.message)
   return updated as InvoiceInstallment
 }
 
 function toScadenzarioInstallmentRow(item: ListInstallmentJoinRow): ScadenzarioRow {
   const invoice = firstRelation(item.invoice)
   const counterparty = firstRelation(item.counterparty)
-  const remaining = round2(Math.max(0, Number(item.amount_due || 0) - Number(item.paid_amount || 0)))
+  const amountDue = ensureAmount(item.amount_due)
+  const paidAmount = ensureAmount(item.paid_amount)
+  const remainingSigned = computeOpenSigned(amountDue, paidAmount)
   const reference = `Fatt. ${invoice?.number || 'senza numero'}`
   const dueDate = String(item.due_date)
   const today = todayIso()
   const days = daysBetween(dueDate, today)
   const type = item.direction === 'out' ? 'incasso' : 'pagamento'
+  const status = computeStatusFromAmounts(amountDue, paidAmount, dueDate, today)
+  const isCreditNote = Boolean(item.is_credit_note || isCreditNoteDocType(invoice?.doc_type))
 
   return {
     id: String(item.id),
     kind: 'installment',
+    invoice_id: String(item.invoice_id),
+    invoice_doc_type: invoice?.doc_type ? String(invoice.doc_type) : null,
+    is_credit_note: isCreditNote,
     due_date: dueDate,
     type,
     direction: item.direction,
@@ -898,12 +971,15 @@ function toScadenzarioInstallmentRow(item: ListInstallmentJoinRow): ScadenzarioR
     reference,
     reference_link: `/fatture?invoiceId=${item.invoice_id}`,
     installment_label: item.installment_total > 1 ? `${item.installment_no} di ${item.installment_total}` : null,
-    amount: round2(Number(item.amount_due || 0)),
-    remaining_amount: remaining,
-    status: item.status,
-    status_label: installmentStatusLabel(item.status, type),
+    amount: amountDue,
+    remaining_amount: remainingSigned,
+    status,
+    status_label: installmentStatusLabel(status, type),
     is_estimated: Boolean(item.is_estimated),
     estimate_source: item.estimate_source || null,
+    nc_available_amount: 0,
+    nc_net_amount: Math.max(0, remainingSigned),
+    nc_residual_after_compensation_preview: 0,
     days,
     notes: item.notes || null,
   }
@@ -917,6 +993,7 @@ function toScadenzarioVatRow(row: {
   period_index: number
   due_date: string
   amount_due: number
+  amount_credit_carry: number | null
   status: string
   paid_amount: number | null
 }): ScadenzarioRow | null {
@@ -940,7 +1017,7 @@ function toScadenzarioVatRow(row: {
     quarterly_interest: 0,
     acconto_amount: null,
     amount_due: ensureAmount(row.amount_due),
-    amount_credit_carry: 0,
+    amount_credit_carry: ensureAmount(row.amount_credit_carry),
     status: String(row.status) as any,
     snapshot_json: null,
     paid_amount: row.paid_amount == null ? null : ensureAmount(row.paid_amount),
@@ -955,13 +1032,33 @@ function toScadenzarioVatRow(row: {
   const dueDate = String(row.due_date)
   const today = todayIso()
   const days = daysBetween(dueDate, today)
-  const amount = mappedStatus === 'paid'
-    ? ensureAmount(row.paid_amount ?? row.amount_due)
-    : ensureAmount(row.amount_due)
+  const dueAmount = ensureAmount(row.amount_due)
+  const creditCarry = ensureAmount(row.amount_credit_carry)
+
+  let amountSigned = 0
+  if (dueAmount > 0) {
+    amountSigned = mappedStatus === 'paid'
+      ? ensureAmount(row.paid_amount ?? row.amount_due)
+      : dueAmount
+  } else if (creditCarry > 0) {
+    amountSigned = -creditCarry
+  }
+  amountSigned = round2(amountSigned)
+
+  const remainingSigned = mappedStatus === 'paid'
+    ? 0
+    : amountSigned
+
+  const statusLabel = row.status === 'credit'
+    ? 'A credito'
+    : installmentStatusLabel(mappedStatus, 'iva')
 
   return {
     id: String(row.id),
     kind: 'vat',
+    invoice_id: null,
+    invoice_doc_type: null,
+    is_credit_note: false,
     due_date: dueDate,
     type: 'iva',
     direction: 'in',
@@ -971,12 +1068,15 @@ function toScadenzarioVatRow(row: {
     reference: `Liquidazione ${formatVatPeriodLabel(vatPeriod)}`,
     reference_link: `/iva?periodId=${row.id}`,
     installment_label: null,
-    amount,
-    remaining_amount: mappedStatus === 'paid' ? 0 : amount,
+    amount: amountSigned,
+    remaining_amount: remainingSigned,
     status: mappedStatus,
-    status_label: installmentStatusLabel(mappedStatus, 'iva'),
+    status_label: statusLabel,
     is_estimated: false,
     estimate_source: null,
+    nc_available_amount: 0,
+    nc_net_amount: Math.max(0, remainingSigned),
+    nc_residual_after_compensation_preview: 0,
     days,
     notes: null,
   }
@@ -994,6 +1094,7 @@ function applyRowsFilters(rows: ScadenzarioRow[], filters: ScadenzarioFilters): 
 
     if (filters.mode === 'incassi' && row.type !== 'incasso') return false
     if (filters.mode === 'pagamenti' && !(row.type === 'pagamento' || row.type === 'iva')) return false
+    if (filters.mode === 'iva' && row.type !== 'iva') return false
 
     if (filters.counterpartyId && row.counterparty_id !== filters.counterpartyId) return false
     if (statuses.size > 0 && !statuses.has(row.status)) return false
@@ -1035,28 +1136,33 @@ function applyRowsFilters(rows: ScadenzarioRow[], filters: ScadenzarioFilters): 
 
 export async function listScadenzarioRows(companyId: string, filters: ScadenzarioFilters = {}): Promise<ScadenzarioRow[]> {
   const mode = filters.mode || 'all'
+  const rows: ScadenzarioRow[] = []
 
-  let installmentQuery = supabase
-    .from('invoice_installments')
-    .select('id, invoice_id, counterparty_id, direction, installment_no, installment_total, due_date, amount_due, paid_amount, last_payment_date, status, is_estimated, estimate_source, estimate_days, notes, invoice:invoices(id, number, doc_type, date), counterparty:counterparties(id, name)')
-    .eq('company_id', companyId)
+  if (mode !== 'iva') {
+    let installmentQuery = supabase
+      .from('invoice_installments')
+      .select('id, invoice_id, counterparty_id, is_credit_note, direction, installment_no, installment_total, due_date, amount_due, paid_amount, last_payment_date, status, is_estimated, estimate_source, estimate_days, notes, invoice:invoices(id, number, doc_type, date), counterparty:counterparties(id, name)')
+      .eq('company_id', companyId)
 
-  if (mode === 'incassi') installmentQuery = installmentQuery.eq('direction', 'out')
-  if (mode === 'pagamenti') installmentQuery = installmentQuery.eq('direction', 'in')
+    if (mode === 'incassi') installmentQuery = installmentQuery.eq('direction', 'out')
+    if (mode === 'pagamenti') installmentQuery = installmentQuery.eq('direction', 'in')
 
-  const { data: installmentRows, error: installmentsErr } = await installmentQuery
-  if (installmentsErr) throw new Error(installmentsErr.message)
+    const { data: installmentRows, error: installmentsErr } = await installmentQuery
+    if (installmentsErr) throw new Error(installmentsErr.message)
 
-  const rows: ScadenzarioRow[] = ((installmentRows || []) as unknown as ListInstallmentJoinRow[])
-    .map(toScadenzarioInstallmentRow)
+    rows.push(
+      ...((installmentRows || []) as unknown as ListInstallmentJoinRow[])
+        .map(toScadenzarioInstallmentRow),
+    )
+  }
 
-  if (mode === 'all' || mode === 'pagamenti') {
+  if (mode === 'all' || mode === 'pagamenti' || mode === 'iva') {
     const { data: vatRows, error: vatErr } = await supabase
       .from('vat_periods')
-      .select('id, regime, period_type, year, period_index, due_date, amount_due, status, paid_amount')
+      .select('id, regime, period_type, year, period_index, due_date, amount_due, amount_credit_carry, status, paid_amount')
       .eq('company_id', companyId)
-      .gt('amount_due', 0)
-      .in('status', ['to_pay', 'overdue', 'paid'])
+      .or('amount_due.gt.0,amount_credit_carry.gt.0')
+      .in('status', ['to_pay', 'overdue', 'paid', 'credit', 'under_threshold', 'draft'])
 
     if (vatErr) throw new Error(vatErr.message)
 
@@ -1068,11 +1174,51 @@ export async function listScadenzarioRows(companyId: string, filters: Scadenzari
       period_index: number
       due_date: string
       amount_due: number
+      amount_credit_carry: number | null
       status: string
       paid_amount: number | null
     }>) {
       const mapped = toScadenzarioVatRow(row)
       if (mapped) rows.push(mapped)
+    }
+  }
+
+  if (mode === 'all' || mode === 'pagamenti') {
+    const { data: ncRows, error: ncErr } = await supabase
+      .from('invoice_installments')
+      .select('counterparty_id, amount_due, paid_amount, is_credit_note')
+      .eq('company_id', companyId)
+      .eq('direction', 'in')
+      .in('status', ['pending', 'overdue', 'partial'])
+
+    if (ncErr) throw new Error(ncErr.message)
+
+    const ncByCounterparty = new Map<string, number>()
+    for (const row of (ncRows || []) as NcAvailableRow[]) {
+      const isNc = Boolean(row.is_credit_note) || Number(row.amount_due || 0) < 0
+      if (!isNc) continue
+      const key = row.counterparty_id ? String(row.counterparty_id) : ''
+      if (!key) continue
+      const openAbs = computeOpenAbs(row.amount_due, row.paid_amount)
+      if (openAbs <= 0.01) continue
+      ncByCounterparty.set(key, round2((ncByCounterparty.get(key) || 0) + openAbs))
+    }
+
+    for (const row of rows) {
+      if (
+        row.kind !== 'installment'
+        || row.type !== 'pagamento'
+        || row.is_credit_note
+        || row.status === 'paid'
+        || !row.counterparty_id
+      ) {
+        continue
+      }
+      const ncAvailable = round2(ncByCounterparty.get(row.counterparty_id) || 0)
+      const debitOpen = round2(Math.max(row.remaining_amount, 0))
+      row.nc_available_amount = ncAvailable
+      row.nc_net_amount = round2(Math.max(debitOpen - ncAvailable, 0))
+      row.nc_residual_after_compensation_preview = round2(Math.max(ncAvailable - debitOpen, 0))
     }
   }
 
@@ -1093,10 +1239,10 @@ export async function buildScadenzarioKpis(companyId: string, horizonDays = 30):
 
   const { data: vatRows, error: vatErr } = await supabase
     .from('vat_periods')
-    .select('due_date, amount_due, status')
+    .select('due_date, amount_due, amount_credit_carry, status')
     .eq('company_id', companyId)
-    .gt('amount_due', 0)
-    .in('status', ['to_pay', 'overdue'])
+    .or('amount_due.gt.0,amount_credit_carry.gt.0')
+    .in('status', ['to_pay', 'overdue', 'credit', 'under_threshold'])
 
   if (vatErr) throw new Error(vatErr.message)
 
@@ -1113,33 +1259,35 @@ export async function buildScadenzarioKpis(companyId: string, horizonDays = 30):
     status: InstallmentStatus
   }>) {
     const dueDate = String(row.due_date)
-    const remaining = round2(Math.max(0, Number(row.amount_due || 0) - Number(row.paid_amount || 0)))
-    if (remaining <= 0.01) continue
+    const remainingSigned = computeOpenSigned(row.amount_due, row.paid_amount)
+    if (Math.abs(remainingSigned) <= 0.01) continue
 
     if (row.direction === 'out') {
-      if (dueDate < today) scadutoClienti = round2(scadutoClienti + remaining)
-      if (dueDate >= today && dueDate <= toDate) daIncassare = round2(daIncassare + remaining)
+      if (dueDate < today) scadutoClienti = round2(scadutoClienti + remainingSigned)
+      if (dueDate >= today && dueDate <= toDate) daIncassare = round2(daIncassare + remainingSigned)
     } else {
-      if (dueDate < today) scadutoFornitori = round2(scadutoFornitori + remaining)
-      if (dueDate >= today && dueDate <= toDate) daPagare = round2(daPagare + remaining)
+      if (dueDate < today) scadutoFornitori = round2(scadutoFornitori + remainingSigned)
+      if (dueDate >= today && dueDate <= toDate) daPagare = round2(daPagare + remainingSigned)
     }
   }
 
   let ivaEvents = 0
-  for (const row of (vatRows || []) as Array<{ due_date: string; amount_due: number; status: string }>) {
+  for (const row of (vatRows || []) as Array<{ due_date: string; amount_due: number; amount_credit_carry: number | null; status: string }>) {
     const dueDate = String(row.due_date)
-    const amount = ensureAmount(row.amount_due)
-    if (amount <= 0) continue
+    const dueAmount = ensureAmount(row.amount_due)
+    const creditAmount = ensureAmount(row.amount_credit_carry)
+    const signedAmount = dueAmount > 0 ? dueAmount : creditAmount > 0 ? -creditAmount : 0
+    if (Math.abs(signedAmount) <= 0.01) continue
 
-    if (dueDate >= today && dueDate <= toDate) daPagare = round2(daPagare + amount)
+    if (dueDate >= today && dueDate <= toDate) daPagare = round2(daPagare + signedAmount)
     ivaEvents += 1
   }
 
   return {
-    da_incassare: daIncassare,
-    da_pagare: daPagare,
-    scaduto_clienti: scadutoClienti,
-    scaduto_fornitori: scadutoFornitori,
+    da_incassare: round2(Math.max(daIncassare, 0)),
+    da_pagare: round2(Math.max(daPagare, 0)),
+    scaduto_clienti: round2(Math.max(scadutoClienti, 0)),
+    scaduto_fornitori: round2(Math.max(scadutoFornitori, 0)),
     eventi_iva: ivaEvents,
   }
 }
@@ -1178,8 +1326,8 @@ export async function buildAging(
     paid_amount: number
     counterparty?: { id: string; name: string } | Array<{ id: string; name: string }> | null
   }>) {
-    const remaining = round2(Math.max(0, Number(row.amount_due || 0) - Number(row.paid_amount || 0)))
-    if (remaining <= 0.01) continue
+    const remaining = computeOpenSigned(ensureAmount(row.amount_due), ensureAmount(row.paid_amount))
+    if (Math.abs(remaining) <= 0.01) continue
 
     const counterparty = firstRelation(row.counterparty)
     const counterpartyName = counterparty?.name || 'Controparte non assegnata'
@@ -1218,11 +1366,11 @@ export async function buildAging(
     rowsMap.set(counterpartyId, bucket)
 
     totalOutstanding = round2(totalOutstanding + remaining)
-    weightedDays = round2(weightedDays + Math.max(overdueDays, 0) * remaining)
+    weightedDays = round2(weightedDays + Math.max(overdueDays, 0) * Math.abs(remaining))
   }
 
   const agingRows = Array.from(rowsMap.values()).sort((a, b) => b.total - a.total)
-  const kpiDays = totalOutstanding > 0 ? round2(weightedDays / totalOutstanding) : 0
+  const kpiDays = Math.abs(totalOutstanding) > 0 ? round2(weightedDays / Math.abs(totalOutstanding)) : 0
 
   return {
     rows: agingRows,
@@ -1235,7 +1383,7 @@ export async function validateInstallmentConsistency(companyId: string): Promise
   const [invoiceRes, installmentsRes] = await Promise.all([
     supabase
       .from('invoices')
-      .select('id, number, date, total_amount')
+      .select('id, number, date, doc_type, total_amount')
       .eq('company_id', companyId),
     supabase
       .from('invoice_installments')
@@ -1254,9 +1402,9 @@ export async function validateInstallmentConsistency(companyId: string): Promise
   }
 
   const anomalies: InstallmentConsistencyAnomaly[] = []
-  for (const invoice of (invoiceRes.data || []) as Array<{ id: string; number: string; date: string; total_amount: number }>) {
+  for (const invoice of (invoiceRes.data || []) as Array<{ id: string; number: string; date: string; doc_type: string; total_amount: number }>) {
     const installmentsTotal = round2(totalsByInvoice.get(invoice.id) || 0)
-    const totalAmount = round2(ensureAmount(invoice.total_amount))
+    const totalAmount = round2(signedInvoiceTotal(invoice.doc_type, invoice.total_amount))
     const delta = round2(installmentsTotal - totalAmount)
 
     if (Math.abs(delta) > 0.01) {
@@ -1264,6 +1412,7 @@ export async function validateInstallmentConsistency(companyId: string): Promise
         invoice_id: String(invoice.id),
         invoice_number: String(invoice.number || ''),
         invoice_date: String(invoice.date || ''),
+        doc_type: String(invoice.doc_type || ''),
         total_amount: totalAmount,
         installments_total: installmentsTotal,
         delta,
@@ -1280,4 +1429,42 @@ export async function validateInstallmentConsistency(companyId: string): Promise
   }
 
   return anomalies.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+}
+
+export async function getScadenzarioAuditTotals(companyId: string): Promise<ScadenzarioAuditTotals> {
+  const { data, error } = await supabase.rpc('scadenzario_audit_totals', {
+    p_company_id: companyId,
+  })
+
+  if (error) throw new Error(error.message)
+  const row = Array.isArray(data) ? data[0] : data
+  if (!row) {
+    return {
+      invoices_count: 0,
+      invoices_covered: 0,
+      missing_count: 0,
+      orphan_count: 0,
+      duplicate_count: 0,
+      fatture_incassi_netto: 0,
+      fatture_uscite_netto: 0,
+      scadenzario_incassi_netto: 0,
+      scadenzario_uscite_netto: 0,
+      delta_incassi: 0,
+      delta_uscite: 0,
+    }
+  }
+
+  return {
+    invoices_count: Number(row.invoices_count || 0),
+    invoices_covered: Number(row.invoices_covered || 0),
+    missing_count: Number(row.missing_count || 0),
+    orphan_count: Number(row.orphan_count || 0),
+    duplicate_count: Number(row.duplicate_count || 0),
+    fatture_incassi_netto: ensureAmount(row.fatture_incassi_netto),
+    fatture_uscite_netto: ensureAmount(row.fatture_uscite_netto),
+    scadenzario_incassi_netto: ensureAmount(row.scadenzario_incassi_netto),
+    scadenzario_uscite_netto: ensureAmount(row.scadenzario_uscite_netto),
+    delta_incassi: ensureAmount(row.delta_incassi),
+    delta_uscite: ensureAmount(row.delta_uscite),
+  }
 }
