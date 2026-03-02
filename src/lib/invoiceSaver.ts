@@ -7,6 +7,7 @@
 // source_filename, import_batch_id, xml_hash, created_at, updated_at
 import { supabase } from '@/integrations/supabase/client';
 import { resolveOrCreateCounterpartyFromInvoice } from './counterpartyService';
+import { normalizeVatError, recomputeVatPeriodsIncremental, syncVatEntriesForInvoicesBatch } from './vat';
 
 // ============================================================
 // TYPES
@@ -81,6 +82,12 @@ async function hashXml(xml: string): Promise<string> {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+function minIsoDate(a: string | null, b: string | null): string | null {
+  if (!a) return b;
+  if (!b) return a;
+  return a <= b ? a : b;
+}
+
 // ============================================================
 // SAVE — salva fatture parsate su DB
 // ============================================================
@@ -92,6 +99,7 @@ export async function saveInvoicesToDB(
   let saved = 0;
   let duplicates = 0;
   const errors: { fn: string; err: string }[] = [];
+  const savedInvoiceIds: string[] = [];
 
   // Fetch company PIVA/CF to auto-detect direction
   let companyPiva = '';
@@ -243,11 +251,27 @@ export async function saveInvoicesToDB(
         }
       }
 
+      if (inv?.id) savedInvoiceIds.push(String(inv.id));
       saved++;
       onProgress?.(i + 1, parsedResults.length, 'ok', r.fn);
     } catch (e: any) {
       errors.push({ fn: r.fn, err: e.message });
       onProgress?.(i + 1, parsedResults.length, 'error', r.fn);
+    }
+  }
+
+  if (savedInvoiceIds.length > 0) {
+    try {
+      const vatSync = await syncVatEntriesForInvoicesBatch(companyId, savedInvoiceIds);
+      if (vatSync.global_min_effective_date_impacted) {
+        await recomputeVatPeriodsIncremental(companyId, vatSync.global_min_effective_date_impacted);
+      }
+    } catch (e: any) {
+      const vatError = normalizeVatError(e);
+      errors.push({
+        fn: 'VAT_SYNC',
+        err: `${vatError.message}${vatError.code ? ` [${vatError.code}]` : ''}`,
+      });
     }
   }
 
@@ -318,9 +342,48 @@ export async function loadInvoiceDetail(invoiceId: string): Promise<DBInvoiceDet
 export async function deleteInvoices(invoiceIds: string[]): Promise<{ deleted: number; errors: string[] }> {
   let deleted = 0;
   const errors: string[] = [];
+  const normalizedIds = Array.from(new Set(invoiceIds.map((id) => String(id || '').trim()).filter(Boolean)));
+  if (!normalizedIds.length) return { deleted: 0, errors };
 
-  for (let i = 0; i < invoiceIds.length; i += 50) {
-    const batch = invoiceIds.slice(i, i + 50);
+  const { data: invoicesToDelete, error: beforeInvErr } = await supabase
+    .from('invoices')
+    .select('id, company_id, date')
+    .in('id', normalizedIds);
+
+  if (beforeInvErr) {
+    errors.push(`Errore lettura fatture pre-delete: ${beforeInvErr.message}`);
+  }
+
+  const impactedByCompany = new Map<string, string | null>();
+  for (const inv of (invoicesToDelete || []) as Array<{ id: string; company_id: string; date: string | null }>) {
+    const companyId = String(inv.company_id || '');
+    if (!companyId) continue;
+    impactedByCompany.set(companyId, minIsoDate(impactedByCompany.get(companyId) || null, inv.date ? String(inv.date) : null));
+  }
+
+  for (let i = 0; i < normalizedIds.length; i += 500) {
+    const chunk = normalizedIds.slice(i, i + 500);
+    const { data: oldVatRows, error: oldVatErr } = await supabase
+      .from('invoice_vat_entries')
+      .select('company_id, effective_date, invoice_date')
+      .eq('is_manual', false)
+      .in('invoice_id', chunk);
+
+    if (oldVatErr) {
+      errors.push(`Errore lettura entries IVA pre-delete: ${oldVatErr.message}`);
+      continue;
+    }
+
+    for (const row of (oldVatRows || []) as Array<{ company_id: string; effective_date: string | null; invoice_date: string | null }>) {
+      const companyId = String(row.company_id || '');
+      if (!companyId) continue;
+      const impactedDate = row.effective_date || row.invoice_date || null;
+      impactedByCompany.set(companyId, minIsoDate(impactedByCompany.get(companyId) || null, impactedDate));
+    }
+  }
+
+  for (let i = 0; i < normalizedIds.length; i += 50) {
+    const batch = normalizedIds.slice(i, i + 50);
 
     const { error: linesErr } = await supabase
       .from('invoice_lines')
@@ -343,6 +406,16 @@ export async function deleteInvoices(invoiceIds: string[]): Promise<{ deleted: n
     }
   }
 
+  for (const [companyId, impactedStart] of impactedByCompany.entries()) {
+    if (!impactedStart) continue;
+    try {
+      await recomputeVatPeriodsIncremental(companyId, impactedStart);
+    } catch (e: any) {
+      const vatErr = normalizeVatError(e);
+      errors.push(`Errore ricalcolo IVA post-delete (${companyId}): ${vatErr.message}${vatErr.code ? ` [${vatErr.code}]` : ''}`);
+    }
+  }
+
   return { deleted, errors };
 }
 
@@ -350,6 +423,29 @@ export async function deleteInvoices(invoiceIds: string[]): Promise<{ deleted: n
 // UPDATE — modifica fattura
 // ============================================================
 export async function updateInvoice(invoiceId: string, updates: InvoiceUpdate): Promise<void> {
+  const { data: beforeInvoice, error: beforeInvoiceErr } = await supabase
+    .from('invoices')
+    .select('id, company_id, date')
+    .eq('id', invoiceId)
+    .single();
+
+  if (beforeInvoiceErr || !beforeInvoice) {
+    throw new Error(beforeInvoiceErr?.message || 'Fattura non trovata');
+  }
+
+  let oldMinImpactedDate: string | null = null;
+  const { data: oldVatRows, error: oldVatErr } = await supabase
+    .from('invoice_vat_entries')
+    .select('effective_date, invoice_date')
+    .eq('company_id', beforeInvoice.company_id)
+    .eq('is_manual', false)
+    .eq('invoice_id', invoiceId);
+
+  if (oldVatErr) throw new Error(oldVatErr.message);
+  for (const row of (oldVatRows || []) as Array<{ effective_date: string | null; invoice_date: string | null }>) {
+    oldMinImpactedDate = minIsoDate(oldMinImpactedDate, row.effective_date || row.invoice_date || null);
+  }
+
   const payload: InvoiceUpdate = { ...updates };
   if (payload.payment_status === 'paid' && payload.paid_date === undefined) {
     payload.paid_date = new Date().toISOString().slice(0, 10);
@@ -364,6 +460,16 @@ export async function updateInvoice(invoiceId: string, updates: InvoiceUpdate): 
     .eq('id', invoiceId);
 
   if (error) throw new Error(error.message);
+
+  const vatSync = await syncVatEntriesForInvoicesBatch(beforeInvoice.company_id, [invoiceId]);
+  const impactedStart = minIsoDate(
+    minIsoDate(oldMinImpactedDate, vatSync.global_min_effective_date_impacted),
+    beforeInvoice.date ? String(beforeInvoice.date) : null,
+  );
+
+  if (impactedStart) {
+    await recomputeVatPeriodsIncremental(beforeInvoice.company_id, impactedStart);
+  }
 }
 
 // ============================================================

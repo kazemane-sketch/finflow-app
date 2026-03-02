@@ -14,13 +14,13 @@ import {
   getCompanyFiscalRegime,
   getCompanyRole,
   getFirstInvoiceDate,
-  getVatCurrentSummary,
   getVatProfile,
   listVatBreakdown,
   listManualVatEntries,
   listVatPaymentMatches,
   listVatPeriodSnapshotEntries,
   listVatPeriodsLight,
+  normalizeVatError,
   suggestVatMatches,
   syncVatEngine,
   upsertVatProfile,
@@ -101,6 +101,19 @@ function isTimeoutVatError(message: string | null | undefined): boolean {
   return /statement timeout|canceling statement due to statement timeout/i.test(String(message || ''))
 }
 
+function formatVatErrorMessage(error: any): string {
+  const payload = normalizeVatError(error)
+  if (payload.code === 'VAT_LOCKED') return 'Ricalcolo già in corso, riprova tra pochi secondi.'
+  if (isTimeoutVatError(payload.message)) {
+    return 'Ricalcolo IVA non completato per timeout query: i dati precedenti sono stati mantenuti.'
+  }
+
+  let out = payload.message || 'Errore modulo IVA'
+  if (payload.code) out += ` [${payload.code}]`
+  if (payload.details) out += ` - ${payload.details}`
+  return out
+}
+
 export default function IvaPage() {
   const { company } = useCompany()
 
@@ -135,6 +148,17 @@ export default function IvaPage() {
 
   const [error, setError] = useState<string | null>(null)
   const [info, setInfo] = useState<string | null>(null)
+
+  const logVatError = useCallback((operation: string, e: any) => {
+    const payload = normalizeVatError(e)
+    console.error('[VAT]', {
+      company_id: company?.id || null,
+      operation,
+      code: payload.code,
+      details: payload.details,
+      message: payload.message,
+    })
+  }, [company?.id])
 
   const canEdit = useMemo(() => isEditor(role), [role])
   const backfillPending = useMemo(() => Boolean(profile && !profile.backfill_confirmed), [profile])
@@ -174,9 +198,10 @@ export default function IvaPage() {
       setSnapshotEntries([])
       setSnapshotPeriodId(null)
     } catch (e: any) {
-      setError(e.message || 'Errore caricamento dettaglio IVA')
+      logVatError('loadBreakdown', e)
+      setError(formatVatErrorMessage(e))
     }
-  }, [company?.id])
+  }, [company?.id, logVatError])
 
   const loadSnapshotAudit = useCallback(async (periodId: string) => {
     if (!company?.id) return
@@ -187,11 +212,12 @@ export default function IvaPage() {
       setSnapshotEntries(data)
       setSnapshotPeriodId(periodId)
     } catch (e: any) {
-      setError(e.message || 'Errore caricamento snapshot audit')
+      logVatError('loadSnapshotAudit', e)
+      setError(formatVatErrorMessage(e))
     } finally {
       setSnapshotLoading(false)
     }
-  }, [company?.id])
+  }, [company?.id, logVatError])
 
   const refreshPeriods = useCallback(async () => {
     if (!company?.id) return
@@ -251,11 +277,11 @@ export default function IvaPage() {
 
       let currentPeriods = await listVatPeriodsLight(company.id)
       if (currentPeriods.length === 0) {
-        await syncVatEngine(company.id, { requireBackfillConfirmation: isEditor(memberRole) })
-        currentPeriods = await listVatPeriodsLight(company.id)
-        const refreshed = await getVatProfile(company.id)
-        setProfile(refreshed)
-        if (refreshed) setProfileForm(fromProfile(refreshed))
+        setInfo(
+          currentProfile.backfill_confirmed
+            ? 'Nessuna liquidazione IVA disponibile: premi "Ricalcola IVA" per avviare il calcolo.'
+            : 'Backfill da confermare: dopo la conferma usa "Ricalcola IVA" per generare le liquidazioni.',
+        )
       }
 
       setPeriods(currentPeriods)
@@ -268,18 +294,13 @@ export default function IvaPage() {
         setBreakdown(bd)
       }
 
-      await getVatCurrentSummary(company.id)
     } catch (e: any) {
-      const message = e?.message || 'Errore caricamento modulo IVA'
-      setError(
-        isTimeoutVatError(message)
-          ? 'Ricalcolo IVA non completato per timeout query: i dati precedenti sono stati mantenuti.'
-          : message,
-      )
+      logVatError('loadAll', e)
+      setError(formatVatErrorMessage(e))
     } finally {
       setLoading(false)
     }
-  }, [company?.id])
+  }, [company?.id, logVatError])
 
   useEffect(() => {
     loadAll()
@@ -296,7 +317,11 @@ export default function IvaPage() {
       const saved = await upsertVatProfile(company.id, profileForm)
       setProfile(saved)
       setProfileForm(fromProfile(saved))
-      await syncVatEngine(company.id, { requireBackfillConfirmation: true })
+      await syncVatEngine(company.id, {
+        requireBackfillConfirmation: true,
+        refreshEntries: 'all',
+        forceFullRecompute: true,
+      })
       const refreshedProfile = await getVatProfile(company.id)
       if (refreshedProfile) {
         setProfile(refreshedProfile)
@@ -305,12 +330,8 @@ export default function IvaPage() {
       await refreshPeriods()
       setInfo('Configurazione IVA salvata. Verifica il riepilogo backfill e conferma prima di operare.')
     } catch (e: any) {
-      const message = e?.message || 'Errore salvataggio profilo IVA'
-      setError(
-        isTimeoutVatError(message)
-          ? 'Ricalcolo IVA non completato per timeout query: i dati precedenti sono stati mantenuti.'
-          : message,
-      )
+      logVatError('saveProfile', e)
+      setError(formatVatErrorMessage(e))
     } finally {
       setSavingProfile(false)
     }
@@ -326,14 +347,11 @@ export default function IvaPage() {
       const refreshedProfile = await getVatProfile(company.id)
       if (refreshedProfile) setProfile(refreshedProfile)
       await refreshPeriods()
-      setInfo(`Ricalcolo IVA completato (${result.invoices_processed} fatture, ${result.entries_written} movimenti, ${result.periods_upserted} periodi)`)
+      const elapsedSec = Math.max(0, Math.round(Number(result.elapsed_ms || 0) / 1000))
+      setInfo(`Ricalcolo IVA completato (${result.periods_upserted} periodi, ${result.snapshot_entries_written} snapshot, ${elapsedSec}s)`)
     } catch (e: any) {
-      const message = e?.message || 'Errore ricalcolo IVA'
-      setError(
-        isTimeoutVatError(message)
-          ? 'Ricalcolo IVA non completato per timeout query: i dati precedenti sono stati mantenuti.'
-          : message,
-      )
+      logVatError('recompute', e)
+      setError(formatVatErrorMessage(e))
     } finally {
       setSyncing(false)
     }
@@ -349,7 +367,8 @@ export default function IvaPage() {
       setMatchesByPeriod((prev) => ({ ...prev, [periodId]: matches }))
       setInfo(matches.length > 0 ? `${matches.length} suggerimento/i F24 trovati` : 'Nessun suggerimento F24 compatibile')
     } catch (e: any) {
-      setError(e.message || 'Errore ricerca suggerimenti F24')
+      logVatError('suggestMatches', e)
+      setError(formatVatErrorMessage(e))
     }
   }
 
@@ -368,7 +387,8 @@ export default function IvaPage() {
       await refreshPeriods()
       setInfo(`Periodo ${formatVatPeriodLabel(period)} marcato come versato`)
     } catch (e: any) {
-      setError(e.message || 'Errore conferma versamento')
+      logVatError('confirmManualPaid', e)
+      setError(formatVatErrorMessage(e))
     }
   }
 
@@ -389,7 +409,8 @@ export default function IvaPage() {
       setMatchesByPeriod((prev) => ({ ...prev, [periodId]: updatedMatches }))
       setInfo('Versamento confermato da movimento F24')
     } catch (e: any) {
-      setError(e.message || 'Errore conferma match F24')
+      logVatError('acceptMatch', e)
+      setError(formatVatErrorMessage(e))
     }
   }
 
@@ -401,20 +422,23 @@ export default function IvaPage() {
       if (refreshed) setProfile(refreshed)
       setInfo('Backfill confermato. Le liquidazioni IVA sono ora operative.')
     } catch (e: any) {
-      setError(e.message || 'Errore conferma backfill')
+      logVatError('confirmBackfill', e)
+      setError(formatVatErrorMessage(e))
     }
   }
 
   const handleAddManualEntry = async () => {
     if (!company?.id) return
     try {
+      const recomputeStart = manualForm.effective_date || null
       await createManualVatEntry(company.id, manualForm)
-      await syncVatEngine(company.id)
+      await syncVatEngine(company.id, { startDate: recomputeStart })
       await refreshPeriods()
       setManualForm((prev) => ({ ...prev, manual_note: '', vat_amount: 0, vat_debit_amount: 0, vat_credit_amount: 0, taxable_amount: 0 }))
       setInfo('Rettifica manuale IVA aggiunta')
     } catch (e: any) {
-      setError(e.message || 'Errore inserimento rettifica manuale')
+      logVatError('addManualEntry', e)
+      setError(formatVatErrorMessage(e))
     }
   }
 
@@ -422,12 +446,14 @@ export default function IvaPage() {
     if (!company?.id) return
     if (!window.confirm('Eliminare questa rettifica manuale IVA?')) return
     try {
+      const deletingEntry = manualEntries.find((entry) => entry.id === entryId)
       await deleteManualVatEntry(company.id, entryId)
-      await syncVatEngine(company.id)
+      await syncVatEngine(company.id, { startDate: deletingEntry?.effective_date || deletingEntry?.invoice_date || null })
       await refreshPeriods()
       setInfo('Rettifica manuale eliminata')
     } catch (e: any) {
-      setError(e.message || 'Errore eliminazione rettifica manuale')
+      logVatError('deleteManualEntry', e)
+      setError(formatVatErrorMessage(e))
     }
   }
 
@@ -833,7 +859,7 @@ export default function IvaPage() {
                 </div>
               )}
 
-              {snapshotPeriodId === currentPeriodId && (
+              {currentPeriodId && snapshotPeriodId === currentPeriodId && (
                 <div className="border rounded-lg p-3 space-y-2">
                   <p className="text-sm font-semibold">Snapshot audit periodo ({snapshotEntries.length} entry)</p>
                   {snapshotEntries.length === 0 ? (

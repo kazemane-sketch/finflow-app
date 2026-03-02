@@ -183,6 +183,30 @@ export interface VatPeriodSnapshotEntry {
   created_at: string
 }
 
+export interface VatRecomputeResult {
+  periods_upserted: number
+  snapshot_entries_written: number
+  from_period: string | null
+  to_period: string | null
+  elapsed_ms: number
+  status: 'ok' | 'locked' | 'error'
+}
+
+export interface VatSyncEntriesResult {
+  invoices_processed: number
+  entries_inserted: number
+  entries_deleted: number
+  min_effective_date_impacted: string | null
+  global_min_effective_date_impacted: string | null
+}
+
+export interface VatErrorPayload {
+  message: string
+  code: string | null
+  details: string | null
+  hint: string | null
+}
+
 export interface VatCurrentSummary {
   period: VatPeriod
   days_to_due: number
@@ -376,6 +400,27 @@ function ensureVatNumber(v: unknown): number {
   return round2(n)
 }
 
+function minIsoDate(a: string | null, b: string | null): string | null {
+  if (!a) return b
+  if (!b) return a
+  return a <= b ? a : b
+}
+
+function extractImpactedDateFromEntry(entry: Pick<VatEntry, 'effective_date' | 'invoice_date'>): string | null {
+  if (entry.effective_date) return String(entry.effective_date)
+  if (entry.invoice_date) return String(entry.invoice_date)
+  return null
+}
+
+export function normalizeVatError(error: any): VatErrorPayload {
+  return {
+    message: String(error?.message || 'Errore IVA non specificato'),
+    code: error?.code ? String(error.code) : null,
+    details: error?.details ? String(error.details) : null,
+    hint: error?.hint ? String(error.hint) : null,
+  }
+}
+
 function isBackfillPreviewInconsistent(preview: Record<string, unknown> | null | undefined): boolean {
   if (!preview) return false
   const invoicesCount = Number(preview.invoices_count || 0)
@@ -533,15 +578,35 @@ export async function confirmVatBackfill(companyId: string): Promise<void> {
   if (error) throw new Error(error.message)
 }
 
-async function loadInvoicePaidDateMap(companyId: string): Promise<Map<string, string>> {
+async function loadInvoicePaidDateMapForInvoices(companyId: string, invoiceIds?: string[]): Promise<Map<string, string>> {
   const map = new Map<string, string>()
 
-  const { data: reconciliations, error: recErr } = await supabase
-    .from('reconciliations')
-    .select('invoice_id, bank_transaction_id')
-    .eq('company_id', companyId)
+  let reconciliations: Array<{ invoice_id: string; bank_transaction_id: string }> = []
+  if (invoiceIds && invoiceIds.length) {
+    const normalizedIds = Array.from(new Set(invoiceIds.map((id) => String(id || '').trim()).filter(Boolean)))
+    if (!normalizedIds.length) return map
 
-  if (recErr) throw new Error(recErr.message)
+    for (let i = 0; i < normalizedIds.length; i += 500) {
+      const chunk = normalizedIds.slice(i, i + 500)
+      const { data: chunkRows, error: recErr } = await supabase
+        .from('reconciliations')
+        .select('invoice_id, bank_transaction_id')
+        .eq('company_id', companyId)
+        .in('invoice_id', chunk)
+
+      if (recErr) throw new Error(recErr.message)
+      reconciliations.push(...((chunkRows || []) as Array<{ invoice_id: string; bank_transaction_id: string }>))
+    }
+  } else {
+    const { data, error: recErr } = await supabase
+      .from('reconciliations')
+      .select('invoice_id, bank_transaction_id')
+      .eq('company_id', companyId)
+
+    if (recErr) throw new Error(recErr.message)
+    reconciliations = (data || []) as Array<{ invoice_id: string; bank_transaction_id: string }>
+  }
+
   if (!reconciliations?.length) return map
 
   const txIds = Array.from(new Set(
@@ -578,6 +643,10 @@ async function loadInvoicePaidDateMap(companyId: string): Promise<Map<string, st
   }
 
   return map
+}
+
+async function loadInvoicePaidDateMap(companyId: string): Promise<Map<string, string>> {
+  return loadInvoicePaidDateMapForInvoices(companyId)
 }
 
 function normalizeVatNature(v: string | null | undefined): string {
@@ -759,7 +828,151 @@ function toVatEntryRowsFromInvoice(
   return rows
 }
 
-export async function rebuildVatEntries(companyId: string): Promise<{ invoices: number; entries: number; pendingDeferred: number }> {
+async function loadInvoicesByIds(companyId: string, invoiceIds: string[]): Promise<InvoiceForVat[]> {
+  const normalizedIds = Array.from(new Set(invoiceIds.map((id) => String(id || '').trim()).filter(Boolean)))
+  if (!normalizedIds.length) return []
+
+  const out: InvoiceForVat[] = []
+  for (let i = 0; i < normalizedIds.length; i += 500) {
+    const chunk = normalizedIds.slice(i, i + 500)
+    const { data, error } = await supabase
+      .from('invoices')
+      .select('id, date, direction, doc_type, tax_amount, taxable_amount, raw_xml, paid_date')
+      .eq('company_id', companyId)
+      .in('id', chunk)
+
+    if (error) throw new Error(error.message)
+    out.push(...((data || []) as InvoiceForVat[]))
+  }
+
+  out.sort((a, b) => String(a.date).localeCompare(String(b.date)) || String(a.id).localeCompare(String(b.id)))
+  return out
+}
+
+async function loadInvoiceLinesMapByInvoiceIds(invoiceIds: string[]): Promise<Map<string, InvoiceLineForVat[]>> {
+  const linesByInvoice = new Map<string, InvoiceLineForVat[]>()
+  const normalizedIds = Array.from(new Set(invoiceIds.map((id) => String(id || '').trim()).filter(Boolean)))
+  if (!normalizedIds.length) return linesByInvoice
+
+  for (let i = 0; i < normalizedIds.length; i += 500) {
+    const chunk = normalizedIds.slice(i, i + 500)
+    const { data: lineRows, error: lineErr } = await supabase
+      .from('invoice_lines')
+      .select('id, invoice_id, vat_rate, vat_nature')
+      .in('invoice_id', chunk)
+
+    if (lineErr) throw new Error(lineErr.message)
+    for (const line of (lineRows || []) as InvoiceLineForVat[]) {
+      const list = linesByInvoice.get(line.invoice_id) || []
+      list.push(line)
+      linesByInvoice.set(line.invoice_id, list)
+    }
+  }
+
+  return linesByInvoice
+}
+
+export async function syncVatEntriesForInvoicesBatch(
+  companyId: string,
+  invoiceIds: string[],
+): Promise<VatSyncEntriesResult> {
+  const normalizedIds = Array.from(new Set(invoiceIds.map((id) => String(id || '').trim()).filter(Boolean)))
+  if (!normalizedIds.length) {
+    return {
+      invoices_processed: 0,
+      entries_inserted: 0,
+      entries_deleted: 0,
+      min_effective_date_impacted: null,
+      global_min_effective_date_impacted: null,
+    }
+  }
+
+  let oldMinImpactedDate: string | null = null
+  for (let i = 0; i < normalizedIds.length; i += 500) {
+    const chunk = normalizedIds.slice(i, i + 500)
+    const { data: oldRows, error: oldErr } = await supabase
+      .from('invoice_vat_entries')
+      .select('effective_date, invoice_date')
+      .eq('company_id', companyId)
+      .eq('is_manual', false)
+      .in('invoice_id', chunk)
+
+    if (oldErr) throw new Error(oldErr.message)
+    for (const row of (oldRows || []) as Array<Pick<VatEntry, 'effective_date' | 'invoice_date'>>) {
+      oldMinImpactedDate = minIsoDate(oldMinImpactedDate, extractImpactedDateFromEntry(row))
+    }
+  }
+
+  const invoices = await loadInvoicesByIds(companyId, normalizedIds)
+  const existingInvoiceIds = invoices.map((inv) => inv.id)
+  const [linesByInvoice, paidDateMap] = await Promise.all([
+    loadInvoiceLinesMapByInvoiceIds(existingInvoiceIds),
+    loadInvoicePaidDateMapForInvoices(companyId, existingInvoiceIds),
+  ])
+
+  const rows: VatEntryInsertRow[] = []
+  let newMinImpactedDate: string | null = null
+
+  for (const invoice of invoices) {
+    const fromInvoice = toVatEntryRowsFromInvoice(
+      invoice,
+      paidDateMap.get(invoice.id) || null,
+      linesByInvoice.get(invoice.id) || [],
+    )
+    for (const row of fromInvoice) {
+      row.company_id = companyId
+      rows.push(row)
+      newMinImpactedDate = minIsoDate(newMinImpactedDate, row.effective_date || row.invoice_date || null)
+    }
+  }
+
+  let deletedCount = 0
+  for (let i = 0; i < normalizedIds.length; i += 500) {
+    const chunk = normalizedIds.slice(i, i + 500)
+    const { count, error: delErr } = await supabase
+      .from('invoice_vat_entries')
+      .delete({ count: 'exact' })
+      .eq('company_id', companyId)
+      .eq('is_manual', false)
+      .in('invoice_id', chunk)
+
+    if (delErr) throw new Error(delErr.message)
+    deletedCount += Number(count || 0)
+  }
+
+  for (let i = 0; i < rows.length; i += VAT_INSERT_CHUNK_SIZE) {
+    const chunk = rows.slice(i, i + VAT_INSERT_CHUNK_SIZE)
+    const { error: insErr } = await supabase
+      .from('invoice_vat_entries')
+      .insert(chunk as any)
+
+    if (insErr) throw new Error(insErr.message)
+  }
+
+  const impacted = minIsoDate(oldMinImpactedDate, newMinImpactedDate)
+  return {
+    invoices_processed: normalizedIds.length,
+    entries_inserted: rows.length,
+    entries_deleted: deletedCount,
+    min_effective_date_impacted: impacted,
+    global_min_effective_date_impacted: impacted,
+  }
+}
+
+export async function syncVatEntriesForInvoice(
+  companyId: string,
+  invoiceId: string,
+  _options?: { allowMissingInvoice?: boolean },
+): Promise<VatSyncEntriesResult> {
+  return syncVatEntriesForInvoicesBatch(companyId, [invoiceId])
+}
+
+export async function rebuildVatEntriesFull(companyId: string): Promise<{ invoices: number; entries: number; pendingDeferred: number }> {
+  const role = await getCompanyRole(companyId)
+  if (!isUserAllowedToEdit(role)) {
+    throw new Error('Permesso negato: solo owner/admin possono rigenerare tutte le entries IVA')
+  }
+
   const paidDateMap = await loadInvoicePaidDateMap(companyId)
   const rows: VatEntryInsertRow[] = []
   let invoicesProcessed = 0
@@ -838,6 +1051,10 @@ export async function rebuildVatEntries(companyId: string): Promise<{ invoices: 
     entries: rows.length,
     pendingDeferred,
   }
+}
+
+export async function rebuildVatEntries(companyId: string): Promise<{ invoices: number; entries: number; pendingDeferred: number }> {
+  return rebuildVatEntriesFull(companyId)
 }
 
 export async function createManualVatEntry(companyId: string, input: ManualVatEntryInput): Promise<void> {
@@ -972,6 +1189,56 @@ export async function buildVatBackfillPreview(companyId: string): Promise<Record
         amount_credit_carry: p.amount_credit_carry,
       })),
   }
+}
+
+export async function recomputeVatPeriodsIncremental(
+  companyId: string,
+  startDate?: string | null,
+  forceFull = false,
+): Promise<VatRecomputeResult> {
+  const { data, error } = await supabase
+    .rpc('recompute_vat_periods_incremental', {
+      p_company_id: companyId,
+      p_start_date: startDate || null,
+      p_force_full: forceFull,
+    })
+
+  if (error) {
+    const e: any = new Error(error.message || 'Errore ricalcolo periodi IVA')
+    e.code = error.code || null
+    e.details = error.details || null
+    e.hint = error.hint || null
+    throw e
+  }
+
+  const row = Array.isArray(data) ? data[0] : data
+  if (!row) {
+    throw new Error('Risposta vuota da recompute_vat_periods_incremental')
+  }
+
+  const result: VatRecomputeResult = {
+    periods_upserted: Number(row.periods_upserted || 0),
+    snapshot_entries_written: Number(row.snapshot_entries_written || 0),
+    from_period: row.from_period ? String(row.from_period) : null,
+    to_period: row.to_period ? String(row.to_period) : null,
+    elapsed_ms: Number(row.elapsed_ms || 0),
+    status: (String(row.status || 'ok') as VatRecomputeResult['status']),
+  }
+
+  if (result.status === 'locked') {
+    const e: any = new Error('Ricalcolo già in corso')
+    e.code = 'VAT_LOCKED'
+    e.details = 'Un altro processo di ricalcolo IVA è già attivo per questa azienda.'
+    throw e
+  }
+
+  if (result.status === 'error') {
+    const e: any = new Error('Ricalcolo IVA terminato con errore')
+    e.code = 'VAT_RECOMPUTE_FAILED'
+    throw e
+  }
+
+  return result
 }
 
 function computeRegularPeriodsRange(startDateIso: string, endDateIso: string, regime: VatLiquidationRegime): Array<{
@@ -1736,19 +2003,43 @@ export async function getVatCurrentSummary(companyId: string): Promise<VatCurren
 
 export async function syncVatEngine(
   companyId: string,
-  options?: { requireBackfillConfirmation?: boolean },
-): Promise<{ invoices_processed: number; entries_written: number; periods_upserted: number }> {
-  const rebuildResult = await rebuildVatEntries(companyId)
-  const periodResult = await computeVatPeriods(companyId)
-  await suggestVatMatches(companyId)
+  options?: {
+    requireBackfillConfirmation?: boolean
+    refreshEntries?: 'none' | 'all'
+    startDate?: string | null
+    forceFullRecompute?: boolean
+  },
+): Promise<{
+  invoices_processed: number
+  entries_written: number
+  periods_upserted: number
+  snapshot_entries_written: number
+  elapsed_ms: number
+}> {
+  const refreshEntries = options?.refreshEntries || 'none'
+  let rebuildResult = { invoices: 0, entries: 0, pendingDeferred: 0 }
+
+  if (refreshEntries === 'all') {
+    rebuildResult = await rebuildVatEntriesFull(companyId)
+  }
+
+  const recompute = await recomputeVatPeriodsIncremental(
+    companyId,
+    refreshEntries === 'all' ? null : (options?.startDate || null),
+    options?.forceFullRecompute || refreshEntries === 'all',
+  )
+
   if (options?.requireBackfillConfirmation) {
     const preview = await buildVatBackfillPreview(companyId)
     await updateVatBackfillPreview(companyId, preview)
   }
+
   return {
     invoices_processed: rebuildResult.invoices,
     entries_written: rebuildResult.entries,
-    periods_upserted: periodResult.periodsUpserted,
+    periods_upserted: recompute.periods_upserted,
+    snapshot_entries_written: recompute.snapshot_entries_written,
+    elapsed_ms: recompute.elapsed_ms,
   }
 }
 
