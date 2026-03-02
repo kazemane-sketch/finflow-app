@@ -15,7 +15,7 @@ import {
   deleteBankTransactions, deleteAllBankTransactions, updateBankTransactionDirection,
   type BankImportStats, type BankParseProgress, type BankParseResult, type BankTransaction,
 } from '@/lib/bankParser'
-import { SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
+import { supabase } from '@/integrations/supabase/client'
 
 // ============================================================
 // UTILS
@@ -542,20 +542,14 @@ type BankAiSearchResponse = {
 }
 
 async function askBankAiSearch(query: string, transactions: any[]): Promise<BankAiSearchResponse> {
-  const response = await fetch(`${SUPABASE_URL}/functions/v1/bank-ai-search`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-      'apikey': SUPABASE_ANON_KEY,
-    },
-    body: JSON.stringify({ query, transactions }),
+  const { data, error } = await supabase.functions.invoke('bank-ai-search', {
+    body: { query, transactions },
   })
 
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    throw new Error(data.error || data.message || `Errore server ${response.status}`)
+  if (error) {
+    throw new Error(error.message || 'Errore AI search')
   }
+
   return {
     answer: typeof data.answer === 'string' && data.answer.trim() ? data.answer.trim() : 'Nessuna risposta',
     used_count: Number(data.used_count || transactions.length || 0),

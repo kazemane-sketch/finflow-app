@@ -263,7 +263,29 @@ export async function loadInvoices(companyId: string): Promise<DBInvoice[]> {
     .range(0, 4999);
 
   if (error) throw new Error(error.message);
-  return (data || []) as DBInvoice[];
+  const rows = (data || []) as DBInvoice[];
+  const hasLinkedCounterparty = rows.some((r) => Boolean(r.counterparty_id));
+  if (!hasLinkedCounterparty) return rows;
+
+  const { data: statuses, error: statusErr } = await supabase
+    .from('counterparties')
+    .select('id, status')
+    .eq('company_id', companyId);
+
+  if (statusErr || !statuses) return rows;
+
+  const statusMap = new Map<string, string>(
+    statuses
+      .filter((s: any) => s?.id && s?.status)
+      .map((s: any) => [String(s.id), String(s.status)]),
+  );
+
+  return rows.map((row) => ({
+    ...row,
+    counterparty_status_snapshot: row.counterparty_id
+      ? (statusMap.get(row.counterparty_id) || row.counterparty_status_snapshot)
+      : row.counterparty_status_snapshot,
+  }));
 }
 
 // ============================================================

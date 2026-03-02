@@ -76,6 +76,7 @@ const ROLE_BADGE: Record<CounterpartyRole, string> = {
 const MONTH_LABELS_EN = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 type VatMode = 'IT' | 'INT'
+type AnalyticsVatMode = 'excl' | 'incl'
 
 function sanitizeVatInput(value: string): string {
   return value.toUpperCase().replace(/[^A-Z0-9]/g, '')
@@ -119,6 +120,16 @@ function formatMonthKey(monthKey: string): string {
 
 function fmtEurOrDash(amount: number): string {
   return Math.abs(amount) < 0.005 ? '-' : fmtEur(amount)
+}
+
+function analyticsAmountByVatMode(
+  inv: { total_amount: number; taxable_amount: number | null; tax_amount: number | null },
+  mode: AnalyticsVatMode,
+): number {
+  if (mode === 'incl') return Number(inv.total_amount || 0)
+  if (inv.taxable_amount != null) return Number(inv.taxable_amount || 0)
+  if (inv.tax_amount != null) return Number(inv.total_amount || 0) - Number(inv.tax_amount || 0)
+  return Number(inv.total_amount || 0)
 }
 
 function CounterpartyCreateModal({
@@ -316,6 +327,7 @@ export default function ContropartiPage() {
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
   const [invoiceDirectionFilter, setInvoiceDirectionFilter] = useState<'all' | 'in' | 'out'>('all')
+  const [analyticsVatMode, setAnalyticsVatMode] = useState<AnalyticsVatMode>('excl')
 
   const [focusedId, setFocusedId] = useState<string | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
@@ -327,6 +339,8 @@ export default function ContropartiPage() {
     number: string
     date: string
     total_amount: number
+    taxable_amount: number | null
+    tax_amount: number | null
     payment_status: string
     counterparty_status_snapshot: string | null
   }>>([])
@@ -457,10 +471,10 @@ export default function ContropartiPage() {
       counterparty_id: r.counterparty_id,
       direction: r.direction,
       date: r.date,
-      total_amount: r.total_amount,
+      total_amount: analyticsAmountByVatMode(r, analyticsVatMode),
     }))
     return buildCounterpartyAnalytics(rows, counterparties)
-  }, [linkedInvoices, counterparties])
+  }, [linkedInvoices, counterparties, analyticsVatMode])
 
   const trendChartData = useMemo(
     () =>
@@ -518,7 +532,7 @@ export default function ContropartiPage() {
     }
 
     for (const inv of linkedInvoices) {
-      const amount = Math.abs(Number(inv.total_amount || 0))
+      const amount = Math.abs(analyticsAmountByVatMode(inv, analyticsVatMode))
       const month = inv.date?.slice(0, 7)
       const row = ensureRow(inv.counterparty_id)
 
@@ -544,7 +558,7 @@ export default function ContropartiPage() {
         passiveAmount: Number(row.passiveAmount.toFixed(2)),
         totalAmount: Number(row.totalAmount.toFixed(2)),
       }))
-  }, [counterparties, linkedInvoices, analyticsTargetIds, analyticsMonths])
+  }, [counterparties, linkedInvoices, analyticsTargetIds, analyticsMonths, analyticsVatMode])
 
   const toggleSelect = (id: string) => {
     setSelectedIds((prev) => {
@@ -988,20 +1002,28 @@ export default function ContropartiPage() {
                   <option value="out">Solo Attive</option>
                   <option value="in">Solo Passive</option>
                 </select>
+                <select
+                  value={analyticsVatMode}
+                  onChange={(e) => setAnalyticsVatMode(e.target.value as AnalyticsVatMode)}
+                  className="border rounded-md px-2 py-1 text-xs"
+                >
+                  <option value="excl">IVA Excl</option>
+                  <option value="incl">IVA Incl</option>
+                </select>
                 <span className="text-xs text-gray-500 ml-auto">Target: {analyticsTargetIds.length || 0} controparti</span>
               </div>
 
               <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
                 <div className="p-2 rounded border bg-emerald-50">
-                  <p className="text-[10px] text-emerald-700 uppercase">Totale attive</p>
+                  <p className="text-[10px] text-emerald-700 uppercase">Totale attive ({analyticsVatMode === 'excl' ? 'IVA Excl' : 'IVA Incl'})</p>
                   <p className="text-sm font-bold text-emerald-700">{fmtEur(analytics.totalActiveAmount)}</p>
                 </div>
                 <div className="p-2 rounded border bg-red-50">
-                  <p className="text-[10px] text-red-700 uppercase">Totale passive</p>
+                  <p className="text-[10px] text-red-700 uppercase">Totale passive ({analyticsVatMode === 'excl' ? 'IVA Excl' : 'IVA Incl'})</p>
                   <p className="text-sm font-bold text-red-700">{fmtEur(analytics.totalPassiveAmount)}</p>
                 </div>
                 <div className="p-2 rounded border bg-blue-50">
-                  <p className="text-[10px] text-blue-700 uppercase">Saldo netto</p>
+                  <p className="text-[10px] text-blue-700 uppercase">Saldo netto ({analyticsVatMode === 'excl' ? 'IVA Excl' : 'IVA Incl'})</p>
                   <p className="text-sm font-bold text-blue-700">{fmtEur(analytics.totalNetAmount)}</p>
                 </div>
                 <div className="p-2 rounded border bg-gray-50">

@@ -113,6 +113,20 @@ function safeNum(v: unknown, fallback = 0): number {
   return Number.isFinite(n) ? n : fallback
 }
 
+async function updateInvoiceSnapshotsForCounterparty(
+  counterpartyId: string,
+  status: CounterpartyStatus,
+): Promise<void> {
+  const { error } = await supabase
+    .from('invoices')
+    .update({ counterparty_status_snapshot: status })
+    .eq('counterparty_id', counterpartyId)
+
+  if (error) {
+    console.warn('Snapshot counterparty status update skipped:', error.message)
+  }
+}
+
 function inferLegalTypeByRules(input: ResolveCounterpartyInput): {
   legalType: CounterpartyLegalType
   confidence: number
@@ -481,6 +495,10 @@ export async function updateCounterparty(
     .eq('id', counterpartyId)
 
   if (error) throw new Error(error.message)
+
+  if (updates.status) {
+    await updateInvoiceSnapshotsForCounterparty(counterpartyId, updates.status)
+  }
 }
 
 export async function syncCounterpartyRoles(companyId: string): Promise<void> {
@@ -559,6 +577,7 @@ export async function verifyCounterparty(counterpartyId: string): Promise<void> 
     .eq('id', counterpartyId)
 
   if (error) throw new Error(error.message)
+  await updateInvoiceSnapshotsForCounterparty(counterpartyId, 'verified')
 }
 
 export async function rejectCounterparty(counterpartyId: string, reason?: string): Promise<void> {
@@ -574,6 +593,7 @@ export async function rejectCounterparty(counterpartyId: string, reason?: string
     .eq('id', counterpartyId)
 
   if (error) throw new Error(error.message)
+  await updateInvoiceSnapshotsForCounterparty(counterpartyId, 'rejected')
 }
 
 export async function loadInvoicesByCounterparty(
@@ -592,6 +612,8 @@ export async function loadInvoicesByCounterparty(
   number: string
   date: string
   total_amount: number
+  taxable_amount: number | null
+  tax_amount: number | null
   payment_status: string
   counterparty_status_snapshot: string | null
 }>> {
@@ -599,7 +621,7 @@ export async function loadInvoicesByCounterparty(
 
   let query = supabase
     .from('invoices')
-    .select('id, counterparty_id, direction, doc_type, number, date, total_amount, payment_status, counterparty_status_snapshot')
+    .select('id, counterparty_id, direction, doc_type, number, date, total_amount, taxable_amount, tax_amount, payment_status, counterparty_status_snapshot')
     .eq('company_id', companyId)
     .in('counterparty_id', counterpartyIds)
 
@@ -618,6 +640,8 @@ export async function loadInvoicesByCounterparty(
     number: string
     date: string
     total_amount: number
+    taxable_amount: number | null
+    tax_amount: number | null
     payment_status: string
     counterparty_status_snapshot: string | null
   }>

@@ -7,7 +7,7 @@ const corsHeaders = {
 
 const MAX_TRANSACTIONS = Number(Deno.env.get("BANK_AI_SEARCH_MAX_TX") ?? "1500");
 const REQUEST_TIMEOUT_MS = Number(Deno.env.get("BANK_AI_SEARCH_TIMEOUT_MS") ?? "30000");
-const ANTHROPIC_MODEL = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-3-5-haiku-latest";
+const ANTHROPIC_MODEL = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-3-5-haiku-20241022";
 const GEMINI_MODEL = Deno.env.get("GEMINI_TEXT_MODEL") ?? "gemini-2.5-flash";
 
 type SearchTx = {
@@ -194,15 +194,49 @@ Deno.serve(async (req) => {
 
     let answer = "";
     let model = "";
+    const providerErrors: string[] = [];
+
     if (anthropicKey) {
-      answer = await callAnthropic(anthropicKey, prompt);
-      model = `anthropic:${ANTHROPIC_MODEL}`;
-    } else if (geminiKey) {
-      answer = await callGemini(geminiKey, prompt);
-      model = `gemini:${GEMINI_MODEL}`;
-    } else {
+      try {
+        answer = await callAnthropic(anthropicKey, prompt);
+        model = `anthropic:${ANTHROPIC_MODEL}`;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Anthropic errore sconosciuto";
+        providerErrors.push(msg);
+      }
+    }
+
+    if (!answer && geminiKey) {
+      try {
+        answer = await callGemini(geminiKey, prompt);
+        model = `gemini:${GEMINI_MODEL}`;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Gemini errore sconosciuto";
+        providerErrors.push(msg);
+      }
+    }
+
+    if (!answer) {
+      if (!anthropicKey && !geminiKey) {
+        return new Response(JSON.stringify({
+          error: "AI provider non configurato (manca ANTHROPIC_API_KEY o GEMINI_API_KEY).",
+        }), {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+
       return new Response(JSON.stringify({
-        error: "AI provider non configurato (manca ANTHROPIC_API_KEY o GEMINI_API_KEY).",
+        error: `Nessun provider AI disponibile: ${providerErrors.join(" | ") || "errore sconosciuto"}`,
+      }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (!model) {
+      return new Response(JSON.stringify({
+        error: "Risposta AI senza modello identificato.",
       }), {
         status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
