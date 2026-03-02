@@ -5,6 +5,7 @@ import { Separator } from '@/components/ui/separator'
 import {
   LayoutDashboard,
   FileText,
+  Users,
   Landmark,
   Link2,
   CalendarClock,
@@ -18,6 +19,7 @@ import { useState } from 'react'
 const nav = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/fatture', icon: FileText, label: 'Fatture' },
+  { to: '/controparti', icon: Users, label: 'Controparti' },
   { to: '/banca', icon: Landmark, label: 'Banca' },
   { to: '/riconciliazione', icon: Link2, label: 'Riconciliazione' },
   { to: '/scadenzario', icon: CalendarClock, label: 'Scadenzario' },

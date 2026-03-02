@@ -6,6 +6,7 @@ import AuthPage from '@/pages/AuthPage'
 import DashboardPage from '@/pages/DashboardPage'
 import FatturePage from '@/pages/FatturePage'
 import BancaPage from '@/pages/BancaPage'
+import ContropartiPage from '@/pages/ContropartiPage'
 import RiconciliazionePage from '@/pages/RiconciliazionePage'
 import ScadenzarioPage from '@/pages/ScadenzarioPage'
 import ImpostazioniPage from '@/pages/ImpostazioniPage'
@@ -44,6 +45,7 @@ export default function App() {
         }>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/fatture" element={<FatturePage />} />
+          <Route path="/controparti" element={<ContropartiPage />} />
           <Route path="/banca" element={<BancaPage />} />
           <Route path="/riconciliazione" element={<RiconciliazionePage />} />
           <Route path="/scadenzario" element={<ScadenzarioPage />} />

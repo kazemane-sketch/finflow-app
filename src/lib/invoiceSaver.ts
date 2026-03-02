@@ -6,6 +6,7 @@
 // reconciliation_status, sdi_id, notes, raw_xml, xml_version, parse_method,
 // source_filename, import_batch_id, xml_hash, created_at, updated_at
 import { supabase } from '@/integrations/supabase/client';
+import { resolveOrCreateCounterpartyFromInvoice } from './counterpartyService';
 
 // ============================================================
 // TYPES
@@ -14,6 +15,7 @@ export interface DBInvoice {
   id: string;
   company_id: string;
   counterparty_id: string | null;
+  counterparty_status_snapshot: string | null;
   counterparty: {
     denom: string;
     piva: string;
@@ -138,6 +140,18 @@ export async function saveInvoicesToDB(
         cf: cpSource.cf,
         sede: cpSource.sede,
       };
+      const resolved = await resolveOrCreateCounterpartyFromInvoice(
+        companyId,
+        {
+          name: counterpartyData.denom,
+          vat_number: counterpartyData.piva,
+          fiscal_code: counterpartyData.cf,
+          address: counterpartyData.sede,
+          source_context: 'invoice_import',
+        },
+        direction as 'in' | 'out',
+      );
+
       let taxableAmount = 0;
       let taxAmount = 0;
       if (b.riepilogo) {
@@ -177,6 +191,8 @@ export async function saveInvoicesToDB(
           tax_amount: taxAmount || null,
           withholding_amount: b.ritenuta?.importo ? parseFloat(b.ritenuta.importo) : null,
           stamp_amount: b.bollo?.importo ? parseFloat(b.bollo.importo) : null,
+          counterparty_id: resolved.counterpartyId,
+          counterparty_status_snapshot: resolved.status,
           counterparty: counterpartyData,
           payment_status: paymentStatus,
           payment_method: b.pagamenti?.[0]?.modalita || '',
@@ -241,7 +257,7 @@ export async function saveInvoicesToDB(
 export async function loadInvoices(companyId: string): Promise<DBInvoice[]> {
   const { data, error } = await supabase
     .from('invoices')
-    .select('id, company_id, counterparty_id, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, payment_status, reconciliation_status, sdi_id, notes, source_filename, parse_method, xml_hash, created_at')
+    .select('id, company_id, counterparty_id, counterparty_status_snapshot, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, payment_status, reconciliation_status, sdi_id, notes, source_filename, parse_method, xml_hash, created_at')
     .eq('company_id', companyId)
     .order('date', { ascending: false })
     .range(0, 4999);

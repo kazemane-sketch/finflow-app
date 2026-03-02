@@ -1,6 +1,7 @@
 // src/pages/FatturePage.tsx — v5
 // Date filter + AI search (Haiku) + removed Fix Nomi
 import { useState, useCallback, useRef, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { processInvoiceFile, TIPO, MP, REG } from '@/lib/invoiceParser';
 import {
   saveInvoicesToDB, loadInvoices, loadInvoiceDetail,
@@ -256,9 +257,10 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck }: 
 // ============================================================
 // FULL INVOICE DETAIL — matches artifact output
 // ============================================================
-function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onReload }: {
+function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onReload, onOpenCounterparty }: {
   invoice: DBInvoice; detail: DBInvoiceDetail | null; loadingDetail: boolean;
   onEdit: (u: InvoiceUpdate) => Promise<void>; onDelete: () => void; onReload: () => void;
+  onOpenCounterparty: (mode: 'verify' | 'edit') => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [showXml, setShowXml] = useState(false);
@@ -302,6 +304,8 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
   const d = parsed;
   const b = d?.bodies?.[0];
   const cp = (invoice.counterparty || {}) as any;
+  const cpStatus = String(invoice.counterparty_status_snapshot || '').toLowerCase();
+  const showCounterpartyAlert = cpStatus === 'pending' || cpStatus === 'rejected' || !invoice.counterparty_id;
   const hasRefs = b?.contratti?.length > 0 || b?.ordini?.length > 0 || b?.convenzioni?.length > 0;
 
   return (
@@ -327,6 +331,35 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
       )}
 
       {editing && <EditForm invoice={invoice} onSave={handleSave} onCancel={() => setEditing(false)} />}
+
+      {showCounterpartyAlert && (
+        <div className={`mb-4 rounded-lg border px-3 py-2.5 ${
+          cpStatus === 'rejected' ? 'border-red-200 bg-red-50' : 'border-amber-200 bg-amber-50'
+        }`}>
+          <p className={`text-sm font-semibold ${cpStatus === 'rejected' ? 'text-red-800' : 'text-amber-800'}`}>
+            {cpStatus === 'rejected' ? 'Controparte respinta' : 'Controparte da verificare'}
+          </p>
+          <p className={`text-xs mt-0.5 ${cpStatus === 'rejected' ? 'text-red-700' : 'text-amber-700'}`}>
+            {cpStatus === 'rejected'
+              ? 'I dati della controparte non sono stati validati. Controlla e correggi l’anagrafica.'
+              : 'La controparte è stata creata automaticamente e richiede verifica utente.'}
+          </p>
+          <div className="flex gap-2 mt-2">
+            <button
+              onClick={() => onOpenCounterparty('verify')}
+              className="px-2.5 py-1 text-xs font-semibold rounded border border-sky-300 bg-white text-sky-700 hover:bg-sky-50"
+            >
+              Verifica controparte
+            </button>
+            <button
+              onClick={() => onOpenCounterparty('edit')}
+              className="px-2.5 py-1 text-xs font-semibold rounded border border-gray-300 bg-white text-gray-700 hover:bg-gray-50"
+            >
+              Modifica dati
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Header */}
       <div className="text-center mb-5 pb-4 border-b-2 border-sky-200">
@@ -552,6 +585,7 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
 // ============================================================
 export default function FatturePage() {
   const { company, loading: companyLoading, ensureCompany, refetch: refetchCompany } = useCompany();
+  const navigate = useNavigate();
   const companyId = company?.id || null;
   const [invoices, setInvoices] = useState<DBInvoice[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -801,7 +835,21 @@ export default function FatturePage() {
         </div>
         {/* Detail */}
         <div className="flex-1 overflow-y-auto bg-gray-50">
-          {selectedInvoice ? <InvoiceDetail invoice={selectedInvoice} detail={detail} loadingDetail={loadingDetail} onEdit={handleEdit} onDelete={() => setDeleteModal({ open: true, ids: [selectedInvoice.id] })} onReload={reload} />
+          {selectedInvoice ? <InvoiceDetail
+            invoice={selectedInvoice}
+            detail={detail}
+            loadingDetail={loadingDetail}
+            onEdit={handleEdit}
+            onDelete={() => setDeleteModal({ open: true, ids: [selectedInvoice.id] })}
+            onReload={reload}
+            onOpenCounterparty={(mode) => {
+              if (selectedInvoice.counterparty_id) {
+                navigate(`/controparti?counterpartyId=${selectedInvoice.counterparty_id}&mode=${mode}`);
+              } else {
+                navigate('/controparti');
+              }
+            }}
+          />
             : <div className="flex items-center justify-center h-full text-gray-400 text-sm">Seleziona una fattura dalla lista</div>}
         </div>
       </div>
