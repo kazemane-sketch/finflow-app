@@ -149,11 +149,15 @@ function CounterpartyCreateModal({
   onClose,
   onCreated,
   companyId,
+  defaultDsoDays,
+  defaultPsoDays,
 }: {
   open: boolean
   onClose: () => void
   onCreated: () => void
   companyId: string
+  defaultDsoDays: number
+  defaultPsoDays: number
 }) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -305,7 +309,7 @@ function CounterpartyCreateModal({
           </div>
 
           <div>
-            <Label className="text-xs">Override DSO (giorni)</Label>
+            <Label className="text-xs">DSO (giorni)</Label>
             <Input
               type="number"
               min={0}
@@ -313,12 +317,12 @@ function CounterpartyCreateModal({
               value={form.dso_days_override}
               onChange={(e) => setForm((f) => ({ ...f, dso_days_override: e.target.value }))}
               className="mt-1"
-              placeholder="Vuoto = default azienda"
+              placeholder={`Default: ${defaultDsoDays}`}
             />
           </div>
 
           <div>
-            <Label className="text-xs">Override PSO (giorni)</Label>
+            <Label className="text-xs">PSO (giorni)</Label>
             <Input
               type="number"
               min={0}
@@ -326,7 +330,7 @@ function CounterpartyCreateModal({
               value={form.pso_days_override}
               onChange={(e) => setForm((f) => ({ ...f, pso_days_override: e.target.value }))}
               className="mt-1"
-              placeholder="Vuoto = default azienda"
+              placeholder={`Default: ${defaultPsoDays}`}
             />
           </div>
 
@@ -1001,7 +1005,7 @@ export default function ContropartiPage() {
                   </div>
 
                   <div>
-                    <Label className="text-xs">Override DSO (giorni)</Label>
+                    <Label className="text-xs">DSO (giorni)</Label>
                     <Input
                       type="number"
                       min={0}
@@ -1009,12 +1013,12 @@ export default function ContropartiPage() {
                       value={draft.dso_days_override}
                       onChange={(e) => setDraft((d) => d ? ({ ...d, dso_days_override: e.target.value }) : d)}
                       className="mt-1"
-                      placeholder="Vuoto = default azienda"
+                      placeholder={`Default: ${company?.default_dso_days ?? 30}`}
                     />
                   </div>
 
                   <div>
-                    <Label className="text-xs">Override PSO (giorni)</Label>
+                    <Label className="text-xs">PSO (giorni)</Label>
                     <Input
                       type="number"
                       min={0}
@@ -1022,7 +1026,7 @@ export default function ContropartiPage() {
                       value={draft.pso_days_override}
                       onChange={(e) => setDraft((d) => d ? ({ ...d, pso_days_override: e.target.value }) : d)}
                       className="mt-1"
-                      placeholder="Vuoto = default azienda"
+                      placeholder={`Default: ${company?.default_pso_days ?? 30}`}
                     />
                   </div>
 
@@ -1250,6 +1254,8 @@ export default function ContropartiPage() {
           onClose={() => setShowCreate(false)}
           onCreated={reloadCounterparties}
           companyId={companyId}
+          defaultDsoDays={company?.default_dso_days ?? 30}
+          defaultPsoDays={company?.default_pso_days ?? 30}
         />
       )}
     </div>
