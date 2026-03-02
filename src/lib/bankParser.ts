@@ -32,6 +32,13 @@ export interface BankTransaction {
   direction_reason?: string;
   direction_updated_at?: string;
   direction_updated_by?: string;
+  summary_reason?: string;
+}
+
+export interface BankStatement {
+  openingBalance?: number;
+  closingBalance?: number;
+  closingDate?: string;
 }
 
 export interface BankImportStats {
@@ -47,16 +54,19 @@ export interface BankImportStats {
   semantic_override_count: number;
   unknown_side_count: number;
   qc_fail_count: number;
+  summary_candidates_count: number;
 }
 
 export interface BankParseResult {
   transactions: BankTransaction[];
+  summaryCandidates: BankTransaction[];
   accountHolder?: string;
   iban?: string;
   bankName?: string;
   statementPeriod?: { from: string; to: string };
   openingBalance?: number;
   closingBalance?: number;
+  statement?: BankStatement;
   pagesProcessed: number;
   errors: string[];
   failedChunks?: number[];
@@ -99,6 +109,53 @@ function normalizeAmountSignExplicit(v: unknown): 'minus' | 'plus_or_none' | 'un
   if (s === 'minus') return 'minus';
   if (s === 'plus_or_none') return 'plus_or_none';
   return 'unknown';
+}
+
+function mapRawTx(raw: any): BankTransaction | null {
+  if (!raw?.date || raw?.amount == null) return null;
+  const parsedAmount = parseFloat(String(raw.amount));
+  if (!Number.isFinite(parsedAmount)) return null;
+
+  const direction = normalizeDirection(raw.direction) || (parsedAmount >= 0 ? 'in' : 'out');
+  const amountAbs = Math.abs(parsedAmount);
+  const amount = direction === 'in' ? amountAbs : -amountAbs;
+  const commission = raw.commission != null && raw.commission !== 0
+    ? -Math.abs(parseFloat(String(raw.commission)))
+    : undefined;
+  const confParsed = parseFloat(String(raw.direction_confidence ?? '0.5'));
+  const directionConfidence = Number.isFinite(confParsed)
+    ? Math.min(1, Math.max(0, Math.round(confParsed * 100) / 100))
+    : 0.5;
+  const directionNeedsReview = Boolean(
+    raw.direction_needs_review === true ||
+    raw.direction_needs_review === 'true' ||
+    (raw.direction_needs_review == null && directionConfidence < 0.7),
+  );
+
+  return {
+    date: parseItalianDate(raw.date),
+    value_date: raw.value_date ? parseItalianDate(raw.value_date) : undefined,
+    amount,
+    commission_amount: commission,
+    net_amount: commission ? amount - Math.abs(commission) : amount,
+    balance: raw.balance != null ? parseFloat(String(raw.balance)) : undefined,
+    description: String(raw.description || '').trim(),
+    counterparty_name: raw.counterparty_name || undefined,
+    category_code: raw.category_code || undefined,
+    transaction_type: raw.transaction_type || 'altro',
+    reference: raw.reference || undefined,
+    invoice_ref: raw.invoice_ref || undefined,
+    raw_text: String(raw.raw_text || raw.description || '').trim(),
+    amount_text: raw.amount_text ? String(raw.amount_text).trim() : undefined,
+    amount_sign_explicit: normalizeAmountSignExplicit(raw.amount_sign_explicit),
+    posting_side: normalizePostingSide(raw.posting_side),
+    direction,
+    direction_source: normalizeDirectionSource(raw.direction_source),
+    direction_confidence: directionConfidence,
+    direction_needs_review: directionNeedsReview,
+    direction_reason: String(raw.direction_reason || '').trim() || undefined,
+    summary_reason: raw.summary_reason ? String(raw.summary_reason).trim() : undefined,
+  };
 }
 
 // Stub — chiave è server-side in Supabase Edge Function secrets
@@ -263,6 +320,7 @@ export async function parseBankPdf(
   }
 
   const allTxRaw: any[] = [];
+  const allSummaryRaw: any[] = [];
   const allFailedChunks = new Set<number>();
   const allErrors: string[] = [];
   const allWarnings: string[] = [];
@@ -273,6 +331,10 @@ export async function parseBankPdf(
   let semanticOverrideCount = 0;
   let unknownSideCount = 0;
   let qcFailCount = 0;
+  let summaryCandidatesCount = 0;
+  let statementOpeningBalance: number | undefined;
+  let statementClosingBalance: number | undefined;
+  let statementClosingDate: string | undefined;
   let totalChunks = 0;
   let startChunk = 0;
   let completed = false;
@@ -281,11 +343,11 @@ export async function parseBankPdf(
     const finalData = await parseWindow(startChunk);
 
     for (const t of (finalData.transactions || [])) allTxRaw.push(t);
+    for (const t of (finalData.summaryCandidates || [])) allSummaryRaw.push(t);
     for (const c of (finalData.failedChunks || [])) allFailedChunks.add(Number(c));
     for (const w of (finalData.warnings || [])) {
       if (typeof w === 'string' && w.trim()) {
         allWarnings.push(w);
-        allErrors.push(w);
       }
     }
     const stats = finalData?.stats || {};
@@ -296,6 +358,21 @@ export async function parseBankPdf(
     semanticOverrideCount += Number(stats.semantic_override_count || 0);
     unknownSideCount += Number(stats.unknown_side_count || 0);
     qcFailCount += Number(stats.qc_fail_count || 0);
+    summaryCandidatesCount += Number(stats.summary_candidates_count || 0);
+
+    const statement = finalData?.statement || {};
+    const openingRaw = Number(statement.openingBalance);
+    const closingRaw = Number(statement.closingBalance);
+    const closingDateRaw = typeof statement.closingDate === 'string' ? statement.closingDate : undefined;
+    if (statementOpeningBalance == null && Number.isFinite(openingRaw)) {
+      statementOpeningBalance = openingRaw;
+    }
+    if (Number.isFinite(closingRaw)) {
+      statementClosingBalance = closingRaw;
+    }
+    if (closingDateRaw) {
+      statementClosingDate = parseItalianDate(closingDateRaw);
+    }
 
     totalChunks = Number(finalData.totalChunks || totalChunks || 0);
     const hasMore = !!finalData.hasMore;
@@ -312,9 +389,23 @@ export async function parseBankPdf(
   }
   if (!completed) throw new Error('Import interrotto: superato limite interno di finestre chunk.');
 
+  const statement: BankStatement | undefined = (
+    statementOpeningBalance != null || statementClosingBalance != null || statementClosingDate != null
+  )
+    ? {
+        openingBalance: statementOpeningBalance,
+        closingBalance: statementClosingBalance,
+        closingDate: statementClosingDate,
+      }
+    : undefined;
+
   const result: BankParseResult = {
     transactions: [],
-    pagesProcessed: allTxRaw.length,
+    summaryCandidates: [],
+    openingBalance: statementOpeningBalance,
+    closingBalance: statementClosingBalance,
+    statement,
+    pagesProcessed: rawParsedCount || allTxRaw.length,
     errors: allErrors,
     failedChunks: Array.from(allFailedChunks).sort((a, b) => a - b),
     warnings: allWarnings,
@@ -331,68 +422,35 @@ export async function parseBankPdf(
       semantic_override_count: semanticOverrideCount,
       unknown_side_count: unknownSideCount,
       qc_fail_count: qcFailCount,
+      summary_candidates_count: summaryCandidatesCount,
     },
   };
 
   let droppedMissingRequiredCountClient = 0;
   for (const t of allTxRaw) {
-    if (!t?.date || t?.amount == null) {
+    const mapped = mapRawTx(t);
+    if (!mapped) {
       droppedMissingRequiredCountClient++;
       continue;
     }
-    const parsedAmount = parseFloat(String(t.amount));
-    if (!Number.isFinite(parsedAmount)) {
-      droppedMissingRequiredCountClient++;
-      continue;
-    }
-    const direction = normalizeDirection(t.direction) || (parsedAmount >= 0 ? 'in' : 'out');
-    const amountAbs = Math.abs(parsedAmount);
-    const amount = direction === 'in' ? amountAbs : -amountAbs;
-    const commission = t.commission != null && t.commission !== 0
-      ? -Math.abs(parseFloat(String(t.commission)))
-      : undefined;
-    const confParsed = parseFloat(String(t.direction_confidence ?? '0.5'));
-    const directionConfidence = Number.isFinite(confParsed)
-      ? Math.min(1, Math.max(0, Math.round(confParsed * 100) / 100))
-      : 0.5;
-    const directionNeedsReview = Boolean(
-      t.direction_needs_review === true ||
-      t.direction_needs_review === 'true' ||
-      (t.direction_needs_review == null && directionConfidence < 0.7),
-    );
+    result.transactions.push(mapped);
+  }
 
-    result.transactions.push({
-      date: parseItalianDate(t.date),
-      value_date: t.value_date ? parseItalianDate(t.value_date) : undefined,
-      amount,
-      commission_amount: commission,
-      net_amount: commission ? amount - Math.abs(commission) : amount,
-      balance: t.balance != null ? parseFloat(String(t.balance)) : undefined,
-      description: String(t.description || '').trim(),
-      counterparty_name: t.counterparty_name || undefined,
-      category_code: t.category_code || undefined,
-      transaction_type: t.transaction_type || 'altro',
-      reference: t.reference || undefined,
-      invoice_ref: t.invoice_ref || undefined,
-      raw_text: String(t.raw_text || t.description || '').trim(),
-      amount_text: t.amount_text ? String(t.amount_text).trim() : undefined,
-      amount_sign_explicit: normalizeAmountSignExplicit(t.amount_sign_explicit),
-      posting_side: normalizePostingSide(t.posting_side),
-      direction,
-      direction_source: normalizeDirectionSource(t.direction_source),
-      direction_confidence: directionConfidence,
-      direction_needs_review: directionNeedsReview,
-      direction_reason: String(t.direction_reason || '').trim() || undefined,
-    });
+  for (const s of allSummaryRaw) {
+    const mapped = mapRawTx(s);
+    if (!mapped) continue;
+    result.summaryCandidates.push(mapped);
   }
 
   result.transactions = result.transactions.sort((a, b) => b.date.localeCompare(a.date));
+  result.summaryCandidates = result.summaryCandidates.sort((a, b) => b.date.localeCompare(a.date));
   result.stats.dropped_missing_required_count += droppedMissingRequiredCountClient;
+  result.stats.summary_candidates_count = result.summaryCandidates.length || result.stats.summary_candidates_count;
 
   if (result.failedChunks && result.failedChunks.length > 0) {
     result.errors.push(`${result.failedChunks.length} blocchi di pagine non processati (chunk ${result.failedChunks.join(', ')})`);
   }
-  if (result.transactions.length === 0) {
+  if (result.transactions.length === 0 && result.summaryCandidates.length === 0) {
     result.errors.push('La edge function ha risposto ma non ha estratto movimenti (JSON Gemini vuoto/troncato o formato inatteso).');
   }
 
@@ -400,7 +458,7 @@ export async function parseBankPdf(
     phase: 'done',
     current: result.transactions.length,
     total: result.transactions.length,
-    message: `✓ ${result.transactions.length} movimenti estratti${totalChunks ? ` (${totalChunks} chunk)` : ''}`,
+    message: `✓ ${result.transactions.length} movimenti estratti${result.summaryCandidates.length ? ` · ${result.summaryCandidates.length} summary candidati` : ''}${totalChunks ? ` (${totalChunks} chunk)` : ''}`,
   });
 
   return result;
@@ -522,6 +580,22 @@ export async function ensureBankAccount(
   }).select('id').single();
   if (error) throw new Error('Errore conto: ' + error.message);
   return data.id;
+}
+
+export async function updateBankAccountBalance(
+  bankAccountId: string,
+  balance: number,
+  balanceDate?: string
+): Promise<void> {
+  const payload: Record<string, unknown> = { current_balance: balance };
+  if (balanceDate) payload.balance_date = balanceDate;
+
+  const { error } = await supabase
+    .from('bank_accounts')
+    .update(payload)
+    .eq('id', bankAccountId);
+
+  if (error) throw new Error('Errore aggiornamento saldo conto: ' + error.message);
 }
 
 export async function createImportBatch(companyId: string, filename: string): Promise<string> {

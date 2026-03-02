@@ -11,8 +11,9 @@ import {
 import {
   parseBankPdf, saveBankTransactions, ensureBankAccount, createImportBatch,
   updateImportBatch, loadBankTransactions, loadBankAccounts, getClaudeApiKey,
+  updateBankAccountBalance,
   deleteBankTransactions, deleteAllBankTransactions, updateBankTransactionDirection,
-  type BankImportStats, type BankParseProgress,
+  type BankImportStats, type BankParseProgress, type BankParseResult, type BankTransaction,
 } from '@/lib/bankParser'
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 
@@ -62,6 +63,22 @@ function txDirectionSourceLabel(source?: string) {
 function txDirectionConfidenceLabel(conf?: number) {
   if (conf == null || Number.isNaN(Number(conf))) return '—'
   return `${Math.round(Number(conf) * 100)}%`
+}
+
+function getTxTitle(tx: any): string {
+  const cp = String(tx?.counterparty_name || '').trim()
+  const cpNorm = cp.toLowerCase()
+  const invalidCounterparty = !cp ||
+    cpNorm === 'n.d.' ||
+    cpNorm === 'n.d' ||
+    cpNorm === 'nd' ||
+    cpNorm === 'n/d'
+  if (!invalidCounterparty) return cp
+
+  const description = String(tx?.description || '').trim()
+  if (!description) return '—'
+  const firstLine = description.split('\n')[0].trim()
+  return firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine
 }
 function isoDate(d: Date) {
   return d.toISOString().split('T')[0]
@@ -150,6 +167,84 @@ function DeleteModal({ mode, count, onConfirm, onCancel }: {
   )
 }
 
+function SummaryReviewModal({
+  items,
+  onToggle,
+  onDiscardAll,
+  onConfirm,
+  onCancel,
+  saving,
+}: {
+  items: Array<BankTransaction & { _id: string; include: boolean }>;
+  onToggle: (id: string) => void;
+  onDiscardAll: () => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+  saving: boolean;
+}) {
+  const selectedCount = items.filter((it) => it.include).length;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-4xl mx-4 max-h-[85vh] flex flex-col">
+        <div className="px-5 py-4 border-b flex items-center justify-between">
+          <div>
+            <p className="font-semibold text-gray-900">Righe di riepilogo trovate</p>
+            <p className="text-xs text-gray-500">
+              Seleziona solo le righe da importare come transazione. Default: scarta tutte.
+            </p>
+          </div>
+          <button onClick={onCancel} className="text-gray-400 hover:text-gray-600 p-1" disabled={saving}>
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-4 space-y-2">
+          {items.map((it) => (
+            <label
+              key={it._id}
+              className="flex items-start gap-3 rounded-lg border border-gray-200 p-3 hover:bg-gray-50 cursor-pointer"
+            >
+              <input
+                type="checkbox"
+                checked={it.include}
+                onChange={() => onToggle(it._id)}
+                className="mt-1"
+                disabled={saving}
+              />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs text-gray-500">{fmtDate(it.date)}</span>
+                  <span className="text-xs font-semibold text-gray-800">{fmtEur(it.amount)}</span>
+                  {it.summary_reason && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">
+                      {it.summary_reason}
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-gray-800 mt-1 break-words">{it.description || it.raw_text || 'Riga summary'}</p>
+              </div>
+            </label>
+          ))}
+        </div>
+
+        <div className="px-5 py-3 border-t bg-gray-50 flex items-center justify-between gap-3">
+          <p className="text-xs text-gray-600">
+            Selezionate: <span className="font-semibold">{selectedCount}</span> / {items.length}
+          </p>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={onDiscardAll} disabled={saving}>Scarta tutte</Button>
+            <Button variant="outline" size="sm" onClick={onCancel} disabled={saving}>Annulla import</Button>
+            <Button size="sm" onClick={onConfirm} disabled={saving}>
+              {saving ? 'Salvataggio...' : 'Conferma selezione'}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ============================================================
 // TRANSACTION ROW
 // ============================================================
@@ -177,7 +272,7 @@ function TxRow({ tx, selected, onClick, onDoubleClick }: {
       </div>
       <div className="flex-1 min-w-0">
         <p className="text-xs font-semibold text-gray-800 truncate">
-          {tx.counterparty_name || tx.description?.substring(0, 60) || '—'}
+          {getTxTitle(tx)}
         </p>
         <div className="flex items-center gap-2 mt-0.5">
           <span className="text-[10px] text-gray-400">{fmtDate(tx.date)}</span>
@@ -294,6 +389,14 @@ function TxDetail({
         <Row l="IBAN / Conto controparte" v={tx.counterparty_account} />
         <Row l="Saldo dopo" v={tx.balance != null ? fmtEur(tx.balance) : null} />
         <Row l="Descrizione" v={tx.description} />
+        {tx.raw_text && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Testo operazione completo</p>
+            <pre className="mt-0.5 text-[10px] text-gray-800 bg-gray-50 p-2 rounded whitespace-pre-wrap font-mono">
+              {tx.raw_text}
+            </pre>
+          </div>
+        )}
         <Row l="Rif. fattura" v={tx.invoice_ref} />
         <Row l="ID flusso CBI" v={tx.cbi_flow_id} />
         <Row l="Filiale disponente" v={tx.branch} />
@@ -398,8 +501,16 @@ export default function BancaPage() {
     duplicates: number;
     dedup_db_count: number;
     errors: string[];
+    warnings: string[];
     stats: BankImportStats;
   } | null>(null)
+  const [summaryReview, setSummaryReview] = useState<{
+    items: Array<BankTransaction & { _id: string; include: boolean }>;
+    parseResult: BankParseResult;
+    bankAccountId: string;
+    filename: string;
+  } | null>(null)
+  const [summaryConfirming, setSummaryConfirming] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
 
@@ -547,67 +658,111 @@ export default function BancaPage() {
     setDirectionSaving(false)
   }
 
-  const handleImport = useCallback(async (files: FileList | null) => {
-    if (!files?.length || !companyId) return
-    const file = files[0]
-    const apiKey = getClaudeApiKey()
-    if (!apiKey) { alert('Configura la chiave API Claude in Impostazioni.'); return }
-    setImporting(true); setImportResult(null); setImportTxCount(0)
+  const finalizeImport = useCallback(async (
+    filename: string,
+    parseResult: BankParseResult,
+    bankAccountId: string,
+    selectedSummaryRows: BankTransaction[]
+  ) => {
+    if (!companyId) return
 
-    try {
-      const parseResult = await parseBankPdf(file, apiKey, companyId, (p) => { setImportProgress(p) })
-      setImportTxCount(parseResult.transactions.length)
-      const batchId = await createImportBatch(companyId, file.name)
+    const warnings = [...(parseResult.warnings || [])]
+    const txToSave = [...parseResult.transactions, ...selectedSummaryRows]
+    const batchId = await createImportBatch(companyId, filename)
 
-      if (parseResult.transactions.length === 0) {
-        const errs = parseResult.errors.length > 0
-          ? parseResult.errors
-          : ['Nessun movimento trovato.']
-        const finalStats: BankImportStats = {
-          ...parseResult.stats,
-          dedup_db_count: 0,
-          saved_count: 0,
-        }
-        await updateImportBatch(batchId, {
-          total: 0,
-          success: 0,
-          errors: errs.length,
-          error_details: {
-            stats: finalStats,
-            failed_chunks: parseResult.failedChunks || [],
-            warnings: parseResult.warnings || [],
-            errors: errs,
-          },
-        })
-        setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: errs, stats: finalStats })
-        setImporting(false); return
-      }
-
-      const bankAccountId = await ensureBankAccount(companyId, { iban: undefined, bankName: 'Monte dei Paschi', accountHolder: undefined })
-      setImportProgress({ phase: 'saving', current: 0, total: parseResult.transactions.length, message: 'Salvataggio...' })
-
-      const saveResult = await saveBankTransactions(
-        companyId, bankAccountId, parseResult.transactions, batchId,
-        (cur, tot) => setImportProgress({ phase: 'saving', current: cur, total: tot, message: `Salvataggio ${cur}/${tot}...` })
-      )
+    if (txToSave.length === 0) {
+      const errs = parseResult.errors.length > 0
+        ? parseResult.errors
+        : ['Nessun movimento trovato.']
       const finalStats: BankImportStats = {
         ...parseResult.stats,
-        dedup_db_count: saveResult.dedup_db_count,
-        saved_count: saveResult.saved,
+        dedup_db_count: 0,
+        saved_count: 0,
       }
-      const mergedErrors = [...saveResult.errors, ...parseResult.errors]
       await updateImportBatch(batchId, {
-        total: parseResult.transactions.length, success: saveResult.saved,
-        errors: mergedErrors.length,
+        total: 0,
+        success: 0,
+        errors: errs.length,
         error_details: {
           stats: finalStats,
           failed_chunks: parseResult.failedChunks || [],
-          warnings: parseResult.warnings || [],
-          errors: mergedErrors,
+          warnings,
+          errors: errs,
+          summary_candidates_count: parseResult.summaryCandidates.length,
+          summary_selected_count: selectedSummaryRows.length,
         },
       })
-      setImportResult({ ...saveResult, errors: mergedErrors, stats: finalStats })
-      await loadData()
+      setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: errs, warnings, stats: finalStats })
+      return
+    }
+
+    setImportProgress({ phase: 'saving', current: 0, total: txToSave.length, message: 'Salvataggio...' })
+    const saveResult = await saveBankTransactions(
+      companyId,
+      bankAccountId,
+      txToSave,
+      batchId,
+      (cur, tot) => setImportProgress({ phase: 'saving', current: cur, total: tot, message: `Salvataggio ${cur}/${tot}...` })
+    )
+
+    if (parseResult.statement?.closingBalance != null) {
+      try {
+        await updateBankAccountBalance(
+          bankAccountId,
+          Number(parseResult.statement.closingBalance),
+          parseResult.statement.closingDate,
+        )
+      } catch (err: any) {
+        warnings.push(`Saldo finale non aggiornato: ${err?.message || 'errore sconosciuto'}`)
+      }
+    }
+
+    const finalStats: BankImportStats = {
+      ...parseResult.stats,
+      dedup_db_count: saveResult.dedup_db_count,
+      saved_count: saveResult.saved,
+    }
+    const mergedErrors = [...saveResult.errors, ...parseResult.errors]
+    await updateImportBatch(batchId, {
+      total: txToSave.length,
+      success: saveResult.saved,
+      errors: mergedErrors.length,
+      error_details: {
+        stats: finalStats,
+        failed_chunks: parseResult.failedChunks || [],
+        warnings,
+        errors: mergedErrors,
+        summary_candidates_count: parseResult.summaryCandidates.length,
+        summary_selected_count: selectedSummaryRows.length,
+        statement: parseResult.statement || null,
+      },
+    })
+
+    setImportResult({
+      ...saveResult,
+      errors: mergedErrors,
+      warnings,
+      stats: finalStats,
+    })
+    await loadData()
+  }, [companyId, loadData])
+
+  const handleSummaryConfirm = useCallback(async () => {
+    if (!summaryReview) return
+    setSummaryConfirming(true)
+    setImporting(true)
+    try {
+      const selectedSummaryRows = summaryReview.items
+        .filter((it) => it.include)
+        .map(({ _id, include, ...tx }) => tx)
+
+      await finalizeImport(
+        summaryReview.filename,
+        summaryReview.parseResult,
+        summaryReview.bankAccountId,
+        selectedSummaryRows,
+      )
+      setSummaryReview(null)
     } catch (e: any) {
       const emptyStats: BankImportStats = {
         raw_parsed_count: 0,
@@ -622,12 +777,70 @@ export default function BancaPage() {
         semantic_override_count: 0,
         unknown_side_count: 0,
         qc_fail_count: 0,
+        summary_candidates_count: 0,
       }
-      setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], stats: emptyStats })
+      setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], warnings: [], stats: emptyStats })
+    } finally {
+      setSummaryConfirming(false)
+      setImporting(false)
+      if (fileRef.current) fileRef.current.value = ''
+    }
+  }, [finalizeImport, summaryReview])
+
+  const handleImport = useCallback(async (files: FileList | null) => {
+    if (!files?.length || !companyId) return
+    const file = files[0]
+    const apiKey = getClaudeApiKey()
+    if (!apiKey) { alert('Configura la chiave API Claude in Impostazioni.'); return }
+    setImporting(true)
+    setImportResult(null)
+    setImportTxCount(0)
+    setSummaryReview(null)
+
+    try {
+      const parseResult = await parseBankPdf(file, apiKey, companyId, (p) => { setImportProgress(p) })
+      setImportTxCount(parseResult.transactions.length)
+
+      const bankAccountId = await ensureBankAccount(companyId, { iban: undefined, bankName: 'Monte dei Paschi', accountHolder: undefined })
+
+      if (parseResult.summaryCandidates.length > 0) {
+        const items = parseResult.summaryCandidates.map((tx, idx) => ({
+          ...tx,
+          _id: `summary-${idx}-${tx.date}-${tx.amount}`,
+          include: false,
+        }))
+        setSummaryReview({
+          items,
+          parseResult,
+          bankAccountId,
+          filename: file.name,
+        })
+        setImporting(false)
+        return
+      }
+
+      await finalizeImport(file.name, parseResult, bankAccountId, [])
+    } catch (e: any) {
+      const emptyStats: BankImportStats = {
+        raw_parsed_count: 0,
+        dropped_missing_required_count: 0,
+        dedup_edge_count: 0,
+        dedup_client_count: 0,
+        dedup_db_count: 0,
+        saved_count: 0,
+        failed_chunks_count: 0,
+        warnings_count: 0,
+        side_rule_count: 0,
+        semantic_override_count: 0,
+        unknown_side_count: 0,
+        qc_fail_count: 0,
+        summary_candidates_count: 0,
+      }
+      setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], warnings: [], stats: emptyStats })
     }
     setImporting(false)
     if (fileRef.current) fileRef.current.value = ''
-  }, [companyId, loadData])
+  }, [companyId, finalizeImport])
 
   // Filters (defined before handleAiSearch so it can reference it)
   const filtered = transactions.filter(tx => {
@@ -754,11 +967,17 @@ export default function BancaPage() {
 
           {importResult && !importing && (
             <div className={`flex items-start gap-3 p-3 rounded-lg border ${
-              importResult.errors.filter(e => !e.startsWith('Batch')).length > 0 && importResult.saved === 0
-                ? 'bg-red-50 border-red-200' : 'bg-emerald-50 border-emerald-200'}`}>
-              {importResult.saved > 0
-                ? <CheckCircle className="h-4 w-4 text-emerald-600 flex-shrink-0 mt-0.5" />
-                : <AlertCircle className="h-4 w-4 text-red-600 flex-shrink-0 mt-0.5" />}
+              importResult.saved === 0 && importResult.errors.length > 0
+                ? 'bg-red-50 border-red-200'
+                : (importResult.warnings.length > 0 || importResult.stats.warnings_count > 0 || importResult.stats.failed_chunks_count > 0)
+                  ? 'bg-amber-50 border-amber-200'
+                  : 'bg-emerald-50 border-emerald-200'
+            }`}>
+              {importResult.saved === 0 && importResult.errors.length > 0
+                ? <AlertCircle className="h-4 w-4 text-red-600 flex-shrink-0 mt-0.5" />
+                : (importResult.warnings.length > 0 || importResult.stats.warnings_count > 0 || importResult.stats.failed_chunks_count > 0)
+                  ? <AlertTriangle className="h-4 w-4 text-amber-600 flex-shrink-0 mt-0.5" />
+                  : <CheckCircle className="h-4 w-4 text-emerald-600 flex-shrink-0 mt-0.5" />}
               <div className="flex-1 min-w-0">
                 <p className="text-sm font-medium">
                   {importResult.saved > 0 ? `✓ ${importResult.saved} movimenti importati` : 'Import fallito'}
@@ -779,13 +998,20 @@ export default function BancaPage() {
                     Side-rule: {importResult.stats.side_rule_count} ·
                     Override semantico: {importResult.stats.semantic_override_count} ·
                     Unknown side: {importResult.stats.unknown_side_count} ·
-                    QC fail: {importResult.stats.qc_fail_count}
+                    QC fail: {importResult.stats.qc_fail_count} ·
+                    Summary candidati: {importResult.stats.summary_candidates_count}
                   </div>
                 )}
                 {(importResult.stats.failed_chunks_count > 0 || importResult.stats.warnings_count > 0) && (
                   <div className="text-xs text-amber-700 mt-1">
                     Chunk falliti: {importResult.stats.failed_chunks_count} · Warning: {importResult.stats.warnings_count}
                   </div>
+                )}
+                {importResult.warnings.length > 0 && (
+                  <ul className="text-xs text-amber-700 mt-1 space-y-0.5">
+                    {importResult.warnings.slice(0, 4).map((w, i) => <li key={`w-${i}`}>• {w}</li>)}
+                    {importResult.warnings.length > 4 && <li>...e altri {importResult.warnings.length - 4} warning</li>}
+                  </ul>
                 )}
                 {importResult.errors.length > 0 && (
                   <ul className="text-xs text-red-700 mt-1 space-y-0.5">
@@ -944,6 +1170,37 @@ export default function BancaPage() {
             }}
           />
         </div>
+      )}
+
+      {summaryReview && (
+        <SummaryReviewModal
+          items={summaryReview.items}
+          onToggle={(id) => {
+            if (summaryConfirming) return
+            setSummaryReview((prev) => {
+              if (!prev) return prev
+              return {
+                ...prev,
+                items: prev.items.map((it) => it._id === id ? { ...it, include: !it.include } : it),
+              }
+            })
+          }}
+          onDiscardAll={() => {
+            if (summaryConfirming) return
+            setSummaryReview((prev) => {
+              if (!prev) return prev
+              return { ...prev, items: prev.items.map((it) => ({ ...it, include: false })) }
+            })
+          }}
+          onConfirm={handleSummaryConfirm}
+          onCancel={() => {
+            if (summaryConfirming) return
+            setSummaryReview(null)
+            setImporting(false)
+            if (fileRef.current) fileRef.current.value = ''
+          }}
+          saving={summaryConfirming}
+        />
       )}
 
       {deleteModal && (

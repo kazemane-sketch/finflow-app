@@ -35,6 +35,7 @@ type Tx = {
   direction_confidence: number;
   direction_needs_review: boolean;
   direction_reason: string;
+  summary_reason?: string | null;
 };
 
 type ParserTx = {
@@ -48,17 +49,30 @@ type ParserTx = {
   reference?: unknown;
   category_code?: unknown;
   transaction_type?: unknown;
+  counterparty_name?: unknown;
   column_confidence?: unknown;
   qc_needs_review?: unknown;
+  row_reason?: unknown;
+};
+
+type ParserSummaryRow = ParserTx;
+
+type ParserStatement = {
+  opening_balance?: unknown;
+  closing_balance?: unknown;
+  closing_date?: unknown;
 };
 
 type ParserResponse = {
   transactions?: ParserTx[];
+  summary_rows?: ParserSummaryRow[];
+  statement?: ParserStatement;
   stats?: {
     pages_processed?: unknown;
     rows_detected?: unknown;
     rows_unknown_side?: unknown;
     parse_errors?: unknown;
+    summary_rows_detected?: unknown;
   };
   quality?: {
     qc_fail_count?: unknown;
@@ -358,7 +372,7 @@ function mapParserTx(item: ParserTx): Tx | null {
     amount,
     commission,
     description,
-    counterparty_name: null,
+    counterparty_name: clip(item?.counterparty_name, 220),
     transaction_type: txType,
     reference,
     invoice_ref: null,
@@ -372,6 +386,7 @@ function mapParserTx(item: ParserTx): Tx | null {
     direction_confidence: decision.confidence,
     direction_needs_review: decision.needsReview,
     direction_reason: clip(decision.reason, 240) || "Direzione determinata automaticamente",
+    summary_reason: clip(item?.row_reason, 120),
   };
 }
 
@@ -470,6 +485,13 @@ Deno.serve(async (req) => {
               semantic_override_count: 0,
               unknown_side_count: 0,
               qc_fail_count: 0,
+              summary_candidates_count: 0,
+            },
+            summaryCandidates: [],
+            statement: {
+              openingBalance: null,
+              closingBalance: null,
+              closingDate: null,
             },
             totalChunks,
             startChunk,
@@ -493,6 +515,7 @@ Deno.serve(async (req) => {
     const stream = new ReadableStream<Uint8Array>({
       async start(controller) {
         let allTransactions: Tx[] = [];
+        let allSummaryCandidates: Tx[] = [];
         const failedChunks: number[] = [];
         const warnings: string[] = [];
 
@@ -503,6 +526,10 @@ Deno.serve(async (req) => {
         let sideRuleCount = 0;
         let semanticOverrideCount = 0;
         let qcFailCount = 0;
+        let summaryCandidatesCount = 0;
+        let statementOpeningBalance: number | null = null;
+        let statementClosingBalance: number | null = null;
+        let statementClosingDate: string | null = null;
 
         for (let i = startChunk; i < endChunkExclusive; i++) {
           const fromPage = i * CHUNK_SIZE + 1;
@@ -521,19 +548,26 @@ Deno.serve(async (req) => {
             try {
               const parsed = await callParser(parserUrl, parserToken, pdfBase64, fromPage, toPage);
               const parserTx = Array.isArray(parsed.transactions) ? parsed.transactions : [];
+              const parserSummaryRows = Array.isArray(parsed.summary_rows) ? parsed.summary_rows : [];
               const mapped = parserTx.map(mapParserTx).filter(Boolean) as Tx[];
+              const mappedSummary = parserSummaryRows.map(mapParserTx).filter(Boolean) as Tx[];
 
               const rowsDetected = Number(parsed?.stats?.rows_detected || parserTx.length || 0);
               const chunkUnknownSide = Number(parsed?.stats?.rows_unknown_side || 0);
               const chunkParseErrors = Number(parsed?.stats?.parse_errors || 0);
+              const chunkSummaryRows = Number(parsed?.stats?.summary_rows_detected || parserSummaryRows.length || 0);
               const chunkQcFail = Number(parsed?.quality?.qc_fail_count || 0);
               const ledgerMatch = parsed?.quality?.ledger_match;
+              const openingBalance = toNumber(parsed?.statement?.opening_balance);
+              const closingBalance = toNumber(parsed?.statement?.closing_balance);
+              const closingDate = clip(parsed?.statement?.closing_date, 20);
 
               rawParsedCount += rowsDetected;
               droppedMissingRequiredCount += Math.max(0, rowsDetected - mapped.length);
               parseErrorsCount += chunkParseErrors;
               unknownSideCount += chunkUnknownSide;
               qcFailCount += chunkQcFail;
+              summaryCandidatesCount += Math.max(0, chunkSummaryRows);
 
               sideRuleCount += mapped.filter((t) => t.direction_source === "side_rule").length;
               semanticOverrideCount += mapped.filter((t) => t.direction_source === "semantic_rule").length;
@@ -549,7 +583,14 @@ Deno.serve(async (req) => {
               }
 
               allTransactions = allTransactions.concat(mapped);
-              console.log(`Chunk ${i + 1}: mapped=${mapped.length}, detected=${rowsDetected}, qc_fail=${chunkQcFail}`);
+              allSummaryCandidates = allSummaryCandidates.concat(mappedSummary);
+              if (statementOpeningBalance == null && openingBalance != null) statementOpeningBalance = Math.abs(openingBalance);
+              if (closingBalance != null) statementClosingBalance = Math.abs(closingBalance);
+              if (closingDate) statementClosingDate = closingDate;
+
+              console.log(
+                `Chunk ${i + 1}: mapped=${mapped.length}, summary=${mappedSummary.length}, detected=${rowsDetected}, qc_fail=${chunkQcFail}`,
+              );
 
               ok = true;
               break;
@@ -604,6 +645,13 @@ Deno.serve(async (req) => {
             semantic_override_count: semanticOverrideCount,
             unknown_side_count: unknownSideCount,
             qc_fail_count: qcFailCount + parseErrorsCount,
+            summary_candidates_count: allSummaryCandidates.length || summaryCandidatesCount,
+          },
+          summaryCandidates: allSummaryCandidates,
+          statement: {
+            openingBalance: statementOpeningBalance,
+            closingBalance: statementClosingBalance,
+            closingDate: statementClosingDate,
           },
           failedChunks: failedChunks.length ? failedChunks : undefined,
           warnings: warnings.length ? warnings : undefined,

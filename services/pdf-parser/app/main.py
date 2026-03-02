@@ -12,33 +12,30 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
-app = FastAPI(title="FinFlow PDF Parser", version="0.1.0")
+app = FastAPI(title="FinFlow PDF Parser", version="0.2.0")
 
 DATE_RE = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
 AMOUNT_RE = re.compile(r"^\(?-?\d+(?:\.\d{3})*,\d{2}\)?$")
 AMOUNT_IN_TEXT_RE = re.compile(r"\(?-?\d+(?:\.\d{3})*,\d{2}\)?")
 SPACES_RE = re.compile(r"\s+")
 
-OUT_HINTS = (
-    "vostra disposizione a favore",
-    "addebito",
-    "pagamento",
-    "f24",
-    "commissioni",
-    "commissione",
-    "rid",
-    "sdd",
-    "prelievo",
-    "effetti ritirati",
+SUMMARY_KEYWORDS = (
+    "saldo finale",
+    "saldo iniziale",
+    "riporti",
+    "totale",
+    "tot.",
+    "movimenti con data contabile",
 )
-IN_HINTS = (
-    "a vostro favore",
-    "accredito",
-    "stipendio",
-    "interessi a credito",
-    "versamento",
-    "incasso",
-)
+
+GENERIC_COUNTERPARTY = {
+    "n.d.",
+    "nd",
+    "n/d",
+    "pagamenti diversi",
+    "altro",
+    "saldo finale",
+}
 
 
 class ExtractRequest(BaseModel):
@@ -57,6 +54,11 @@ def require_internal_token(x_internal_token: str | None) -> None:
 
 def normalize_space(value: str) -> str:
     return SPACES_RE.sub(" ", value.replace("\n", " ").replace("\r", " ")).strip()
+
+
+def normalize_multiline(lines: list[str]) -> str:
+    cleaned = [normalize_space(line) for line in lines]
+    return "\n".join([line for line in cleaned if line])
 
 
 def parse_amount_token(token: str) -> float | None:
@@ -118,7 +120,6 @@ def extract_reference(text: str) -> str | None:
 
 
 def extract_category_code(line_text: str) -> str | None:
-    # Nei PDF MPS il codice causale e' spesso vicino all'importo (es. 26, 31, 48)
     match = re.search(r"\b(?:CS\.?\s*)?(\d{1,3})\b", line_text)
     if not match:
         return None
@@ -144,14 +145,72 @@ def infer_transaction_type(text: str, direction_base: str) -> str:
     return "altro"
 
 
-def contains_out_hint(text: str) -> bool:
-    t = normalize_space(text).lower()
-    return any(h in t for h in OUT_HINTS)
+def clean_counterparty_name(raw: str | None) -> str | None:
+    if not raw:
+        return None
+
+    value = raw.strip().strip("-:;,. ")
+    value = re.sub(r"^\([^)]*\)\s*", "", value).strip()
+    value = re.sub(r"\s+", " ", value)
+    if not value:
+        return None
+
+    stop_pattern = re.compile(
+        r"\b(BONIFICO\s+PER|FILIALE|BIC:|INF:|RI:|RIF\.?|NUM\.?|TOT\.?|IMPORTO|ORD\.ORIG)\b",
+        flags=re.IGNORECASE,
+    )
+    stop = stop_pattern.search(value)
+    if stop:
+        value = value[: stop.start()].strip(" -:;,. ")
+
+    value_lower = value.lower().strip()
+    if not value_lower or value_lower in GENERIC_COUNTERPARTY:
+        return None
+
+    if len(value) < 3:
+        return None
+    return value
 
 
-def contains_in_hint(text: str) -> bool:
+def extract_counterparty(raw_lines: list[str], raw_text: str) -> str:
+    lines = [normalize_space(x) for x in raw_lines if normalize_space(x)]
+
+    line_patterns = [
+        r"BONIFICO\s+A\s+VOSTRO\s+FAVORE(?:\s*\([^)]*\))?\s*(.+)",
+        r"A\s+FAVORE\s+DI\s+(.+)",
+        r"CRED\s*:\s*(.+)",
+        r"BEN\s*:\s*(.+)",
+        r"ORDINANTE\s*:\s*(.+)",
+        r"BENEFICIARIO\s*:\s*(.+)",
+    ]
+
+    for line in lines:
+        for pattern in line_patterns:
+            match = re.search(pattern, line, flags=re.IGNORECASE)
+            if match:
+                candidate = clean_counterparty_name(match.group(1))
+                if candidate:
+                    return candidate
+
+    compact = normalize_space(raw_text)
+    free_patterns = [
+        r"BONIFICO\s+A\s+VOSTRO\s+FAVORE(?:\s*\([^)]*\))?\s*([A-Z0-9À-ÿ .,'&/-]{3,})",
+        r"A\s+FAVORE\s+DI\s+([A-Z0-9À-ÿ .,'&/-]{3,})",
+        r"CRED\s*:\s*([A-Z0-9À-ÿ .,'&/-]{3,})",
+    ]
+    for pattern in free_patterns:
+        match = re.search(pattern, compact, flags=re.IGNORECASE)
+        if match:
+            candidate = clean_counterparty_name(match.group(1))
+            if candidate:
+                return candidate
+
+    return "N.D."
+
+
+def is_summary_text(text: str) -> bool:
     t = normalize_space(text).lower()
-    return any(h in t for h in IN_HINTS)
+    return any(k in t for k in SUMMARY_KEYWORDS)
 
 
 def build_lines(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -263,11 +322,18 @@ def parse_pdf_transactions(
     if total_pages == 0:
         return {
             "transactions": [],
+            "summary_rows": [],
+            "statement": {
+                "opening_balance": None,
+                "closing_balance": None,
+                "closing_date": None,
+            },
             "stats": {
                 "pages_processed": 0,
                 "rows_detected": 0,
                 "rows_unknown_side": 0,
                 "parse_errors": 1,
+                "summary_rows_detected": 0,
             },
             "quality": {
                 "qc_fail_count": 1,
@@ -313,65 +379,78 @@ def parse_pdf_transactions(
     anomalies: list[dict[str, Any]] = []
     parse_errors = 0
     transactions: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = []
+    detected_closing_date: str | None = None
 
-    current_tx: dict[str, Any] | None = None
+    current_row: dict[str, Any] | None = None
 
-    def finalize_current_tx() -> None:
-        nonlocal current_tx
-        if not current_tx:
+    def finalize_current_row() -> None:
+        nonlocal current_row, parse_errors, detected_closing_date
+        if not current_row:
             return
 
-        raw_text = normalize_space(" ".join(current_tx.pop("raw_lines", [])))
-        current_tx["raw_text"] = raw_text
+        raw_lines = current_row.pop("raw_lines", [])
+        raw_text_multiline = normalize_multiline(raw_lines)
+        raw_text_flat = normalize_space(raw_text_multiline)
+        current_row["raw_text"] = raw_text_multiline
 
-        if not current_tx.get("description"):
-            current_tx["description"] = raw_text[:300]
+        if not current_row.get("description"):
+            current_row["description"] = normalize_space(raw_lines[0]) if raw_lines else raw_text_flat[:300]
 
-        current_tx["reference"] = current_tx.get("reference") or extract_reference(raw_text)
-        current_tx["category_code"] = current_tx.get("category_code") or extract_category_code(raw_text)
-        current_tx["direction_base"] = "out" if current_tx.get("posting_side") == "dare" else (
-            "in" if current_tx.get("posting_side") == "avere" else "unknown"
+        current_row["reference"] = current_row.get("reference") or extract_reference(raw_text_flat)
+        current_row["category_code"] = current_row.get("category_code") or extract_category_code(raw_text_flat)
+
+        posting_side = current_row.get("posting_side", "unknown")
+        current_row["direction_base"] = "out" if posting_side == "dare" else (
+            "in" if posting_side == "avere" else "unknown"
         )
-        current_tx["transaction_type"] = infer_transaction_type(raw_text, current_tx["direction_base"])
+        current_row["transaction_type"] = infer_transaction_type(raw_text_flat, current_row["direction_base"])
+        current_row["counterparty_name"] = extract_counterparty(raw_lines, raw_text_flat)
+
+        row_kind = current_row.get("row_kind", "transaction")
+        if row_kind == "summary":
+            reason = current_row.get("row_reason") or "summary_row_detected"
+            current_row["row_reason"] = reason
+            summary_rows.append(current_row)
+
+            if detected_closing_date is None and "saldo finale" in raw_text_flat.lower() and current_row.get("date"):
+                detected_closing_date = current_row["date"]
+
+            current_row = None
+            return
 
         needs_review = bool(
-            current_tx.get("posting_side") == "unknown"
-            or float(current_tx.get("column_confidence", 0.0)) < 0.80
-            or current_tx.get("amount_abs") is None
-            or not current_tx.get("date")
+            current_row.get("posting_side") == "unknown"
+            or float(current_row.get("column_confidence", 0.0)) < 0.80
+            or current_row.get("amount_abs") is None
+            or not current_row.get("date")
         )
-        current_tx["qc_needs_review"] = needs_review
+        current_row["qc_needs_review"] = needs_review
 
-        if current_tx.get("posting_side") == "unknown":
+        if not current_row.get("date") or current_row.get("amount_abs") is None:
+            parse_errors += 1
+            anomalies.append(
+                {
+                    "type": "invalid_transaction_row",
+                    "page": current_row.get("page"),
+                    "description": current_row.get("description", "")[:120],
+                }
+            )
+            current_row = None
+            return
+
+        if current_row.get("posting_side") == "unknown":
             anomalies.append(
                 {
                     "type": "unknown_side",
-                    "page": current_tx.get("page"),
-                    "date": current_tx.get("date"),
-                    "description": current_tx.get("description", "")[:120],
+                    "page": current_row.get("page"),
+                    "date": current_row.get("date"),
+                    "description": current_row.get("description", "")[:120],
                 }
             )
 
-        if not current_tx.get("date"):
-            anomalies.append(
-                {
-                    "type": "missing_date",
-                    "page": current_tx.get("page"),
-                    "description": current_tx.get("description", "")[:120],
-                }
-            )
-
-        if current_tx.get("amount_abs") is None:
-            anomalies.append(
-                {
-                    "type": "amount_parse_failed",
-                    "page": current_tx.get("page"),
-                    "description": current_tx.get("description", "")[:120],
-                }
-            )
-
-        transactions.append(current_tx)
-        current_tx = None
+        transactions.append(current_row)
+        current_row = None
 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page_idx in range(start - 1, end):
@@ -394,64 +473,72 @@ def parse_pdf_transactions(
                     continue
 
                 dates = DATE_RE.findall(text)
-                is_new_tx = len(dates) > 0
+                has_date = len(dates) > 0
+                summary_text = is_summary_text(text)
 
-                if is_new_tx:
-                    finalize_current_tx()
+                amount_candidates: list[dict[str, Any]] = []
+                for w in line["words"]:
+                    token = str(w.get("text", "")).strip()
+                    value = parse_amount_token(token)
+                    if value is None:
+                        continue
+                    amount_candidates.append(
+                        {
+                            "text": token,
+                            "value": value,
+                            "xcenter": (float(w.get("x0", 0.0)) + float(w.get("x1", 0.0))) / 2,
+                        }
+                    )
+
+                dare_candidates = [a for a in amount_candidates if a["xcenter"] <= split_x]
+                avere_candidates = [a for a in amount_candidates if a["xcenter"] > split_x]
+
+                fallback_amount, fallback_text = parse_amount_in_text(text)
+                has_amount = len(amount_candidates) > 0 or fallback_amount is not None
+                row_kind = "summary" if (summary_text or (len(dare_candidates) > 0 and len(avere_candidates) > 0)) else "transaction"
+                start_row = (has_date and has_amount) or (row_kind == "summary" and has_amount)
+
+                if start_row:
+                    finalize_current_row()
 
                     valid_date = parse_date(dates[0]) if dates else None
                     value_date = parse_date(dates[1]) if len(dates) > 1 else None
 
-                    amount_candidates: list[dict[str, Any]] = []
-                    for w in line["words"]:
-                        token = str(w.get("text", "")).strip()
-                        value = parse_amount_token(token)
-                        if value is None:
-                            continue
-                        amount_candidates.append(
-                            {
-                                "text": token,
-                                "value": value,
-                                "xcenter": (float(w.get("x0", 0.0)) + float(w.get("x1", 0.0))) / 2,
-                            }
-                        )
-
-                    dare_candidates = [a for a in amount_candidates if a["xcenter"] <= split_x]
-                    avere_candidates = [a for a in amount_candidates if a["xcenter"] > split_x]
-
                     posting_side = "unknown"
                     selected_amount = None
+                    row_reason = None
 
-                    if dare_candidates and not avere_candidates:
+                    if len(dare_candidates) > 0 and len(avere_candidates) == 0:
                         posting_side = "dare"
                         selected_amount = sorted(dare_candidates, key=lambda a: a["xcenter"])[-1]
-                    elif avere_candidates and not dare_candidates:
+                    elif len(avere_candidates) > 0 and len(dare_candidates) == 0:
                         posting_side = "avere"
                         selected_amount = sorted(avere_candidates, key=lambda a: a["xcenter"])[0]
-                    elif dare_candidates and avere_candidates:
-                        anomalies.append(
-                            {
-                                "type": "both_columns",
-                                "page": page_no,
-                                "line": text[:180],
-                            }
-                        )
+                    elif len(dare_candidates) > 0 and len(avere_candidates) > 0:
+                        posting_side = "unknown"
                         selected_amount = sorted(amount_candidates, key=lambda a: a["xcenter"])[-1]
+                        row_kind = "summary"
+                        row_reason = "both_dare_avere"
                     elif amount_candidates:
                         selected_amount = sorted(amount_candidates, key=lambda a: a["xcenter"])[-1]
 
                     amount_abs = abs(float(selected_amount["value"])) if selected_amount else None
                     amount_text = str(selected_amount["text"]) if selected_amount else None
 
-                    if amount_abs is None:
-                        fallback_amount, fallback_text = parse_amount_in_text(text)
+                    if amount_abs is None and fallback_amount is not None:
                         amount_abs = fallback_amount
                         amount_text = amount_text or fallback_text
 
-                    if valid_date is None:
+                    if row_kind == "transaction" and (valid_date is None or amount_abs is None):
                         parse_errors += 1
-                    if amount_abs is None:
-                        parse_errors += 1
+                        anomalies.append(
+                            {
+                                "type": "parse_error_transaction_candidate",
+                                "page": page_no,
+                                "line": text[:180],
+                            }
+                        )
+                        continue
 
                     description = text
                     for d in dates[:2]:
@@ -464,7 +551,12 @@ def parse_pdf_transactions(
                     if category_code:
                         description = re.sub(rf"^\s*{re.escape(category_code)}\s*", "", description).strip()
 
-                    current_tx = {
+                    if row_kind == "summary" and row_reason is None:
+                        row_reason = "summary_keyword" if summary_text else "aggregated_row"
+
+                    current_row = {
+                        "row_kind": row_kind,
+                        "row_reason": row_reason,
                         "date": valid_date,
                         "value_date": value_date,
                         "amount_abs": amount_abs,
@@ -482,13 +574,13 @@ def parse_pdf_transactions(
                     }
                     continue
 
-                if current_tx is not None:
-                    current_tx["raw_lines"].append(text)
-                    current_tx["bbox"] = merge_bbox(current_tx["bbox"], line_bbox(line))
+                if current_row is not None:
+                    current_row["raw_lines"].append(text)
+                    current_row["bbox"] = merge_bbox(current_row["bbox"], line_bbox(line))
 
-        finalize_current_tx()
+        finalize_current_row()
 
-    # Dedup diagnostic only: flag duplicates but do not drop rows.
+    # Dedup diagnostic only on transactions.
     seen: set[str] = set()
     for tx in transactions:
         key = "|".join(
@@ -535,13 +627,13 @@ def parse_pdf_transactions(
             )
 
     rows_unknown_side = sum(1 for tx in transactions if tx.get("posting_side") == "unknown")
-    parse_errors += len([a for a in anomalies if a.get("type") in ("missing_date", "amount_parse_failed")])
 
     stats = {
         "pages_processed": end - start + 1,
         "rows_detected": len(transactions),
         "rows_unknown_side": rows_unknown_side,
         "parse_errors": parse_errors,
+        "summary_rows_detected": len(summary_rows),
     }
 
     quality = {
@@ -555,7 +647,19 @@ def parse_pdf_transactions(
         "sum_out": round(sum_out, 2),
     }
 
-    return {"transactions": transactions, "stats": stats, "quality": quality}
+    statement = {
+        "opening_balance": opening_balance,
+        "closing_balance": closing_balance,
+        "closing_date": detected_closing_date,
+    }
+
+    return {
+        "transactions": transactions,
+        "summary_rows": summary_rows,
+        "statement": statement,
+        "stats": stats,
+        "quality": quality,
+    }
 
 
 @app.get("/health")
@@ -602,6 +706,8 @@ def extract_mps(
 
     return {
         "transactions": result["transactions"],
+        "summary_rows": result["summary_rows"],
+        "statement": result["statement"],
         "stats": result["stats"],
         "quality": result["quality"],
         "range": {
