@@ -8,6 +8,7 @@
 import { supabase } from '@/integrations/supabase/client';
 import { resolveOrCreateCounterpartyFromInvoice } from './counterpartyService';
 import { normalizeVatError, recomputeVatPeriodsIncremental, syncVatEntriesForInvoicesBatch } from './vat';
+import { syncInstallmentsForInvoice, syncInstallmentsForInvoicesBatch } from './scadenzario';
 
 // ============================================================
 // TYPES
@@ -100,6 +101,7 @@ export async function saveInvoicesToDB(
   let duplicates = 0;
   const errors: { fn: string; err: string }[] = [];
   const savedInvoiceIds: string[] = [];
+  const parsedByInvoiceId: Record<string, any> = {};
 
   // Fetch company PIVA/CF to auto-detect direction
   let companyPiva = '';
@@ -251,7 +253,10 @@ export async function saveInvoicesToDB(
         }
       }
 
-      if (inv?.id) savedInvoiceIds.push(String(inv.id));
+      if (inv?.id) {
+        savedInvoiceIds.push(String(inv.id));
+        parsedByInvoiceId[String(inv.id)] = r.data;
+      }
       saved++;
       onProgress?.(i + 1, parsedResults.length, 'ok', r.fn);
     } catch (e: any) {
@@ -261,6 +266,15 @@ export async function saveInvoicesToDB(
   }
 
   if (savedInvoiceIds.length > 0) {
+    try {
+      await syncInstallmentsForInvoicesBatch(companyId, savedInvoiceIds, parsedByInvoiceId);
+    } catch (e: any) {
+      errors.push({
+        fn: 'SCADENZARIO_SYNC',
+        err: e.message || 'Errore sincronizzazione rate scadenzario',
+      });
+    }
+
     try {
       const vatSync = await syncVatEntriesForInvoicesBatch(companyId, savedInvoiceIds);
       if (vatSync.global_min_effective_date_impacted) {
@@ -460,6 +474,8 @@ export async function updateInvoice(invoiceId: string, updates: InvoiceUpdate): 
     .eq('id', invoiceId);
 
   if (error) throw new Error(error.message);
+
+  await syncInstallmentsForInvoice(beforeInvoice.company_id, invoiceId);
 
   const vatSync = await syncVatEntriesForInvoicesBatch(beforeInvoice.company_id, [invoiceId]);
   const impactedStart = minIsoDate(

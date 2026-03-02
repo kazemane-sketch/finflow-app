@@ -165,6 +165,8 @@ function CounterpartyCreateModal({
     fiscal_code: '',
     legal_type: 'azienda' as CounterpartyLegalType,
     address: '',
+    dso_days_override: '',
+    pso_days_override: '',
     notes: '',
   })
 
@@ -187,6 +189,8 @@ function CounterpartyCreateModal({
         fiscal_code: form.fiscal_code || null,
         legal_type: form.legal_type,
         address: form.address || null,
+        dso_days_override: form.dso_days_override === '' ? null : Number(form.dso_days_override),
+        pso_days_override: form.pso_days_override === '' ? null : Number(form.pso_days_override),
         notes: form.notes || null,
       })
 
@@ -200,6 +204,8 @@ function CounterpartyCreateModal({
         fiscal_code: '',
         legal_type: 'azienda',
         address: '',
+        dso_days_override: '',
+        pso_days_override: '',
         notes: '',
       })
     } catch (e: any) {
@@ -298,6 +304,32 @@ function CounterpartyCreateModal({
             />
           </div>
 
+          <div>
+            <Label className="text-xs">Override DSO (giorni)</Label>
+            <Input
+              type="number"
+              min={0}
+              step={1}
+              value={form.dso_days_override}
+              onChange={(e) => setForm((f) => ({ ...f, dso_days_override: e.target.value }))}
+              className="mt-1"
+              placeholder="Vuoto = default azienda"
+            />
+          </div>
+
+          <div>
+            <Label className="text-xs">Override PSO (giorni)</Label>
+            <Input
+              type="number"
+              min={0}
+              step={1}
+              value={form.pso_days_override}
+              onChange={(e) => setForm((f) => ({ ...f, pso_days_override: e.target.value }))}
+              className="mt-1"
+              placeholder="Vuoto = default azienda"
+            />
+          </div>
+
           <div className="sm:col-span-2">
             <Label className="text-xs">Note</Label>
             <textarea
@@ -365,6 +397,8 @@ export default function ContropartiPage() {
     vat_value: string
     fiscal_code: string
     address: string
+    dso_days_override: string
+    pso_days_override: string
     notes: string
   } | null>(null)
 
@@ -444,6 +478,8 @@ export default function ContropartiPage() {
       vat_value: vat.value,
       fiscal_code: focused.fiscal_code || '',
       address: focused.address || '',
+      dso_days_override: focused.dso_days_override == null ? '' : String(focused.dso_days_override),
+      pso_days_override: focused.pso_days_override == null ? '' : String(focused.pso_days_override),
       notes: focused.notes || '',
     })
   }, [focused])
@@ -612,6 +648,8 @@ export default function ContropartiPage() {
         vat_number: buildVatForSave(draft.vat_mode, draft.vat_value),
         fiscal_code: draft.fiscal_code || null,
         address: draft.address || null,
+        dso_days_override: draft.dso_days_override === '' ? null : Number(draft.dso_days_override),
+        pso_days_override: draft.pso_days_override === '' ? null : Number(draft.pso_days_override),
         notes: draft.notes || null,
       })
       await reloadCounterparties()
@@ -959,6 +997,32 @@ export default function ContropartiPage() {
                       value={draft.address}
                       onChange={(e) => setDraft((d) => d ? ({ ...d, address: e.target.value }) : d)}
                       className="mt-1"
+                    />
+                  </div>
+
+                  <div>
+                    <Label className="text-xs">Override DSO (giorni)</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={draft.dso_days_override}
+                      onChange={(e) => setDraft((d) => d ? ({ ...d, dso_days_override: e.target.value }) : d)}
+                      className="mt-1"
+                      placeholder="Vuoto = default azienda"
+                    />
+                  </div>
+
+                  <div>
+                    <Label className="text-xs">Override PSO (giorni)</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={draft.pso_days_override}
+                      onChange={(e) => setDraft((d) => d ? ({ ...d, pso_days_override: e.target.value }) : d)}
+                      className="mt-1"
+                      placeholder="Vuoto = default azienda"
                     />
                   </div>
 

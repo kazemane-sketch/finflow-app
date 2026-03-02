@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -140,6 +141,8 @@ function formatVatErrorMessage(error: any): string {
 
 export default function IvaPage() {
   const { company } = useCompany()
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
 
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
@@ -341,9 +344,12 @@ export default function IvaPage() {
     setManualEntries(manual)
 
     if (list.length > 0) {
-      const selected = currentPeriodId && list.some((p) => p.id === currentPeriodId)
-        ? currentPeriodId
-        : list.find((p) => p.period_type === 'regular')?.id || list[0].id
+      const queryPeriodId = searchParams.get('periodId')
+      const selected = queryPeriodId && list.some((p) => p.id === queryPeriodId)
+        ? queryPeriodId
+        : currentPeriodId && list.some((p) => p.id === currentPeriodId)
+          ? currentPeriodId
+          : list.find((p) => p.period_type === 'regular')?.id || list[0].id
       if (selected) await loadBreakdown(selected)
     } else {
       setBreakdown([])
@@ -351,7 +357,7 @@ export default function IvaPage() {
       setSnapshotEntries([])
       setSnapshotPeriodId(null)
     }
-  }, [company?.id, currentPeriodId, loadBreakdown])
+  }, [company?.id, currentPeriodId, loadBreakdown, searchParams])
 
   const loadAll = useCallback(async () => {
     if (!company?.id) return
@@ -398,7 +404,10 @@ export default function IvaPage() {
       setPeriods(currentPeriods)
       const manual = await listManualVatEntries(company.id)
       setManualEntries(manual)
-      const selected = currentPeriods.find((p) => p.period_type === 'regular')?.id || currentPeriods[0]?.id || null
+      const queryPeriodId = searchParams.get('periodId')
+      const selected = queryPeriodId && currentPeriods.some((p) => p.id === queryPeriodId)
+        ? queryPeriodId
+        : currentPeriods.find((p) => p.period_type === 'regular')?.id || currentPeriods[0]?.id || null
       if (selected) {
         setCurrentPeriodId(selected)
         const bd = await listVatBreakdown(company.id, selected)
@@ -411,7 +420,7 @@ export default function IvaPage() {
     } finally {
       setLoading(false)
     }
-  }, [company?.id, logVatError])
+  }, [company?.id, logVatError, searchParams])
 
   useEffect(() => {
     loadAll()
@@ -925,6 +934,11 @@ export default function IvaPage() {
                           <td className="px-3 py-2">
                             <div className="flex justify-end gap-2 flex-wrap">
                               <Button variant="outline" size="sm" onClick={() => loadBreakdown(p.id)}>Dettaglio</Button>
+                              {(p.status === 'to_pay' || p.status === 'overdue') && (
+                                <Button variant="outline" size="sm" onClick={() => navigate('/scadenzario?tab=pagamenti&period=next_90')}>
+                                  Vedi nello scadenzario
+                                </Button>
+                              )}
                               {(p.status === 'to_pay' || p.status === 'overdue') && (
                                 <Button variant="outline" size="sm" disabled={backfillPending || !hasRegularPeriods} onClick={() => handleSuggestMatches(p.id)}>
                                   Suggerisci F24

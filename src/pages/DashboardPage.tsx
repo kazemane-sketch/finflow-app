@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { fmtDate, fmtEur } from '@/lib/utils'
 import {
@@ -13,6 +14,7 @@ import {
 } from 'lucide-react'
 import { useCompany } from '@/hooks/useCompany'
 import { getVatCurrentSummary, formatVatPeriodLabel, type VatCurrentSummary } from '@/lib/vat'
+import { listScadenzarioRows, touchOverdueInstallments, type ScadenzarioRow } from '@/lib/scadenzario'
 
 const kpis = [
   { label: 'Fatture importate', value: '0', icon: FileText, color: 'text-blue-600', bg: 'bg-blue-50' },
@@ -23,7 +25,9 @@ const kpis = [
 
 export default function DashboardPage() {
   const { company } = useCompany()
+  const navigate = useNavigate()
   const [vatSummary, setVatSummary] = useState<VatCurrentSummary | null>(null)
+  const [upcomingRows, setUpcomingRows] = useState<ScadenzarioRow[]>([])
 
   useEffect(() => {
     let mounted = true
@@ -40,6 +44,36 @@ export default function DashboardPage() {
       }
     }
     loadVatSummary()
+    return () => {
+      mounted = false
+    }
+  }, [company?.id])
+
+  useEffect(() => {
+    let mounted = true
+
+    async function loadUpcoming() {
+      if (!company?.id) {
+        if (mounted) setUpcomingRows([])
+        return
+      }
+
+      try {
+        await touchOverdueInstallments(company.id)
+        const rows = await listScadenzarioRows(company.id, {
+          mode: 'all',
+          periodPreset: 'next_30',
+          statuses: ['pending', 'overdue', 'partial'],
+          sortBy: 'due_date',
+          sortDir: 'asc',
+        })
+        if (mounted) setUpcomingRows(rows.slice(0, 5))
+      } catch {
+        if (mounted) setUpcomingRows([])
+      }
+    }
+
+    loadUpcoming()
     return () => {
       mounted = false
     }
@@ -100,6 +134,40 @@ export default function DashboardPage() {
                 <p className="text-sm text-gray-600 mt-1">{fmtDate(vatSummary.period.due_date)}</p>
                 <p className="text-xs text-gray-500 mt-1">{vatSummary.days_to_due} giorni</p>
               </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <CalendarClock className="h-4 w-4 text-red-600" />
+            Prossime scadenze
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {upcomingRows.length === 0 ? (
+            <p className="text-sm text-muted-foreground">Nessuna scadenza nei prossimi 30 giorni.</p>
+          ) : (
+            <div className="space-y-2">
+              {upcomingRows.map((row) => (
+                <button
+                  key={`${row.kind}-${row.id}`}
+                  onClick={() => navigate(row.reference_link)}
+                  className="w-full text-left border rounded-lg px-3 py-2 hover:bg-gray-50"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-medium">{row.reference}</p>
+                      <p className="text-xs text-muted-foreground">{row.counterparty_name} · {fmtDate(row.due_date)}</p>
+                    </div>
+                    <p className={`text-sm font-semibold ${row.type === 'incasso' ? 'text-emerald-700' : 'text-red-700'}`}>
+                      {fmtEur(row.remaining_amount > 0 ? row.remaining_amount : row.amount)}
+                    </p>
+                  </div>
+                </button>
+              ))}
             </div>
           )}
         </CardContent>

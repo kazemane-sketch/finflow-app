@@ -13,6 +13,8 @@ export interface Company {
   city: string | null
   province: string | null
   fiscal_regime: string | null
+  default_dso_days: number
+  default_pso_days: number
 }
 
 export function useCompany() {

@@ -18,6 +18,8 @@ export interface Counterparty {
   classification_source: CounterpartyClassificationSource | null
   classification_confidence: number | null
   address: string | null
+  dso_days_override: number | null
+  pso_days_override: number | null
   notes: string | null
   auto_created: boolean | null
   created_at: string
@@ -352,7 +354,7 @@ export async function loadCounterparties(
 ): Promise<Counterparty[]> {
   let query = supabase
     .from('counterparties')
-    .select('id, company_id, type, status, name, vat_number, vat_key, fiscal_code, legal_type, classification_source, classification_confidence, address, notes, auto_created, created_at, updated_at')
+    .select('id, company_id, type, status, name, vat_number, vat_key, fiscal_code, legal_type, classification_source, classification_confidence, address, dso_days_override, pso_days_override, notes, auto_created, created_at, updated_at')
     .eq('company_id', companyId)
     .order('name', { ascending: true })
 
@@ -388,6 +390,8 @@ export async function createManualCounterparty(
     vat_number?: string | null
     fiscal_code?: string | null
     legal_type?: CounterpartyLegalType | null
+    dso_days_override?: number | null
+    pso_days_override?: number | null
     notes?: string | null
     address?: string | null
   }
@@ -422,12 +426,14 @@ export async function createManualCounterparty(
       legal_type: classification.legalType,
       classification_source: classification.source,
       classification_confidence: classification.confidence,
+      dso_days_override: payload.dso_days_override ?? null,
+      pso_days_override: payload.pso_days_override ?? null,
       notes: payload.notes || null,
       address: payload.address || null,
       auto_created: false,
       verified_at: status === 'verified' ? new Date().toISOString() : null,
     })
-    .select('id, company_id, type, status, name, vat_number, vat_key, fiscal_code, legal_type, classification_source, classification_confidence, address, notes, auto_created, created_at, updated_at')
+    .select('id, company_id, type, status, name, vat_number, vat_key, fiscal_code, legal_type, classification_source, classification_confidence, address, dso_days_override, pso_days_override, notes, auto_created, created_at, updated_at')
     .single()
 
   if (error) throw new Error(error.message)
@@ -443,6 +449,8 @@ export async function updateCounterparty(
     vat_number: string | null
     fiscal_code: string | null
     legal_type: CounterpartyLegalType | null
+    dso_days_override: number | null
+    pso_days_override: number | null
     notes: string | null
     address: string | null
     rejection_reason: string | null
@@ -454,6 +462,8 @@ export async function updateCounterparty(
   if (updates.type) payload.type = updates.type
   if (updates.notes !== undefined) payload.notes = updates.notes
   if (updates.address !== undefined) payload.address = updates.address
+  if (updates.dso_days_override !== undefined) payload.dso_days_override = updates.dso_days_override
+  if (updates.pso_days_override !== undefined) payload.pso_days_override = updates.pso_days_override
   if (updates.rejection_reason !== undefined) payload.rejection_reason = updates.rejection_reason
 
   if (updates.vat_number !== undefined) {

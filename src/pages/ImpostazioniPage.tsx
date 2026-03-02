@@ -137,7 +137,7 @@ function DeleteBankModal({ name, onConfirm, onCancel }: {
 // ============================================================
 export default function ImpostazioniPage() {
   const { user } = useAuth()
-  const { company } = useCompany()
+  const { company, refetch: refetchCompany } = useCompany()
   const companyId = company?.id || null
 
   // Bank accounts
@@ -145,6 +145,8 @@ export default function ImpostazioniPage() {
   const [bankModal, setBankModal] = useState<{ account?: any } | null>(null)
   const [deleteModal, setDeleteModal] = useState<any>(null)
   const [deleting, setDeleting] = useState(false)
+  const [paymentDefaults, setPaymentDefaults] = useState({ default_dso_days: '30', default_pso_days: '30' })
+  const [savingDefaults, setSavingDefaults] = useState(false)
 
   const loadBankAccounts = useCallback(async () => {
     if (!companyId) return
@@ -157,6 +159,13 @@ export default function ImpostazioniPage() {
   }, [companyId])
 
   useEffect(() => { loadBankAccounts() }, [loadBankAccounts])
+
+  useEffect(() => {
+    setPaymentDefaults({
+      default_dso_days: company?.default_dso_days != null ? String(company.default_dso_days) : '30',
+      default_pso_days: company?.default_pso_days != null ? String(company.default_pso_days) : '30',
+    })
+  }, [company?.default_dso_days, company?.default_pso_days])
 
   const handleDeleteAccount = async () => {
     if (!deleteModal) return
@@ -171,6 +180,30 @@ export default function ImpostazioniPage() {
     }
     setDeleting(false)
     setDeleteModal(null)
+  }
+
+  const handleSavePaymentDefaults = async () => {
+    if (!companyId) return
+
+    const dso = Math.max(0, Number(paymentDefaults.default_dso_days || 30))
+    const pso = Math.max(0, Number(paymentDefaults.default_pso_days || 30))
+
+    setSavingDefaults(true)
+    try {
+      const { error } = await supabase
+        .from('companies')
+        .update({
+          default_dso_days: Math.round(dso),
+          default_pso_days: Math.round(pso),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', companyId)
+      if (error) throw error
+      await refetchCompany()
+    } catch (e: any) {
+      alert('Errore salvataggio default scadenze: ' + e.message)
+    }
+    setSavingDefaults(false)
   }
 
   return (
@@ -231,6 +264,38 @@ export default function ImpostazioniPage() {
                   <p className="text-sm font-medium mt-1">{[company.city, company.province ? `(${company.province})` : ''].filter(Boolean).join(' ')}</p>
                 </div>
               )}
+              <div className="pt-2 border-t">
+                <Label className="text-xs text-muted-foreground">Default scadenze (giorni)</Label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-2">
+                  <div>
+                    <Label className="text-xs">Default DSO (incassi clienti)</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={paymentDefaults.default_dso_days}
+                      onChange={(e) => setPaymentDefaults((p) => ({ ...p, default_dso_days: e.target.value }))}
+                      className="mt-1"
+                    />
+                  </div>
+                  <div>
+                    <Label className="text-xs">Default PSO (pagamenti fornitori)</Label>
+                    <Input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={paymentDefaults.default_pso_days}
+                      onChange={(e) => setPaymentDefaults((p) => ({ ...p, default_pso_days: e.target.value }))}
+                      className="mt-1"
+                    />
+                  </div>
+                </div>
+                <div className="mt-3">
+                  <Button size="sm" onClick={handleSavePaymentDefaults} disabled={savingDefaults}>
+                    {savingDefaults ? 'Salvataggio...' : 'Salva default scadenze'}
+                  </Button>
+                </div>
+              </div>
             </>
           ) : (
             <p className="text-sm text-muted-foreground">

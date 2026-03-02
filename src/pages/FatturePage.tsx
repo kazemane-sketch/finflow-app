@@ -1,13 +1,14 @@
 // src/pages/FatturePage.tsx — v5
 // Date filter + AI search (Haiku) + removed Fix Nomi
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { processInvoiceFile, TIPO, MP, REG } from '@/lib/invoiceParser';
 import {
   saveInvoicesToDB, loadInvoices, loadInvoiceDetail,
   deleteInvoices, updateInvoice, verifyPassword,
   type DBInvoice, type DBInvoiceDetail, type InvoiceUpdate,
 } from '@/lib/invoiceSaver';
+import { listInstallmentsForInvoice, type InvoiceInstallment } from '@/lib/scadenzario';
 import { aiSearchInvoices, type AISearchResult } from '@/lib/aiSearch';
 import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
@@ -257,8 +258,8 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck }: 
 // ============================================================
 // FULL INVOICE DETAIL — matches artifact output
 // ============================================================
-function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onReload, onOpenCounterparty }: {
-  invoice: DBInvoice; detail: DBInvoiceDetail | null; loadingDetail: boolean;
+function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, onDelete, onReload, onOpenCounterparty }: {
+  invoice: DBInvoice; detail: DBInvoiceDetail | null; installments: InvoiceInstallment[]; loadingDetail: boolean;
   onEdit: (u: InvoiceUpdate) => Promise<void>; onDelete: () => void; onReload: () => void;
   onOpenCounterparty: (mode: 'verify' | 'edit') => void;
 }) {
@@ -331,6 +332,52 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
       )}
 
       {editing && <EditForm invoice={invoice} onSave={handleSave} onCancel={() => setEditing(false)} />}
+
+      <Sec title="Rate / Scadenze">
+        {!installments.length ? (
+          <div className="text-xs text-gray-500">Nessuna rata disponibile per questa fattura.</div>
+        ) : (
+          <table className="w-full border-collapse text-[11px]">
+            <thead>
+              <tr className="bg-sky-50 border-b border-sky-100">
+                <th className="text-left px-2 py-1.5 text-sky-700 font-semibold">Rata</th>
+                <th className="text-left px-2 py-1.5 text-sky-700 font-semibold">Scadenza</th>
+                <th className="text-right px-2 py-1.5 text-sky-700 font-semibold">Importo</th>
+                <th className="text-right px-2 py-1.5 text-sky-700 font-semibold">Pagato</th>
+                <th className="text-left px-2 py-1.5 text-sky-700 font-semibold">Stato</th>
+              </tr>
+            </thead>
+            <tbody>
+              {installments.map((inst) => (
+                <tr key={inst.id} className="border-b border-gray-100">
+                  <td className="px-2 py-1.5">
+                    {inst.installment_total > 1 ? `${inst.installment_no} di ${inst.installment_total}` : 'Unica'}
+                  </td>
+                  <td className="px-2 py-1.5">
+                    {fmtDate(inst.due_date)}
+                    {inst.is_estimated && <span className="ml-2 text-[10px] text-blue-700">stimata</span>}
+                  </td>
+                  <td className="px-2 py-1.5 text-right font-semibold">{fmtEur(inst.amount_due)}</td>
+                  <td className="px-2 py-1.5 text-right">{fmtEur(inst.paid_amount)}</td>
+                  <td className="px-2 py-1.5">
+                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${
+                      inst.status === 'paid'
+                        ? 'bg-emerald-100 text-emerald-700'
+                        : inst.status === 'overdue'
+                          ? 'bg-red-100 text-red-700'
+                          : inst.status === 'partial'
+                            ? 'bg-amber-100 text-amber-700'
+                            : 'bg-gray-100 text-gray-700'
+                    }`}>
+                      {inst.status === 'paid' ? 'Pagata/Incassata' : inst.status === 'overdue' ? 'Scaduta' : inst.status === 'partial' ? 'Parziale' : 'Da saldare'}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </Sec>
 
       {showCounterpartyAlert && (
         <div className={`mb-4 rounded-lg border px-3 py-2.5 ${
@@ -586,10 +633,12 @@ function InvoiceDetail({ invoice, detail, loadingDetail, onEdit, onDelete, onRel
 export default function FatturePage() {
   const { company, loading: companyLoading, ensureCompany, refetch: refetchCompany } = useCompany();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const companyId = company?.id || null;
   const [invoices, setInvoices] = useState<DBInvoice[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<DBInvoiceDetail | null>(null);
+  const [installments, setInstallments] = useState<InvoiceInstallment[]>([]);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [loadingList, setLoadingList] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -623,11 +672,33 @@ export default function FatturePage() {
   useEffect(() => { reload(); }, [reload]);
 
   useEffect(() => {
-    if (!selectedId) { setDetail(null); return; }
+    if (!selectedId || !companyId) { setDetail(null); setInstallments([]); return; }
     let c = false; setLoadingDetail(true);
-    loadInvoiceDetail(selectedId).then(d => { if (!c) { setDetail(d); setLoadingDetail(false); } });
+    Promise.all([
+      loadInvoiceDetail(selectedId),
+      listInstallmentsForInvoice(companyId, selectedId),
+    ]).then(([d, inst]) => {
+      if (!c) {
+        setDetail(d);
+        setInstallments(inst);
+        setLoadingDetail(false);
+      }
+    }).catch(() => {
+      if (!c) {
+        setDetail(null);
+        setInstallments([]);
+        setLoadingDetail(false);
+      }
+    });
     return () => { c = true; };
-  }, [selectedId]);
+  }, [selectedId, companyId]);
+
+  useEffect(() => {
+    const invoiceIdParam = searchParams.get('invoiceId');
+    if (!invoiceIdParam) return;
+    if (!invoices.some(inv => inv.id === invoiceIdParam)) return;
+    setSelectedId(invoiceIdParam);
+  }, [searchParams, invoices]);
 
   // ── AI Search handler ──
   const handleAISearch = useCallback(async () => {
@@ -838,6 +909,7 @@ export default function FatturePage() {
           {selectedInvoice ? <InvoiceDetail
             invoice={selectedInvoice}
             detail={detail}
+            installments={installments}
             loadingDetail={loadingDetail}
             onEdit={handleEdit}
             onDelete={() => setDeleteModal({ open: true, ids: [selectedInvoice.id] })}

@@ -20,10 +20,10 @@ import { useState } from 'react'
 const nav = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/fatture', icon: FileText, label: 'Fatture' },
+  { to: '/scadenzario', icon: CalendarClock, label: 'Scadenzario' },
   { to: '/controparti', icon: Users, label: 'Controparti' },
   { to: '/banca', icon: Landmark, label: 'Banca' },
   { to: '/riconciliazione', icon: Link2, label: 'Riconciliazione' },
-  { to: '/scadenzario', icon: CalendarClock, label: 'Scadenzario' },
   { to: '/iva', icon: Receipt, label: 'IVA' },
   { to: '/impostazioni', icon: Settings, label: 'Impostazioni' },
 ]
