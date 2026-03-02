@@ -145,13 +145,16 @@ function getTxTitle(tx: any): string {
   const cp = cleanCounterpartyCandidate(tx?.counterparty_name)
   if (cp) return cp
 
+  const description = String(tx?.description || '').trim()
+  if (description) {
+    const firstLine = description.split('\n')[0].trim()
+    if (firstLine) return firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine
+  }
+
   const rawCounterparty = extractCounterpartyFromRawText(tx?.raw_text)
   if (rawCounterparty) return rawCounterparty
 
-  const description = String(tx?.description || '').trim()
-  if (!description) return '—'
-  const firstLine = description.split('\n')[0].trim()
-  return firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine
+  return '—'
 }
 function isoDate(d: Date) {
   return d.toISOString().split('T')[0]
@@ -469,7 +472,9 @@ function TxDetail({
         <Row l="Controparte da verificare" v={tx.counterparty_needs_review ? 'Sì' : null} />
         <Row l="IBAN / Conto controparte" v={tx.counterparty_account} />
         <Row l="Saldo dopo" v={tx.balance != null ? fmtEur(tx.balance) : null} />
-        <Row l="Descrizione" v={tx.description} />
+        <Row l="Descrizione breve" v={tx.description} />
+        <Row l="Origine descrizione" v={tx.description_source} />
+        <Row l="Confidenza descrizione" v={tx.description_confidence != null ? `${Math.round(Number(tx.description_confidence) * 100)}%` : null} />
         {tx.raw_text && (
           <div>
             <p className="text-[10px] text-gray-400 uppercase tracking-wide">Testo operazione completo</p>
@@ -859,10 +864,13 @@ export default function BancaPage() {
         unknown_side_count: 0,
         qc_fail_count: 0,
         summary_candidates_count: 0,
+        llm_description_attempted_count: 0,
+        llm_description_resolved_count: 0,
         counterparty_unknown_count: 0,
         counterparty_llm_attempted_count: 0,
         counterparty_llm_resolved_count: 0,
         counterparty_review_count: 0,
+        llm_batch_fail_count: 0,
       }
       setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], warnings: [], stats: emptyStats })
     } finally {
@@ -920,10 +928,13 @@ export default function BancaPage() {
         unknown_side_count: 0,
         qc_fail_count: 0,
         summary_candidates_count: 0,
+        llm_description_attempted_count: 0,
+        llm_description_resolved_count: 0,
         counterparty_unknown_count: 0,
         counterparty_llm_attempted_count: 0,
         counterparty_llm_resolved_count: 0,
         counterparty_review_count: 0,
+        llm_batch_fail_count: 0,
       }
       setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], warnings: [], stats: emptyStats })
     }
@@ -1091,15 +1102,21 @@ export default function BancaPage() {
                     Summary candidati: {importResult.stats.summary_candidates_count}
                   </div>
                 )}
-                {(importResult.stats.counterparty_unknown_count > 0 ||
+                {(importResult.stats.llm_description_attempted_count > 0 ||
+                  importResult.stats.llm_description_resolved_count > 0 ||
+                  importResult.stats.counterparty_unknown_count > 0 ||
                   importResult.stats.counterparty_llm_attempted_count > 0 ||
                   importResult.stats.counterparty_llm_resolved_count > 0 ||
-                  importResult.stats.counterparty_review_count > 0) && (
+                  importResult.stats.counterparty_review_count > 0 ||
+                  importResult.stats.llm_batch_fail_count > 0) && (
                   <div className="text-xs text-gray-600 mt-1">
+                    Descr. LLM tentate: {importResult.stats.llm_description_attempted_count} ·
+                    Descr. LLM risolte: {importResult.stats.llm_description_resolved_count} ·
                     Controparte unknown: {importResult.stats.counterparty_unknown_count} ·
                     LLM tentati: {importResult.stats.counterparty_llm_attempted_count} ·
                     LLM risolti: {importResult.stats.counterparty_llm_resolved_count} ·
-                    Da verificare: {importResult.stats.counterparty_review_count}
+                    Da verificare: {importResult.stats.counterparty_review_count} ·
+                    LLM batch fail: {importResult.stats.llm_batch_fail_count}
                   </div>
                 )}
                 {(importResult.stats.failed_chunks_count > 0 || importResult.stats.warnings_count > 0) && (

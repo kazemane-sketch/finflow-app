@@ -90,6 +90,13 @@ LEGAL_ENTITY_SUFFIXES = {
     "FONDAZIONE",
 }
 
+HEADER_COLUMNS_RE = re.compile(
+    r"data\s+cont\..*valuta.*mov\.\s+dare.*mov\.\s+avere.*descrizione\s+operazioni",
+    flags=re.IGNORECASE,
+)
+
+PAGE_NUMBER_RE = re.compile(r"^(?:pag\.?\s*)?\d{1,3}$", flags=re.IGNORECASE)
+
 
 class ExtractRequest(BaseModel):
     pdfBase64: str = Field(..., min_length=8)
@@ -333,6 +340,24 @@ def is_summary_text(text: str) -> bool:
     return any(k in t for k in SUMMARY_KEYWORDS)
 
 
+def is_statement_noise_line(text: str) -> bool:
+    t = normalize_space(text)
+    if not t:
+        return True
+    l = t.lower()
+    if l.startswith("movimenti con data contabile"):
+        return True
+    if l.startswith("stampa del "):
+        return True
+    if re.match(r"^(abi|cab|iban)\b", l):
+        return True
+    if HEADER_COLUMNS_RE.search(l):
+        return True
+    if PAGE_NUMBER_RE.match(l):
+        return True
+    return False
+
+
 def build_lines(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not words:
         return []
@@ -509,7 +534,10 @@ def parse_pdf_transactions(
         if not current_row:
             return
 
-        raw_lines = current_row.pop("raw_lines", [])
+        raw_lines_source = current_row.pop("raw_lines", [])
+        raw_lines = [line for line in raw_lines_source if not is_statement_noise_line(line)]
+        if not raw_lines:
+            raw_lines = raw_lines_source
         raw_text_multiline = normalize_multiline(raw_lines)
         raw_text_flat = normalize_space(raw_text_multiline)
         current_row["raw_text"] = raw_text_multiline
@@ -698,10 +726,13 @@ def parse_pdf_transactions(
                     continue
 
                 if current_row is not None:
+                    if is_statement_noise_line(text):
+                        continue
                     current_row["raw_lines"].append(text)
                     current_row["bbox"] = merge_bbox(current_row["bbox"], line_bbox(line))
 
-        finalize_current_row()
+            # Isola le transazioni per pagina ed evita contaminazione con header/footer pagina successiva.
+            finalize_current_row()
 
     # Dedup diagnostic only on transactions.
     seen: set[str] = set()

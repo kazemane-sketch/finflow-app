@@ -11,14 +11,16 @@ const CHUNK_SIZE = Number(Deno.env.get("PDF_PLUMBER_CHUNK_PAGES") ?? Deno.env.ge
 const PARSER_TIMEOUT_MS = Number(Deno.env.get("PDF_PARSER_TIMEOUT_MS") ?? "120000");
 const GEMINI_TEXT_MODEL = Deno.env.get("GEMINI_TEXT_MODEL") ?? "gemini-2.5-flash";
 const GEMINI_TEXT_TIMEOUT_MS = Number(Deno.env.get("GEMINI_TEXT_TIMEOUT_MS") ?? "8000");
-const COUNTERPARTY_LLM_BATCH_SIZE = 20;
+const LLM_ENRICH_BATCH_SIZE = 20;
+const DESCRIPTION_CONFIDENCE_THRESHOLD = 0.6;
 const COUNTERPARTY_CONFIDENCE_THRESHOLD = 0.7;
 
 type PostingSide = "dare" | "avere" | "unknown";
 type Direction = "in" | "out";
 type DirectionSource = "side_rule" | "semantic_rule" | "amount_fallback" | "manual";
 type AmountSignExplicit = "minus" | "plus_or_none" | "unknown";
-type CounterpartySource = "regex" | "heuristic" | "llm" | "unknown";
+type CounterpartySource = "regex" | "heuristic" | "llm" | "parser_seed" | "unknown";
+type DescriptionSource = "llm" | "parser_fallback";
 
 type Tx = {
   date: string;
@@ -40,10 +42,22 @@ type Tx = {
   direction_confidence: number;
   direction_needs_review: boolean;
   direction_reason: string;
+  description_source: DescriptionSource;
+  description_confidence: number;
   counterparty_source: CounterpartySource;
   counterparty_confidence: number;
   counterparty_needs_review: boolean;
+  parser_description: string;
+  parser_counterparty_name: string | null;
   summary_reason?: string | null;
+};
+
+type LlmEnrichmentItem = {
+  index: number;
+  short_description: string | null;
+  counterparty_name: string | null;
+  confidence_description: number;
+  confidence_counterparty: number;
 };
 
 type ParserTx = {
@@ -221,6 +235,7 @@ function normalizeCounterpartySource(v: unknown): CounterpartySource {
   if (s === "regex") return "regex";
   if (s === "heuristic") return "heuristic";
   if (s === "llm") return "llm";
+  if (s === "parser_seed") return "parser_seed";
   return "unknown";
 }
 
@@ -243,6 +258,46 @@ function cleanCounterpartyName(v: unknown): string | null {
   if (!name) return null;
   if (name.length < 3 || name.length > 120) return null;
   return name;
+}
+
+function cleanShortDescription(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  let text = v.trim();
+  if (!text) return null;
+  text = text
+    .replace(/^[\s()[\]{}\-–—:;,.]+/, "")
+    .replace(/^\(\s*[a-z0-9\s/.,-]*\)?/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return null;
+  for (const marker of COUNTERPARTY_STOP_MARKERS) {
+    const idx = text.toLowerCase().indexOf(marker);
+    if (idx > 0) {
+      text = text.slice(0, idx).trim();
+      break;
+    }
+  }
+  text = text.replace(/[()[\]]/g, "").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  if (text.length > 70) text = text.slice(0, 70).trim();
+  if (text.length < 4) return null;
+  const low = text.toLowerCase();
+  if (INVALID_COUNTERPARTY_VALUES.has(low) || INVALID_COUNTERPARTY_VALUES.has(low.replace(/[^a-z0-9]/g, ""))) {
+    return null;
+  }
+  return text;
+}
+
+function cleanParserFallbackDescription(v: unknown): string {
+  const raw = typeof v === "string" ? v : String(v ?? "");
+  const compact = raw
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const cleaned = cleanShortDescription(compact);
+  if (cleaned) return cleaned;
+  if (!compact) return "Movimento bancario";
+  return compact.length > 90 ? `${compact.slice(0, 90).trim()}…` : compact;
 }
 
 function isInvalidCounterparty(name: string | null | undefined): boolean {
@@ -396,8 +451,9 @@ function mapParserTx(item: ParserTx): Tx | null {
   const amountText = clip(item?.amount_text, 80);
   const amountSignExplicit = detectExplicitAmountSign(amountText);
 
-  const description = clip(item?.description, 600) ?? "";
-  const rawText = clip(item?.raw_text, 5000) ?? description;
+  const parserDescriptionRaw = clip(item?.description, 600) ?? "";
+  const parserDescription = cleanParserFallbackDescription(parserDescriptionRaw);
+  const rawText = clip(item?.raw_text, 5000) ?? parserDescriptionRaw;
   const reference = clip(item?.reference, 120);
   const categoryCode = clip(item?.category_code, 40);
 
@@ -419,13 +475,13 @@ function mapParserTx(item: ParserTx): Tx | null {
       reason: "Regola AVERE applicata",
     };
   } else {
-    decision = inferDirectionSemantic(normalizeText(`${description} ${rawText} ${reference ?? ""}`), "altro");
+    decision = inferDirectionSemantic(normalizeText(`${parserDescription} ${rawText} ${reference ?? ""}`), "altro");
     decision.needsReview = true;
   }
 
   let txType = normType(item?.transaction_type);
   if (txType === "altro") {
-    txType = inferTypeByText(`${description} ${rawText}`, decision.direction);
+    txType = inferTypeByText(`${parserDescription} ${rawText}`, decision.direction);
   }
 
   const parserCounterparty = cleanCounterpartyName(item?.counterparty_name);
@@ -482,7 +538,7 @@ function mapParserTx(item: ParserTx): Tx | null {
     value_date: clip(item?.value_date, 20),
     amount,
     commission,
-    description,
+    description: parserDescription,
     counterparty_name: counterpartyName,
     transaction_type: txType,
     reference,
@@ -497,9 +553,13 @@ function mapParserTx(item: ParserTx): Tx | null {
     direction_confidence: decision.confidence,
     direction_needs_review: decision.needsReview,
     direction_reason: clip(decision.reason, 240) || "Direzione determinata automaticamente",
-    counterparty_source: counterpartyInvalid ? "unknown" : parserCounterpartySource,
+    description_source: "parser_fallback",
+    description_confidence: 0.5,
+    counterparty_source: counterpartyInvalid ? "unknown" : "parser_seed",
     counterparty_confidence: counterpartyInvalid ? 0 : parserCounterpartyConfidence,
     counterparty_needs_review: counterpartyNeedsReview,
+    parser_description: parserDescription,
+    parser_counterparty_name: counterpartyInvalid ? null : parserCounterparty,
     summary_reason: clip(item?.row_reason, 120),
   };
 }
@@ -533,18 +593,33 @@ function parseAnyJson(raw: string): any {
   return null;
 }
 
-async function callGeminiCounterpartyBatch(
+async function callGeminiEnrichmentBatch(
   apiKey: string,
-  batch: Array<{ index: number; description: string; raw_text: string; transaction_type: string }>,
-): Promise<Array<{ index: number; counterparty_name: string | null; confidence: number }>> {
+  batch: Array<{
+    index: number;
+    raw_text: string;
+    transaction_type: string;
+    direction: Direction;
+    posting_side: PostingSide;
+    parser_description: string;
+    parser_counterparty: string | null;
+  }>,
+): Promise<LlmEnrichmentItem[]> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${apiKey}`;
   const prompt = [
-    "Sei un estrattore dati bancari italiano.",
-    "Per ogni elemento, estrai SOLO il nome controparte reale (azienda/persona), senza testo tecnico.",
-    "Non inventare mai nomi: se non certo, restituisci null e confidence 0.",
-    "Valori non validi: '(PER)', 'PER', 'ORDINE E CONTO', 'N.D.' e token tecnici.",
+    "Sei un assistente per normalizzazione movimenti bancari italiani.",
+    "Analizza ogni item usando SOLO raw_text.",
+    "Per ogni item restituisci:",
+    '- short_description: descrizione molto breve e compatta (max 70 char), senza parentesi spurie/codici tecnici.',
+    "- counterparty_name: nome persona/societa senza indirizzo, oppure N.D. se non chiaro.",
+    "- confidence_description: numero 0..1",
+    "- confidence_counterparty: numero 0..1",
+    "Regole:",
+    "- Non inventare dati non presenti nel testo.",
+    "- Niente indirizzi o codici in counterparty_name.",
+    "- Se dubbio controparte: N.D. con confidenza bassa.",
     "Rispondi SOLO JSON valido con formato:",
-    '{"results":[{"index":0,"counterparty_name":"NOME O null","confidence":0.0}]}',
+    '{"results":[{"index":0,"short_description":"testo breve","counterparty_name":"NOME o N.D.","confidence_description":0.0,"confidence_counterparty":0.0}]}',
     "",
     JSON.stringify({ items: batch }),
   ].join("\n");
@@ -568,7 +643,7 @@ async function callGeminiCounterpartyBatch(
     });
     if (!response.ok) {
       const rawErr = await response.text();
-      throw new Error(`Gemini counterparty HTTP ${response.status}: ${rawErr.slice(0, 180)}`);
+      throw new Error(`Gemini enrich HTTP ${response.status}: ${rawErr.slice(0, 180)}`);
     }
     const payload = await response.json();
     const text = (payload?.candidates?.[0]?.content?.parts ?? [])
@@ -578,23 +653,29 @@ async function callGeminiCounterpartyBatch(
     const parsed = parseAnyJson(text);
     const arr = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.results) ? parsed.results : [];
 
-    const out: Array<{ index: number; counterparty_name: string | null; confidence: number }> = [];
+    const out: LlmEnrichmentItem[] = [];
     for (const item of arr) {
       const idx = Number(item?.index);
       if (!Number.isFinite(idx)) continue;
-      const name = cleanCounterpartyName(item?.counterparty_name);
-      const confRaw = toNumber(item?.confidence);
-      const confidence = roundConfidence(confRaw ?? 0);
+      const shortDescription = cleanShortDescription(item?.short_description);
+      const counterpartyNameRaw = cleanCounterpartyName(item?.counterparty_name);
+      const counterpartyName = (counterpartyNameRaw && !isInvalidCounterparty(counterpartyNameRaw))
+        ? counterpartyNameRaw
+        : null;
+      const confidenceDescription = roundConfidence(toNumber(item?.confidence_description) ?? 0);
+      const confidenceCounterparty = roundConfidence(toNumber(item?.confidence_counterparty) ?? 0);
       out.push({
         index: Math.floor(idx),
-        counterparty_name: name,
-        confidence,
+        short_description: shortDescription,
+        counterparty_name: counterpartyName,
+        confidence_description: confidenceDescription,
+        confidence_counterparty: confidenceCounterparty,
       });
     }
     return out;
   } catch (e: unknown) {
     if (e instanceof DOMException && e.name === "AbortError") {
-      throw new Error(`Gemini counterparty timeout dopo ${Math.round(GEMINI_TEXT_TIMEOUT_MS / 1000)}s`);
+      throw new Error(`Gemini enrich timeout dopo ${Math.round(GEMINI_TEXT_TIMEOUT_MS / 1000)}s`);
     }
     throw e;
   } finally {
@@ -602,89 +683,163 @@ async function callGeminiCounterpartyBatch(
   }
 }
 
-async function resolveCounterpartiesWithLlm(
+async function enrichTransactionsWithLlm(
   apiKey: string,
   transactions: Tx[],
-): Promise<{ attempted: number; resolved: number; review: number; warnings: string[] }> {
-  const unresolved = transactions
-    .map((tx, i) => ({ tx, i }))
-    .filter(({ tx }) => isInvalidCounterparty(tx.counterparty_name) && counterpartyCanUseLlm(tx.transaction_type))
-    .map(({ tx, i }) => ({
-      idx: i,
-      payload: {
-        index: i,
-        description: tx.description || "",
-        raw_text: tx.raw_text || tx.description || "",
-        transaction_type: tx.transaction_type || "altro",
-      },
-    }));
-
-  if (!unresolved.length) {
-    return { attempted: 0, resolved: 0, review: 0, warnings: [] };
+): Promise<{
+  llmDescriptionAttemptedCount: number;
+  llmDescriptionResolvedCount: number;
+  counterpartyAttemptedCount: number;
+  counterpartyResolvedCount: number;
+  counterpartyReviewCount: number;
+  llmBatchFailCount: number;
+  warnings: string[];
+}> {
+  if (!transactions.length) {
+    return {
+      llmDescriptionAttemptedCount: 0,
+      llmDescriptionResolvedCount: 0,
+      counterpartyAttemptedCount: 0,
+      counterpartyResolvedCount: 0,
+      counterpartyReviewCount: 0,
+      llmBatchFailCount: 0,
+      warnings: [],
+    };
   }
 
   const warnings: string[] = [];
-  let attempted = 0;
-  let resolved = 0;
-  const llmApplied = new Set<number>();
+  let llmDescriptionAttemptedCount = 0;
+  let llmDescriptionResolvedCount = 0;
+  let counterpartyAttemptedCount = 0;
+  let counterpartyResolvedCount = 0;
+  let llmBatchFailCount = 0;
+  const failedIndices = new Set<number>();
 
-  for (let start = 0; start < unresolved.length; start += COUNTERPARTY_LLM_BATCH_SIZE) {
-    const slice = unresolved.slice(start, start + COUNTERPARTY_LLM_BATCH_SIZE);
-    const batch = slice.map((x) => x.payload);
-    attempted += batch.length;
+  for (let start = 0; start < transactions.length; start += LLM_ENRICH_BATCH_SIZE) {
+    const slice = transactions.slice(start, start + LLM_ENRICH_BATCH_SIZE);
+    const batch = slice.map((tx, localIdx) => ({
+      index: start + localIdx,
+      raw_text: tx.raw_text || tx.parser_description || "",
+      transaction_type: tx.transaction_type || "altro",
+      direction: tx.direction,
+      posting_side: tx.posting_side,
+      parser_description: tx.parser_description || "",
+      parser_counterparty: tx.parser_counterparty_name || null,
+    }));
 
-    let result: Array<{ index: number; counterparty_name: string | null; confidence: number }> = [];
+    llmDescriptionAttemptedCount += batch.length;
+    counterpartyAttemptedCount += batch.length;
+
+    let result: LlmEnrichmentItem[] = [];
     let lastErr: string | null = null;
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        result = await callGeminiCounterpartyBatch(apiKey, batch);
+        result = await callGeminiEnrichmentBatch(apiKey, batch);
         lastErr = null;
         break;
       } catch (e: any) {
-        lastErr = String(e?.message || e || "Errore fallback LLM");
+        lastErr = String(e?.message || e || "Errore enrichment LLM");
         if (attempt < 2) await delay(300);
       }
     }
 
     if (lastErr) {
-      warnings.push(`Counterparty fallback batch ${Math.floor(start / COUNTERPARTY_LLM_BATCH_SIZE) + 1}: ${lastErr}`);
+      llmBatchFailCount++;
+      for (const item of batch) failedIndices.add(item.index);
+      warnings.push(`LLM enrichment batch ${Math.floor(start / LLM_ENRICH_BATCH_SIZE) + 1}: ${lastErr}`);
       continue;
     }
 
+    const byIndex = new Map<number, LlmEnrichmentItem>();
     for (const item of result) {
+      if (!Number.isFinite(item.index)) continue;
+      byIndex.set(item.index, item);
+    }
+
+    for (const item of batch) {
       const tx = transactions[item.index];
       if (!tx) continue;
-      const candidate = cleanCounterpartyName(item.counterparty_name);
-      if (!candidate || isInvalidCounterparty(candidate) || item.confidence < COUNTERPARTY_CONFIDENCE_THRESHOLD) {
-        continue;
+
+      const llmItem = byIndex.get(item.index);
+
+      const descCandidate = cleanShortDescription(llmItem?.short_description);
+      const descConfidence = roundConfidence(llmItem?.confidence_description ?? 0);
+      if (descCandidate && descConfidence >= DESCRIPTION_CONFIDENCE_THRESHOLD) {
+        tx.description = descCandidate;
+        tx.description_source = "llm";
+        tx.description_confidence = descConfidence;
+        llmDescriptionResolvedCount++;
+      } else {
+        tx.description = cleanParserFallbackDescription(tx.parser_description || tx.description || tx.raw_text || "");
+        tx.description_source = "parser_fallback";
+        tx.description_confidence = 0.5;
       }
-      tx.counterparty_name = candidate;
-      tx.counterparty_source = "llm";
-      tx.counterparty_confidence = roundConfidence(item.confidence);
-      tx.counterparty_needs_review = false;
-      llmApplied.add(item.index);
-      resolved++;
+
+      const cpCandidate = cleanCounterpartyName(llmItem?.counterparty_name);
+      const cpConfidence = roundConfidence(llmItem?.confidence_counterparty ?? 0);
+      if (cpCandidate && !isInvalidCounterparty(cpCandidate) && cpConfidence >= COUNTERPARTY_CONFIDENCE_THRESHOLD) {
+        tx.counterparty_name = cpCandidate;
+        tx.counterparty_source = "llm";
+        tx.counterparty_confidence = cpConfidence;
+        tx.counterparty_needs_review = false;
+        counterpartyResolvedCount++;
+      } else {
+        tx.counterparty_name = "N.D.";
+        tx.counterparty_source = "unknown";
+        tx.counterparty_confidence = 0;
+        tx.counterparty_needs_review = counterpartyCanUseLlm(tx.transaction_type);
+      }
     }
   }
 
-  let review = 0;
-  transactions.forEach((tx, idx) => {
+  for (let idx = 0; idx < transactions.length; idx++) {
+    const tx = transactions[idx];
+
+    if (!tx.description || tx.description_source !== "llm") {
+      tx.description = cleanParserFallbackDescription(tx.parser_description || tx.description || tx.raw_text || "");
+      tx.description_source = "parser_fallback";
+      tx.description_confidence = tx.description_confidence || 0.5;
+    } else {
+      const cleanedDesc = cleanShortDescription(tx.description);
+      if (cleanedDesc) tx.description = cleanedDesc;
+    }
+
+    if (failedIndices.has(idx)) {
+      const seedCounterparty = cleanCounterpartyName(tx.parser_counterparty_name || tx.counterparty_name);
+      if (seedCounterparty && !isInvalidCounterparty(seedCounterparty)) {
+        tx.counterparty_name = seedCounterparty;
+        tx.counterparty_source = "parser_seed";
+        tx.counterparty_confidence = roundConfidence(Math.max(tx.counterparty_confidence || 0, 0.65));
+        tx.counterparty_needs_review = false;
+      } else {
+        tx.counterparty_name = "N.D.";
+        tx.counterparty_source = "unknown";
+        tx.counterparty_confidence = 0;
+        tx.counterparty_needs_review = counterpartyCanUseLlm(tx.transaction_type);
+      }
+      continue;
+    }
+
     if (isInvalidCounterparty(tx.counterparty_name)) {
       tx.counterparty_name = "N.D.";
-      if (tx.counterparty_source !== "llm") tx.counterparty_source = "unknown";
-      if (!Number.isFinite(tx.counterparty_confidence)) tx.counterparty_confidence = 0;
-      const needsReview = counterpartyCanUseLlm(tx.transaction_type);
-      tx.counterparty_needs_review = needsReview;
-      if (needsReview) review++;
-      return;
+      tx.counterparty_source = "unknown";
+      tx.counterparty_confidence = 0;
+      tx.counterparty_needs_review = counterpartyCanUseLlm(tx.transaction_type);
     }
-    if (!llmApplied.has(idx) && tx.counterparty_needs_review == null) {
-      tx.counterparty_needs_review = false;
-    }
-  });
+  }
 
-  return { attempted, resolved, review, warnings };
+  const counterpartyReviewCount = transactions.filter((tx) => tx.counterparty_needs_review === true).length;
+
+  return {
+    llmDescriptionAttemptedCount,
+    llmDescriptionResolvedCount,
+    counterpartyAttemptedCount,
+    counterpartyResolvedCount,
+    counterpartyReviewCount,
+    llmBatchFailCount,
+    warnings,
+  };
 }
 
 async function getTotalPages(pdfBase64: string): Promise<number> {
@@ -784,10 +939,13 @@ Deno.serve(async (req) => {
               unknown_side_count: 0,
               qc_fail_count: 0,
               summary_candidates_count: 0,
+              llm_description_attempted_count: 0,
+              llm_description_resolved_count: 0,
               counterparty_unknown_count: 0,
               counterparty_llm_attempted_count: 0,
               counterparty_llm_resolved_count: 0,
               counterparty_review_count: 0,
+              llm_batch_fail_count: 0,
             },
             summaryCandidates: [],
             statement: {
@@ -829,10 +987,13 @@ Deno.serve(async (req) => {
         let semanticOverrideCount = 0;
         let qcFailCount = 0;
         let summaryCandidatesCount = 0;
+        let llmDescriptionAttemptedCount = 0;
+        let llmDescriptionResolvedCount = 0;
         let counterpartyUnknownCount = 0;
         let counterpartyLlmAttemptedCount = 0;
         let counterpartyLlmResolvedCount = 0;
         let counterpartyReviewCount = 0;
+        let llmBatchFailCount = 0;
         let statementOpeningBalance: number | null = null;
         let statementClosingBalance: number | null = null;
         let statementClosingDate: string | null = null;
@@ -932,14 +1093,17 @@ Deno.serve(async (req) => {
           if (i < endChunkExclusive - 1) await delay(150);
         }
 
-        counterpartyUnknownCount = allTransactions.filter((tx) => isInvalidCounterparty(tx.counterparty_name)).length;
-        if (counterpartyUnknownCount > 0) {
+        if (allTransactions.length > 0) {
           if (!geminiApiKey) {
-            warnings.push("Counterparty fallback LLM disattivato: GEMINI_API_KEY non configurata");
+            warnings.push("LLM enrichment disattivato: GEMINI_API_KEY non configurata");
           } else {
-            const llmResult = await resolveCounterpartiesWithLlm(geminiApiKey, allTransactions);
-            counterpartyLlmAttemptedCount += llmResult.attempted;
-            counterpartyLlmResolvedCount += llmResult.resolved;
+            const llmResult = await enrichTransactionsWithLlm(geminiApiKey, allTransactions);
+            llmDescriptionAttemptedCount += llmResult.llmDescriptionAttemptedCount;
+            llmDescriptionResolvedCount += llmResult.llmDescriptionResolvedCount;
+            counterpartyLlmAttemptedCount += llmResult.counterpartyAttemptedCount;
+            counterpartyLlmResolvedCount += llmResult.counterpartyResolvedCount;
+            counterpartyReviewCount = llmResult.counterpartyReviewCount;
+            llmBatchFailCount += llmResult.llmBatchFailCount;
             warnings.push(...llmResult.warnings);
           }
         }
@@ -967,10 +1131,13 @@ Deno.serve(async (req) => {
             unknown_side_count: unknownSideCount,
             qc_fail_count: qcFailCount + parseErrorsCount,
             summary_candidates_count: allSummaryCandidates.length || summaryCandidatesCount,
+            llm_description_attempted_count: llmDescriptionAttemptedCount,
+            llm_description_resolved_count: llmDescriptionResolvedCount,
             counterparty_unknown_count: counterpartyUnknownCount,
             counterparty_llm_attempted_count: counterpartyLlmAttemptedCount,
             counterparty_llm_resolved_count: counterpartyLlmResolvedCount,
             counterparty_review_count: counterpartyReviewCount,
+            llm_batch_fail_count: llmBatchFailCount,
           },
           summaryCandidates: allSummaryCandidates,
           statement: {
