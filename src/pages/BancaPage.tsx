@@ -65,15 +65,88 @@ function txDirectionConfidenceLabel(conf?: number) {
   return `${Math.round(Number(conf) * 100)}%`
 }
 
+const invalidCounterpartyTokens = new Set([
+  '',
+  'n.d.',
+  'n.d',
+  'nd',
+  'n/d',
+  '(per',
+  'per',
+  'ordine e conto',
+  'ordine',
+  'conto',
+  'bonifico',
+  'filiale',
+  'bic',
+  'inf',
+  'ri',
+  'rif',
+  'num',
+  'tot',
+  'importo',
+])
+
+function cleanCounterpartyCandidate(raw: string | null | undefined): string | null {
+  if (!raw) return null
+  let value = String(raw).trim()
+  if (!value) return null
+  value = value
+    .replace(/^[\s(]*per\b/i, '')
+    .replace(/^\(?\s*ordine\s+e\s+conto\)?/i, '')
+    .replace(/^\s*a\s+favore\s+di\s+/i, '')
+    .replace(/^\s*bonifico\s+a\s+vostro\s+favore\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!value || value.length < 3 || value.length > 120) return null
+
+  const lower = value.toLowerCase()
+  if (invalidCounterpartyTokens.has(lower)) return null
+  const compact = lower.replace(/[^a-z0-9]/g, '')
+  if (invalidCounterpartyTokens.has(compact)) return null
+
+  const parts = lower.split(/\s+/).filter(Boolean)
+  if (parts.length <= 2 && parts.every((p) => invalidCounterpartyTokens.has(p))) return null
+  return value
+}
+
+function extractCounterpartyFromRawText(rawText: string | null | undefined): string | null {
+  if (!rawText) return null
+  const lines = String(rawText).split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+  if (!lines.length) return null
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const sameLine = line.match(/ORDINE\s+E\s+CONTO\)\s*(.+)$/i)
+    if (sameLine?.[1]) {
+      const merged = [sameLine[1], lines[i + 1], lines[i + 2]].filter(Boolean).join(' ')
+      const candidate = cleanCounterpartyCandidate(merged)
+      if (candidate) return candidate
+    }
+
+    const favorLine = line.match(/A\s+FAVORE\s+DI\s+(.+)$/i)
+    if (favorLine?.[1]) {
+      const merged = [favorLine[1], lines[i + 1]].filter(Boolean).join(' ')
+      const candidate = cleanCounterpartyCandidate(merged)
+      if (candidate) return candidate
+    }
+
+    const markerLine = line.match(/(?:CRED|BEN|ORDINANTE|BENEFICIARIO)\s*:\s*(.+)$/i)
+    if (markerLine?.[1]) {
+      const candidate = cleanCounterpartyCandidate(markerLine[1])
+      if (candidate) return candidate
+    }
+  }
+
+  return null
+}
+
 function getTxTitle(tx: any): string {
-  const cp = String(tx?.counterparty_name || '').trim()
-  const cpNorm = cp.toLowerCase()
-  const invalidCounterparty = !cp ||
-    cpNorm === 'n.d.' ||
-    cpNorm === 'n.d' ||
-    cpNorm === 'nd' ||
-    cpNorm === 'n/d'
-  if (!invalidCounterparty) return cp
+  const cp = cleanCounterpartyCandidate(tx?.counterparty_name)
+  if (cp) return cp
+
+  const rawCounterparty = extractCounterpartyFromRawText(tx?.raw_text)
+  if (rawCounterparty) return rawCounterparty
 
   const description = String(tx?.description || '').trim()
   if (!description) return '—'
@@ -294,6 +367,11 @@ function TxRow({ tx, selected, onClick, onDoubleClick }: {
           Da verificare
         </span>
       )}
+      {tx.counterparty_needs_review && (
+        <span className="hidden lg:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-orange-100 text-orange-700 flex-shrink-0">
+          Controparte da verificare
+        </span>
+      )}
       <div className="text-right flex-shrink-0">
         <p className={`text-sm font-bold ${isIn ? 'text-emerald-700' : 'text-red-700'}`}>
           {isIn ? '+' : '-'}{fmtEur(Math.abs(signedAmount))}
@@ -386,6 +464,9 @@ function TxDetail({
         <Row l="Data accredito" v={tx.date ? fmtDate(tx.date) : null} />
         <Row l="Data valuta" v={tx.value_date ? fmtDate(tx.value_date) : null} />
         <Row l="Controparte" v={tx.counterparty_name} />
+        <Row l="Origine controparte" v={tx.counterparty_source} />
+        <Row l="Confidenza controparte" v={tx.counterparty_confidence != null ? `${Math.round(Number(tx.counterparty_confidence) * 100)}%` : null} />
+        <Row l="Controparte da verificare" v={tx.counterparty_needs_review ? 'Sì' : null} />
         <Row l="IBAN / Conto controparte" v={tx.counterparty_account} />
         <Row l="Saldo dopo" v={tx.balance != null ? fmtEur(tx.balance) : null} />
         <Row l="Descrizione" v={tx.description} />
@@ -778,6 +859,10 @@ export default function BancaPage() {
         unknown_side_count: 0,
         qc_fail_count: 0,
         summary_candidates_count: 0,
+        counterparty_unknown_count: 0,
+        counterparty_llm_attempted_count: 0,
+        counterparty_llm_resolved_count: 0,
+        counterparty_review_count: 0,
       }
       setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], warnings: [], stats: emptyStats })
     } finally {
@@ -835,6 +920,10 @@ export default function BancaPage() {
         unknown_side_count: 0,
         qc_fail_count: 0,
         summary_candidates_count: 0,
+        counterparty_unknown_count: 0,
+        counterparty_llm_attempted_count: 0,
+        counterparty_llm_resolved_count: 0,
+        counterparty_review_count: 0,
       }
       setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], warnings: [], stats: emptyStats })
     }
@@ -847,7 +936,7 @@ export default function BancaPage() {
     const direction = txDirection(tx)
     if (dirFilter === 'in' && direction !== 'in') return false
     if (dirFilter === 'out' && direction !== 'out') return false
-    if (dirFilter === 'review' && !tx.direction_needs_review) return false
+    if (dirFilter === 'review' && !tx.direction_needs_review && !tx.counterparty_needs_review) return false
     if (typeFilter !== 'all' && tx.transaction_type !== typeFilter) return false
     if (dateFrom && tx.date < dateFrom) return false
     if (dateTo && tx.date > dateTo) return false
@@ -1000,6 +1089,17 @@ export default function BancaPage() {
                     Unknown side: {importResult.stats.unknown_side_count} ·
                     QC fail: {importResult.stats.qc_fail_count} ·
                     Summary candidati: {importResult.stats.summary_candidates_count}
+                  </div>
+                )}
+                {(importResult.stats.counterparty_unknown_count > 0 ||
+                  importResult.stats.counterparty_llm_attempted_count > 0 ||
+                  importResult.stats.counterparty_llm_resolved_count > 0 ||
+                  importResult.stats.counterparty_review_count > 0) && (
+                  <div className="text-xs text-gray-600 mt-1">
+                    Controparte unknown: {importResult.stats.counterparty_unknown_count} ·
+                    LLM tentati: {importResult.stats.counterparty_llm_attempted_count} ·
+                    LLM risolti: {importResult.stats.counterparty_llm_resolved_count} ·
+                    Da verificare: {importResult.stats.counterparty_review_count}
                   </div>
                 )}
                 {(importResult.stats.failed_chunks_count > 0 || importResult.stats.warnings_count > 0) && (

@@ -33,6 +33,9 @@ export interface BankTransaction {
   direction_updated_at?: string;
   direction_updated_by?: string;
   summary_reason?: string;
+  counterparty_source?: 'regex' | 'heuristic' | 'llm' | 'unknown';
+  counterparty_confidence?: number;
+  counterparty_needs_review?: boolean;
 }
 
 export interface BankStatement {
@@ -55,6 +58,10 @@ export interface BankImportStats {
   unknown_side_count: number;
   qc_fail_count: number;
   summary_candidates_count: number;
+  counterparty_unknown_count: number;
+  counterparty_llm_attempted_count: number;
+  counterparty_llm_resolved_count: number;
+  counterparty_review_count: number;
 }
 
 export interface BankParseResult {
@@ -111,6 +118,61 @@ function normalizeAmountSignExplicit(v: unknown): 'minus' | 'plus_or_none' | 'un
   return 'unknown';
 }
 
+function normalizeCounterpartySource(v: unknown): 'regex' | 'heuristic' | 'llm' | 'unknown' {
+  const s = String(v ?? '').trim().toLowerCase();
+  if (s === 'regex') return 'regex';
+  if (s === 'heuristic') return 'heuristic';
+  if (s === 'llm') return 'llm';
+  return 'unknown';
+}
+
+const INVALID_COUNTERPARTY = new Set([
+  '',
+  'n.d.',
+  'n.d',
+  'nd',
+  'n/d',
+  '(per',
+  'per',
+  'ordine e conto',
+  'ordine',
+  'conto',
+  'bonifico',
+  'filiale',
+  'bic',
+  'inf',
+  'ri',
+  'rif',
+  'num',
+  'tot',
+  'importo',
+]);
+
+function sanitizeCounterpartyName(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  let name = v.trim();
+  if (!name) return null;
+  name = name
+    .replace(/^[\s(]*per\b/i, '')
+    .replace(/^\(?\s*ordine\s+e\s+conto\)?/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!name || name.length < 3 || name.length > 120) return null;
+  const lower = name.toLowerCase();
+  if (INVALID_COUNTERPARTY.has(lower)) return null;
+  const compact = lower.replace(/[^a-z0-9]/g, '');
+  if (INVALID_COUNTERPARTY.has(compact)) return null;
+  return name;
+}
+
+function shouldReviewCounterparty(txType: string): boolean {
+  return txType === 'bonifico_in' ||
+    txType === 'bonifico_out' ||
+    txType === 'riba' ||
+    txType === 'sdd' ||
+    txType === 'altro';
+}
+
 function mapRawTx(raw: any): BankTransaction | null {
   if (!raw?.date || raw?.amount == null) return null;
   const parsedAmount = parseFloat(String(raw.amount));
@@ -131,6 +193,17 @@ function mapRawTx(raw: any): BankTransaction | null {
     raw.direction_needs_review === 'true' ||
     (raw.direction_needs_review == null && directionConfidence < 0.7),
   );
+  const txType = raw.transaction_type || 'altro';
+  const counterparty = sanitizeCounterpartyName(raw.counterparty_name);
+  const cpConfidenceRaw = parseFloat(String(raw.counterparty_confidence ?? '0'));
+  const cpConfidence = Number.isFinite(cpConfidenceRaw)
+    ? Math.min(1, Math.max(0, Math.round(cpConfidenceRaw * 100) / 100))
+    : 0;
+  const counterpartyNeedsReview = Boolean(
+    raw.counterparty_needs_review === true ||
+    raw.counterparty_needs_review === 'true' ||
+    (!counterparty && shouldReviewCounterparty(txType)),
+  );
 
   return {
     date: parseItalianDate(raw.date),
@@ -140,9 +213,9 @@ function mapRawTx(raw: any): BankTransaction | null {
     net_amount: commission ? amount - Math.abs(commission) : amount,
     balance: raw.balance != null ? parseFloat(String(raw.balance)) : undefined,
     description: String(raw.description || '').trim(),
-    counterparty_name: raw.counterparty_name || undefined,
+    counterparty_name: counterparty || 'N.D.',
     category_code: raw.category_code || undefined,
-    transaction_type: raw.transaction_type || 'altro',
+    transaction_type: txType,
     reference: raw.reference || undefined,
     invoice_ref: raw.invoice_ref || undefined,
     raw_text: String(raw.raw_text || raw.description || '').trim(),
@@ -155,6 +228,9 @@ function mapRawTx(raw: any): BankTransaction | null {
     direction_needs_review: directionNeedsReview,
     direction_reason: String(raw.direction_reason || '').trim() || undefined,
     summary_reason: raw.summary_reason ? String(raw.summary_reason).trim() : undefined,
+    counterparty_source: normalizeCounterpartySource(raw.counterparty_source),
+    counterparty_confidence: cpConfidence,
+    counterparty_needs_review: counterpartyNeedsReview,
   };
 }
 
@@ -332,6 +408,10 @@ export async function parseBankPdf(
   let unknownSideCount = 0;
   let qcFailCount = 0;
   let summaryCandidatesCount = 0;
+  let counterpartyUnknownCount = 0;
+  let counterpartyLlmAttemptedCount = 0;
+  let counterpartyLlmResolvedCount = 0;
+  let counterpartyReviewCount = 0;
   let statementOpeningBalance: number | undefined;
   let statementClosingBalance: number | undefined;
   let statementClosingDate: string | undefined;
@@ -359,6 +439,10 @@ export async function parseBankPdf(
     unknownSideCount += Number(stats.unknown_side_count || 0);
     qcFailCount += Number(stats.qc_fail_count || 0);
     summaryCandidatesCount += Number(stats.summary_candidates_count || 0);
+    counterpartyUnknownCount += Number(stats.counterparty_unknown_count || 0);
+    counterpartyLlmAttemptedCount += Number(stats.counterparty_llm_attempted_count || 0);
+    counterpartyLlmResolvedCount += Number(stats.counterparty_llm_resolved_count || 0);
+    counterpartyReviewCount += Number(stats.counterparty_review_count || 0);
 
     const statement = finalData?.statement || {};
     const openingRaw = Number(statement.openingBalance);
@@ -423,6 +507,10 @@ export async function parseBankPdf(
       unknown_side_count: unknownSideCount,
       qc_fail_count: qcFailCount,
       summary_candidates_count: summaryCandidatesCount,
+      counterparty_unknown_count: counterpartyUnknownCount,
+      counterparty_llm_attempted_count: counterpartyLlmAttemptedCount,
+      counterparty_llm_resolved_count: counterpartyLlmResolvedCount,
+      counterparty_review_count: counterpartyReviewCount,
     },
   };
 

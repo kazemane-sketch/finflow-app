@@ -37,6 +37,59 @@ GENERIC_COUNTERPARTY = {
     "saldo finale",
 }
 
+COUNTERPARTY_TECH_TOKENS = {
+    "(PER",
+    "PER",
+    "ORDINE",
+    "E",
+    "CONTO",
+    "ORDINE E CONTO",
+    "N.D.",
+    "N.D",
+    "ND",
+    "BONIFICO",
+    "FILIALE",
+    "BIC",
+    "INF",
+    "RI",
+    "RIF",
+    "NUM",
+    "TOT",
+    "IMPORTO",
+    "COMMISSIONI",
+    "ORD.ORIG",
+}
+
+COUNTERPARTY_LINE_STOPWORDS = (
+    "FILIALE DISPONENTE",
+    "BONIFICO PER ORDINE/CONTO",
+    "BONIFICO PER",
+    "ID FLUSSO CBI",
+    "BIC:",
+    "INF:",
+    "RI:",
+    "RIF.",
+    "NUM.",
+    "TOT.",
+    "IMPORTO",
+    "ORD.ORIG",
+    "CAUS:",
+)
+
+LEGAL_ENTITY_SUFFIXES = {
+    "SRL",
+    "SRLS",
+    "SPA",
+    "SAS",
+    "SNC",
+    "SAPA",
+    "SCARL",
+    "COOP",
+    "CONSORZIO",
+    "ASSOCIAZIONE",
+    "FONDAZIONE",
+}
+
 
 class ExtractRequest(BaseModel):
     pdfBase64: str = Field(..., min_length=8)
@@ -150,62 +203,129 @@ def clean_counterparty_name(raw: str | None) -> str | None:
         return None
 
     value = raw.strip().strip("-:;,. ")
-    value = re.sub(r"^\([^)]*\)\s*", "", value).strip()
+    value = re.sub(r"^\(\s*PER\b", "", value, flags=re.IGNORECASE).strip(" )")
+    value = re.sub(r"^\(?\s*ORDINE\s+E\s+CONTO\)?", "", value, flags=re.IGNORECASE).strip(" )")
+    value = re.sub(r"^\s*A\s+FAVORE\s+DI\s+", "", value, flags=re.IGNORECASE).strip()
+    value = re.sub(r"^\s*BONIFICO\s+A\s+VOSTRO\s+FAVORE\s*", "", value, flags=re.IGNORECASE).strip()
     value = re.sub(r"\s+", " ", value)
     if not value:
         return None
 
-    stop_pattern = re.compile(
-        r"\b(BONIFICO\s+PER|FILIALE|BIC:|INF:|RI:|RIF\.?|NUM\.?|TOT\.?|IMPORTO|ORD\.ORIG)\b",
-        flags=re.IGNORECASE,
-    )
-    stop = stop_pattern.search(value)
-    if stop:
-        value = value[: stop.start()].strip(" -:;,. ")
+    for marker in COUNTERPARTY_LINE_STOPWORDS:
+        idx = value.upper().find(marker)
+        if idx > 0:
+            value = value[:idx].strip(" -:;,.")
+            break
 
     value_lower = value.lower().strip()
     if not value_lower or value_lower in GENERIC_COUNTERPARTY:
         return None
 
-    if len(value) < 3:
+    # Reject obvious technical placeholders and fragments like "(PER".
+    token_only = re.sub(r"[^A-Z0-9 ]", "", value.upper()).strip()
+    if token_only in COUNTERPARTY_TECH_TOKENS:
+        return None
+    if len(token_only.split()) <= 2 and all(part in COUNTERPARTY_TECH_TOKENS for part in token_only.split()):
+        return None
+
+    if len(value) < 3 or len(value) > 120:
         return None
     return value
 
 
-def extract_counterparty(raw_lines: list[str], raw_text: str) -> str:
+def _counterparty_result(name: str, source: str, confidence: float) -> dict[str, Any]:
+    return {
+        "name": name,
+        "source": source,
+        "confidence": round(max(0.0, min(1.0, confidence)), 2),
+    }
+
+
+def normalize_entity_token(text: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", text.upper())
+
+
+def is_suffix_only_line(text: str) -> bool:
+    token = normalize_entity_token(text)
+    return token in LEGAL_ENTITY_SUFFIXES
+
+
+def looks_company_line(text: str) -> bool:
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return False
+    upper = cleaned.upper()
+    if any(marker in upper for marker in COUNTERPARTY_LINE_STOPWORDS):
+        return False
+
+    digits = sum(1 for ch in upper if ch.isdigit())
+    if digits > max(2, int(len(upper) * 0.22)):
+        return False
+
+    parts = [p for p in re.split(r"\s+", upper) if p]
+    if not parts:
+        return False
+
+    if len(parts) == 1:
+        return is_suffix_only_line(parts[0])
+
+    has_suffix = any(normalize_entity_token(part) in LEGAL_ENTITY_SUFFIXES for part in parts)
+    has_letters = sum(1 for p in parts if any(ch.isalpha() for ch in p))
+    return has_letters >= 2 or has_suffix
+
+
+def extract_counterparty(raw_lines: list[str], raw_text: str) -> dict[str, Any]:
     lines = [normalize_space(x) for x in raw_lines if normalize_space(x)]
-
-    line_patterns = [
-        r"BONIFICO\s+A\s+VOSTRO\s+FAVORE(?:\s*\([^)]*\))?\s*(.+)",
-        r"A\s+FAVORE\s+DI\s+(.+)",
-        r"CRED\s*:\s*(.+)",
-        r"BEN\s*:\s*(.+)",
-        r"ORDINANTE\s*:\s*(.+)",
-        r"BENEFICIARIO\s*:\s*(.+)",
-    ]
-
-    for line in lines:
-        for pattern in line_patterns:
-            match = re.search(pattern, line, flags=re.IGNORECASE)
-            if match:
-                candidate = clean_counterparty_name(match.group(1))
-                if candidate:
-                    return candidate
-
     compact = normalize_space(raw_text)
-    free_patterns = [
-        r"BONIFICO\s+A\s+VOSTRO\s+FAVORE(?:\s*\([^)]*\))?\s*([A-Z0-9À-ÿ .,'&/-]{3,})",
-        r"A\s+FAVORE\s+DI\s+([A-Z0-9À-ÿ .,'&/-]{3,})",
-        r"CRED\s*:\s*([A-Z0-9À-ÿ .,'&/-]{3,})",
+
+    multiline_patterns = [
+        r"BONIFICO\s+A\s+VOSTRO\s+FAVORE(?:\s*\(PER)?(?:\s+ORDINE\s+E\s+CONTO\)?)?\s+([A-Z0-9À-ÿ .,'&/-]{3,220})",
+        r"A\s+FAVORE\s+DI\s+([A-Z0-9À-ÿ .,'&/-]{3,220})",
     ]
-    for pattern in free_patterns:
+    for pattern in multiline_patterns:
         match = re.search(pattern, compact, flags=re.IGNORECASE)
-        if match:
+        if not match:
+            continue
+        candidate = clean_counterparty_name(match.group(1))
+        if candidate:
+            return _counterparty_result(candidate, "regex", 0.92)
+
+    marker_patterns = [
+        r"\bCRED\s*:\s*(.+)",
+        r"\bBEN\s*:\s*(.+)",
+        r"\bORDINANTE\s*:\s*(.+)",
+        r"\bBENEFICIARIO\s*:\s*(.+)",
+    ]
+    for idx, line in enumerate(lines):
+        for pattern in marker_patterns:
+            match = re.search(pattern, line, flags=re.IGNORECASE)
+            if not match:
+                continue
             candidate = clean_counterparty_name(match.group(1))
             if candidate:
-                return candidate
+                return _counterparty_result(candidate, "regex", 0.9)
+            if idx + 1 < len(lines):
+                next_candidate = clean_counterparty_name(lines[idx + 1])
+                if next_candidate:
+                    return _counterparty_result(next_candidate, "regex", 0.86)
 
-    return "N.D."
+    for idx, line in enumerate(lines):
+        if not looks_company_line(line):
+            continue
+        candidate = clean_counterparty_name(line)
+        if not candidate:
+            continue
+
+        merged = candidate
+        if idx + 1 < len(lines):
+            next_line = clean_counterparty_name(lines[idx + 1])
+            if next_line and is_suffix_only_line(next_line):
+                merged = clean_counterparty_name(f"{candidate} {next_line}") or merged
+
+        if merged and merged.upper() not in COUNTERPARTY_TECH_TOKENS:
+            return _counterparty_result(merged, "heuristic", 0.75)
+
+    return _counterparty_result("N.D.", "unknown", 0.0)
 
 
 def is_summary_text(text: str) -> bool:
@@ -405,7 +525,10 @@ def parse_pdf_transactions(
             "in" if posting_side == "avere" else "unknown"
         )
         current_row["transaction_type"] = infer_transaction_type(raw_text_flat, current_row["direction_base"])
-        current_row["counterparty_name"] = extract_counterparty(raw_lines, raw_text_flat)
+        counterparty = extract_counterparty(raw_lines, raw_text_flat)
+        current_row["counterparty_name"] = counterparty["name"]
+        current_row["counterparty_source"] = counterparty["source"]
+        current_row["counterparty_confidence"] = counterparty["confidence"]
 
         row_kind = current_row.get("row_kind", "transaction")
         if row_kind == "summary":
