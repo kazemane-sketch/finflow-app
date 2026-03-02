@@ -217,28 +217,27 @@ Deno.serve(async (req) => {
     }
 
     if (!answer) {
-      if (!anthropicKey && !geminiKey) {
-        return new Response(JSON.stringify({
-          error: "AI provider non configurato (manca ANTHROPIC_API_KEY o GEMINI_API_KEY).",
-        }), {
-          status: 500,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
+      const reason = !anthropicKey && !geminiKey
+        ? "AI provider non configurato (manca ANTHROPIC_API_KEY o GEMINI_API_KEY)."
+        : `Nessun provider AI disponibile: ${providerErrors.join(" | ") || "errore sconosciuto"}`;
 
       return new Response(JSON.stringify({
-        error: `Nessun provider AI disponibile: ${providerErrors.join(" | ") || "errore sconosciuto"}`,
+        answer: `Servizio AI temporaneamente non disponibile.\n${reason}`,
+        used_count: usedTx.length,
+        truncated,
+        model: "fallback:unavailable",
       }), {
-        status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
     if (!model) {
       return new Response(JSON.stringify({
-        error: "Risposta AI senza modello identificato.",
+        answer: "Servizio AI disponibile ma senza modello identificato. Riprovare tra poco.",
+        used_count: usedTx.length,
+        truncated,
+        model: "fallback:unknown-model",
       }), {
-        status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
@@ -253,8 +252,12 @@ Deno.serve(async (req) => {
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "Errore sconosciuto";
-    return new Response(JSON.stringify({ error: msg }), {
-      status: 500,
+    return new Response(JSON.stringify({
+      answer: `Servizio AI temporaneamente non disponibile.\n${msg}`,
+      used_count: 0,
+      truncated: false,
+      model: "fallback:exception",
+    }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }

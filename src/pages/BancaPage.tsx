@@ -549,6 +549,9 @@ async function askBankAiSearch(query: string, transactions: any[]): Promise<Bank
   if (error) {
     throw new Error(error.message || 'Errore AI search')
   }
+  if (data?.error) {
+    throw new Error(String(data.error))
+  }
 
   return {
     answer: typeof data.answer === 'string' && data.answer.trim() ? data.answer.trim() : 'Nessuna risposta',
@@ -556,6 +559,57 @@ async function askBankAiSearch(query: string, transactions: any[]): Promise<Bank
     truncated: Boolean(data.truncated),
     model: typeof data.model === 'string' ? data.model : undefined,
   }
+}
+
+function buildLocalAiFallback(query: string, transactions: Array<{
+  amount: number
+  description?: string | null
+  counterparty_name?: string | null
+  reference?: string | null
+  invoice_ref?: string | null
+  transaction_type?: string | null
+}>): string {
+  const q = query.trim().toLowerCase()
+  if (!q) return "Inserisci una query per avviare l'analisi."
+
+  const matched = transactions.filter((tx) => {
+    const hay = [
+      tx.description || '',
+      tx.counterparty_name || '',
+      tx.reference || '',
+      tx.invoice_ref || '',
+      tx.transaction_type || '',
+    ].join(' ').toLowerCase()
+    return hay.includes(q)
+  })
+
+  if (matched.length === 0) {
+    return `Nessuna corrispondenza testuale per "${query}". Prova con termini più specifici (controparte, causale, riferimento, tipo).`
+  }
+
+  const totalIn = matched
+    .filter((tx) => Number(tx.amount || 0) >= 0)
+    .reduce((s, tx) => s + Math.abs(Number(tx.amount || 0)), 0)
+  const totalOut = matched
+    .filter((tx) => Number(tx.amount || 0) < 0)
+    .reduce((s, tx) => s + Math.abs(Number(tx.amount || 0)), 0)
+
+  const byCounterparty = new Map<string, number>()
+  for (const tx of matched) {
+    const name = (tx.counterparty_name || 'N.D.').trim()
+    byCounterparty.set(name, (byCounterparty.get(name) || 0) + Math.abs(Number(tx.amount || 0)))
+  }
+  const top = Array.from(byCounterparty.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([name, amount]) => `${name}: ${fmtEur(amount)}`)
+
+  const lines = [
+    `Risultati trovati: ${matched.length} movimento/i per "${query}".`,
+    `Entrate: ${fmtEur(totalIn)} · Uscite: ${fmtEur(totalOut)} · Netto: ${fmtEur(totalIn - totalOut)}`,
+  ]
+  if (top.length) lines.push(`Top controparti: ${top.join(' · ')}`)
+  return lines.join('\n')
 }
 
 // ============================================================
@@ -1008,7 +1062,8 @@ export default function BancaPage() {
         `${result.model ? ` · modello: ${result.model}` : ''}`
       setAiResult(`${result.answer}${scopeLine}`)
     } catch (e: any) {
-      setAiResult('Errore AI search: ' + e.message)
+      const fallback = buildLocalAiFallback(query, aiScopeTransactions)
+      setAiResult(`${fallback}\n\n(Fallback locale attivato: servizio AI temporaneamente non disponibile)`)
     }
     setAiLoading(false)
   }

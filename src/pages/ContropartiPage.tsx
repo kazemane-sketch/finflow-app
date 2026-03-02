@@ -122,6 +122,18 @@ function fmtEurOrDash(amount: number): string {
   return Math.abs(amount) < 0.005 ? '-' : fmtEur(amount)
 }
 
+function trimDecimals(v: string): string {
+  return v.replace(/\.00$/, '').replace(/(\.\d*[1-9])0+$/, '$1')
+}
+
+function formatCompactNumber(value: number): string {
+  const abs = Math.abs(Number(value || 0))
+  if (abs >= 1_000_000_000) return `${trimDecimals((value / 1_000_000_000).toFixed(2))}B`
+  if (abs >= 1_000_000) return `${trimDecimals((value / 1_000_000).toFixed(2))}M`
+  if (abs >= 1_000) return `${trimDecimals((value / 1_000).toFixed(2))}K`
+  return trimDecimals(value.toFixed(0))
+}
+
 function analyticsAmountByVatMode(
   inv: { total_amount: number; taxable_amount: number | null; tax_amount: number | null },
   mode: AnalyticsVatMode,
@@ -1044,7 +1056,12 @@ export default function ContropartiPage() {
                     <BarChart data={trendChartData}>
                       <CartesianGrid strokeDasharray="3 3" />
                       <XAxis dataKey="monthLabel" />
-                      <YAxis />
+                      <YAxis
+                        width={72}
+                        tickMargin={6}
+                        tick={{ fontSize: 11 }}
+                        tickFormatter={(v: any) => formatCompactNumber(Number(v || 0))}
+                      />
                       <Tooltip formatter={(v: any) => fmtEur(Number(v || 0))} />
                       <Legend />
                       <Bar dataKey="activeAmount" name="Attive" stackId="a" fill="#059669" />
