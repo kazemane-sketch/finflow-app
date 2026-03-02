@@ -6,6 +6,8 @@ import { supabase } from '@/integrations/supabase/client'
 import { fmtDate, fmtEur } from '@/lib/utils'
 import { listVatPeriods, formatVatPeriodLabel, type VatPeriod } from '@/lib/vat'
 
+const INVOICE_PAGE_SIZE = 1000
+
 type DueItem = {
   id: string
   kind: 'invoice' | 'vat'
@@ -20,6 +22,50 @@ function statusClass(status: string): string {
   if (status === 'paid') return 'bg-emerald-100 text-emerald-700'
   if (status === 'to_pay' || status === 'pending') return 'bg-amber-100 text-amber-700'
   return 'bg-gray-100 text-gray-700'
+}
+
+async function loadAllInvoiceDueItems(companyId: string, today: string): Promise<DueItem[]> {
+  const out: DueItem[] = []
+  let from = 0
+
+  for (;;) {
+    const to = from + INVOICE_PAGE_SIZE - 1
+    const { data, error } = await supabase
+      .from('invoices')
+      .select('id, number, direction, payment_due_date, total_amount, payment_status, reconciliation_status')
+      .eq('company_id', companyId)
+      .not('payment_due_date', 'is', null)
+      .order('payment_due_date', { ascending: true })
+      .order('id', { ascending: true })
+      .range(from, to)
+
+    if (error) throw new Error(error.message)
+    const rows = data || []
+    if (!rows.length) break
+
+    for (const inv of rows as any[]) {
+      const dueDate = String(inv.payment_due_date || '')
+      if (!dueDate) continue
+
+      const isUnreconciled = String(inv.reconciliation_status || 'unmatched') !== 'matched'
+      const isUnpaid = String(inv.payment_status || 'pending') !== 'paid'
+      if (!isUnreconciled && !isUnpaid) continue
+
+      out.push({
+        id: String(inv.id),
+        kind: 'invoice',
+        title: `Fattura ${inv.number || 'senza numero'}`,
+        due_date: dueDate,
+        amount: Number(inv.total_amount || 0),
+        status: dueDate < today ? 'overdue' : 'pending',
+      })
+    }
+
+    from += INVOICE_PAGE_SIZE
+    if (rows.length < INVOICE_PAGE_SIZE) break
+  }
+
+  return out
 }
 
 export default function ScadenzarioPage() {
@@ -44,29 +90,10 @@ export default function ScadenzarioPage() {
 
       try {
         const today = new Date().toISOString().slice(0, 10)
-
-        const [invoiceResp, vatPeriods] = await Promise.all([
-          supabase
-            .from('invoices')
-            .select('id, number, payment_due_date, total_amount, payment_status')
-            .eq('company_id', company.id)
-            .not('payment_due_date', 'is', null)
-            .in('payment_status', ['pending', 'overdue'])
-            .order('payment_due_date', { ascending: true })
-            .limit(200),
+        const [invoiceItems, vatPeriods] = await Promise.all([
+          loadAllInvoiceDueItems(company.id, today),
           listVatPeriods(company.id),
         ])
-
-        if (invoiceResp.error) throw new Error(invoiceResp.error.message)
-
-        const invoiceItems: DueItem[] = (invoiceResp.data || []).map((inv: any) => ({
-          id: String(inv.id),
-          kind: 'invoice',
-          title: `Fattura ${inv.number || 'senza numero'}`,
-          due_date: String(inv.payment_due_date),
-          amount: Number(inv.total_amount || 0),
-          status: String(inv.payment_status || 'pending'),
-        }))
 
         const vatItems: DueItem[] = (vatPeriods || [])
           .filter((p: VatPeriod) => ['to_pay', 'overdue', 'paid'].includes(p.status))

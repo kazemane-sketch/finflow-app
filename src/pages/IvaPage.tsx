@@ -4,6 +4,17 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Receipt, Calculator, CalendarClock, RefreshCw, ShieldCheck } from 'lucide-react'
+import {
+  Bar,
+  CartesianGrid,
+  ComposedChart,
+  Legend,
+  Line,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts'
 import { useCompany } from '@/hooks/useCompany'
 import {
   confirmVatBackfill,
@@ -36,6 +47,8 @@ import {
 } from '@/lib/vat'
 import { fmtDate, fmtEur } from '@/lib/utils'
 
+const MONTH_LABELS = ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu', 'Lug', 'Ago', 'Set', 'Ott', 'Nov', 'Dic']
+
 function statusLabel(status: string): string {
   const map: Record<string, string> = {
     draft: 'Bozza',
@@ -63,6 +76,17 @@ function statusClass(status: string): string {
 function getDaysToDue(dueDate: string): number {
   const ms = new Date(`${dueDate}T00:00:00`).getTime() - new Date().setHours(0, 0, 0, 0)
   return Math.round(ms / (1000 * 60 * 60 * 24))
+}
+
+function formatCompactNumber(value: number): string {
+  return new Intl.NumberFormat('it-IT', {
+    notation: 'compact',
+    maximumFractionDigits: 1,
+  }).format(Number(value || 0))
+}
+
+function round2(value: number): number {
+  return Math.round(Number(value || 0) * 100) / 100
 }
 
 function emptyProfileInput(startDate: string): VatProfileInput {
@@ -148,6 +172,7 @@ export default function IvaPage() {
 
   const [error, setError] = useState<string | null>(null)
   const [info, setInfo] = useState<string | null>(null)
+  const [chartYear, setChartYear] = useState<number>(new Date().getFullYear())
 
   const logVatError = useCallback((operation: string, e: any) => {
     const payload = normalizeVatError(e)
@@ -177,17 +202,103 @@ export default function IvaPage() {
   const currentSummary = useMemo(() => {
     if (!periods.length) return null
     const today = new Date().toISOString().slice(0, 10)
-    let current = periods.find((p) => p.period_type === 'regular' && p.period_start <= today && p.period_end >= today)
-    if (!current) {
-      current = periods
-        .filter((p) => p.status === 'to_pay' || p.status === 'overdue')
-        .sort((a, b) => a.due_date.localeCompare(b.due_date))[0]
-    }
-    if (!current) {
-      current = [...periods].sort((a, b) => b.period_end.localeCompare(a.period_end))[0]
-    }
-    return current || null
+    const regular = periods.filter((p) => p.period_type === 'regular')
+
+    const openDue = regular
+      .filter((p) => (p.status === 'to_pay' || p.status === 'overdue') && Number(p.amount_due || 0) > 0)
+      .sort((a, b) => a.due_date.localeCompare(b.due_date))[0]
+    if (openDue) return openDue
+
+    const latestWithValues = regular
+      .filter((p) =>
+        Math.abs(Number(p.vat_debit || 0)) > 0 ||
+        Math.abs(Number(p.vat_credit || 0)) > 0 ||
+        Math.abs(Number(p.amount_due || 0)) > 0 ||
+        Math.abs(Number(p.amount_credit_carry || 0)) > 0,
+      )
+      .sort((a, b) => b.period_end.localeCompare(a.period_end))[0]
+    if (latestWithValues) return latestWithValues
+
+    const inCourse = regular.find((p) => p.period_start <= today && p.period_end >= today)
+    if (inCourse) return inCourse
+
+    return [...periods].sort((a, b) => b.period_end.localeCompare(a.period_end))[0] || null
   }, [periods])
+
+  const regularPeriods = useMemo(
+    () => periods.filter((p) => p.period_type === 'regular'),
+    [periods],
+  )
+
+  const vatChartYears = useMemo(() => {
+    const years = new Set<number>()
+    for (const period of regularPeriods) years.add(Number(period.year))
+    return Array.from(years).sort((a, b) => b - a)
+  }, [regularPeriods])
+
+  const accontoZeroWarning = useMemo(() => {
+    const currentYear = new Date().getFullYear()
+    const currentAcconto = periods.find((p) => p.period_type === 'acconto' && Number(p.year) === currentYear)
+    if (!currentAcconto) return false
+    if (Number(currentAcconto.amount_due || 0) > 0) return false
+    if ((profile?.acconto_override_amount ?? null) != null) return false
+    return true
+  }, [periods, profile?.acconto_override_amount])
+
+  const chartData = useMemo(() => {
+    const byIndex = new Map<number, VatPeriod>()
+    for (const period of regularPeriods) {
+      if (Number(period.year) !== chartYear) continue
+      byIndex.set(Number(period.period_index), period)
+    }
+
+    const regime = profile?.liquidation_regime || 'monthly'
+    if (regime === 'quarterly') {
+      return [1, 2, 3, 4].map((q) => {
+        const period = byIndex.get(q)
+        const debit = round2(Number(period?.vat_debit || 0))
+        const credit = round2(Number(period?.vat_credit || 0))
+        return {
+          label: `Q${q}`,
+          debit,
+          credit,
+          net: round2(debit - credit),
+        }
+      })
+    }
+
+    return MONTH_LABELS.map((label, idx) => {
+      const period = byIndex.get(idx + 1)
+      const debit = round2(Number(period?.vat_debit || 0))
+      const credit = round2(Number(period?.vat_credit || 0))
+      return {
+        label,
+        debit,
+        credit,
+        net: round2(debit - credit),
+      }
+    })
+  }, [chartYear, profile?.liquidation_regime, regularPeriods])
+
+  const chartTotals = useMemo(() => {
+    const debit = round2(chartData.reduce((sum, row) => sum + Number(row.debit || 0), 0))
+    const credit = round2(chartData.reduce((sum, row) => sum + Number(row.credit || 0), 0))
+    return {
+      debit,
+      credit,
+      net: round2(debit - credit),
+    }
+  }, [chartData])
+
+  useEffect(() => {
+    if (!vatChartYears.length) {
+      setChartYear(new Date().getFullYear())
+      return
+    }
+    if (!vatChartYears.includes(chartYear)) {
+      setChartYear(vatChartYears[0])
+    }
+  }, [chartYear, vatChartYears])
 
   const loadBreakdown = useCallback(async (periodId: string) => {
     if (!company?.id) return
@@ -710,6 +821,62 @@ export default function IvaPage() {
           </Card>
 
           <Card>
+            <CardHeader className="flex flex-row items-center justify-between gap-3">
+              <CardTitle className="text-base">Calcolo IVA {chartYear}</CardTitle>
+              <select
+                value={chartYear}
+                onChange={(e) => setChartYear(Number(e.target.value))}
+                className="w-[120px] border rounded-md px-2 py-1.5 text-sm"
+              >
+                {vatChartYears.map((year) => (
+                  <option key={year} value={year}>{year}</option>
+                ))}
+              </select>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="h-72 border rounded-lg p-2">
+                {chartData.every((row) => Number(row.debit || 0) === 0 && Number(row.credit || 0) === 0) ? (
+                  <div className="h-full flex items-center justify-center text-sm text-muted-foreground">
+                    Nessun dato IVA disponibile per l'anno selezionato.
+                  </div>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ComposedChart data={chartData}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="label" />
+                      <YAxis
+                        width={70}
+                        tick={{ fontSize: 11 }}
+                        tickFormatter={(value) => formatCompactNumber(Number(value || 0))}
+                      />
+                      <Tooltip formatter={(value: any) => fmtEur(Number(value || 0))} />
+                      <Legend />
+                      <Bar dataKey="debit" name="IVA a debito" fill="#ef4444" radius={[4, 4, 0, 0]} />
+                      <Bar dataKey="credit" name="IVA a credito" fill="#14b8a6" radius={[4, 4, 0, 0]} />
+                      <Line dataKey="net" name="IVA netta" stroke="#2563eb" strokeWidth={2} dot={false} />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div className="rounded-lg border bg-emerald-50 border-emerald-200 p-3">
+                  <p className="text-xs text-emerald-700 uppercase">A credito</p>
+                  <p className="text-lg font-semibold text-emerald-800">{fmtEur(chartTotals.credit)}</p>
+                </div>
+                <div className="rounded-lg border bg-red-50 border-red-200 p-3">
+                  <p className="text-xs text-red-700 uppercase">A debito</p>
+                  <p className="text-lg font-semibold text-red-800">{fmtEur(chartTotals.debit)}</p>
+                </div>
+                <div className="rounded-lg border bg-blue-50 border-blue-200 p-3">
+                  <p className="text-xs text-blue-700 uppercase">IVA netta</p>
+                  <p className="text-lg font-semibold text-blue-800">{fmtEur(chartTotals.net)}</p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
             <CardHeader>
               <CardTitle className="text-base flex items-center gap-2">
                 <CalendarClock className="h-4 w-4" />
@@ -717,6 +884,11 @@ export default function IvaPage() {
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
+              {accontoZeroWarning && (
+                <div className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+                  Acconto IVA anno corrente a 0 EUR: base storica potenzialmente insufficiente. Inserisci un override manuale in configurazione fiscale se necessario.
+                </div>
+              )}
               {periods.length === 0 ? (
                 <p className="text-sm text-muted-foreground">Nessuna liquidazione calcolata.</p>
               ) : (
@@ -727,6 +899,8 @@ export default function IvaPage() {
                         <th className="text-left px-3 py-2">Periodo</th>
                         <th className="text-right px-3 py-2">Debito</th>
                         <th className="text-right px-3 py-2">Credito</th>
+                        <th className="text-right px-3 py-2">Riporto credito</th>
+                        <th className="text-right px-3 py-2">Riporto debito&lt;100</th>
                         <th className="text-right px-3 py-2">Saldo</th>
                         <th className="text-left px-3 py-2">Scadenza</th>
                         <th className="text-left px-3 py-2">Stato</th>
@@ -739,6 +913,8 @@ export default function IvaPage() {
                           <td className="px-3 py-2 font-medium">{formatVatPeriodLabel(p)}</td>
                           <td className="px-3 py-2 text-right">{fmtEur(p.vat_debit)}</td>
                           <td className="px-3 py-2 text-right">{fmtEur(p.vat_credit)}</td>
+                          <td className="px-3 py-2 text-right">{fmtEur(p.prev_credit_used)}</td>
+                          <td className="px-3 py-2 text-right">{fmtEur(p.prev_debit_under_threshold)}</td>
                           <td className="px-3 py-2 text-right font-semibold">{fmtEur(p.amount_due > 0 ? p.amount_due : p.amount_credit_carry)}</td>
                           <td className="px-3 py-2">{fmtDate(p.due_date)}</td>
                           <td className="px-3 py-2">
