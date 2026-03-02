@@ -369,7 +369,7 @@ export async function createManualCounterparty(
   companyId: string,
   payload: {
     name: string
-    type: CounterpartyRole
+    type?: CounterpartyRole
     status?: CounterpartyStatus
     vat_number?: string | null
     fiscal_code?: string | null
@@ -381,6 +381,7 @@ export async function createManualCounterparty(
   const name = payload.name?.trim()
   if (!name) throw new Error('Nome controparte obbligatorio')
 
+  const role = payload.type || 'supplier'
   const status = payload.status || 'pending'
   const vatNumber = payload.vat_number?.trim() || null
   const vatKey = normalizeVatKey(vatNumber)
@@ -399,7 +400,7 @@ export async function createManualCounterparty(
     .insert({
       company_id: companyId,
       name,
-      type: payload.type,
+      type: role,
       status,
       vat_number: vatNumber,
       vat_key: vatKey,
@@ -480,6 +481,57 @@ export async function updateCounterparty(
     .eq('id', counterpartyId)
 
   if (error) throw new Error(error.message)
+}
+
+export async function syncCounterpartyRoles(companyId: string): Promise<void> {
+  const { data: invoices, error: invErr } = await supabase
+    .from('invoices')
+    .select('counterparty_id, direction')
+    .eq('company_id', companyId)
+    .not('counterparty_id', 'is', null)
+
+  if (invErr) throw new Error(invErr.message)
+  if (!invoices?.length) return
+
+  const usage = new Map<string, { hasOut: boolean; hasIn: boolean }>()
+  for (const inv of invoices as Array<{ counterparty_id: string | null; direction: 'in' | 'out' }>) {
+    if (!inv.counterparty_id) continue
+    const cur = usage.get(inv.counterparty_id) || { hasOut: false, hasIn: false }
+    if (inv.direction === 'out') cur.hasOut = true
+    if (inv.direction === 'in') cur.hasIn = true
+    usage.set(inv.counterparty_id, cur)
+  }
+
+  if (usage.size === 0) return
+
+  const ids = Array.from(usage.keys())
+  const { data: cps, error: cpErr } = await supabase
+    .from('counterparties')
+    .select('id, type')
+    .in('id', ids)
+
+  if (cpErr) throw new Error(cpErr.message)
+  if (!cps?.length) return
+
+  const updates = (cps as Array<{ id: string; type: CounterpartyRole }>)
+    .map((cp) => {
+      const u = usage.get(cp.id)
+      if (!u) return null
+      const nextType: CounterpartyRole = u.hasOut && u.hasIn ? 'both' : u.hasOut ? 'client' : 'supplier'
+      if (nextType === cp.type) return null
+      return { id: cp.id, type: nextType }
+    })
+    .filter(Boolean) as Array<{ id: string; type: CounterpartyRole }>
+
+  if (!updates.length) return
+
+  for (const row of updates) {
+    const { error } = await supabase
+      .from('counterparties')
+      .update({ type: row.type, updated_at: new Date().toISOString() })
+      .eq('id', row.id)
+    if (error) throw new Error(error.message)
+  }
 }
 
 export async function verifyCounterparty(counterpartyId: string): Promise<void> {

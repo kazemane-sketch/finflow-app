@@ -13,6 +13,7 @@ import {
   rejectCounterparty,
   loadInvoicesByCounterparty,
   buildCounterpartyAnalytics,
+  syncCounterpartyRoles,
   type Counterparty,
   type CounterpartyLegalType,
   type CounterpartyRole,
@@ -72,6 +73,38 @@ const ROLE_BADGE: Record<CounterpartyRole, string> = {
   both: 'bg-violet-100 text-violet-800',
 }
 
+type VatMode = 'IT' | 'INT'
+
+function sanitizeVatInput(value: string): string {
+  return value.toUpperCase().replace(/[^A-Z0-9]/g, '')
+}
+
+function parseVatForUi(rawVat: string | null | undefined): { mode: VatMode; value: string } {
+  const compact = sanitizeVatInput(rawVat || '')
+  if (!compact) return { mode: 'IT', value: '' }
+
+  if (compact.startsWith('IT')) {
+    return { mode: 'IT', value: compact.slice(2) }
+  }
+
+  if (/^[A-Z]{2}[A-Z0-9]+$/.test(compact)) {
+    return { mode: 'INT', value: compact }
+  }
+
+  return { mode: 'IT', value: compact }
+}
+
+function buildVatForSave(mode: VatMode, value: string): string | null {
+  const compact = sanitizeVatInput(value)
+  if (!compact) return null
+
+  if (mode === 'IT') {
+    return `IT${compact.replace(/^IT/, '')}`
+  }
+
+  return compact
+}
+
 function CounterpartyCreateModal({
   open,
   onClose,
@@ -87,9 +120,9 @@ function CounterpartyCreateModal({
   const [error, setError] = useState('')
   const [form, setForm] = useState({
     name: '',
-    type: 'client' as CounterpartyRole,
     status: 'pending' as CounterpartyStatus,
-    vat_number: '',
+    vat_mode: 'IT' as VatMode,
+    vat_value: '',
     fiscal_code: '',
     legal_type: 'azienda' as CounterpartyLegalType,
     address: '',
@@ -103,26 +136,28 @@ function CounterpartyCreateModal({
       setError('Nome obbligatorio')
       return
     }
+
     setSaving(true)
     setError('')
+
     try {
       await createManualCounterparty(companyId, {
         name: form.name,
-        type: form.type,
         status: form.status,
-        vat_number: form.vat_number || null,
+        vat_number: buildVatForSave(form.vat_mode, form.vat_value),
         fiscal_code: form.fiscal_code || null,
         legal_type: form.legal_type,
         address: form.address || null,
         notes: form.notes || null,
       })
+
       onCreated()
       onClose()
       setForm({
         name: '',
-        type: 'client',
         status: 'pending',
-        vat_number: '',
+        vat_mode: 'IT',
+        vat_value: '',
         fiscal_code: '',
         legal_type: 'azienda',
         address: '',
@@ -131,6 +166,7 @@ function CounterpartyCreateModal({
     } catch (e: any) {
       setError(e.message || 'Errore creazione controparte')
     }
+
     setSaving(false)
   }
 
@@ -151,19 +187,6 @@ function CounterpartyCreateModal({
           </div>
 
           <div>
-            <Label className="text-xs">Ruolo</Label>
-            <select
-              value={form.type}
-              onChange={(e) => setForm((f) => ({ ...f, type: e.target.value as CounterpartyRole }))}
-              className="w-full mt-1 border rounded-md px-3 py-2 text-sm"
-            >
-              <option value="client">Cliente</option>
-              <option value="supplier">Fornitore</option>
-              <option value="both">Cliente + Fornitore</option>
-            </select>
-          </div>
-
-          <div>
             <Label className="text-xs">Stato</Label>
             <select
               value={form.status}
@@ -177,13 +200,30 @@ function CounterpartyCreateModal({
           </div>
 
           <div>
+            <Label className="text-xs">Ruolo</Label>
+            <div className="mt-1 border rounded-md px-3 py-2 text-sm text-gray-600 bg-gray-50">
+              Auto da fatture (attive/passive)
+            </div>
+          </div>
+
+          <div>
             <Label className="text-xs">Partita IVA</Label>
-            <Input
-              value={form.vat_number}
-              onChange={(e) => setForm((f) => ({ ...f, vat_number: e.target.value }))}
-              className="mt-1"
-              placeholder="IT12345678901"
-            />
+            <div className="mt-1 flex gap-2">
+              <select
+                value={form.vat_mode}
+                onChange={(e) => setForm((f) => ({ ...f, vat_mode: e.target.value as VatMode }))}
+                className="w-20 border rounded-md px-2 py-2 text-sm"
+              >
+                <option value="IT">IT</option>
+                <option value="INT">Int.</option>
+              </select>
+              <Input
+                value={form.vat_value}
+                onChange={(e) => setForm((f) => ({ ...f, vat_value: sanitizeVatInput(e.target.value) }))}
+                className="flex-1"
+                placeholder={form.vat_mode === 'IT' ? '12345678901' : 'FR123456789'}
+              />
+            </div>
           </div>
 
           <div>
@@ -249,6 +289,7 @@ export default function ContropartiPage() {
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [rolesSynced, setRolesSynced] = useState(false)
   const [showCreate, setShowCreate] = useState(false)
 
   const [roleFilter, setRoleFilter] = useState<'all' | CounterpartyRole>('all')
@@ -276,10 +317,10 @@ export default function ContropartiPage() {
 
   const [draft, setDraft] = useState<{
     name: string
-    type: CounterpartyRole
     status: CounterpartyStatus
     legal_type: CounterpartyLegalType
-    vat_number: string
+    vat_mode: VatMode
+    vat_value: string
     fiscal_code: string
     address: string
     notes: string
@@ -287,34 +328,59 @@ export default function ContropartiPage() {
 
   const reloadCounterparties = useCallback(async () => {
     if (!companyId) return
+
     setLoading(true)
     setError('')
+
     try {
+      if (!rolesSynced) {
+        await syncCounterpartyRoles(companyId)
+        setRolesSynced(true)
+      }
+
       const data = await loadCounterparties(companyId, {
         role: roleFilter,
         status: statusFilter,
         legalType: legalTypeFilter,
         query,
       })
-      setCounterparties(data)
 
-      const paramId = searchParams.get('counterpartyId')
-      if (paramId && data.some((cp) => cp.id === paramId)) {
-        setFocusedId(paramId)
-      } else if (!focusedId && data.length > 0) {
-        setFocusedId(data[0].id)
-      } else if (focusedId && !data.some((cp) => cp.id === focusedId)) {
-        setFocusedId(data[0]?.id || null)
+      setCounterparties(data)
+      setSelectedIds((prev) => {
+        const allowed = new Set(data.map((cp) => cp.id))
+        return new Set(Array.from(prev).filter((id) => allowed.has(id)))
+      })
+
+      if (focusedId && !data.some((cp) => cp.id === focusedId)) {
+        setFocusedId(null)
       }
     } catch (e: any) {
       setError(e.message || 'Errore caricamento controparti')
     }
+
     setLoading(false)
-  }, [companyId, roleFilter, statusFilter, legalTypeFilter, query, focusedId, searchParams])
+  }, [companyId, roleFilter, statusFilter, legalTypeFilter, query, focusedId, rolesSynced])
 
   useEffect(() => {
     reloadCounterparties()
   }, [reloadCounterparties])
+
+  useEffect(() => {
+    setRolesSynced(false)
+  }, [companyId])
+
+  useEffect(() => {
+    const paramId = searchParams.get('counterpartyId')
+    if (!paramId || !counterparties.some((cp) => cp.id === paramId)) return
+
+    setFocusedId(paramId)
+    setSelectedIds((prev) => {
+      if (prev.has(paramId)) return prev
+      const next = new Set(prev)
+      next.add(paramId)
+      return next
+    })
+  }, [searchParams, counterparties])
 
   const focused = useMemo(
     () => counterparties.find((cp) => cp.id === focusedId) || null,
@@ -326,12 +392,14 @@ export default function ContropartiPage() {
       setDraft(null)
       return
     }
+
+    const vat = parseVatForUi(focused.vat_number)
     setDraft({
       name: focused.name || '',
-      type: focused.type,
       status: focused.status,
       legal_type: focused.legal_type || 'altro',
-      vat_number: focused.vat_number || '',
+      vat_mode: vat.mode,
+      vat_value: vat.value,
       fiscal_code: focused.fiscal_code || '',
       address: focused.address || '',
       notes: focused.notes || '',
@@ -344,11 +412,14 @@ export default function ContropartiPage() {
     return []
   }, [selectedIds, focusedId])
 
+  const analyticsTargetIdsSet = useMemo(() => new Set(analyticsTargetIds), [analyticsTargetIds])
+
   const reloadLinkedInvoices = useCallback(async () => {
     if (!companyId || analyticsTargetIds.length === 0) {
       setLinkedInvoices([])
       return
     }
+
     try {
       const rows = await loadInvoicesByCounterparty(companyId, analyticsTargetIds, {
         direction: invoiceDirectionFilter,
@@ -375,6 +446,81 @@ export default function ContropartiPage() {
     return buildCounterpartyAnalytics(rows, counterparties)
   }, [linkedInvoices, counterparties])
 
+  const analyticsMonths = useMemo(() => {
+    const months = new Set<string>()
+    for (const row of linkedInvoices) {
+      if (row.date) months.add(row.date.slice(0, 7))
+    }
+    return Array.from(months).sort((a, b) => a.localeCompare(b))
+  }, [linkedInvoices])
+
+  const analyticsTableRows = useMemo(() => {
+    const cpMap = new Map(counterparties.map((cp) => [cp.id, cp]))
+    const rowMap = new Map<string, {
+      counterparty_id: string
+      counterparty_name: string
+      status: CounterpartyStatus
+      activeAmount: number
+      passiveAmount: number
+      activeCount: number
+      passiveCount: number
+      totalAmount: number
+      months: Record<string, number>
+    }>()
+
+    const ensureRow = (counterpartyId: string) => {
+      const existing = rowMap.get(counterpartyId)
+      if (existing) return existing
+
+      const cp = cpMap.get(counterpartyId)
+      const created = {
+        counterparty_id: counterpartyId,
+        counterparty_name: cp?.name || 'Controparte sconosciuta',
+        status: (cp?.status || 'pending') as CounterpartyStatus,
+        activeAmount: 0,
+        passiveAmount: 0,
+        activeCount: 0,
+        passiveCount: 0,
+        totalAmount: 0,
+        months: Object.fromEntries(analyticsMonths.map((month) => [month, 0])),
+      }
+      rowMap.set(counterpartyId, created)
+      return created
+    }
+
+    for (const id of analyticsTargetIds) {
+      ensureRow(id)
+    }
+
+    for (const inv of linkedInvoices) {
+      const amount = Math.abs(Number(inv.total_amount || 0))
+      const month = inv.date?.slice(0, 7)
+      const row = ensureRow(inv.counterparty_id)
+
+      if (inv.direction === 'out') {
+        row.activeAmount += amount
+        row.activeCount += 1
+      } else {
+        row.passiveAmount += amount
+        row.passiveCount += 1
+      }
+
+      row.totalAmount += amount
+      if (month) {
+        row.months[month] = Number(((row.months[month] || 0) + amount).toFixed(2))
+      }
+    }
+
+    return Array.from(rowMap.values())
+      .sort((a, b) => b.totalAmount - a.totalAmount)
+      .map((row) => ({
+        ...row,
+        activeAmount: Number(row.activeAmount.toFixed(2)),
+        passiveAmount: Number(row.passiveAmount.toFixed(2)),
+        totalAmount: Number(row.totalAmount.toFixed(2)),
+      }))
+  }, [counterparties, linkedInvoices, analyticsTargetIds, analyticsMonths])
+
   const toggleSelect = (id: string) => {
     setSelectedIds((prev) => {
       const next = new Set(prev)
@@ -384,19 +530,40 @@ export default function ContropartiPage() {
     })
   }
 
+  const selectAllVisible = () => {
+    setSelectedIds(new Set(counterparties.map((cp) => cp.id)))
+  }
+
   const clearSelection = () => setSelectedIds(new Set())
+
+  const allVisibleSelected = counterparties.length > 0 && counterparties.every((cp) => selectedIds.has(cp.id))
+
+  const onRowClick = (id: string) => {
+    toggleSelect(id)
+  }
+
+  const onRowDoubleClick = (id: string) => {
+    setFocusedId(id)
+    setSelectedIds((prev) => {
+      if (prev.has(id)) return prev
+      const next = new Set(prev)
+      next.add(id)
+      return next
+    })
+  }
 
   const saveFocused = async () => {
     if (!focused || !draft) return
+
     setSaving(true)
     setError('')
+
     try {
       await updateCounterparty(focused.id, {
         name: draft.name,
-        type: draft.type,
         status: draft.status,
         legal_type: draft.legal_type,
-        vat_number: draft.vat_number || null,
+        vat_number: buildVatForSave(draft.vat_mode, draft.vat_value),
         fiscal_code: draft.fiscal_code || null,
         address: draft.address || null,
         notes: draft.notes || null,
@@ -406,13 +573,16 @@ export default function ContropartiPage() {
     } catch (e: any) {
       setError(e.message || 'Errore salvataggio')
     }
+
     setSaving(false)
   }
 
   const verifyFocused = async () => {
     if (!focused) return
+
     setSaving(true)
     setError('')
+
     try {
       await verifyCounterparty(focused.id)
       await reloadCounterparties()
@@ -420,14 +590,48 @@ export default function ContropartiPage() {
     } catch (e: any) {
       setError(e.message || 'Errore verifica')
     }
+
+    setSaving(false)
+  }
+
+  const verifySelected = async () => {
+    const ids = Array.from(selectedIds)
+    if (!ids.length) return
+
+    setSaving(true)
+    setError('')
+
+    let success = 0
+    const failures: string[] = []
+
+    for (const id of ids) {
+      try {
+        await verifyCounterparty(id)
+        success += 1
+      } catch (e: any) {
+        const name = counterparties.find((cp) => cp.id === id)?.name || id
+        failures.push(`${name}: ${e?.message || 'errore verifica'}`)
+      }
+    }
+
+    await reloadCounterparties()
+    await reloadLinkedInvoices()
+
+    if (failures.length) {
+      const preview = failures.slice(0, 3).join(' | ')
+      setError(`Verificate ${success}/${ids.length}. ${preview}${failures.length > 3 ? ' | ...' : ''}`)
+    }
+
     setSaving(false)
   }
 
   const rejectFocused = async () => {
     if (!focused) return
     const reason = window.prompt('Motivo rifiuto controparte', 'Dati fiscali incompleti o non coerenti') || undefined
+
     setSaving(true)
     setError('')
+
     try {
       await rejectCounterparty(focused.id, reason)
       await reloadCounterparties()
@@ -435,6 +639,7 @@ export default function ContropartiPage() {
     } catch (e: any) {
       setError(e.message || 'Errore rifiuto')
     }
+
     setSaving(false)
   }
 
@@ -534,6 +739,30 @@ export default function ContropartiPage() {
                   <option value="altro">Altro</option>
                 </select>
               </div>
+
+              <div className="text-[11px] text-gray-500">Clic: seleziona/deseleziona. Doppio clic: apre dettaglio.</div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 border rounded-lg p-2 bg-sky-50/40">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={allVisibleSelected ? clearSelection : selectAllVisible}
+                disabled={counterparties.length === 0}
+              >
+                {allVisibleSelected ? 'Deseleziona tutti' : 'Seleziona tutti'}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={verifySelected}
+                disabled={selectedIds.size === 0 || saving}
+              >
+                <CheckCircle className="h-3.5 w-3.5 mr-1.5" />Verifica selezionate
+              </Button>
+              <span className="text-xs text-sky-800 ml-auto">{selectedIds.size} selezionate</span>
             </div>
 
             <div className="flex-1 overflow-y-auto border rounded-lg divide-y">
@@ -543,25 +772,18 @@ export default function ContropartiPage() {
                 <div className="text-center py-8 text-sm text-gray-500">Nessuna controparte trovata</div>
               ) : (
                 counterparties.map((cp) => {
-                  const selected = focusedId === cp.id
-                  const checked = selectedIds.has(cp.id)
+                  const selected = selectedIds.has(cp.id)
+                  const focusedRow = focusedId === cp.id
                   return (
                     <div
                       key={cp.id}
-                      className={`px-3 py-2 cursor-pointer ${selected ? 'bg-sky-50' : 'hover:bg-gray-50'}`}
-                      onClick={() => setFocusedId(cp.id)}
+                      className={`px-3 py-2 cursor-pointer transition-colors ${
+                        selected ? 'bg-sky-100' : 'hover:bg-gray-50'
+                      } ${focusedRow ? 'ring-1 ring-inset ring-sky-400' : ''}`}
+                      onClick={() => onRowClick(cp.id)}
+                      onDoubleClick={() => onRowDoubleClick(cp.id)}
                     >
                       <div className="flex items-start gap-2">
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={(e) => {
-                            e.stopPropagation()
-                            toggleSelect(cp.id)
-                          }}
-                          onClick={(e) => e.stopPropagation()}
-                          className="mt-0.5"
-                        />
                         <div className="flex-1 min-w-0">
                           <p className="text-sm font-semibold text-gray-900 truncate">{cp.name}</p>
                           <div className="flex flex-wrap gap-1 mt-1">
@@ -587,284 +809,305 @@ export default function ContropartiPage() {
                 })
               )}
             </div>
-
-            {selectedIds.size > 0 && (
-              <div className="flex items-center justify-between text-xs bg-sky-50 border border-sky-200 rounded-md px-2 py-1.5">
-                <span>{selectedIds.size} selezionate per analytics</span>
-                <button className="text-sky-700 font-medium" onClick={clearSelection}>Deseleziona</button>
-              </div>
-            )}
           </CardContent>
         </Card>
 
         <div className="space-y-4">
           {!focused || !draft ? (
             <Card>
-              <CardContent className="p-10 text-center text-gray-500">Seleziona una controparte dalla lista</CardContent>
+              <CardContent className="p-10 text-center text-gray-500">Doppio clic su una controparte per aprire il dettaglio</CardContent>
             </Card>
           ) : (
-            <>
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-base">Dettaglio controparte</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div className="sm:col-span-2">
-                      <Label className="text-xs">Nome</Label>
-                      <Input
-                        value={draft.name}
-                        onChange={(e) => setDraft((d) => d ? ({ ...d, name: e.target.value }) : d)}
-                        className="mt-1"
-                      />
-                    </div>
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">Dettaglio controparte</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="sm:col-span-2">
+                    <Label className="text-xs">Nome</Label>
+                    <Input
+                      value={draft.name}
+                      onChange={(e) => setDraft((d) => d ? ({ ...d, name: e.target.value }) : d)}
+                      className="mt-1"
+                    />
+                  </div>
 
-                    <div>
-                      <Label className="text-xs">Ruolo</Label>
-                      <select
-                        value={draft.type}
-                        onChange={(e) => setDraft((d) => d ? ({ ...d, type: e.target.value as CounterpartyRole }) : d)}
-                        className="w-full mt-1 border rounded-md px-3 py-2 text-sm"
-                      >
-                        <option value="client">Cliente</option>
-                        <option value="supplier">Fornitore</option>
-                        <option value="both">Cliente + Fornitore</option>
-                      </select>
-                    </div>
-
-                    <div>
-                      <Label className="text-xs">Stato</Label>
-                      <select
-                        value={draft.status}
-                        onChange={(e) => setDraft((d) => d ? ({ ...d, status: e.target.value as CounterpartyStatus }) : d)}
-                        className="w-full mt-1 border rounded-md px-3 py-2 text-sm"
-                      >
-                        <option value="pending">Da verificare</option>
-                        <option value="verified">Verificata</option>
-                        <option value="rejected">Respinta</option>
-                      </select>
-                    </div>
-
-                    <div>
-                      <Label className="text-xs">Partita IVA</Label>
-                      <Input
-                        value={draft.vat_number}
-                        onChange={(e) => setDraft((d) => d ? ({ ...d, vat_number: e.target.value }) : d)}
-                        className="mt-1"
-                      />
-                    </div>
-
-                    <div>
-                      <Label className="text-xs">Codice Fiscale</Label>
-                      <Input
-                        value={draft.fiscal_code}
-                        onChange={(e) => setDraft((d) => d ? ({ ...d, fiscal_code: e.target.value }) : d)}
-                        className="mt-1"
-                      />
-                    </div>
-
-                    <div>
-                      <Label className="text-xs">Tipologia</Label>
-                      <select
-                        value={draft.legal_type}
-                        onChange={(e) => setDraft((d) => d ? ({ ...d, legal_type: e.target.value as CounterpartyLegalType }) : d)}
-                        className="w-full mt-1 border rounded-md px-3 py-2 text-sm"
-                      >
-                        <option value="azienda">Azienda</option>
-                        <option value="pa">PA</option>
-                        <option value="professionista">Professionista</option>
-                        <option value="persona">Persona</option>
-                        <option value="altro">Altro</option>
-                      </select>
-                    </div>
-
-                    <div>
-                      <Label className="text-xs">Indirizzo</Label>
-                      <Input
-                        value={draft.address}
-                        onChange={(e) => setDraft((d) => d ? ({ ...d, address: e.target.value }) : d)}
-                        className="mt-1"
-                      />
-                    </div>
-
-                    <div className="sm:col-span-2">
-                      <Label className="text-xs">Note</Label>
-                      <textarea
-                        value={draft.notes}
-                        onChange={(e) => setDraft((d) => d ? ({ ...d, notes: e.target.value }) : d)}
-                        className="w-full mt-1 border rounded-md px-3 py-2 text-sm min-h-[70px]"
-                      />
+                  <div>
+                    <Label className="text-xs">Ruolo</Label>
+                    <div className="mt-1 border rounded-md px-3 py-2 text-sm text-gray-700 bg-gray-50">
+                      {ROLE_LABEL[focused.type]}
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <Button size="sm" onClick={saveFocused} disabled={saving}>Salva</Button>
-                    <Button size="sm" variant="outline" onClick={verifyFocused} disabled={saving}>
-                      <CheckCircle className="h-3.5 w-3.5 mr-1.5" />Verifica
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={rejectFocused} disabled={saving}>
-                      <XCircle className="h-3.5 w-3.5 mr-1.5" />Rifiuta
-                    </Button>
-                    <p className="text-xs text-gray-500 ml-auto">Creata il {fmtDate(focused.created_at)}</p>
-                  </div>
-                </CardContent>
-              </Card>
-
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-base">Analytics controparti</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <input
-                      type="date"
-                      value={dateFrom}
-                      onChange={(e) => setDateFrom(e.target.value)}
-                      className="border rounded-md px-2 py-1 text-xs"
-                    />
-                    <span className="text-xs text-gray-500">→</span>
-                    <input
-                      type="date"
-                      value={dateTo}
-                      onChange={(e) => setDateTo(e.target.value)}
-                      className="border rounded-md px-2 py-1 text-xs"
-                    />
+                  <div>
+                    <Label className="text-xs">Stato</Label>
                     <select
-                      value={invoiceDirectionFilter}
-                      onChange={(e) => setInvoiceDirectionFilter(e.target.value as 'all' | 'in' | 'out')}
-                      className="border rounded-md px-2 py-1 text-xs"
+                      value={draft.status}
+                      onChange={(e) => setDraft((d) => d ? ({ ...d, status: e.target.value as CounterpartyStatus }) : d)}
+                      className="w-full mt-1 border rounded-md px-3 py-2 text-sm"
                     >
-                      <option value="all">Attive + Passive</option>
-                      <option value="out">Solo Attive</option>
-                      <option value="in">Solo Passive</option>
+                      <option value="pending">Da verificare</option>
+                      <option value="verified">Verificata</option>
+                      <option value="rejected">Respinta</option>
                     </select>
                   </div>
 
-                  <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
-                    <div className="p-2 rounded border bg-emerald-50">
-                      <p className="text-[10px] text-emerald-700 uppercase">Totale attive</p>
-                      <p className="text-sm font-bold text-emerald-700">{fmtEur(analytics.totalActiveAmount)}</p>
-                    </div>
-                    <div className="p-2 rounded border bg-red-50">
-                      <p className="text-[10px] text-red-700 uppercase">Totale passive</p>
-                      <p className="text-sm font-bold text-red-700">{fmtEur(analytics.totalPassiveAmount)}</p>
-                    </div>
-                    <div className="p-2 rounded border bg-blue-50">
-                      <p className="text-[10px] text-blue-700 uppercase">Saldo netto</p>
-                      <p className="text-sm font-bold text-blue-700">{fmtEur(analytics.totalNetAmount)}</p>
-                    </div>
-                    <div className="p-2 rounded border bg-gray-50">
-                      <p className="text-[10px] text-gray-700 uppercase">N. attive</p>
-                      <p className="text-sm font-bold text-gray-800">{analytics.countActive}</p>
-                    </div>
-                    <div className="p-2 rounded border bg-gray-50">
-                      <p className="text-[10px] text-gray-700 uppercase">N. passive</p>
-                      <p className="text-sm font-bold text-gray-800">{analytics.countPassive}</p>
+                  <div>
+                    <Label className="text-xs">Partita IVA</Label>
+                    <div className="mt-1 flex gap-2">
+                      <select
+                        value={draft.vat_mode}
+                        onChange={(e) => setDraft((d) => d ? ({ ...d, vat_mode: e.target.value as VatMode }) : d)}
+                        className="w-20 border rounded-md px-2 py-2 text-sm"
+                      >
+                        <option value="IT">IT</option>
+                        <option value="INT">Int.</option>
+                      </select>
+                      <Input
+                        value={draft.vat_value}
+                        onChange={(e) => setDraft((d) => d ? ({ ...d, vat_value: sanitizeVatInput(e.target.value) }) : d)}
+                        className="flex-1"
+                        placeholder={draft.vat_mode === 'IT' ? '12345678901' : 'FR123456789'}
+                      />
                     </div>
                   </div>
 
-                  <div className="h-64 border rounded-lg p-2">
-                    {analytics.trend.length === 0 ? (
-                      <div className="h-full flex items-center justify-center text-sm text-gray-500">Nessun dato nel periodo</div>
-                    ) : (
-                      <ResponsiveContainer width="100%" height="100%">
-                        <BarChart data={analytics.trend}>
-                          <CartesianGrid strokeDasharray="3 3" />
-                          <XAxis dataKey="month" />
-                          <YAxis />
-                          <Tooltip formatter={(v: any) => fmtEur(Number(v || 0))} />
-                          <Legend />
-                          <Bar dataKey="activeAmount" name="Attive" stackId="a" fill="#059669" />
-                          <Bar dataKey="passiveAmount" name="Passive" stackId="a" fill="#dc2626" />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    )}
+                  <div>
+                    <Label className="text-xs">Codice Fiscale</Label>
+                    <Input
+                      value={draft.fiscal_code}
+                      onChange={(e) => setDraft((d) => d ? ({ ...d, fiscal_code: e.target.value }) : d)}
+                      className="mt-1"
+                    />
                   </div>
 
-                  <div className="border rounded-lg overflow-hidden">
-                    <table className="w-full text-xs">
-                      <thead className="bg-gray-50">
-                        <tr>
-                          <th className="text-left px-3 py-2">Controparte</th>
-                          <th className="text-right px-3 py-2">Attive</th>
-                          <th className="text-right px-3 py-2">Passive</th>
-                          <th className="text-right px-3 py-2">N. attive</th>
-                          <th className="text-right px-3 py-2">N. passive</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {analytics.byCounterparty.length === 0 ? (
-                          <tr>
-                            <td colSpan={5} className="text-center py-4 text-gray-500">Nessun dato</td>
-                          </tr>
-                        ) : (
-                          analytics.byCounterparty.map((row) => (
-                            <tr key={row.counterparty_id} className="border-t">
-                              <td className="px-3 py-2">{row.counterparty_name}</td>
-                              <td className="px-3 py-2 text-right text-emerald-700 font-medium">{fmtEur(row.activeAmount)}</td>
-                              <td className="px-3 py-2 text-right text-red-700 font-medium">{fmtEur(row.passiveAmount)}</td>
-                              <td className="px-3 py-2 text-right">{row.activeCount}</td>
-                              <td className="px-3 py-2 text-right">{row.passiveCount}</td>
-                            </tr>
-                          ))
-                        )}
-                      </tbody>
-                    </table>
+                  <div>
+                    <Label className="text-xs">Tipologia</Label>
+                    <select
+                      value={draft.legal_type}
+                      onChange={(e) => setDraft((d) => d ? ({ ...d, legal_type: e.target.value as CounterpartyLegalType }) : d)}
+                      className="w-full mt-1 border rounded-md px-3 py-2 text-sm"
+                    >
+                      <option value="azienda">Azienda</option>
+                      <option value="pa">PA</option>
+                      <option value="professionista">Professionista</option>
+                      <option value="persona">Persona</option>
+                      <option value="altro">Altro</option>
+                    </select>
                   </div>
-                </CardContent>
-              </Card>
 
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-base">Fatture collegate</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="overflow-x-auto border rounded-lg">
-                    <table className="w-full text-xs">
-                      <thead className="bg-gray-50">
-                        <tr>
-                          <th className="text-left px-3 py-2">Data</th>
-                          <th className="text-left px-3 py-2">Direzione</th>
-                          <th className="text-left px-3 py-2">Doc</th>
-                          <th className="text-left px-3 py-2">Numero</th>
-                          <th className="text-right px-3 py-2">Totale</th>
-                          <th className="text-left px-3 py-2">Stato pagamento</th>
-                          <th className="text-left px-3 py-2">Stato controparte</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {linkedInvoices.length === 0 ? (
-                          <tr>
-                            <td colSpan={7} className="text-center py-4 text-gray-500">Nessuna fattura collegata nel periodo</td>
-                          </tr>
-                        ) : (
-                          linkedInvoices.map((inv) => (
-                            <tr key={inv.id} className="border-t">
-                              <td className="px-3 py-2">{fmtDate(inv.date)}</td>
-                              <td className="px-3 py-2">{inv.direction === 'out' ? 'Attiva' : 'Passiva'}</td>
-                              <td className="px-3 py-2">{inv.doc_type}</td>
-                              <td className="px-3 py-2">{inv.number}</td>
-                              <td className="px-3 py-2 text-right font-medium">{fmtEur(inv.total_amount)}</td>
-                              <td className="px-3 py-2">{inv.payment_status}</td>
-                              <td className="px-3 py-2">
-                                {inv.counterparty_status_snapshot ? (
-                                  <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${STATUS_BADGE[(inv.counterparty_status_snapshot as CounterpartyStatus)] || 'bg-gray-100 text-gray-700'}`}>
-                                    {STATUS_LABEL[(inv.counterparty_status_snapshot as CounterpartyStatus)] || inv.counterparty_status_snapshot}
-                                  </span>
-                                ) : (
-                                  '—'
-                                )}
-                              </td>
-                            </tr>
-                          ))
-                        )}
-                      </tbody>
-                    </table>
+                  <div>
+                    <Label className="text-xs">Indirizzo</Label>
+                    <Input
+                      value={draft.address}
+                      onChange={(e) => setDraft((d) => d ? ({ ...d, address: e.target.value }) : d)}
+                      className="mt-1"
+                    />
                   </div>
-                </CardContent>
-              </Card>
-            </>
+
+                  <div className="sm:col-span-2">
+                    <Label className="text-xs">Note</Label>
+                    <textarea
+                      value={draft.notes}
+                      onChange={(e) => setDraft((d) => d ? ({ ...d, notes: e.target.value }) : d)}
+                      className="w-full mt-1 border rounded-md px-3 py-2 text-sm min-h-[70px]"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Button size="sm" onClick={saveFocused} disabled={saving}>Salva</Button>
+                  <Button size="sm" variant="outline" onClick={verifyFocused} disabled={saving}>
+                    <CheckCircle className="h-3.5 w-3.5 mr-1.5" />Verifica
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={rejectFocused} disabled={saving}>
+                    <XCircle className="h-3.5 w-3.5 mr-1.5" />Rifiuta
+                  </Button>
+                  <p className="text-xs text-gray-500 ml-auto">Creata il {fmtDate(focused.created_at)}</p>
+                </div>
+              </CardContent>
+            </Card>
           )}
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Analytics controparti</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="date"
+                  value={dateFrom}
+                  onChange={(e) => setDateFrom(e.target.value)}
+                  className="border rounded-md px-2 py-1 text-xs"
+                />
+                <span className="text-xs text-gray-500">→</span>
+                <input
+                  type="date"
+                  value={dateTo}
+                  onChange={(e) => setDateTo(e.target.value)}
+                  className="border rounded-md px-2 py-1 text-xs"
+                />
+                <select
+                  value={invoiceDirectionFilter}
+                  onChange={(e) => setInvoiceDirectionFilter(e.target.value as 'all' | 'in' | 'out')}
+                  className="border rounded-md px-2 py-1 text-xs"
+                >
+                  <option value="all">Attive + Passive</option>
+                  <option value="out">Solo Attive</option>
+                  <option value="in">Solo Passive</option>
+                </select>
+                <span className="text-xs text-gray-500 ml-auto">Target: {analyticsTargetIds.length || 0} controparti</span>
+              </div>
+
+              <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
+                <div className="p-2 rounded border bg-emerald-50">
+                  <p className="text-[10px] text-emerald-700 uppercase">Totale attive</p>
+                  <p className="text-sm font-bold text-emerald-700">{fmtEur(analytics.totalActiveAmount)}</p>
+                </div>
+                <div className="p-2 rounded border bg-red-50">
+                  <p className="text-[10px] text-red-700 uppercase">Totale passive</p>
+                  <p className="text-sm font-bold text-red-700">{fmtEur(analytics.totalPassiveAmount)}</p>
+                </div>
+                <div className="p-2 rounded border bg-blue-50">
+                  <p className="text-[10px] text-blue-700 uppercase">Saldo netto</p>
+                  <p className="text-sm font-bold text-blue-700">{fmtEur(analytics.totalNetAmount)}</p>
+                </div>
+                <div className="p-2 rounded border bg-gray-50">
+                  <p className="text-[10px] text-gray-700 uppercase">N. attive</p>
+                  <p className="text-sm font-bold text-gray-800">{analytics.countActive}</p>
+                </div>
+                <div className="p-2 rounded border bg-gray-50">
+                  <p className="text-[10px] text-gray-700 uppercase">N. passive</p>
+                  <p className="text-sm font-bold text-gray-800">{analytics.countPassive}</p>
+                </div>
+              </div>
+
+              <div className="h-64 border rounded-lg p-2">
+                {analytics.trend.length === 0 ? (
+                  <div className="h-full flex items-center justify-center text-sm text-gray-500">Nessun dato nel periodo</div>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={analytics.trend}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="month" />
+                      <YAxis />
+                      <Tooltip formatter={(v: any) => fmtEur(Number(v || 0))} />
+                      <Legend />
+                      <Bar dataKey="activeAmount" name="Attive" stackId="a" fill="#059669" />
+                      <Bar dataKey="passiveAmount" name="Passive" stackId="a" fill="#dc2626" />
+                    </BarChart>
+                  </ResponsiveContainer>
+                )}
+              </div>
+
+              <div className="border rounded-lg overflow-x-auto">
+                <table className="w-full text-xs min-w-[920px]">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="text-left px-3 py-2">Controparte</th>
+                      <th className="text-right px-3 py-2">Attive</th>
+                      <th className="text-right px-3 py-2">Passive</th>
+                      <th className="text-right px-3 py-2">Totale</th>
+                      {analyticsMonths.map((month) => (
+                        <th key={month} className="text-right px-3 py-2">{month}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {analyticsTableRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={4 + analyticsMonths.length} className="text-center py-4 text-gray-500">Nessun dato</td>
+                      </tr>
+                    ) : (
+                      analyticsTableRows.map((row) => (
+                        <tr key={row.counterparty_id} className="border-t">
+                          <td className="px-3 py-2">
+                            <div className="flex items-center gap-2">
+                              <span>{row.counterparty_name}</span>
+                              {row.status !== 'verified' && (
+                                <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${STATUS_BADGE[row.status]}`}>
+                                  {STATUS_LABEL[row.status]}
+                                </span>
+                              )}
+                              {!analyticsTargetIdsSet.has(row.counterparty_id) && (
+                                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-gray-100 text-gray-600">
+                                  fuori filtro
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2 text-right text-emerald-700 font-medium">{fmtEur(row.activeAmount)}</td>
+                          <td className="px-3 py-2 text-right text-red-700 font-medium">{fmtEur(row.passiveAmount)}</td>
+                          <td className="px-3 py-2 text-right font-semibold">{fmtEur(row.totalAmount)}</td>
+                          {analyticsMonths.map((month) => (
+                            <td key={`${row.counterparty_id}-${month}`} className="px-3 py-2 text-right">
+                              {fmtEur(row.months[month] || 0)}
+                            </td>
+                          ))}
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Fatture collegate</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {!analyticsTargetIds.length ? (
+                <div className="text-sm text-gray-500 py-6 text-center">Seleziona almeno una controparte dalla lista</div>
+              ) : (
+                <div className="overflow-x-auto border rounded-lg">
+                  <table className="w-full text-xs">
+                    <thead className="bg-gray-50">
+                      <tr>
+                        <th className="text-left px-3 py-2">Data</th>
+                        <th className="text-left px-3 py-2">Direzione</th>
+                        <th className="text-left px-3 py-2">Doc</th>
+                        <th className="text-left px-3 py-2">Numero</th>
+                        <th className="text-right px-3 py-2">Totale</th>
+                        <th className="text-left px-3 py-2">Stato pagamento</th>
+                        <th className="text-left px-3 py-2">Stato controparte</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {linkedInvoices.length === 0 ? (
+                        <tr>
+                          <td colSpan={7} className="text-center py-4 text-gray-500">Nessuna fattura collegata nel periodo</td>
+                        </tr>
+                      ) : (
+                        linkedInvoices.map((inv) => (
+                          <tr key={inv.id} className="border-t">
+                            <td className="px-3 py-2">{fmtDate(inv.date)}</td>
+                            <td className="px-3 py-2">{inv.direction === 'out' ? 'Attiva' : 'Passiva'}</td>
+                            <td className="px-3 py-2">{inv.doc_type}</td>
+                            <td className="px-3 py-2">{inv.number}</td>
+                            <td className="px-3 py-2 text-right font-medium">{fmtEur(inv.total_amount)}</td>
+                            <td className="px-3 py-2">{inv.payment_status}</td>
+                            <td className="px-3 py-2">
+                              {inv.counterparty_status_snapshot ? (
+                                <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${STATUS_BADGE[(inv.counterparty_status_snapshot as CounterpartyStatus)] || 'bg-gray-100 text-gray-700'}`}>
+                                  {STATUS_LABEL[(inv.counterparty_status_snapshot as CounterpartyStatus)] || inv.counterparty_status_snapshot}
+                                </span>
+                              ) : (
+                                '—'
+                              )}
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </CardContent>
+          </Card>
         </div>
       </div>
 
