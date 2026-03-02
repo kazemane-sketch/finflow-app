@@ -117,6 +117,10 @@ function formatMonthKey(monthKey: string): string {
   return `${MONTH_LABELS_EN[monthIndex]}-${match[1].slice(2)}`
 }
 
+function fmtEurOrDash(amount: number): string {
+  return Math.abs(amount) < 0.005 ? '-' : fmtEur(amount)
+}
+
 function CounterpartyCreateModal({
   open,
   onClose,
@@ -1064,12 +1068,12 @@ export default function ContropartiPage() {
                               )}
                             </div>
                           </td>
-                          <td className="px-3 py-2 text-right text-emerald-700 font-medium">{fmtEur(row.activeAmount)}</td>
-                          <td className="px-3 py-2 text-right text-red-700 font-medium">{fmtEur(row.passiveAmount)}</td>
-                          <td className="px-3 py-2 text-right font-semibold">{fmtEur(row.totalAmount)}</td>
+                          <td className="px-3 py-2 text-right text-emerald-700 font-medium">{fmtEurOrDash(row.activeAmount)}</td>
+                          <td className="px-3 py-2 text-right text-red-700 font-medium">{fmtEurOrDash(row.passiveAmount)}</td>
+                          <td className="px-3 py-2 text-right font-semibold">{fmtEurOrDash(row.totalAmount)}</td>
                           {analyticsMonths.map((month) => (
                             <td key={`${row.counterparty_id}-${month}`} className="px-3 py-2 text-right">
-                              {fmtEur(row.months[month] || 0)}
+                              {fmtEurOrDash(row.months[month] || 0)}
                             </td>
                           ))}
                         </tr>
