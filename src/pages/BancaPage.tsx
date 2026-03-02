@@ -618,6 +618,10 @@ export default function BancaPage() {
         saved_count: 0,
         failed_chunks_count: 0,
         warnings_count: 0,
+        side_rule_count: 0,
+        semantic_override_count: 0,
+        unknown_side_count: 0,
+        qc_fail_count: 0,
       }
       setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], stats: emptyStats })
     }
@@ -767,6 +771,17 @@ export default function BancaPage() {
                   Deduplica DB: {importResult.stats.dedup_db_count} ·
                   Salvati: {importResult.stats.saved_count}
                 </div>
+                {(importResult.stats.side_rule_count > 0 ||
+                  importResult.stats.semantic_override_count > 0 ||
+                  importResult.stats.unknown_side_count > 0 ||
+                  importResult.stats.qc_fail_count > 0) && (
+                  <div className="text-xs text-gray-600 mt-1">
+                    Side-rule: {importResult.stats.side_rule_count} ·
+                    Override semantico: {importResult.stats.semantic_override_count} ·
+                    Unknown side: {importResult.stats.unknown_side_count} ·
+                    QC fail: {importResult.stats.qc_fail_count}
+                  </div>
+                )}
                 {(importResult.stats.failed_chunks_count > 0 || importResult.stats.warnings_count > 0) && (
                   <div className="text-xs text-amber-700 mt-1">
                     Chunk falliti: {importResult.stats.failed_chunks_count} · Warning: {importResult.stats.warnings_count}

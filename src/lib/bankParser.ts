@@ -43,6 +43,10 @@ export interface BankImportStats {
   saved_count: number;
   failed_chunks_count: number;
   warnings_count: number;
+  side_rule_count: number;
+  semantic_override_count: number;
+  unknown_side_count: number;
+  qc_fail_count: number;
 }
 
 export interface BankParseResult {
@@ -265,6 +269,10 @@ export async function parseBankPdf(
   let rawParsedCount = 0;
   let droppedMissingRequiredCountEdge = 0;
   let dedupEdgeCount = 0;
+  let sideRuleCount = 0;
+  let semanticOverrideCount = 0;
+  let unknownSideCount = 0;
+  let qcFailCount = 0;
   let totalChunks = 0;
   let startChunk = 0;
   let completed = false;
@@ -284,6 +292,10 @@ export async function parseBankPdf(
     rawParsedCount += Number(stats.raw_parsed_count || 0);
     droppedMissingRequiredCountEdge += Number(stats.dropped_missing_required_count || 0);
     dedupEdgeCount += Number(stats.dedup_edge_count || 0);
+    sideRuleCount += Number(stats.side_rule_count || 0);
+    semanticOverrideCount += Number(stats.semantic_override_count || 0);
+    unknownSideCount += Number(stats.unknown_side_count || 0);
+    qcFailCount += Number(stats.qc_fail_count || 0);
 
     totalChunks = Number(finalData.totalChunks || totalChunks || 0);
     const hasMore = !!finalData.hasMore;
@@ -315,6 +327,10 @@ export async function parseBankPdf(
       saved_count: 0,
       failed_chunks_count: allFailedChunks.size,
       warnings_count: allWarnings.length,
+      side_rule_count: sideRuleCount,
+      semantic_override_count: semanticOverrideCount,
+      unknown_side_count: unknownSideCount,
+      qc_fail_count: qcFailCount,
     },
   };
 

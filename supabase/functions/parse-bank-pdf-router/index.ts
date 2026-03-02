@@ -1,5 +1,5 @@
 // supabase/functions/parse-bank-pdf-router/index.ts
-// Router per import banca: sceglie engine legacy/ocr per company_id.
+// Router per import banca: sceglie engine legacy/ocr/plumber per company_id.
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const corsHeaders = {
@@ -30,7 +30,7 @@ Deno.serve(async (req) => {
       return json({ error: "SUPABASE_URL non configurata" }, 500);
     }
 
-    let engine: "legacy" | "ocr" = "legacy";
+    let engine: "legacy" | "ocr" | "plumber" = "legacy";
     if (companyId && serviceRoleKey) {
       const admin = createClient(supabaseUrl, serviceRoleKey, {
         auth: { persistSession: false, autoRefreshToken: false },
@@ -44,14 +44,18 @@ Deno.serve(async (req) => {
 
       if (error) {
         console.error("engine setting lookup error:", error.message);
-      } else if (data?.engine === "ocr") {
-        engine = "ocr";
+      } else if (data?.engine === "ocr" || data?.engine === "plumber" || data?.engine === "legacy") {
+        engine = data.engine;
       }
     } else if (companyId && !serviceRoleKey) {
       console.warn("SUPABASE_SERVICE_ROLE_KEY mancante: fallback engine=legacy");
     }
 
-    const targetFn = engine === "ocr" ? "parse-bank-pdf-ocr" : "parse-bank-pdf";
+    const targetFn = engine === "ocr"
+      ? "parse-bank-pdf-ocr"
+      : engine === "plumber"
+      ? "parse-bank-pdf-plumber"
+      : "parse-bank-pdf";
     console.log(`engine_selected=${engine} company_id=${companyId ?? "n/a"} target=${targetFn}`);
 
     const incomingAuthorization = req.headers.get("Authorization") ?? req.headers.get("authorization");
