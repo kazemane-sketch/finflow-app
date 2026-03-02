@@ -9,6 +9,7 @@ import {
   Landmark,
   Link2,
   CalendarClock,
+  Receipt,
   Settings,
   LogOut,
   Menu,
@@ -23,6 +24,7 @@ const nav = [
   { to: '/banca', icon: Landmark, label: 'Banca' },
   { to: '/riconciliazione', icon: Link2, label: 'Riconciliazione' },
   { to: '/scadenzario', icon: CalendarClock, label: 'Scadenzario' },
+  { to: '/iva', icon: Receipt, label: 'IVA' },
   { to: '/impostazioni', icon: Settings, label: 'Impostazioni' },
 ]
 

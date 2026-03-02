@@ -1,5 +1,6 @@
+import { useEffect, useState } from 'react'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
-import { fmtEur } from '@/lib/utils'
+import { fmtDate, fmtEur } from '@/lib/utils'
 import {
   FileText,
   Landmark,
@@ -8,7 +9,10 @@ import {
   TrendingUp,
   TrendingDown,
   AlertCircle,
+  Receipt,
 } from 'lucide-react'
+import { useCompany } from '@/hooks/useCompany'
+import { getVatCurrentSummary, formatVatPeriodLabel, type VatCurrentSummary } from '@/lib/vat'
 
 const kpis = [
   { label: 'Fatture importate', value: '0', icon: FileText, color: 'text-blue-600', bg: 'bg-blue-50' },
@@ -18,6 +22,29 @@ const kpis = [
 ]
 
 export default function DashboardPage() {
+  const { company } = useCompany()
+  const [vatSummary, setVatSummary] = useState<VatCurrentSummary | null>(null)
+
+  useEffect(() => {
+    let mounted = true
+    async function loadVatSummary() {
+      if (!company?.id) {
+        if (mounted) setVatSummary(null)
+        return
+      }
+      try {
+        const data = await getVatCurrentSummary(company.id)
+        if (mounted) setVatSummary(data)
+      } catch {
+        if (mounted) setVatSummary(null)
+      }
+    }
+    loadVatSummary()
+    return () => {
+      mounted = false
+    }
+  }, [company?.id])
+
   return (
     <div className="p-6 space-y-6">
       <div>
@@ -25,7 +52,6 @@ export default function DashboardPage() {
         <p className="text-muted-foreground text-sm mt-1">Panoramica della situazione finanziaria</p>
       </div>
 
-      {/* KPI Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {kpis.map(k => (
           <Card key={k.label}>
@@ -44,7 +70,41 @@ export default function DashboardPage() {
         ))}
       </div>
 
-      {/* Placeholder sections */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <Receipt className="h-4 w-4 text-amber-600" />
+            IVA Stimata
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {!vatSummary ? (
+            <p className="text-sm text-muted-foreground">Configura la sezione IVA per vedere saldo e prossima scadenza.</p>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div className="rounded-lg border bg-emerald-50 border-emerald-200 p-3">
+                <p className="text-xs text-emerald-700 uppercase">IVA debito</p>
+                <p className="text-lg font-bold text-emerald-800">{fmtEur(vatSummary.period.vat_debit)}</p>
+              </div>
+              <div className="rounded-lg border bg-blue-50 border-blue-200 p-3">
+                <p className="text-xs text-blue-700 uppercase">IVA credito</p>
+                <p className="text-lg font-bold text-blue-800">{fmtEur(vatSummary.period.vat_credit)}</p>
+              </div>
+              <div className="rounded-lg border bg-amber-50 border-amber-200 p-3">
+                <p className="text-xs text-amber-700 uppercase">Saldo stimato</p>
+                <p className="text-lg font-bold text-amber-800">{fmtEur(vatSummary.period.amount_due > 0 ? vatSummary.period.amount_due : vatSummary.period.amount_credit_carry)}</p>
+              </div>
+              <div className="rounded-lg border bg-gray-50 border-gray-200 p-3">
+                <p className="text-xs text-gray-700 uppercase">Scadenza</p>
+                <p className="text-sm font-semibold text-gray-900">{formatVatPeriodLabel(vatSummary.period)}</p>
+                <p className="text-sm text-gray-600 mt-1">{fmtDate(vatSummary.period.due_date)}</p>
+                <p className="text-xs text-gray-500 mt-1">{vatSummary.days_to_due} giorni</p>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card>
           <CardHeader>
@@ -88,7 +148,7 @@ export default function DashboardPage() {
               { step: '1', text: 'Importa le fatture XML/P7M dalla sezione Fatture', done: false },
               { step: '2', text: 'Carica l\'estratto conto PDF dalla sezione Banca', done: false },
               { step: '3', text: 'Riconcilia automaticamente fatture e movimenti', done: false },
-              { step: '4', text: 'Monitora le scadenze di pagamento', done: false },
+              { step: '4', text: 'Monitora le scadenze di pagamento e IVA', done: false },
             ].map(s => (
               <div key={s.step} className="flex items-center gap-3">
                 <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs font-bold ${

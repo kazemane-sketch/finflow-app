@@ -35,6 +35,7 @@ export interface DBInvoice {
   payment_method: string;
   payment_terms: string;
   payment_due_date: string | null;
+  paid_date: string | null;
   payment_status: string;
   reconciliation_status: string;
   sdi_id: string;
@@ -66,6 +67,7 @@ export interface InvoiceUpdate {
   total_amount?: number;
   payment_status?: string;
   payment_due_date?: string | null;
+  paid_date?: string | null;
   payment_method?: string;
   notes?: string;
 }
@@ -198,6 +200,7 @@ export async function saveInvoicesToDB(
           payment_method: b.pagamenti?.[0]?.modalita || '',
           payment_terms: b.condPag || '',
           payment_due_date: paymentDue,
+          paid_date: null,
           raw_xml: r.rawXml,
           xml_version: r.data.ver || '',
           source_filename: r.fn,
@@ -257,7 +260,7 @@ export async function saveInvoicesToDB(
 export async function loadInvoices(companyId: string): Promise<DBInvoice[]> {
   const { data, error } = await supabase
     .from('invoices')
-    .select('id, company_id, counterparty_id, counterparty_status_snapshot, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, payment_status, reconciliation_status, sdi_id, notes, source_filename, parse_method, xml_hash, created_at')
+    .select('id, company_id, counterparty_id, counterparty_status_snapshot, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, paid_date, payment_status, reconciliation_status, sdi_id, notes, source_filename, parse_method, xml_hash, created_at')
     .eq('company_id', companyId)
     .order('date', { ascending: false })
     .range(0, 4999);
@@ -347,9 +350,17 @@ export async function deleteInvoices(invoiceIds: string[]): Promise<{ deleted: n
 // UPDATE — modifica fattura
 // ============================================================
 export async function updateInvoice(invoiceId: string, updates: InvoiceUpdate): Promise<void> {
+  const payload: InvoiceUpdate = { ...updates };
+  if (payload.payment_status === 'paid' && payload.paid_date === undefined) {
+    payload.paid_date = new Date().toISOString().slice(0, 10);
+  }
+  if (payload.payment_status && payload.payment_status !== 'paid' && payload.paid_date === undefined) {
+    payload.paid_date = null;
+  }
+
   const { error } = await supabase
     .from('invoices')
-    .update(updates)
+    .update(payload)
     .eq('id', invoiceId);
 
   if (error) throw new Error(error.message);

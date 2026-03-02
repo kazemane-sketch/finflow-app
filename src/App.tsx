@@ -10,6 +10,7 @@ import ContropartiPage from '@/pages/ContropartiPage'
 import RiconciliazionePage from '@/pages/RiconciliazionePage'
 import ScadenzarioPage from '@/pages/ScadenzarioPage'
 import ImpostazioniPage from '@/pages/ImpostazioniPage'
+import IvaPage from '@/pages/IvaPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth()
@@ -49,6 +50,7 @@ export default function App() {
           <Route path="/banca" element={<BancaPage />} />
           <Route path="/riconciliazione" element={<RiconciliazionePage />} />
           <Route path="/scadenzario" element={<ScadenzarioPage />} />
+          <Route path="/iva" element={<IvaPage />} />
           <Route path="/impostazioni" element={<ImpostazioniPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
