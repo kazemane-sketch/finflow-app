@@ -41,7 +41,7 @@ create table if not exists public.company_vat_profiles (
 -- per-invoice normalized VAT movements
 -- ------------------------------------------------------------
 create table if not exists public.invoice_vat_entries (
-  id uuid primary key default uuid_generate_v4(),
+  id uuid primary key default gen_random_uuid(),
   company_id uuid not null references public.companies(id) on delete cascade,
   invoice_id uuid references public.invoices(id) on delete cascade,
   source_invoice_line_id uuid references public.invoice_lines(id) on delete set null,
@@ -105,7 +105,7 @@ end $$;
 -- VAT liquidation periods
 -- ------------------------------------------------------------
 create table if not exists public.vat_periods (
-  id uuid primary key default uuid_generate_v4(),
+  id uuid primary key default gen_random_uuid(),
   company_id uuid not null references public.companies(id) on delete cascade,
   regime text not null check (regime in ('monthly', 'quarterly')),
   period_type text not null check (period_type in ('regular', 'acconto', 'annual')),
@@ -144,7 +144,7 @@ create index if not exists idx_vat_periods_company_status
 -- payment matching suggestions (F24)
 -- ------------------------------------------------------------
 create table if not exists public.vat_period_payment_matches (
-  id uuid primary key default uuid_generate_v4(),
+  id uuid primary key default gen_random_uuid(),
   company_id uuid not null references public.companies(id) on delete cascade,
   vat_period_id uuid not null references public.vat_periods(id) on delete cascade,
   bank_transaction_id uuid not null references public.bank_transactions(id) on delete cascade,

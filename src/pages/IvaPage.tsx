@@ -19,7 +19,8 @@ import {
   listVatBreakdown,
   listManualVatEntries,
   listVatPaymentMatches,
-  listVatPeriods,
+  listVatPeriodSnapshotEntries,
+  listVatPeriodsLight,
   suggestVatMatches,
   syncVatEngine,
   upsertVatProfile,
@@ -29,6 +30,7 @@ import {
   type VatBreakdownRow,
   type VatPaymentMatch,
   type VatPeriod,
+  type VatPeriodSnapshotEntry,
   type VatProfile,
   type VatProfileInput,
 } from '@/lib/vat'
@@ -95,6 +97,10 @@ function isEditor(role: CompanyRole | null): boolean {
   return role === 'owner' || role === 'admin'
 }
 
+function isTimeoutVatError(message: string | null | undefined): boolean {
+  return /statement timeout|canceling statement due to statement timeout/i.test(String(message || ''))
+}
+
 export default function IvaPage() {
   const { company } = useCompany()
 
@@ -110,6 +116,9 @@ export default function IvaPage() {
   const [periods, setPeriods] = useState<VatPeriod[]>([])
   const [currentPeriodId, setCurrentPeriodId] = useState<string | null>(null)
   const [breakdown, setBreakdown] = useState<VatBreakdownRow[]>([])
+  const [snapshotEntries, setSnapshotEntries] = useState<VatPeriodSnapshotEntry[]>([])
+  const [snapshotLoading, setSnapshotLoading] = useState(false)
+  const [snapshotPeriodId, setSnapshotPeriodId] = useState<string | null>(null)
   const [manualEntries, setManualEntries] = useState<VatEntry[]>([])
   const [matchesByPeriod, setMatchesByPeriod] = useState<Record<string, VatPaymentMatch[]>>({})
   const [manualForm, setManualForm] = useState<ManualVatEntryInput>({
@@ -129,6 +138,13 @@ export default function IvaPage() {
 
   const canEdit = useMemo(() => isEditor(role), [role])
   const backfillPending = useMemo(() => Boolean(profile && !profile.backfill_confirmed), [profile])
+  const hasRegularPeriods = useMemo(() => periods.some((p) => p.period_type === 'regular'), [periods])
+  const backfillPreviewInconsistent = useMemo(() => {
+    const invoicesCount = Number(profile?.backfill_preview_json?.invoices_count || 0)
+    const regularCount = Number(profile?.backfill_preview_json?.periods_regular_count || 0)
+    const entriesCount = Number(profile?.backfill_preview_json?.entries_count || 0)
+    return invoicesCount > 0 && (regularCount <= 0 || entriesCount <= 0)
+  }, [profile?.backfill_preview_json])
   const vatNotApplicable = useMemo(() => {
     const r = String(fiscalRegime || '').toUpperCase()
     return r === 'RF19' || r === 'RF02'
@@ -155,8 +171,25 @@ export default function IvaPage() {
       const data = await listVatBreakdown(company.id, periodId)
       setBreakdown(data)
       setCurrentPeriodId(periodId)
+      setSnapshotEntries([])
+      setSnapshotPeriodId(null)
     } catch (e: any) {
       setError(e.message || 'Errore caricamento dettaglio IVA')
+    }
+  }, [company?.id])
+
+  const loadSnapshotAudit = useCallback(async (periodId: string) => {
+    if (!company?.id) return
+    setSnapshotLoading(true)
+    setError(null)
+    try {
+      const data = await listVatPeriodSnapshotEntries(company.id, periodId)
+      setSnapshotEntries(data)
+      setSnapshotPeriodId(periodId)
+    } catch (e: any) {
+      setError(e.message || 'Errore caricamento snapshot audit')
+    } finally {
+      setSnapshotLoading(false)
     }
   }, [company?.id])
 
@@ -164,7 +197,7 @@ export default function IvaPage() {
     if (!company?.id) return
 
     const [list, manual] = await Promise.all([
-      listVatPeriods(company.id),
+      listVatPeriodsLight(company.id),
       listManualVatEntries(company.id),
     ])
     setPeriods(list)
@@ -178,6 +211,8 @@ export default function IvaPage() {
     } else {
       setBreakdown([])
       setCurrentPeriodId(null)
+      setSnapshotEntries([])
+      setSnapshotPeriodId(null)
     }
   }, [company?.id, currentPeriodId, loadBreakdown])
 
@@ -205,6 +240,8 @@ export default function IvaPage() {
         setPeriods([])
         setManualEntries([])
         setBreakdown([])
+        setSnapshotEntries([])
+        setSnapshotPeriodId(null)
         setCurrentPeriodId(null)
         setMatchesByPeriod({})
         return
@@ -212,10 +249,10 @@ export default function IvaPage() {
 
       setProfileForm(fromProfile(currentProfile))
 
-      let currentPeriods = await listVatPeriods(company.id)
+      let currentPeriods = await listVatPeriodsLight(company.id)
       if (currentPeriods.length === 0) {
         await syncVatEngine(company.id, { requireBackfillConfirmation: isEditor(memberRole) })
-        currentPeriods = await listVatPeriods(company.id)
+        currentPeriods = await listVatPeriodsLight(company.id)
         const refreshed = await getVatProfile(company.id)
         setProfile(refreshed)
         if (refreshed) setProfileForm(fromProfile(refreshed))
@@ -233,7 +270,12 @@ export default function IvaPage() {
 
       await getVatCurrentSummary(company.id)
     } catch (e: any) {
-      setError(e.message || 'Errore caricamento modulo IVA')
+      const message = e?.message || 'Errore caricamento modulo IVA'
+      setError(
+        isTimeoutVatError(message)
+          ? 'Ricalcolo IVA non completato per timeout query: i dati precedenti sono stati mantenuti.'
+          : message,
+      )
     } finally {
       setLoading(false)
     }
@@ -263,7 +305,12 @@ export default function IvaPage() {
       await refreshPeriods()
       setInfo('Configurazione IVA salvata. Verifica il riepilogo backfill e conferma prima di operare.')
     } catch (e: any) {
-      setError(e.message || 'Errore salvataggio profilo IVA')
+      const message = e?.message || 'Errore salvataggio profilo IVA'
+      setError(
+        isTimeoutVatError(message)
+          ? 'Ricalcolo IVA non completato per timeout query: i dati precedenti sono stati mantenuti.'
+          : message,
+      )
     } finally {
       setSavingProfile(false)
     }
@@ -275,13 +322,18 @@ export default function IvaPage() {
     setError(null)
     setInfo(null)
     try {
-      await syncVatEngine(company.id)
+      const result = await syncVatEngine(company.id)
       const refreshedProfile = await getVatProfile(company.id)
       if (refreshedProfile) setProfile(refreshedProfile)
       await refreshPeriods()
-      setInfo('Ricalcolo IVA completato')
+      setInfo(`Ricalcolo IVA completato (${result.invoices_processed} fatture, ${result.entries_written} movimenti, ${result.periods_upserted} periodi)`)
     } catch (e: any) {
-      setError(e.message || 'Errore ricalcolo IVA')
+      const message = e?.message || 'Errore ricalcolo IVA'
+      setError(
+        isTimeoutVatError(message)
+          ? 'Ricalcolo IVA non completato per timeout query: i dati precedenti sono stati mantenuti.'
+          : message,
+      )
     } finally {
       setSyncing(false)
     }
@@ -289,6 +341,7 @@ export default function IvaPage() {
 
   const handleSuggestMatches = async (periodId: string) => {
     if (!company?.id) return
+    if (!hasRegularPeriods) return
     setError(null)
     try {
       await suggestVatMatches(company.id, periodId)
@@ -302,6 +355,7 @@ export default function IvaPage() {
 
   const handleConfirmManualPaid = async (period: VatPeriod) => {
     if (!company?.id) return
+    if (!hasRegularPeriods) return
     if (!window.confirm(`Confermi il versamento del periodo ${formatVatPeriodLabel(period)}?`)) return
 
     try {
@@ -320,6 +374,7 @@ export default function IvaPage() {
 
   const handleAcceptMatch = async (periodId: string, match: VatPaymentMatch) => {
     if (!company?.id) return
+    if (!hasRegularPeriods) return
 
     try {
       await confirmVatPayment(company.id, {
@@ -439,10 +494,14 @@ export default function IvaPage() {
             <p className="text-sm text-amber-800">
               Prima di rendere operativi i dati IVA, verifica il riepilogo del backfill calcolato.
             </p>
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-2 text-sm">
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-2 text-sm">
               <div className="rounded border bg-white px-3 py-2">
                 <p className="text-xs text-gray-500 uppercase">Fatture trovate</p>
                 <p className="font-semibold">{Number(profile.backfill_preview_json?.invoices_count || 0)}</p>
+              </div>
+              <div className="rounded border bg-white px-3 py-2">
+                <p className="text-xs text-gray-500 uppercase">Entry IVA</p>
+                <p className="font-semibold">{Number(profile.backfill_preview_json?.entries_count || 0)}</p>
               </div>
               <div className="rounded border bg-white px-3 py-2">
                 <p className="text-xs text-gray-500 uppercase">Periodi calcolati</p>
@@ -457,9 +516,14 @@ export default function IvaPage() {
                 <p className="font-semibold">{fmtEur((profile.backfill_preview_json?.totals as any)?.vat_credit || 0)}</p>
               </div>
             </div>
+            {backfillPreviewInconsistent && (
+              <p className="text-xs text-red-700">
+                Backfill non confermabile: fatture presenti ma periodi/entry IVA mancanti. Riesegui il ricalcolo.
+              </p>
+            )}
             {canEdit ? (
               <div className="flex justify-end">
-                <Button onClick={handleConfirmBackfill}>Conferma backfill</Button>
+                <Button disabled={backfillPreviewInconsistent} onClick={handleConfirmBackfill}>Conferma backfill</Button>
               </div>
             ) : (
               <p className="text-xs text-amber-700">Solo owner/admin possono confermare il backfill.</p>
@@ -660,12 +724,12 @@ export default function IvaPage() {
                             <div className="flex justify-end gap-2 flex-wrap">
                               <Button variant="outline" size="sm" onClick={() => loadBreakdown(p.id)}>Dettaglio</Button>
                               {(p.status === 'to_pay' || p.status === 'overdue') && (
-                                <Button variant="outline" size="sm" disabled={backfillPending} onClick={() => handleSuggestMatches(p.id)}>
+                                <Button variant="outline" size="sm" disabled={backfillPending || !hasRegularPeriods} onClick={() => handleSuggestMatches(p.id)}>
                                   Suggerisci F24
                                 </Button>
                               )}
                               {(p.status === 'to_pay' || p.status === 'overdue') && canEdit && (
-                                <Button size="sm" disabled={backfillPending} onClick={() => handleConfirmManualPaid(p)}>Segna versato</Button>
+                                <Button size="sm" disabled={backfillPending || !hasRegularPeriods} onClick={() => handleConfirmManualPaid(p)}>Segna versato</Button>
                               )}
                             </div>
                           </td>
@@ -717,7 +781,19 @@ export default function IvaPage() {
                 Dettaglio per aliquota/natura/esigibilita
               </CardTitle>
             </CardHeader>
-            <CardContent>
+            <CardContent className="space-y-3">
+              {currentPeriodId && (
+                <div className="flex justify-end">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => loadSnapshotAudit(currentPeriodId)}
+                    disabled={snapshotLoading}
+                  >
+                    {snapshotLoading ? 'Caricamento snapshot...' : 'Mostra snapshot audit'}
+                  </Button>
+                </div>
+              )}
               {!currentPeriodId ? (
                 <p className="text-sm text-muted-foreground">Seleziona un periodo dallo storico per vedere il dettaglio.</p>
               ) : breakdown.length === 0 ? (
@@ -754,6 +830,43 @@ export default function IvaPage() {
                       ))}
                     </tbody>
                   </table>
+                </div>
+              )}
+
+              {snapshotPeriodId === currentPeriodId && (
+                <div className="border rounded-lg p-3 space-y-2">
+                  <p className="text-sm font-semibold">Snapshot audit periodo ({snapshotEntries.length} entry)</p>
+                  {snapshotEntries.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">Nessuna entry audit disponibile per questo periodo.</p>
+                  ) : (
+                    <div className="overflow-x-auto border rounded-lg">
+                      <table className="w-full text-xs">
+                        <thead className="bg-gray-50">
+                          <tr>
+                            <th className="text-left px-2 py-1">Data</th>
+                            <th className="text-left px-2 py-1">Documento</th>
+                            <th className="text-right px-2 py-1">Debito</th>
+                            <th className="text-right px-2 py-1">Credito</th>
+                            <th className="text-left px-2 py-1">Nota</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {snapshotEntries.map((entry) => {
+                            const payload = entry.entry_payload || {}
+                            return (
+                              <tr key={entry.id} className="border-t">
+                                <td className="px-2 py-1">{fmtDate(String(payload.effective_date || ''))}</td>
+                                <td className="px-2 py-1">{String(payload.doc_type || '—')}</td>
+                                <td className="px-2 py-1 text-right">{fmtEur(Number(payload.vat_debit_amount || 0))}</td>
+                                <td className="px-2 py-1 text-right">{fmtEur(Number(payload.vat_credit_amount || 0))}</td>
+                                <td className="px-2 py-1">{String(payload.manual_note || payload.notes || '—')}</td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                 </div>
               )}
             </CardContent>
