@@ -532,7 +532,16 @@ function TxDetail({
 // ============================================================
 // AI SEARCH
 // ============================================================
-async function askClaudeOnTransactions(query: string, transactions: any[]): Promise<string> {
+const MAX_AI_TX = 1500
+
+type BankAiSearchResponse = {
+  answer: string
+  used_count: number
+  truncated: boolean
+  model?: string
+}
+
+async function askBankAiSearch(query: string, transactions: any[]): Promise<BankAiSearchResponse> {
   const response = await fetch(`${SUPABASE_URL}/functions/v1/bank-ai-search`, {
     method: 'POST',
     headers: {
@@ -543,12 +552,16 @@ async function askClaudeOnTransactions(query: string, transactions: any[]): Prom
     body: JSON.stringify({ query, transactions }),
   })
 
+  const data = await response.json().catch(() => ({}))
   if (!response.ok) {
-    const err = await response.json().catch(() => ({}))
-    throw new Error(err.error || `Errore server ${response.status}`)
+    throw new Error(data.error || data.message || `Errore server ${response.status}`)
   }
-  const data = await response.json()
-  return data.answer || 'Nessuna risposta'
+  return {
+    answer: typeof data.answer === 'string' && data.answer.trim() ? data.answer.trim() : 'Nessuna risposta',
+    used_count: Number(data.used_count || transactions.length || 0),
+    truncated: Boolean(data.truncated),
+    model: typeof data.model === 'string' ? data.model : undefined,
+  }
 }
 
 // ============================================================
@@ -961,18 +974,41 @@ export default function BancaPage() {
     return true
   })
 
+  const aiScopeTransactions = transactions
+    .slice(0, MAX_AI_TX)
+    .map((tx) => ({
+      id: tx.id,
+      date: tx.date,
+      value_date: tx.value_date ?? null,
+      amount: tx.amount,
+      description: tx.description ?? '',
+      counterparty_name: tx.counterparty_name ?? null,
+      transaction_type: tx.transaction_type ?? 'altro',
+      reference: tx.reference ?? null,
+      invoice_ref: tx.invoice_ref ?? null,
+      direction: tx.direction ?? txDirection(tx),
+    }))
+  const aiScopeTruncated = transactions.length > aiScopeTransactions.length
+
   const handleAiSearch = async () => {
     if (!query.trim()) return
+    if (aiScopeTransactions.length === 0) {
+      setAiResult("Nessun movimento disponibile per l'analisi AI.")
+      return
+    }
     setAiLoading(true); setAiResult(null)
     try {
-      const result = await askClaudeOnTransactions(query, filtered)
-      setAiResult(result)
+      const result = await askBankAiSearch(query, aiScopeTransactions)
+      const effectiveUsedCount = Number.isFinite(result.used_count) && result.used_count > 0
+        ? result.used_count
+        : aiScopeTransactions.length
+      const isTruncated = result.truncated || aiScopeTruncated
+      const scopeLine = `\n\nScope AI: ${effectiveUsedCount} movimenti analizzati (lista visibile: ${filtered.length} di ${transactions.length})` +
+        `${isTruncated ? ` · limitati agli ultimi ${MAX_AI_TX}` : ''}` +
+        `${result.model ? ` · modello: ${result.model}` : ''}`
+      setAiResult(`${result.answer}${scopeLine}`)
     } catch (e: any) {
-      if (e.message.includes('401') || e.message.includes('authentication')) {
-        setAiResult('⚠️ Chiave API Claude non valida. Vai in Impostazioni e inserisci la chiave sk-ant-...')
-      } else {
-        setAiResult('Errore: ' + e.message)
-      }
+      setAiResult('Errore AI search: ' + e.message)
     }
     setAiLoading(false)
   }
