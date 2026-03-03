@@ -11,6 +11,7 @@ const REQUEST_TIMEOUT_MS = Number(Deno.env.get("BANK_EMBED_TIMEOUT_MS") ?? "3000
 const GEMINI_EMBEDDING_MODEL = Deno.env.get("GEMINI_EMBEDDING_MODEL") ?? "gemini-embedding-001";
 const EXPECTED_EMBEDDING_DIMS = 3072;
 const STALE_PROCESSING_SECONDS = Math.max(60, Math.min(Number(Deno.env.get("BANK_EMBED_STALE_SECONDS") ?? "1800") || 1800, 86400));
+const CLAIM_BATCH_SIZE = Math.max(1, Math.min(Number(Deno.env.get("BANK_EMBED_CLAIM_BATCH_SIZE") ?? "200") || 200, 500));
 
 type ClaimedTx = {
   id: string;
@@ -119,6 +120,45 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function claimBatchViaRest(
+  supabaseUrl: string,
+  serviceRoleKey: string,
+  batchSize: number,
+): Promise<ClaimedTx[]> {
+  const response = await fetchWithTimeout(`${supabaseUrl}/rest/v1/rpc/bank_embedding_claim_batch`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      apikey: serviceRoleKey,
+      Authorization: `Bearer ${serviceRoleKey}`,
+      Prefer: "params=single-object",
+      "Accept-Profile": "public",
+      "Content-Profile": "public",
+    },
+    body: JSON.stringify({ p_batch_size: batchSize }),
+  }, REQUEST_TIMEOUT_MS);
+
+  const raw = await response.text().catch(() => "");
+  let payload: any = null;
+  try {
+    payload = raw ? JSON.parse(raw) : null;
+  } catch {
+    payload = raw || null;
+  }
+
+  if (!response.ok) {
+    const message = typeof payload?.message === "string"
+      ? payload.message
+      : typeof payload?.error === "string"
+        ? payload.error
+        : raw || `HTTP ${response.status}`;
+    throw new Error(message);
+  }
+
+  return Array.isArray(payload) ? payload as ClaimedTx[] : [];
 }
 
 async function callGeminiEmbeddingSingle(apiKey: string, text: string): Promise<number[]> {
@@ -264,17 +304,16 @@ Deno.serve(async (req) => {
       .eq("embedding_status", "processing")
       .is("embedding_updated_at", null);
 
-    const { data: claimRows, error: claimError } = await serviceClient
-      .rpc("bank_embedding_claim_batch");
-
-    if (claimError) {
+    let claimed: ClaimedTx[] = [];
+    try {
+      claimed = await claimBatchViaRest(supabaseUrl, serviceRoleKey, CLAIM_BATCH_SIZE);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "errore claim batch";
       return jsonResponse({
-        error: `Errore claim batch: ${claimError.message}`,
+        error: `Errore claim batch: ${msg}`,
         request_id: requestId,
       }, requestId, 500);
     }
-
-    const claimed = (Array.isArray(claimRows) ? claimRows : []) as ClaimedTx[];
     if (!claimed.length) {
       const health = await fetchGlobalHealth(serviceClient);
       return jsonResponse({
