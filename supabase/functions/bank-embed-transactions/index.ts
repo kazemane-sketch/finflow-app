@@ -10,9 +10,11 @@ const corsHeaders = {
 const REQUEST_TIMEOUT_MS = Number(Deno.env.get("BANK_EMBED_TIMEOUT_MS") ?? "30000");
 const GEMINI_EMBEDDING_MODEL = Deno.env.get("GEMINI_EMBEDDING_MODEL") ?? "gemini-embedding-001";
 const EXPECTED_EMBEDDING_DIMS = 3072;
+const STALE_PROCESSING_SECONDS = Math.max(60, Math.min(Number(Deno.env.get("BANK_EMBED_STALE_SECONDS") ?? "1800") || 1800, 86400));
 
 type ClaimedTx = {
   id: string;
+  company_id: string;
   date: string | null;
   value_date: string | null;
   amount: number | null;
@@ -22,6 +24,14 @@ type ClaimedTx = {
   reference: string | null;
   invoice_ref: string | null;
   direction: "in" | "out" | null;
+};
+
+type GlobalHealth = {
+  total_rows: number;
+  ready_rows: number;
+  processing_rows: number;
+  pending_rows: number;
+  error_rows: number;
 };
 
 function jsonResponse(body: unknown, requestId: string, status = 200): Response {
@@ -75,6 +85,12 @@ function parseJwtRole(token: string): string | null {
   }
 }
 
+function isServiceRoleCredential(value: string | null, serviceRoleKey: string): boolean {
+  if (!value) return false;
+  if (value === serviceRoleKey) return true;
+  return parseJwtRole(value) === "service_role";
+}
+
 function toVectorLiteral(values: number[]): string {
   return `[${values.map((v) => Number.isFinite(v) ? v.toFixed(8) : "0").join(",")}]`;
 }
@@ -122,6 +138,7 @@ async function callGeminiEmbeddingSingle(apiKey: string, text: string): Promise<
     const msg = payload?.error?.message || payload?.message || `HTTP ${response.status}`;
     throw new Error(`Gemini embedding error: ${msg}`);
   }
+
   const values = payload?.embedding?.values;
   if (!Array.isArray(values) || values.length !== EXPECTED_EMBEDDING_DIMS) {
     throw new Error(`Embedding dimensione inattesa (${Array.isArray(values) ? values.length : "n/a"})`);
@@ -161,33 +178,30 @@ async function callGeminiEmbeddingBatch(apiKey: string, texts: string[]): Promis
   });
 }
 
-async function requireCompanyAccess(
-  userClient: ReturnType<typeof createClient>,
-  token: string,
-  companyId: string,
-): Promise<void> {
-  const role = parseJwtRole(token);
-  if (role === "anon") {
-    throw new Response(JSON.stringify({ error: "Token anon non valido per questa operazione" }), { status: 401 });
-  }
+async function countRows(serviceClient: ReturnType<typeof createClient>, status?: "ready" | "processing" | "pending" | "error"): Promise<number> {
+  let query = serviceClient.from("bank_transactions").select("id", { count: "exact", head: true });
+  if (status) query = query.eq("embedding_status", status);
+  const { count, error } = await query;
+  if (error) throw new Error(`Count ${status ?? "total"} failed: ${error.message}`);
+  return Number(count || 0);
+}
 
-  const { data: membership, error: membershipError } = await userClient
-    .from("company_members")
-    .select("company_id")
-    .eq("company_id", companyId)
-    .maybeSingle();
+async function fetchGlobalHealth(serviceClient: ReturnType<typeof createClient>): Promise<GlobalHealth> {
+  const [total_rows, ready_rows, processing_rows, pending_rows, error_rows] = await Promise.all([
+    countRows(serviceClient),
+    countRows(serviceClient, "ready"),
+    countRows(serviceClient, "processing"),
+    countRows(serviceClient, "pending"),
+    countRows(serviceClient, "error"),
+  ]);
 
-  if (membershipError) {
-    const msg = membershipError.message || "";
-    const isJwtError = /jwt|auth|token|session|expired|invalid/i.test(msg);
-    throw new Response(JSON.stringify({ error: isJwtError ? "JWT non valido o scaduto" : `Errore verifica permessi: ${msg}` }), {
-      status: isJwtError ? 401 : 500,
-    });
-  }
-
-  if (!membership?.company_id) {
-    throw new Response(JSON.stringify({ error: "Permesso negato su azienda" }), { status: 403 });
-  }
+  return {
+    total_rows,
+    ready_rows,
+    processing_rows,
+    pending_rows,
+    error_rows,
+  };
 }
 
 Deno.serve(async (req) => {
@@ -198,223 +212,166 @@ Deno.serve(async (req) => {
   }
 
   const supabaseUrl = resolveSupabaseUrl(req);
-  const apiKey = getApiKey(req);
+  const serviceRoleKey = (Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "").trim();
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
+
   if (!supabaseUrl) {
     return jsonResponse({ error: "Supabase non configurato", request_id: requestId }, requestId, 500);
   }
-  if (!apiKey) {
-    return jsonResponse({ error: "API key mancante", request_id: requestId }, requestId, 401);
+  if (!serviceRoleKey) {
+    return jsonResponse({ error: "SUPABASE_SERVICE_ROLE_KEY non configurata", request_id: requestId }, requestId, 500);
   }
   if (!geminiKey) {
     return jsonResponse({ error: "GEMINI_API_KEY non configurata", request_id: requestId }, requestId, 503);
   }
 
-  const token = getBearerToken(req);
-  if (!token) {
-    return jsonResponse({ error: "Authorization Bearer mancante", request_id: requestId }, requestId, 401);
+  const bearer = getBearerToken(req);
+  const apiKey = getApiKey(req);
+  const authorized = isServiceRoleCredential(bearer, serviceRoleKey) || isServiceRoleCredential(apiKey, serviceRoleKey);
+  if (!authorized) {
+    return jsonResponse({
+      error: "Richiesta non autorizzata: service_role required",
+      error_code: "AUTH_SERVICE_ROLE_REQUIRED",
+      request_id: requestId,
+    }, requestId, 401);
   }
 
-  let runId: string | null = null;
-  let lockAcquired = false;
-  let targetCompanyId: string | null = null;
-  let callerClient: ReturnType<typeof createClient> | null = null;
+  const serviceClient = createClient(supabaseUrl, serviceRoleKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
 
   try {
-    const body = await req.json().catch(() => ({}));
-    const companyId = clip(body?.company_id, 64);
-    const maxRows = Math.max(1, Math.min(Number(body?.max_rows ?? 400) || 400, 5000));
-    const batchSize = Math.max(1, Math.min(Number(body?.batch_size ?? 60) || 60, 150));
-    const ttlSeconds = Math.max(30, Math.min(Number(body?.ttl_seconds ?? 180) || 180, 900));
-    const staleSeconds = Math.max(60, Math.min(Number(body?.stale_seconds ?? 900) || 900, 7200));
+    await req.json().catch(() => ({}));
 
-    if (!companyId) {
-      return jsonResponse({ error: "company_id obbligatorio", request_id: requestId }, requestId, 400);
-    }
-    targetCompanyId = companyId;
-
-    const userClient = createClient(supabaseUrl, apiKey, {
-      auth: { persistSession: false, autoRefreshToken: false },
-      global: {
-        headers: { Authorization: `Bearer ${token}` },
-      },
-    });
-    callerClient = userClient;
-
-    await requireCompanyAccess(userClient, token, companyId);
-    runId = crypto.randomUUID();
-
-    const { data: lockRows, error: lockError } = await userClient.rpc("bank_embedding_acquire_lock", {
-      p_company_id: companyId,
-      p_run_id: runId,
-      p_ttl_seconds: ttlSeconds,
-    });
-    if (lockError) {
-      return jsonResponse({
-        error: `Errore acquisizione lock: ${lockError.message}`,
-        request_id: requestId,
-      }, requestId, 500);
-    }
-
-    const lock = Array.isArray(lockRows) && lockRows.length > 0 ? lockRows[0] : null;
-    if (!lock?.acquired) {
-      return jsonResponse({
-        status: "already_running",
-        run_id: lock?.current_run_id ?? null,
-        lock_expires_at: lock?.expires_at ?? null,
-        request_id: requestId,
-      }, requestId, 200);
-    }
-    lockAcquired = true;
-
-    const staleIso = new Date(Date.now() - (staleSeconds * 1000)).toISOString();
-    await userClient
+    const staleIso = new Date(Date.now() - (STALE_PROCESSING_SECONDS * 1000)).toISOString();
+    await serviceClient
       .from("bank_transactions")
       .update({
         embedding_status: "pending",
         embedding_error: "Requeued stale processing",
         embedding_updated_at: new Date().toISOString(),
       })
-      .eq("company_id", companyId)
       .eq("embedding_status", "processing")
       .lt("embedding_updated_at", staleIso);
 
-    await userClient
+    await serviceClient
       .from("bank_transactions")
       .update({
         embedding_status: "pending",
         embedding_error: "Requeued stale processing (missing timestamp)",
         embedding_updated_at: new Date().toISOString(),
       })
-      .eq("company_id", companyId)
       .eq("embedding_status", "processing")
       .is("embedding_updated_at", null);
 
-    let processed = 0;
+    const { data: claimRows, error: claimError } = await serviceClient
+      .rpc("bank_embedding_claim_batch");
+
+    if (claimError) {
+      return jsonResponse({
+        error: `Errore claim batch: ${claimError.message}`,
+        request_id: requestId,
+      }, requestId, 500);
+    }
+
+    const claimed = (Array.isArray(claimRows) ? claimRows : []) as ClaimedTx[];
+    if (!claimed.length) {
+      const health = await fetchGlobalHealth(serviceClient);
+      return jsonResponse({
+        status: "completed",
+        processed: 0,
+        ready: 0,
+        errors: 0,
+        health,
+        request_id: requestId,
+      }, requestId, 200);
+    }
+
+    const texts = claimed.map((tx) => buildEmbeddingText(tx));
+    let batchEmbeddings: number[][] = [];
+
+    try {
+      batchEmbeddings = await callGeminiEmbeddingBatch(geminiKey, texts);
+    } catch {
+      batchEmbeddings = [];
+    }
+
+    if (batchEmbeddings.length !== claimed.length) {
+      batchEmbeddings = [];
+      for (const text of texts) {
+        try {
+          batchEmbeddings.push(await callGeminiEmbeddingSingle(geminiKey, text));
+        } catch {
+          batchEmbeddings.push([]);
+        }
+      }
+    }
+
     let ready = 0;
     let errors = 0;
 
-    while (processed < maxRows) {
-      await userClient.rpc("bank_embedding_heartbeat_lock", {
-        p_company_id: companyId,
-        p_run_id: runId,
-        p_ttl_seconds: ttlSeconds,
-      });
+    for (let i = 0; i < claimed.length; i++) {
+      const tx = claimed[i];
+      const vec = batchEmbeddings[i] ?? [];
 
-      const currentBatch = Math.min(batchSize, maxRows - processed);
-      const { data: claimRows, error: claimError } = await userClient.rpc("bank_embedding_claim_pending", {
-        p_company_id: companyId,
-        p_batch_size: currentBatch,
-      });
-      if (claimError) {
-        throw new Error(`Errore claim pending: ${claimError.message}`);
-      }
+      if (vec.length === EXPECTED_EMBEDDING_DIMS) {
+        const { error } = await serviceClient
+          .from("bank_transactions")
+          .update({
+            embedding: toVectorLiteral(vec),
+            embedding_status: "ready",
+            embedding_model: `gemini:${GEMINI_EMBEDDING_MODEL}`,
+            embedding_error: null,
+            embedding_updated_at: new Date().toISOString(),
+          })
+          .eq("id", tx.id)
+          .eq("company_id", tx.company_id);
 
-      const claimed = (Array.isArray(claimRows) ? claimRows : []) as ClaimedTx[];
-      if (!claimed.length) break;
-
-      const texts = claimed.map((tx) => buildEmbeddingText(tx));
-      let batchEmbeddings: number[][] = [];
-
-      try {
-        batchEmbeddings = await callGeminiEmbeddingBatch(geminiKey, texts);
-      } catch {
-        batchEmbeddings = [];
-      }
-
-      if (batchEmbeddings.length !== claimed.length) {
-        batchEmbeddings = [];
-        for (const text of texts) {
-          try {
-            batchEmbeddings.push(await callGeminiEmbeddingSingle(geminiKey, text));
-          } catch {
-            batchEmbeddings.push([]);
-          }
-        }
-      }
-
-      for (let i = 0; i < claimed.length; i++) {
-        const tx = claimed[i];
-        const vec = batchEmbeddings[i] ?? [];
-        if (vec.length === EXPECTED_EMBEDDING_DIMS) {
-          const { error: applyError } = await userClient.rpc("bank_embedding_apply_result", {
-            p_company_id: companyId,
-            p_tx_id: tx.id,
-            p_embedding_text: toVectorLiteral(vec),
-            p_embedding_model: `gemini:${GEMINI_EMBEDDING_MODEL}`,
-            p_error: null,
-          });
-          if (applyError) {
-            errors++;
-            await userClient.rpc("bank_embedding_apply_result", {
-              p_company_id: companyId,
-              p_tx_id: tx.id,
-              p_embedding_text: null,
-              p_embedding_model: `gemini:${GEMINI_EMBEDDING_MODEL}`,
-              p_error: `Errore persistenza embedding: ${applyError.message}`,
-            });
-          } else {
-            ready++;
-          }
-        } else {
+        if (error) {
           errors++;
-          await userClient.rpc("bank_embedding_apply_result", {
-            p_company_id: companyId,
-            p_tx_id: tx.id,
-            p_embedding_text: null,
-            p_embedding_model: `gemini:${GEMINI_EMBEDDING_MODEL}`,
-            p_error: "Embedding non disponibile o dimensione non valida",
-          });
+          await serviceClient
+            .from("bank_transactions")
+            .update({
+              embedding_status: "error",
+              embedding_model: `gemini:${GEMINI_EMBEDDING_MODEL}`,
+              embedding_error: `Errore persistenza embedding: ${error.message}`.slice(0, 500),
+              embedding_updated_at: new Date().toISOString(),
+            })
+            .eq("id", tx.id)
+            .eq("company_id", tx.company_id);
+        } else {
+          ready++;
         }
+      } else {
+        errors++;
+        await serviceClient
+          .from("bank_transactions")
+          .update({
+            embedding_status: "error",
+            embedding_model: `gemini:${GEMINI_EMBEDDING_MODEL}`,
+            embedding_error: "Embedding non disponibile o dimensione non valida",
+            embedding_updated_at: new Date().toISOString(),
+          })
+          .eq("id", tx.id)
+          .eq("company_id", tx.company_id);
       }
-
-      processed += claimed.length;
     }
 
-    const { data: healthRows } = await userClient.rpc("bank_embedding_health", { p_company_id: companyId });
-    const health = Array.isArray(healthRows) && healthRows.length > 0 ? healthRows[0] : null;
-
+    const health = await fetchGlobalHealth(serviceClient);
     return jsonResponse({
       status: "completed",
-      run_id: runId,
-      processed,
+      processed: claimed.length,
       ready,
       errors,
       health,
       request_id: requestId,
     }, requestId, 200);
   } catch (e) {
-    if (e instanceof Response) {
-      const body = await e.text().catch(() => "{}");
-      const parsed = (() => {
-        try {
-          return JSON.parse(body);
-        } catch {
-          return { error: body || "Errore non specificato" };
-        }
-      })();
-      return jsonResponse({ ...parsed, request_id: requestId }, requestId, e.status || 500);
-    }
-
     const msg = e instanceof Error ? e.message : "Errore sconosciuto";
     return jsonResponse({
       error: msg,
       status: "failed",
-      run_id: runId,
       request_id: requestId,
     }, requestId, 500);
-  } finally {
-    if (lockAcquired && runId) {
-      try {
-        if (callerClient && targetCompanyId) {
-          await callerClient.rpc("bank_embedding_release_lock", {
-            p_company_id: targetCompanyId,
-            p_run_id: runId,
-          });
-        }
-      } catch {
-        // best effort
-      }
-    }
   }
 });

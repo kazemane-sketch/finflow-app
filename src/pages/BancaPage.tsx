@@ -13,7 +13,7 @@ import {
   updateImportBatch, loadBankTransactions, loadBankAccounts, getClaudeApiKey,
   updateBankAccountBalance,
   deleteBankTransactions, deleteAllBankTransactions, updateBankTransactionDirection,
-  getBankEmbeddingHealth, triggerBankEmbeddingBackfill,
+  getBankEmbeddingHealth,
   type BankEmbeddingHealth,
   type BankImportStats, type BankParseProgress, type BankParseResult, type BankTransaction,
 } from '@/lib/bankParser'
@@ -759,7 +759,6 @@ export default function BancaPage() {
   const [aiLoading, setAiLoading] = useState(false)
   const [aiStructuredFilter, setAiStructuredFilter] = useState<BankAiStructuredFilter | null>(null)
   const [embeddingHealth, setEmbeddingHealth] = useState<BankEmbeddingHealth | null>(null)
-  const embeddingAutoKickRef = useRef(false)
 
   // Import
   const [importing, setImporting] = useState(false)
@@ -807,41 +806,6 @@ export default function BancaPage() {
   }, [companyId, refreshEmbeddingHealth])
 
   useEffect(() => { loadData() }, [loadData])
-
-  useEffect(() => {
-    embeddingAutoKickRef.current = false
-  }, [companyId])
-
-  useEffect(() => {
-    if (!companyId) return
-    if (embeddingAutoKickRef.current) return
-    embeddingAutoKickRef.current = true
-
-    void (async () => {
-      let health = await refreshEmbeddingHealth()
-      if (!health || health.pending_rows <= 0) return
-
-      let safety = 0
-      while (health && health.pending_rows > 0 && safety < 10) {
-        try {
-          const run = await triggerBankEmbeddingBackfill(companyId, { maxRows: 500, batchSize: 80, ttlSeconds: 180 })
-          console.info('[Bank Embedding] auto-run', { company_id: companyId, attempt: safety + 1, ...run })
-        } catch (e: any) {
-          console.warn('[Bank Embedding] auto-run failed', e?.message || e)
-          break
-        }
-
-        const nextHealth = await refreshEmbeddingHealth()
-        if (!nextHealth) break
-        if (nextHealth.pending_rows >= health.pending_rows) {
-          health = nextHealth
-          break
-        }
-        health = nextHealth
-        safety += 1
-      }
-    })()
-  }, [companyId, refreshEmbeddingHealth])
 
   // Quick date filters
   const setQuickDate = (type: string) => {

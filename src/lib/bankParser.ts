@@ -649,16 +649,6 @@ export interface BankEmbeddingHealth {
   error_rows: number;
 }
 
-export interface BankEmbeddingRunResult {
-  status: 'completed' | 'already_running' | 'failed';
-  run_id?: string | null;
-  processed?: number;
-  ready?: number;
-  errors?: number;
-  health?: BankEmbeddingHealth | null;
-  request_id?: string;
-}
-
 export async function saveBankTransactions(
   companyId: string,
   bankAccountId: string,
@@ -709,12 +699,6 @@ export async function saveBankTransactions(
     }
     onProgress?.(Math.min(i + CHUNK, transactions.length), transactions.length);
   }
-  if (saved > 0) {
-    void triggerBankEmbeddingBackfill(companyId).catch((e) => {
-      console.warn('[Bank Embedding] trigger async fallito:', e?.message || e);
-    });
-  }
-
   return { saved, duplicates, dedup_db_count: duplicates, errors };
 }
 
@@ -798,32 +782,6 @@ export async function getBankEmbeddingHealth(companyId: string): Promise<BankEmb
     processing_rows: Number(row.processing_rows || 0),
     pending_rows: Number(row.pending_rows || 0),
     error_rows: Number(row.error_rows || 0),
-  };
-}
-
-export async function triggerBankEmbeddingBackfill(
-  companyId: string,
-  opts?: { maxRows?: number; batchSize?: number; ttlSeconds?: number }
-): Promise<BankEmbeddingRunResult | null> {
-  const body = {
-    company_id: companyId,
-    max_rows: opts?.maxRows ?? 400,
-    batch_size: opts?.batchSize ?? 60,
-    ttl_seconds: opts?.ttlSeconds ?? 180,
-  };
-
-  const { data, error } = await supabase.functions.invoke('bank-embed-transactions', { body });
-  if (error) throw new Error(error.message || 'Errore invoke bank-embed-transactions');
-  if (!data) return null;
-
-  return {
-    status: (data.status || 'completed') as BankEmbeddingRunResult['status'],
-    run_id: data.run_id ?? null,
-    processed: Number(data.processed || 0),
-    ready: Number(data.ready || 0),
-    errors: Number(data.errors || 0),
-    health: data.health ?? null,
-    request_id: typeof data.request_id === 'string' ? data.request_id : undefined,
   };
 }
 
