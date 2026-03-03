@@ -365,7 +365,17 @@ async function callBankAiSearchCandidatesText(
 ): Promise<CandidateTx[]> {
   const sql = postgres(getDbUrlOrThrow());
   try {
-    const rows = await sql<CandidateTx[]>`
+    const words = query.trim().split(/\s+/).map((w) => w.trim()).filter((w) => w.length >= 2);
+    if (!words.length) {
+      console.log("[text-search] words:", words, "found:", 0);
+      return [];
+    }
+
+    const wordConditions = words.map((_, i) =>
+      `(raw_text ILIKE '%' || $${i + 2} || '%' OR description ILIKE '%' || $${i + 2} || '%' OR reference ILIKE '%' || $${i + 2} || '%' OR invoice_ref ILIKE '%' || $${i + 2} || '%' OR counterparty_name ILIKE '%' || $${i + 2} || '%')`
+    ).join(" AND ");
+
+    const sqlQuery = `
       SELECT
         id,
         date,
@@ -380,17 +390,14 @@ async function callBankAiSearchCandidatesText(
         raw_text,
         0::numeric AS similarity
       FROM public.bank_transactions
-      WHERE company_id = ${companyId}
-        AND (
-          raw_text ILIKE '%' || ${query} || '%'
-          OR description ILIKE '%' || ${query} || '%'
-          OR reference ILIKE '%' || ${query} || '%'
-          OR invoice_ref ILIKE '%' || ${query} || '%'
-          OR counterparty_name ILIKE '%' || ${query} || '%'
-        )
+      WHERE company_id = $1
+        AND ${wordConditions}
       ORDER BY date DESC
-      LIMIT ${limit}
+      LIMIT $${words.length + 2}
     `;
+    const params = [companyId, ...words, limit];
+    const rows = await sql.unsafe(sqlQuery, params) as unknown as CandidateTx[];
+    console.log("[text-search] words:", words, "found:", Array.isArray(rows) ? rows.length : 0);
 
     if (!Array.isArray(rows)) {
       throw {
@@ -639,7 +646,6 @@ Deno.serve(async (req) => {
         query,
         limit,
       );
-      console.log(`[text-search] found ${candidates.length} results for query: ${query}`);
     } catch (e) {
       const status = isRpcErrorPayload(e) ? e.status : 500;
       const msg = isRpcErrorPayload(e) ? e.message : (e instanceof Error ? e.message : "Errore SQL sconosciuto");
