@@ -535,17 +535,7 @@ function TxDetail({
 // ============================================================
 // AI SEARCH
 // ============================================================
-type BankAiMode = 'filter' | 'analysis'
-
-type BankAiStructuredFilter = {
-  counterparty: string | null
-  direction: 'all' | 'in' | 'out'
-  transaction_types: string[]
-  amount_min: number | null
-  amount_max: number | null
-  date_from: string | null
-  date_to: string | null
-}
+type BankAiMode = 'analysis'
 
 type BankAiSearchRequest = {
   query: string
@@ -559,35 +549,11 @@ type BankAiSearchRequest = {
 type BankAiSearchResponse = {
   mode: BankAiMode
   answer?: string
-  filters?: BankAiStructuredFilter
   used_count?: number
   candidate_count?: number
   candidate_ids?: string[]
   model?: string
   request_id?: string
-}
-
-function normalizeBankAiFilters(raw: any): BankAiStructuredFilter | undefined {
-  if (!raw || typeof raw !== 'object') return undefined
-  const direction = raw.direction === 'in' || raw.direction === 'out' ? raw.direction : 'all'
-  const txTypes = Array.isArray(raw.transaction_types)
-    ? raw.transaction_types.map((v: any) => String(v || '').trim()).filter(Boolean)
-    : []
-  const amountMin = raw.amount_min != null && Number.isFinite(Number(raw.amount_min)) ? Number(raw.amount_min) : null
-  const amountMax = raw.amount_max != null && Number.isFinite(Number(raw.amount_max)) ? Number(raw.amount_max) : null
-  const dateFrom = typeof raw.date_from === 'string' && raw.date_from ? raw.date_from : null
-  const dateTo = typeof raw.date_to === 'string' && raw.date_to ? raw.date_to : null
-  const counterparty = typeof raw.counterparty === 'string' && raw.counterparty.trim() ? raw.counterparty.trim() : null
-
-  return {
-    counterparty,
-    direction,
-    transaction_types: txTypes,
-    amount_min: amountMin,
-    amount_max: amountMax,
-    date_from: dateFrom,
-    date_to: dateTo,
-  }
 }
 
 type BankAiErrorPayload = Error & {
@@ -677,9 +643,8 @@ async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: st
   }
 
   return {
-    mode: payload?.mode === 'filter' ? 'filter' : 'analysis',
+    mode: 'analysis' as BankAiMode,
     answer: typeof payload?.answer === 'string' ? payload.answer : undefined,
-    filters: normalizeBankAiFilters(payload?.filters),
     used_count: Number(payload?.used_count || 0),
     candidate_count: Number(payload?.candidate_count || 0),
     candidate_ids: normalizeCandidateIds(payload?.candidate_ids ?? payload?.candidateIds),
@@ -767,7 +732,6 @@ export default function BancaPage() {
   // AI search
   const [aiResult, setAiResult] = useState<{ text: string; mode: BankAiMode; isError: boolean; requestId?: string; candidateIds?: string[] } | null>(null)
   const [aiLoading, setAiLoading] = useState(false)
-  const [aiStructuredFilter, setAiStructuredFilter] = useState<BankAiStructuredFilter | null>(null)
   const [embeddingHealth, setEmbeddingHealth] = useState<BankEmbeddingHealth | null>(null)
 
   // Import
@@ -1152,10 +1116,9 @@ export default function BancaPage() {
     if (fileRef.current) fileRef.current.value = ''
   }, [companyId, finalizeImport])
 
-  // Filters (defined before handleAiSearch so it can reference it)
+  // Filters — AI candidateIds have absolute priority
   const filtered = transactions.filter(tx => {
     if (aiResult?.candidateIds?.length) {
-      console.log('[AI] candidateIds:', aiResult?.candidateIds)
       return aiResult.candidateIds.includes(tx.id)
     }
 
@@ -1166,22 +1129,6 @@ export default function BancaPage() {
     if (typeFilter !== 'all' && tx.transaction_type !== typeFilter) return false
     if (dateFrom && tx.date < dateFrom) return false
     if (dateTo && tx.date > dateTo) return false
-
-    if (aiStructuredFilter) {
-      const amountAbs = Math.abs(Number(tx.amount || 0))
-      if (aiStructuredFilter.amount_min != null && amountAbs < aiStructuredFilter.amount_min) return false
-      if (aiStructuredFilter.amount_max != null && amountAbs > aiStructuredFilter.amount_max) return false
-
-      if (aiStructuredFilter.transaction_types.length > 0) {
-        const txType = String(tx.transaction_type || '')
-        if (!aiStructuredFilter.transaction_types.includes(txType)) return false
-      }
-
-      if (aiStructuredFilter.counterparty) {
-        const cp = String(tx.counterparty_name || '').toLowerCase()
-        if (!cp.includes(aiStructuredFilter.counterparty.toLowerCase())) return false
-      }
-    }
 
     if (query) {
       const q = query.toLowerCase()
@@ -1216,60 +1163,16 @@ export default function BancaPage() {
 
       const result = await askBankAiSearch(payload)
       console.log('AI result candidate_ids:', result.candidate_ids)
-      if (result.mode === 'filter') {
-        const filters = result.filters || null
-        setAiStructuredFilter(filters)
-        if (filters) {
-          setDirFilter(filters.direction || 'all')
-          if (filters.date_from || filters.date_to) {
-            setDateFrom(filters.date_from || '')
-            setDateTo(filters.date_to || '')
-          }
-          if (filters.transaction_types.length === 1) {
-            setTypeFilter(filters.transaction_types[0])
-          } else {
-            setTypeFilter('all')
-          }
-          if (filters.counterparty) {
-            setQuery(filters.counterparty)
-          } else if (
-            filters.amount_min != null ||
-            filters.amount_max != null ||
-            filters.transaction_types.length > 0 ||
-            filters.date_from ||
-            filters.date_to
-          ) {
-            setQuery('')
-          }
-        }
-
-        const filterLines = [
-          result.answer || 'Filtri AI applicati.',
-          `Direzione: ${filters?.direction || 'all'} · Tipi: ${filters?.transaction_types?.length ? filters.transaction_types.join(', ') : 'tutti'}`,
-          `Importi: min ${filters?.amount_min != null ? fmtEur(filters.amount_min) : '—'} · max ${filters?.amount_max != null ? fmtEur(filters.amount_max) : '—'}`,
-          `Periodo: ${filters?.date_from || '—'} → ${filters?.date_to || '—'}`,
-          `Request ID: ${result.request_id || 'n.d.'}`,
-        ]
-        setAiResult({
-          text: filterLines.join('\n'),
-          mode: 'filter',
-          isError: false,
-          requestId: result.request_id,
-          candidateIds: result.candidate_ids || [],
-        })
-      } else {
-        setAiStructuredFilter(null)
-        const scopeLine = `\n\nScope AI: ${Number(result.candidate_count || 0)} candidati · ${Number(result.used_count || 0)} usati nel prompt` +
-          `${result.model ? ` · modello: ${result.model}` : ''}` +
-          `${result.request_id ? ` · request: ${result.request_id}` : ''}`
-        setAiResult({
-          text: `${result.answer || 'Nessuna risposta AI.'}${scopeLine}`,
-          mode: 'analysis',
-          isError: false,
-          requestId: result.request_id,
-          candidateIds: result.candidate_ids || [],
-        })
-      }
+      const scopeLine = `\n\nScope AI: ${Number(result.candidate_count || 0)} candidati · ${(result.candidate_ids || []).length} pertinenti` +
+        `${result.model ? ` · modello: ${result.model}` : ''}` +
+        `${result.request_id ? ` · request: ${result.request_id}` : ''}`
+      setAiResult({
+        text: `${result.answer || 'Nessuna risposta AI.'}${scopeLine}`,
+        mode: 'analysis',
+        isError: false,
+        requestId: result.request_id,
+        candidateIds: result.candidate_ids || [],
+      })
     } catch (e: any) {
       const err = e as BankAiErrorPayload
       const reason = String(err?.message || 'Errore AI non disponibile').trim()
@@ -1510,7 +1413,7 @@ export default function BancaPage() {
                       aiResult ? (aiResult.isError ? 'border-red-300 focus:ring-red-400 bg-red-50' : 'border-purple-300 focus:ring-purple-400 bg-purple-50') : 'border-gray-200 focus:ring-sky-500'
                     }`}
                   />
-                  {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => { setQuery(''); setAiResult(null); setAiStructuredFilter(null) }}><X className="h-3.5 w-3.5" /></button>}
+                  {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => { setQuery(''); setAiResult(null) }}><X className="h-3.5 w-3.5" /></button>}
                 </div>
                 {(['all', 'in', 'out', 'review'] as const).map(d => (
                   <button key={d} onClick={() => setDirFilter(d)}
@@ -1565,18 +1468,6 @@ export default function BancaPage() {
                     {aiResult.isError && (
                       <Button variant="outline" size="sm" onClick={handleAiSearch} disabled={aiLoading}>
                         {aiLoading ? 'Riprovo...' : 'Riprova'}
-                      </Button>
-                    )}
-                    {aiResult.mode === 'filter' && aiStructuredFilter && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => {
-                          setAiStructuredFilter(null)
-                          setAiResult(null)
-                        }}
-                      >
-                        Rimuovi filtro AI
                       </Button>
                     )}
                     <button

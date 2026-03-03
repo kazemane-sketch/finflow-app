@@ -15,14 +15,13 @@ const EXPECTED_EMBEDDING_DIMS = Math.max(1, Number(Deno.env.get("BANK_AI_EMBEDDI
 const MAX_CANDIDATES = 50;
 
 type DirectionFilter = "all" | "in" | "out";
-type AiMode = "filter" | "analysis";
 type AppErrorPayload = {
   status: number;
   error: string;
   error_code: string;
   hint?: string;
   details?: string;
-  mode?: AiMode;
+  mode?: string;
 };
 
 type RpcError = {
@@ -46,15 +45,6 @@ type CandidateTx = {
   similarity?: number | null;
 };
 
-type BankFilterSpec = {
-  counterparty: string | null;
-  direction: DirectionFilter;
-  transaction_types: string[];
-  amount_min: number | null;
-  amount_max: number | null;
-  date_from: string | null;
-  date_to: string | null;
-};
 
 function jsonResponse(body: unknown, requestId: string, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -73,7 +63,7 @@ function appError(
   errorCode: string,
   hint?: string,
   details?: string,
-  mode?: AiMode,
+  mode?: string,
 ): AppErrorPayload {
   return {
     status,
@@ -131,134 +121,59 @@ function parseDirection(v: unknown): DirectionFilter {
   return "all";
 }
 
-function parseAmountIT(value: string): number | null {
-  const normalized = value
-    .replace(/\s+/g, "")
-    .replace(/\.(?=\d{3}(?:\D|$))/g, "")
-    .replace(",", ".")
-    .replace(/[^0-9.-]/g, "");
-  const n = Number(normalized);
-  return Number.isFinite(n) ? Math.abs(n) : null;
-}
-
-function parseYearRange(query: string): { from: string; to: string } | null {
-  const yearMatch = query.match(/\b(20\d{2})\b/);
-  if (!yearMatch) return null;
-  const year = Number(yearMatch[1]);
-  if (year < 2000 || year > 2100) return null;
-  return {
-    from: `${year}-01-01`,
-    to: `${year}-12-31`,
-  };
-}
-
-function parseQuarterRange(query: string): { from: string; to: string } | null {
-  const q = query.toLowerCase();
-  const quarterMatch = q.match(/\bq([1-4])\b/) || q.match(/\b([1-4])(?:o|°)?\s*trimestre\b/);
-  if (!quarterMatch) return null;
-  const quarter = Number(quarterMatch[1]);
-  const yearRange = parseYearRange(q);
-  const year = yearRange ? Number(yearRange.from.slice(0, 4)) : new Date().getFullYear();
-  const quarterRanges: Record<number, { from: string; to: string }> = {
-    1: { from: `${year}-01-01`, to: `${year}-03-31` },
-    2: { from: `${year}-04-01`, to: `${year}-06-30` },
-    3: { from: `${year}-07-01`, to: `${year}-09-30` },
-    4: { from: `${year}-10-01`, to: `${year}-12-31` },
-  };
-  return quarterRanges[quarter] ?? null;
-}
-
-function extractCounterparty(query: string): string | null {
-  const lower = query.toLowerCase();
-  const m = lower.match(/\b(?:da|verso|a favore di|a)\s+([a-z0-9 .&'/-]{3,})$/i);
-  if (!m?.[1]) return null;
-  const candidate = m[1].trim();
-  if (!candidate) return null;
-  if (/(?:\b(202\d|q[1-4]|trimestre|bonific|sdd|f24|moviment|sopra|sotto)\b)/i.test(candidate)) return null;
-  return candidate;
-}
-
-function detectTransactionTypes(query: string): string[] {
-  const q = query.toLowerCase();
-  const out: string[] = [];
-  if (/\bbonific/i.test(q)) out.push("bonifico_in", "bonifico_out");
-  if (/\bsdd\b|\brid\b/i.test(q)) out.push("sdd");
-  if (/\briba\b/i.test(q)) out.push("riba");
-  if (/\bf24\b/i.test(q)) out.push("f24");
-  if (/\bcommission/i.test(q)) out.push("commissione");
-  if (/\bstipend/i.test(q)) out.push("stipendio");
-  if (/\bpos\b/i.test(q)) out.push("pos");
-  if (/\bpreliev/i.test(q)) out.push("prelievo");
-  return Array.from(new Set(out));
-}
-
-function detectDirection(query: string): DirectionFilter {
-  const q = query.toLowerCase();
-  const hasIn = /\b(entrat|incass|accredit|ricevut)/i.test(q);
-  const hasOut = /\b(uscit|pagament|addebito|spes|fornitor|f24|sdd|rid)/i.test(q);
-  if (hasIn && !hasOut) return "in";
-  if (hasOut && !hasIn) return "out";
-  return "all";
-}
-
-function detectAmountBounds(query: string): { min: number | null; max: number | null } {
-  const q = query.toLowerCase();
-  const numbers = Array.from(q.matchAll(/(?:€\s*)?-?\d[\d.,]*/g))
-    .map((m) => parseAmountIT(m[0]))
-    .filter((v): v is number => v != null && v > 0);
-
-  if (!numbers.length) return { min: null, max: null };
-
-  const between = q.match(/(?:tra|fra)\s+([0-9.,\s€]+)\s+(?:e|-)\s+([0-9.,\s€]+)/i);
-  if (between?.[1] && between?.[2]) {
-    const a = parseAmountIT(between[1]);
-    const b = parseAmountIT(between[2]);
-    if (a != null && b != null) return { min: Math.min(a, b), max: Math.max(a, b) };
-  }
-
-  if (/\b(sopra|oltre|maggior|superior|almeno)\b/i.test(q)) return { min: numbers[0], max: null };
-  if (/\b(sotto|inferior|minor|massimo|fino a)\b/i.test(q)) return { min: null, max: numbers[0] };
-  return { min: null, max: null };
-}
-
-function isFilterMode(query: string): boolean {
-  const q = query.toLowerCase();
-  const filterKeywords = /\b(tutti|tutte|elenco|lista|mostra|fammi vedere|movimenti|bonific|sdd|rid|f24|sopra|sotto|dal|al|nel|del)\b/i;
-  const analysisKeywords = /\b(quanto|totale|somma|media|trend|analizza|analisi|doppi|duplicati|anomali|perche|motivo)\b/i;
-  return filterKeywords.test(q) && !analysisKeywords.test(q);
-}
-
-function buildFilterSpec(rawQuery: string): BankFilterSpec {
-  const query = rawQuery.toLowerCase();
-  const yearRange = parseYearRange(query);
-  const quarterRange = parseQuarterRange(query);
-  const amountBounds = detectAmountBounds(query);
-  const txTypes = detectTransactionTypes(query);
-
-  return {
-    counterparty: extractCounterparty(rawQuery),
-    direction: detectDirection(query),
-    transaction_types: txTypes,
-    amount_min: amountBounds.min,
-    amount_max: amountBounds.max,
-    date_from: quarterRange?.from ?? yearRange?.from ?? null,
-    date_to: quarterRange?.to ?? yearRange?.to ?? null,
-  };
-}
 
 function buildPrompt(query: string, candidates: CandidateTx[]): string {
   return [
-    "Sei un assistente contabile che risponde a domande su movimenti bancari.",
-    "Usa SOLO i movimenti forniti in input.",
-    "Non inventare dati o transazioni mancanti.",
+    "Sei un assistente contabile che analizza movimenti bancari.",
+    "Usa SOLO i movimenti forniti in input. Non inventare dati.",
     "Se mancano dati sufficienti, dillo chiaramente.",
-    "Rispondi in italiano, in modo pratico e sintetico.",
+    "",
+    "ISTRUZIONI:",
+    "1. Rispondi alla domanda dell'utente basandoti sui movimenti candidati.",
+    "2. Identifica quali movimenti sono EFFETTIVAMENTE pertinenti alla domanda.",
+    "3. Rispondi ESCLUSIVAMENTE con un oggetto JSON valido (senza markdown, senza ```), con questa struttura:",
+    '{"answer": "La tua risposta in italiano con formattazione markdown, pratica e sintetica", "pertinent_ids": ["id1", "id2"]}',
+    "",
+    "REGOLE per pertinent_ids:",
+    "- Includi SOLO gli ID dei movimenti che rispondono direttamente alla domanda.",
+    "- Se la domanda chiede un elenco generico (es. 'mostra gli SDD di dicembre'), includi tutti quelli pertinenti.",
+    "- Se la domanda è specifica (es. un numero di mandato, un importo preciso, una controparte), includi solo quelli che corrispondono.",
+    "- NON includere movimenti che contengono parole in comune ma non sono pertinenti alla domanda.",
     "",
     `Domanda utente: ${query}`,
     "",
     `Movimenti candidati (${candidates.length}):`,
     JSON.stringify(candidates),
   ].join("\n");
+}
+
+function parseAnthropicResponse(raw: string, allCandidateIds: string[]): { answer: string; pertinentIds: string[] } {
+  const tryParse = (text: string): { answer: string; pertinentIds: string[] } | null => {
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed.answer === "string" && Array.isArray(parsed.pertinent_ids)) {
+        const validIds = parsed.pertinent_ids.filter(
+          (id: unknown) => typeof id === "string" && allCandidateIds.includes(id),
+        );
+        return { answer: parsed.answer, pertinentIds: validIds.length > 0 ? validIds : allCandidateIds };
+      }
+    } catch { /* not valid JSON */ }
+    return null;
+  };
+
+  // Try parsing the whole response as JSON
+  const direct = tryParse(raw);
+  if (direct) return direct;
+
+  // Try extracting JSON from markdown code block
+  const jsonMatch = raw.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+  if (jsonMatch?.[1]) {
+    const fromBlock = tryParse(jsonMatch[1].trim());
+    if (fromBlock) return fromBlock;
+  }
+
+  // Fallback: treat entire response as answer, return all candidates
+  return { answer: raw, pertinentIds: allCandidateIds };
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
@@ -615,19 +530,6 @@ Deno.serve(async (req) => {
 
     await requireCompanyAccess(userClient, token, companyId, requestId);
 
-    if (isFilterMode(query)) {
-      const filters = buildFilterSpec(query);
-      return jsonResponse({
-        mode: "filter" as AiMode,
-        filters,
-        answer: "Filtri strutturati estratti dalla richiesta. Applico la vista elenco completa.",
-        candidate_count: 0,
-        used_count: 0,
-        model: "bank-filter-parser:v1",
-        request_id: requestId,
-      }, requestId, 200);
-    }
-
     if (!anthropicKey) {
       return errorResponse(appError(
         503,
@@ -732,7 +634,7 @@ Deno.serve(async (req) => {
     }
     if (!candidates.length) {
       return jsonResponse({
-        mode: "analysis" as AiMode,
+        mode: "analysis",
         answer: "Nessun movimento compatibile trovato con i filtri correnti.",
         candidate_count: 0,
         candidate_ids: [],
@@ -743,9 +645,9 @@ Deno.serve(async (req) => {
     }
 
     const prompt = buildPrompt(query, candidates);
-    let answer = "";
+    let rawAnswer = "";
     try {
-      answer = await callAnthropic(anthropicKey, prompt);
+      rawAnswer = await callAnthropic(anthropicKey, prompt);
     } catch (e) {
       const providerError = e instanceof Error ? e.message : "Anthropic errore sconosciuto";
       return errorResponse(appError(
@@ -758,11 +660,15 @@ Deno.serve(async (req) => {
       ), requestId);
     }
 
+    const allCandidateIds = candidates.map((c) => c.id);
+    const { answer, pertinentIds } = parseAnthropicResponse(rawAnswer, allCandidateIds);
+    console.log(`[ai-response] candidates: ${allCandidateIds.length}, pertinent: ${pertinentIds.length}`);
+
     return jsonResponse({
-      mode: "analysis" as AiMode,
+      mode: "analysis",
       answer,
       candidate_count: candidates.length,
-      candidate_ids: candidates.map((c) => c.id),
+      candidate_ids: pertinentIds,
       used_count: candidates.length,
       model: `anthropic:${ANTHROPIC_MODEL}`,
       request_id: requestId,
