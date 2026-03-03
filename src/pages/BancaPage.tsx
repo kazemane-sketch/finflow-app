@@ -532,7 +532,7 @@ async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: st
     used_count: Number(payload?.used_count || 0),
     candidate_count: Number(payload?.candidate_count || 0),
     candidate_ids: normalizeCandidateIds(payload?.candidate_ids ?? payload?.candidateIds),
-    filter: responseMode === 'filter' && payload?.filter ? payload.filter as BankAiFilterSpec : undefined,
+    filter: payload?.filter && typeof payload.filter === 'object' ? payload.filter as BankAiFilterSpec : undefined,
     model: typeof payload?.model === 'string' ? payload.model : undefined,
     request_id: typeof payload?.request_id === 'string' ? payload.request_id : requestId,
   }
@@ -1048,10 +1048,14 @@ export default function BancaPage() {
 
       const result = await askBankAiSearch(payload)
 
+      console.log('[Banca AI] raw result:', JSON.stringify({ mode: result.mode, hasFilter: !!result.filter, filter: result.filter, answer: result.answer?.slice(0, 80) }))
+
       // Filter mode: AI returned structured filter params → apply locally
-      if (result.mode === 'filter' && result.filter) {
+      // Check both mode === 'filter' and presence of filter object (defensive)
+      const isFilterMode = (result.mode === 'filter' || !!result.filter) && result.filter
+      if (isFilterMode) {
         console.log('[Banca AI] filter mode:', result.filter)
-        const f = result.filter
+        const f = result.filter!
         if (f.date_from) setDateFrom(f.date_from)
         if (f.date_to) setDateTo(f.date_to)
         if (f.direction === 'in' || f.direction === 'out') setDirFilter(f.direction)
@@ -1067,6 +1071,7 @@ export default function BancaPage() {
         // Analysis mode: use candidateIds as before
         console.log('AI result candidate_ids:', result.candidate_ids)
         const scopeLine = `\n\nScope AI: ${Number(result.candidate_count || 0)} candidati · ${(result.candidate_ids || []).length} pertinenti` +
+          ` · mode: ${result.mode || 'n/d'}` +
           `${result.model ? ` · modello: ${result.model}` : ''}` +
           `${result.request_id ? ` · request: ${result.request_id}` : ''}`
         setAiResult({
