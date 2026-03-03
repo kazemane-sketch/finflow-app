@@ -639,6 +639,7 @@ Deno.serve(async (req) => {
         query,
         limit,
       );
+      console.log(`[text-search] found ${candidates.length} results for query: ${query}`);
     } catch (e) {
       const status = isRpcErrorPayload(e) ? e.status : 500;
       const msg = isRpcErrorPayload(e) ? e.message : (e instanceof Error ? e.message : "Errore SQL sconosciuto");
@@ -699,6 +700,7 @@ Deno.serve(async (req) => {
           dateFrom,
           dateTo,
         );
+        console.log(`[vector-search] found ${candidates.length} results for query: ${query}`);
       } catch (e) {
         const status = isRpcErrorPayload(e) ? e.status : 500;
         const msg = isRpcErrorPayload(e) ? e.message : (e instanceof Error ? e.message : "Errore SQL sconosciuto");
@@ -727,6 +729,7 @@ Deno.serve(async (req) => {
         mode: "analysis" as AiMode,
         answer: "Nessun movimento compatibile trovato con i filtri correnti.",
         candidate_count: 0,
+        candidate_ids: [],
         used_count: 0,
         model: "analysis:none",
         request_id: requestId,
@@ -753,6 +756,7 @@ Deno.serve(async (req) => {
       mode: "analysis" as AiMode,
       answer,
       candidate_count: candidates.length,
+      candidate_ids: candidates.map((c) => c.id),
       used_count: candidates.length,
       model: `anthropic:${ANTHROPIC_MODEL}`,
       request_id: requestId,

@@ -1155,7 +1155,8 @@ export default function BancaPage() {
   // Filters (defined before handleAiSearch so it can reference it)
   const filtered = transactions.filter(tx => {
     if (aiResult?.candidateIds?.length) {
-      return aiResult.candidateIds.includes(String(tx.id || ''))
+      console.log('[AI] candidateIds:', aiResult?.candidateIds)
+      return aiResult.candidateIds.includes(tx.id)
     }
 
     const direction = txDirection(tx)
@@ -1258,7 +1259,7 @@ export default function BancaPage() {
         })
       } else {
         setAiStructuredFilter(null)
-        const scopeLine = `\n\nScope AI: ${Number(result.candidate_count || 0)} candidati pgvector · ${Number(result.used_count || 0)} usati nel prompt` +
+        const scopeLine = `\n\nScope AI: ${Number(result.candidate_count || 0)} candidati · ${Number(result.used_count || 0)} usati nel prompt` +
           `${result.model ? ` · modello: ${result.model}` : ''}` +
           `${result.request_id ? ` · request: ${result.request_id}` : ''}`
         setAiResult({
