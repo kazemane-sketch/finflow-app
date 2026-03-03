@@ -16,6 +16,14 @@ const EXPECTED_EMBEDDING_DIMS = 3072;
 
 type DirectionFilter = "all" | "in" | "out";
 type AiMode = "filter" | "analysis";
+type AppErrorPayload = {
+  status: number;
+  error: string;
+  error_code: string;
+  hint?: string;
+  details?: string;
+  mode?: AiMode;
+};
 
 type CandidateTx = {
   id: string;
@@ -50,6 +58,53 @@ function jsonResponse(body: unknown, requestId: string, status = 200): Response 
       "x-request-id": requestId,
     },
   });
+}
+
+function appError(
+  status: number,
+  error: string,
+  errorCode: string,
+  hint?: string,
+  details?: string,
+  mode?: AiMode,
+): AppErrorPayload {
+  return {
+    status,
+    error,
+    error_code: errorCode,
+    hint,
+    details,
+    mode,
+  };
+}
+
+function isAppErrorPayload(e: unknown): e is AppErrorPayload {
+  const x = e as AppErrorPayload | null;
+  return !!x && typeof x.status === "number" && typeof x.error === "string" && typeof x.error_code === "string";
+}
+
+function errorResponse(err: AppErrorPayload, requestId: string): Response {
+  return jsonResponse({
+    error: err.error,
+    error_code: err.error_code,
+    hint: err.hint,
+    details: err.details,
+    mode: err.mode,
+    request_id: requestId,
+  }, requestId, err.status);
+}
+
+function parseJwtRole(token: string): string | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = `${base64}${"=".repeat((4 - (base64.length % 4)) % 4)}`;
+    const payload = JSON.parse(atob(padded));
+    return typeof payload?.role === "string" ? payload.role : null;
+  } catch {
+    return null;
+  }
 }
 
 function clip(v: unknown, max = 500): string {
@@ -336,10 +391,33 @@ async function requireCompanyAccess(
   admin: ReturnType<typeof createClient>,
   token: string,
   companyId: string,
+  requestId: string,
 ): Promise<{ userId: string }> {
+  const role = parseJwtRole(token);
+  if (role === "anon") {
+    throw appError(
+      401,
+      "Token anon non valido per questa operazione",
+      "AUTH_USER_TOKEN_REQUIRED",
+      "Effettua il login utente e riprova.",
+    );
+  }
+
   const { data: userData, error: userError } = await admin.auth.getUser(token);
   if (userError || !userData?.user?.id) {
-    throw new Response(JSON.stringify({ error: "Sessione non valida" }), { status: 401 });
+    console.error(JSON.stringify({
+      request_id: requestId,
+      company_id: companyId,
+      auth_stage: "get_user",
+      supabase_error: userError?.message ?? null,
+    }));
+    throw appError(
+      401,
+      "JWT non valido o scaduto",
+      "AUTH_INVALID_JWT",
+      "Rifai login e riprova.",
+      userError?.message ?? undefined,
+    );
   }
 
   const { data: membership, error: membershipError } = await admin
@@ -350,7 +428,20 @@ async function requireCompanyAccess(
     .maybeSingle();
 
   if (membershipError || !membership?.company_id) {
-    throw new Response(JSON.stringify({ error: "Permesso negato su azienda" }), { status: 403 });
+    console.error(JSON.stringify({
+      request_id: requestId,
+      company_id: companyId,
+      auth_stage: "company_membership",
+      supabase_error: membershipError?.message ?? null,
+      user_id: userData.user.id,
+    }));
+    throw appError(
+      403,
+      "Permesso negato su azienda",
+      "AUTH_COMPANY_FORBIDDEN",
+      "Verifica di essere membro dell'azienda selezionata.",
+      membershipError?.message ?? undefined,
+    );
   }
 
   return { userId: userData.user.id };
@@ -360,7 +451,7 @@ Deno.serve(async (req) => {
   const requestId = crypto.randomUUID();
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   if (req.method !== "POST") {
-    return jsonResponse({ error: "Method not allowed", request_id: requestId }, requestId, 405);
+    return errorResponse(appError(405, "Method not allowed", "METHOD_NOT_ALLOWED"), requestId);
   }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
@@ -368,12 +459,17 @@ Deno.serve(async (req) => {
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
   if (!supabaseUrl || !serviceRoleKey) {
-    return jsonResponse({ error: "Supabase non configurato", request_id: requestId }, requestId, 500);
+    return errorResponse(appError(500, "Supabase non configurato", "CONFIG_SUPABASE_MISSING"), requestId);
   }
 
   const token = getBearerToken(req);
   if (!token) {
-    return jsonResponse({ error: "Authorization Bearer mancante", request_id: requestId }, requestId, 401);
+    return errorResponse(appError(
+      401,
+      "Authorization Bearer mancante",
+      "AUTH_BEARER_MISSING",
+      "Invia il JWT utente in header Authorization.",
+    ), requestId);
   }
 
   try {
@@ -386,17 +482,17 @@ Deno.serve(async (req) => {
     const limit = Math.max(1, Math.min(Number(body?.limit ?? MAX_CANDIDATES) || MAX_CANDIDATES, MAX_CANDIDATES));
 
     if (!query) {
-      return jsonResponse({ error: "query obbligatoria", request_id: requestId }, requestId, 400);
+      return errorResponse(appError(400, "query obbligatoria", "VALIDATION_QUERY_REQUIRED"), requestId);
     }
     if (!companyId) {
-      return jsonResponse({ error: "company_id obbligatorio", request_id: requestId }, requestId, 400);
+      return errorResponse(appError(400, "company_id obbligatorio", "VALIDATION_COMPANY_REQUIRED"), requestId);
     }
 
     const admin = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
 
-    await requireCompanyAccess(admin, token, companyId);
+    await requireCompanyAccess(admin, token, companyId, requestId);
 
     if (isFilterMode(query)) {
       const filters = buildFilterSpec(query);
@@ -412,11 +508,14 @@ Deno.serve(async (req) => {
     }
 
     if (!geminiKey) {
-      return jsonResponse({
-        error: "GEMINI_API_KEY non configurata",
-        mode: "analysis" as AiMode,
-        request_id: requestId,
-      }, requestId, 503);
+      return errorResponse(appError(
+        503,
+        "GEMINI_API_KEY non configurata",
+        "CONFIG_GEMINI_API_KEY_MISSING",
+        "Configura il secret GEMINI_API_KEY nelle Edge Functions.",
+        undefined,
+        "analysis",
+      ), requestId);
     }
 
     const queryEmbedding = await callGeminiEmbedding(geminiKey, enrichQueryWithMonthHints(query), "RETRIEVAL_QUERY");
@@ -432,11 +531,20 @@ Deno.serve(async (req) => {
     });
 
     if (candidateError) {
-      return jsonResponse({
-        error: `Errore ricerca candidati: ${candidateError.message}`,
-        mode: "analysis" as AiMode,
+      console.error(JSON.stringify({
         request_id: requestId,
-      }, requestId, 500);
+        company_id: companyId,
+        auth_stage: "candidate_query",
+        supabase_error: candidateError.message,
+      }));
+      return errorResponse(appError(
+        500,
+        "Errore ricerca candidati",
+        "AI_CANDIDATES_QUERY_FAILED",
+        "Riprova tra pochi secondi.",
+        candidateError.message,
+        "analysis",
+      ), requestId);
     }
 
     const candidates = (Array.isArray(candidateData) ? candidateData : []) as CandidateTx[];
@@ -475,11 +583,14 @@ Deno.serve(async (req) => {
     }
 
     if (!answer) {
-      return jsonResponse({
-        error: `Nessun provider AI disponibile: ${providerErrors.join(" | ") || "errore sconosciuto"}`,
-        mode: "analysis" as AiMode,
-        request_id: requestId,
-      }, requestId, 503);
+      return errorResponse(appError(
+        503,
+        "Nessun provider AI disponibile",
+        "AI_PROVIDER_UNAVAILABLE",
+        "Verifica i secret provider e riprova.",
+        providerErrors.join(" | ") || "errore sconosciuto",
+        "analysis",
+      ), requestId);
     }
 
     return jsonResponse({
@@ -491,19 +602,16 @@ Deno.serve(async (req) => {
       request_id: requestId,
     }, requestId, 200);
   } catch (e) {
-    if (e instanceof Response) {
-      const body = await e.text().catch(() => "{}");
-      const parsed = (() => {
-        try {
-          return JSON.parse(body);
-        } catch {
-          return { error: body || "Errore non specificato" };
-        }
-      })();
-      return jsonResponse({ ...parsed, request_id: requestId }, requestId, e.status || 500);
+    if (isAppErrorPayload(e)) {
+      return errorResponse(e, requestId);
     }
 
     const msg = e instanceof Error ? e.message : "Errore sconosciuto";
-    return jsonResponse({ error: msg, request_id: requestId }, requestId, 500);
+    console.error(JSON.stringify({
+      request_id: requestId,
+      auth_stage: "unhandled",
+      supabase_error: msg,
+    }));
+    return errorResponse(appError(500, "Errore interno bank-ai-search", "INTERNAL_ERROR", "Riprova tra poco.", msg), requestId);
   }
 });

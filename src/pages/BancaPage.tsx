@@ -1,5 +1,6 @@
 // src/pages/BancaPage.tsx
 import { useState, useEffect, useCallback, useRef, type MouseEvent } from 'react'
+import { toast } from 'sonner'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useCompany } from '@/hooks/useCompany'
@@ -592,6 +593,8 @@ type BankAiErrorPayload = Error & {
   status?: number
   requestId?: string
   details?: string
+  errorCode?: string
+  hint?: string
 }
 
 function createBankAiError(message: string, extra?: Partial<BankAiErrorPayload>): BankAiErrorPayload {
@@ -599,6 +602,8 @@ function createBankAiError(message: string, extra?: Partial<BankAiErrorPayload>)
   if (extra?.status != null) err.status = extra.status
   if (extra?.requestId) err.requestId = extra.requestId
   if (extra?.details) err.details = extra.details
+  if (extra?.errorCode) err.errorCode = extra.errorCode
+  if (extra?.hint) err.hint = extra.hint
   return err
 }
 
@@ -610,24 +615,6 @@ async function parseResponsePayload(res: Response): Promise<{ payload: any; rawT
   } catch {
     return { payload: {}, rawText }
   }
-}
-
-async function parseInvokeError(error: any): Promise<BankAiErrorPayload> {
-  const baseMessage = String(error?.message || 'Errore AI search')
-  const context = error?.context
-  if (!(context instanceof Response)) {
-    return createBankAiError(baseMessage)
-  }
-
-  const status = context.status
-  const requestId = context.headers.get('x-request-id') || context.headers.get('sb-request-id') || undefined
-  const { payload, rawText } = await parseResponsePayload(context)
-  const details = String(payload?.error || payload?.message || rawText || '').trim()
-  return createBankAiError(details || baseMessage, {
-    status,
-    requestId,
-    details: details || undefined,
-  })
 }
 
 async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: string): Promise<BankAiSearchResponse> {
@@ -642,6 +629,8 @@ async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: st
   })
   const requestId = res.headers.get('x-request-id') || res.headers.get('sb-request-id') || undefined
   const { payload, rawText } = await parseResponsePayload(res)
+  const errorCode = typeof payload?.error_code === 'string' ? payload.error_code : undefined
+  const hint = typeof payload?.hint === 'string' ? payload.hint : undefined
 
   if (!res.ok) {
     const msg = String(payload?.error || payload?.message || rawText || `HTTP ${res.status}`).trim()
@@ -649,6 +638,8 @@ async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: st
       status: res.status,
       requestId,
       details: msg || undefined,
+      errorCode,
+      hint,
     })
   }
 
@@ -657,6 +648,8 @@ async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: st
       status: res.status,
       requestId: String(payload?.request_id || requestId || ''),
       details: String(payload.error),
+      errorCode,
+      hint,
     })
   }
 
@@ -672,38 +665,44 @@ async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: st
 }
 
 async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchResponse> {
-  const firstAttempt = async (): Promise<BankAiSearchResponse> => {
-    const { data, error } = await supabase.functions.invoke('bank-ai-search', { body })
-    if (error) throw await parseInvokeError(error)
-    if (!data) throw createBankAiError('Risposta AI vuota')
-    if (data?.error) {
-      throw createBankAiError(String(data.error), {
-        requestId: typeof data?.request_id === 'string' ? data.request_id : undefined,
+  const readSessionToken = async (): Promise<string> => {
+    const { data: sessionData } = await supabase.auth.getSession()
+    const token = sessionData?.session?.access_token
+    if (!token) {
+      throw createBankAiError('Sessione assente: effettua nuovamente il login.', {
+        status: 401,
+        errorCode: 'AUTH_SESSION_MISSING',
+        hint: 'Rifai login e riprova.',
       })
     }
-    return {
-      mode: data?.mode === 'filter' ? 'filter' : 'analysis',
-      answer: typeof data?.answer === 'string' ? data.answer : undefined,
-      filters: normalizeBankAiFilters(data?.filters),
-      used_count: Number(data?.used_count || 0),
-      candidate_count: Number(data?.candidate_count || 0),
-      model: typeof data?.model === 'string' ? data.model : undefined,
-      request_id: typeof data?.request_id === 'string' ? data.request_id : undefined,
-    }
+    return token
   }
 
+  const firstToken = await readSessionToken()
   try {
-    return await firstAttempt()
+    return await invokeBankAiWithBearer(body, firstToken)
   } catch (e: any) {
     const parsed = e as BankAiErrorPayload
     const shouldRetryAuth = parsed?.status === 401 || parsed?.status === 403
     if (!shouldRetryAuth) throw parsed
 
     await supabase.auth.refreshSession().catch(() => null)
-    const { data: sessionData } = await supabase.auth.getSession()
-    const accessToken = sessionData?.session?.access_token
-    if (!accessToken) throw parsed
-    return await invokeBankAiWithBearer(body, accessToken)
+    const refreshedToken = await readSessionToken()
+    try {
+      return await invokeBankAiWithBearer(body, refreshedToken)
+    } catch (e2: any) {
+      const parsedSecond = e2 as BankAiErrorPayload
+      if (parsedSecond?.status === 401 || parsedSecond?.status === 403) {
+        throw createBankAiError(parsedSecond.message || 'Sessione non valida o scaduta.', {
+          status: parsedSecond.status,
+          requestId: parsedSecond.requestId,
+          details: parsedSecond.details,
+          errorCode: parsedSecond.errorCode || 'AUTH_INVALID_JWT',
+          hint: parsedSecond.hint || 'Effettua nuovamente il login.',
+        })
+      }
+      throw parsedSecond
+    }
   }
 }
 
@@ -1263,20 +1262,30 @@ export default function BancaPage() {
       const err = e as BankAiErrorPayload
       const reason = String(err?.message || 'Errore AI non disponibile').trim()
       const statusLine = err?.status ? `HTTP ${err.status}` : 'HTTP n.d.'
+      const codeLine = err?.errorCode ? `\nCodice: ${err.errorCode}` : ''
       const reqLine = err?.requestId ? ` · request: ${err.requestId}` : ''
+      const hintLine = err?.hint ? `\nSuggerimento: ${err.hint}` : ''
       console.error('[Banca AI] bank-ai-search failed', {
         company_id: companyId,
         operation: 'bank-ai-search',
+        error_code: err?.errorCode,
         code: statusLine,
         details: reason,
         request_id: err?.requestId,
       })
       setAiResult({
-        text: `Errore ricerca AI remota.\n${statusLine}${reqLine}\nDettaglio: ${reason}\nUsa "Riprova" per rilanciare la richiesta.`,
+        text: `Errore ricerca AI remota.\n${statusLine}${reqLine}${codeLine}\nDettaglio: ${reason}${hintLine}\nUsa "Riprova" per rilanciare la richiesta.`,
         mode: 'analysis',
         isError: true,
         requestId: err?.requestId,
       })
+
+      const isAuthFailure = err?.status === 401 || err?.status === 403 || String(err?.errorCode || '').startsWith('AUTH_')
+      if (isAuthFailure) {
+        toast.error('Sessione scaduta o non valida. Reindirizzamento al login...')
+        await supabase.auth.signOut().catch(() => null)
+        window.setTimeout(() => window.location.assign('/auth'), 300)
+      }
     }
     setAiLoading(false)
   }
