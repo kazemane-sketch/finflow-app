@@ -8,19 +8,49 @@ export function useAuth() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session)
-      setUser(session?.user ?? null)
+    let mounted = true
+
+    const applySession = (nextSession: Session | null) => {
+      if (!mounted) return
+      setSession(nextSession)
+      setUser(nextSession?.user ?? null)
       setLoading(false)
-    })
+    }
+
+    const bootstrapSession = async () => {
+      const { data: { session: rawSession } } = await supabase.auth.getSession()
+      if (!rawSession) {
+        applySession(null)
+        return
+      }
+
+      const { data: userData, error: userError } = await supabase.auth.getUser()
+      if (!userError && userData?.user) {
+        applySession(rawSession)
+        return
+      }
+
+      const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession()
+      const refreshedSession = refreshed?.session ?? null
+      if (refreshError || !refreshedSession?.access_token) {
+        await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined)
+        applySession(null)
+        return
+      }
+
+      applySession(refreshedSession)
+    }
+
+    void bootstrapSession()
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setSession(session)
-      setUser(session?.user ?? null)
-      setLoading(false)
+      applySession(session)
     })
 
-    return () => subscription.unsubscribe()
+    return () => {
+      mounted = false
+      subscription.unsubscribe()
+    }
   }, [])
 
   const signInWithEmail = async (email: string, password: string) => {

@@ -616,6 +616,24 @@ async function parseResponsePayload(res: Response): Promise<{ payload: any; rawT
   }
 }
 
+function hasJwtAuthSignal(err?: Partial<BankAiErrorPayload> | null): boolean {
+  const code = String(err?.errorCode || '').toUpperCase()
+  if (/JWT|TOKEN|SESSION|BEARER/.test(code)) return true
+  const details = `${String(err?.message || '')} ${String(err?.details || '')}`.toLowerCase()
+  return /jwt|token|session|auth|invalid|expired/.test(details)
+}
+
+function shouldRetryBankAiAuth(err?: Partial<BankAiErrorPayload> | null): boolean {
+  if (!err) return false
+  if (err.status === 401) return true
+  if (err.status !== 403) return false
+  return hasJwtAuthSignal(err)
+}
+
+async function forceLocalRelogin(): Promise<void> {
+  await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined)
+}
+
 async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: string): Promise<BankAiSearchResponse> {
   const res = await fetch(`${SUPABASE_URL}/functions/v1/bank-ai-search`, {
     method: 'POST',
@@ -668,6 +686,7 @@ async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchR
     const { data: sessionData } = await supabase.auth.getSession()
     const token = sessionData?.session?.access_token
     if (!token) {
+      await forceLocalRelogin()
       throw createBankAiError('Sessione assente: effettua nuovamente il login.', {
         status: 401,
         errorCode: 'AUTH_SESSION_MISSING',
@@ -682,11 +701,12 @@ async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchR
     return await invokeBankAiWithBearer(body, firstToken)
   } catch (e: any) {
     const parsed = e as BankAiErrorPayload
-    const shouldRetryAuth = parsed?.status === 401 || parsed?.status === 403
+    const shouldRetryAuth = shouldRetryBankAiAuth(parsed)
     if (!shouldRetryAuth) throw parsed
 
     const { error: refreshError } = await supabase.auth.refreshSession().catch(() => ({ error: new Error('refresh_failed') }))
     if (refreshError) {
+      await forceLocalRelogin()
       throw createBankAiError(parsed?.message || 'Sessione non valida o scaduta.', {
         status: parsed?.status ?? 401,
         requestId: parsed?.requestId,
@@ -700,13 +720,14 @@ async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchR
       return await invokeBankAiWithBearer(body, refreshedToken)
     } catch (e2: any) {
       const parsedSecond = e2 as BankAiErrorPayload
-      if (parsedSecond?.status === 401 || parsedSecond?.status === 403) {
+      if (parsedSecond?.status === 401 && hasJwtAuthSignal(parsedSecond)) {
+        await forceLocalRelogin()
         throw createBankAiError(parsedSecond.message || 'Sessione non valida o scaduta.', {
           status: parsedSecond.status,
           requestId: parsedSecond.requestId,
           details: parsedSecond.details,
           errorCode: parsedSecond.errorCode || 'AUTH_INVALID_JWT',
-          hint: parsedSecond.hint || 'Effettua nuovamente il login.',
+          hint: parsedSecond.hint || 'Sessione non valida: esegui nuovamente il login.',
         })
       }
       throw parsedSecond
