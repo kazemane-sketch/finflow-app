@@ -8,7 +8,7 @@ const corsHeaders = {
 };
 
 const REQUEST_TIMEOUT_MS = Number(Deno.env.get("BANK_AI_SEARCH_TIMEOUT_MS") ?? "30000");
-const ANTHROPIC_MODEL = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-3-haiku-20240307";
+const ANTHROPIC_MODEL = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001";
 const MAX_CANDIDATES = 50;
 
 type DirectionFilter = "all" | "in" | "out";
