@@ -8,12 +8,12 @@ const corsHeaders = {
 };
 
 const REQUEST_TIMEOUT_MS = Number(Deno.env.get("BANK_EMBED_TIMEOUT_MS") ?? "30000");
-const GEMINI_EMBEDDING_MODEL = Deno.env.get("GEMINI_EMBEDDING_MODEL") ?? "gemini-embedding-001";
-const EXPECTED_EMBEDDING_DIMS = 3072;
-const STALE_PROCESSING_SECONDS = Math.max(60, Math.min(Number(Deno.env.get("BANK_EMBED_STALE_SECONDS") ?? "1800") || 1800, 86400));
-const CLAIM_BATCH_SIZE = Math.max(1, Math.min(Number(Deno.env.get("BANK_EMBED_CLAIM_BATCH_SIZE") ?? "200") || 200, 500));
+const EMBEDDING_MODEL = Deno.env.get("GEMINI_EMBEDDING_MODEL") ?? "text-embedding-004";
+const EXPECTED_EMBEDDING_DIMS = Math.max(1, Number(Deno.env.get("BANK_EMBEDDING_DIMS") ?? "3072") || 3072);
+const MAX_ERROR_LEN = 500;
+const EMBED_CONCURRENCY = Math.max(1, Math.min(Number(Deno.env.get("BANK_EMBED_CONCURRENCY") ?? "8") || 8, 20));
 
-type ClaimedTx = {
+type EmbeddingTx = {
   id: string;
   company_id: string;
   date: string | null;
@@ -33,6 +33,12 @@ type GlobalHealth = {
   processing_rows: number;
   pending_rows: number;
   error_rows: number;
+};
+
+type EmbedRequestBody = {
+  company_id?: string;
+  batch_ids?: unknown;
+  skip_claim?: boolean;
 };
 
 function jsonResponse(body: unknown, requestId: string, status = 200): Response {
@@ -59,11 +65,6 @@ function getBearerToken(req: Request): string | null {
   return m?.[1]?.trim() || null;
 }
 
-function getApiKey(req: Request): string | null {
-  const raw = req.headers.get("apikey") ?? req.headers.get("x-api-key");
-  return raw?.trim() || null;
-}
-
 function resolveSupabaseUrl(req: Request): string {
   try {
     const url = new URL(req.url);
@@ -86,17 +87,17 @@ function parseJwtRole(token: string): string | null {
   }
 }
 
-function isServiceRoleCredential(value: string | null, serviceRoleKey: string): boolean {
-  if (!value) return false;
-  if (value === serviceRoleKey) return true;
-  return parseJwtRole(value) === "service_role";
+function isServiceRoleToken(token: string | null, expectedServiceRoleKey: string): boolean {
+  if (!token) return false;
+  if (expectedServiceRoleKey && token === expectedServiceRoleKey) return true;
+  return parseJwtRole(token) === "service_role";
 }
 
 function toVectorLiteral(values: number[]): string {
   return `[${values.map((v) => Number.isFinite(v) ? v.toFixed(8) : "0").join(",")}]`;
 }
 
-function buildEmbeddingText(tx: ClaimedTx): string {
+function buildEmbeddingText(tx: EmbeddingTx): string {
   const direction = tx.direction === "in" ? "entrata" : tx.direction === "out" ? "uscita" : "n.d.";
   const amount = typeof tx.amount === "number" ? tx.amount.toFixed(2) : "0.00";
   return [
@@ -112,6 +113,19 @@ function buildEmbeddingText(tx: ClaimedTx): string {
   ].join("\n");
 }
 
+function toErrorMessage(error: unknown): string {
+  const msg = error instanceof Error ? error.message : String(error ?? "Errore sconosciuto");
+  return clip(msg, MAX_ERROR_LEN);
+}
+
+function parseBatchIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const ids = raw
+    .map((v) => typeof v === "string" ? v.trim() : "")
+    .filter((v) => v.length > 0);
+  return Array.from(new Set(ids));
+}
+
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -122,54 +136,16 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
-async function claimBatchViaRest(
-  supabaseUrl: string,
-  serviceRoleKey: string,
-  batchSize: number,
-): Promise<ClaimedTx[]> {
-  const response = await fetchWithTimeout(`${supabaseUrl}/rest/v1/rpc/bank_embedding_claim_batch`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      apikey: serviceRoleKey,
-      Authorization: `Bearer ${serviceRoleKey}`,
-      Prefer: "params=single-object",
-      "Accept-Profile": "public",
-      "Content-Profile": "public",
-    },
-    body: JSON.stringify({ p_batch_size: batchSize }),
-  }, REQUEST_TIMEOUT_MS);
-
-  const raw = await response.text().catch(() => "");
-  let payload: any = null;
-  try {
-    payload = raw ? JSON.parse(raw) : null;
-  } catch {
-    payload = raw || null;
-  }
-
-  if (!response.ok) {
-    const message = typeof payload?.message === "string"
-      ? payload.message
-      : typeof payload?.error === "string"
-        ? payload.error
-        : raw || `HTTP ${response.status}`;
-    throw new Error(message);
-  }
-
-  return Array.isArray(payload) ? payload as ClaimedTx[] : [];
-}
-
 async function callGeminiEmbeddingSingle(apiKey: string, text: string): Promise<number[]> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBEDDING_MODEL}:embedContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${apiKey}`;
   const response = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: `models/${GEMINI_EMBEDDING_MODEL}`,
+      model: `models/${EMBEDDING_MODEL}`,
       content: { parts: [{ text }] },
       taskType: "RETRIEVAL_DOCUMENT",
+      outputDimensionality: EXPECTED_EMBEDDING_DIMS,
     }),
   }, REQUEST_TIMEOUT_MS);
 
@@ -180,45 +156,21 @@ async function callGeminiEmbeddingSingle(apiKey: string, text: string): Promise<
   }
 
   const values = payload?.embedding?.values;
-  if (!Array.isArray(values) || values.length !== EXPECTED_EMBEDDING_DIMS) {
-    throw new Error(`Embedding dimensione inattesa (${Array.isArray(values) ? values.length : "n/a"})`);
-  }
-  return values.map((v: unknown) => Number(v));
-}
-
-async function callGeminiEmbeddingBatch(apiKey: string, texts: string[]): Promise<number[][]> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBEDDING_MODEL}:batchEmbedContents?key=${apiKey}`;
-  const response = await fetchWithTimeout(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      requests: texts.map((text) => ({
-        model: `models/${GEMINI_EMBEDDING_MODEL}`,
-        content: { parts: [{ text }] },
-        taskType: "RETRIEVAL_DOCUMENT",
-      })),
-    }),
-  }, REQUEST_TIMEOUT_MS);
-
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const msg = payload?.error?.message || payload?.message || `HTTP ${response.status}`;
-    throw new Error(`Gemini batch embedding error: ${msg}`);
+  if (!Array.isArray(values) || !values.length) {
+    throw new Error("Gemini embedding vuoto");
   }
 
-  const embeddings = Array.isArray(payload?.embeddings) ? payload.embeddings : [];
-  if (!embeddings.length) throw new Error("Gemini batch embedding vuoto");
-
-  return embeddings.map((entry: any) => {
-    const values = entry?.values;
-    if (!Array.isArray(values) || values.length !== EXPECTED_EMBEDDING_DIMS) {
-      throw new Error(`Embedding batch dimensione inattesa (${Array.isArray(values) ? values.length : "n/a"})`);
-    }
-    return values.map((v: unknown) => Number(v));
-  });
+  const parsed = values.map((v: unknown) => Number(v));
+  if (parsed.length !== EXPECTED_EMBEDDING_DIMS) {
+    throw new Error(`Embedding dimensione inattesa (${parsed.length}, atteso ${EXPECTED_EMBEDDING_DIMS})`);
+  }
+  return parsed;
 }
 
-async function countRows(serviceClient: ReturnType<typeof createClient>, status?: "ready" | "processing" | "pending" | "error"): Promise<number> {
+async function countRows(
+  serviceClient: ReturnType<typeof createClient>,
+  status?: "ready" | "processing" | "pending" | "error",
+): Promise<number> {
   let query = serviceClient.from("bank_transactions").select("id", { count: "exact", head: true });
   if (status) query = query.eq("embedding_status", status);
   const { count, error } = await query;
@@ -244,6 +196,38 @@ async function fetchGlobalHealth(serviceClient: ReturnType<typeof createClient>)
   };
 }
 
+async function markRowError(
+  serviceClient: ReturnType<typeof createClient>,
+  id: string,
+  message: string,
+): Promise<void> {
+  await serviceClient
+    .from("bank_transactions")
+    .update({
+      embedding_status: "error",
+      embedding_model: EMBEDDING_MODEL,
+      embedding_error: clip(message, MAX_ERROR_LEN),
+      embedding_updated_at: new Date().toISOString(),
+    })
+    .eq("id", id);
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let index = 0;
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (index < items.length) {
+      const current = items[index];
+      index += 1;
+      await worker(current);
+    }
+  });
+  await Promise.all(runners);
+}
+
 Deno.serve(async (req) => {
   const requestId = crypto.randomUUID();
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
@@ -252,23 +236,17 @@ Deno.serve(async (req) => {
   }
 
   const supabaseUrl = resolveSupabaseUrl(req);
-  const serviceRoleKey = (Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "").trim();
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
+  const expectedServiceRoleKey = (Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "").trim();
+  const bearer = getBearerToken(req);
 
   if (!supabaseUrl) {
     return jsonResponse({ error: "Supabase non configurato", request_id: requestId }, requestId, 500);
   }
-  if (!serviceRoleKey) {
-    return jsonResponse({ error: "SUPABASE_SERVICE_ROLE_KEY non configurata", request_id: requestId }, requestId, 500);
-  }
   if (!geminiKey) {
     return jsonResponse({ error: "GEMINI_API_KEY non configurata", request_id: requestId }, requestId, 503);
   }
-
-  const bearer = getBearerToken(req);
-  const apiKey = getApiKey(req);
-  const authorized = isServiceRoleCredential(bearer, serviceRoleKey) || isServiceRoleCredential(apiKey, serviceRoleKey);
-  if (!authorized) {
+  if (!isServiceRoleToken(bearer, expectedServiceRoleKey)) {
     return jsonResponse({
       error: "Richiesta non autorizzata: service_role required",
       error_code: "AUTH_SERVICE_ROLE_REQUIRED",
@@ -276,139 +254,105 @@ Deno.serve(async (req) => {
     }, requestId, 401);
   }
 
+  const body = await req.json().catch(() => ({})) as EmbedRequestBody;
+  if (body?.skip_claim !== true) {
+    return jsonResponse({
+      error: "use skip_claim mode",
+      error_code: "EMBED_SKIP_CLAIM_REQUIRED",
+      request_id: requestId,
+    }, requestId, 400);
+  }
+
+  const batchIds = parseBatchIds(body?.batch_ids);
+  if (!batchIds.length) {
+    return jsonResponse({
+      error: "batch_ids vuoto o non valido",
+      error_code: "EMBED_BATCH_IDS_REQUIRED",
+      request_id: requestId,
+    }, requestId, 400);
+  }
+
+  const companyId = typeof body?.company_id === "string" ? body.company_id.trim() : "";
+  const serviceRoleKey = bearer as string;
   const serviceClient = createClient(supabaseUrl, serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
   try {
-    await req.json().catch(() => ({}));
-
-    const staleIso = new Date(Date.now() - (STALE_PROCESSING_SECONDS * 1000)).toISOString();
-    await serviceClient
+    const { data: rows, error: rowsError } = await serviceClient
       .from("bank_transactions")
-      .update({
-        embedding_status: "pending",
-        embedding_error: "Requeued stale processing",
-        embedding_updated_at: new Date().toISOString(),
-      })
-      .eq("embedding_status", "processing")
-      .lt("embedding_updated_at", staleIso);
+      .select("id,company_id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,direction")
+      .in("id", batchIds);
 
-    await serviceClient
-      .from("bank_transactions")
-      .update({
-        embedding_status: "pending",
-        embedding_error: "Requeued stale processing (missing timestamp)",
-        embedding_updated_at: new Date().toISOString(),
-      })
-      .eq("embedding_status", "processing")
-      .is("embedding_updated_at", null);
-
-    let claimed: ClaimedTx[] = [];
-    try {
-      claimed = await claimBatchViaRest(supabaseUrl, serviceRoleKey, CLAIM_BATCH_SIZE);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "errore claim batch";
+    if (rowsError) {
       return jsonResponse({
-        error: `Errore claim batch: ${msg}`,
+        error: `Errore fetch batch: ${rowsError.message}`,
         request_id: requestId,
       }, requestId, 500);
     }
-    if (!claimed.length) {
-      const health = await fetchGlobalHealth(serviceClient);
-      return jsonResponse({
-        status: "completed",
-        processed: 0,
-        ready: 0,
-        errors: 0,
-        health,
-        request_id: requestId,
-      }, requestId, 200);
-    }
 
-    const texts = claimed.map((tx) => buildEmbeddingText(tx));
-    let batchEmbeddings: number[][] = [];
-
-    try {
-      batchEmbeddings = await callGeminiEmbeddingBatch(geminiKey, texts);
-    } catch {
-      batchEmbeddings = [];
-    }
-
-    if (batchEmbeddings.length !== claimed.length) {
-      batchEmbeddings = [];
-      for (const text of texts) {
-        try {
-          batchEmbeddings.push(await callGeminiEmbeddingSingle(geminiKey, text));
-        } catch {
-          batchEmbeddings.push([]);
-        }
-      }
-    }
+    const txRows = (Array.isArray(rows) ? rows : []) as EmbeddingTx[];
+    const byId = new Map(txRows.map((tx) => [tx.id, tx]));
+    const missingIds = batchIds.filter((id) => !byId.has(id));
 
     let ready = 0;
     let errors = 0;
 
-    for (let i = 0; i < claimed.length; i++) {
-      const tx = claimed[i];
-      const vec = batchEmbeddings[i] ?? [];
+    if (missingIds.length) {
+      errors += missingIds.length;
+      await Promise.all(missingIds.map((id) =>
+        markRowError(serviceClient, id, "Movimento non trovato nel batch claim")
+      ));
+    }
 
-      if (vec.length === EXPECTED_EMBEDDING_DIMS) {
-        const { error } = await serviceClient
+    await runWithConcurrency(txRows, EMBED_CONCURRENCY, async (tx) => {
+      if (companyId && tx.company_id !== companyId) {
+        errors += 1;
+        await markRowError(serviceClient, tx.id, "company_id non coerente con il batch claim");
+        return;
+      }
+
+      try {
+        const text = buildEmbeddingText(tx);
+        const vec = await callGeminiEmbeddingSingle(geminiKey, text);
+
+        const { error: updateError } = await serviceClient
           .from("bank_transactions")
           .update({
             embedding: toVectorLiteral(vec),
             embedding_status: "ready",
-            embedding_model: `gemini:${GEMINI_EMBEDDING_MODEL}`,
+            embedding_model: EMBEDDING_MODEL,
             embedding_error: null,
             embedding_updated_at: new Date().toISOString(),
           })
           .eq("id", tx.id)
           .eq("company_id", tx.company_id);
 
-        if (error) {
-          errors++;
-          await serviceClient
-            .from("bank_transactions")
-            .update({
-              embedding_status: "error",
-              embedding_model: `gemini:${GEMINI_EMBEDDING_MODEL}`,
-              embedding_error: `Errore persistenza embedding: ${error.message}`.slice(0, 500),
-              embedding_updated_at: new Date().toISOString(),
-            })
-            .eq("id", tx.id)
-            .eq("company_id", tx.company_id);
-        } else {
-          ready++;
+        if (updateError) {
+          throw new Error(`Errore persistenza embedding: ${updateError.message}`);
         }
-      } else {
-        errors++;
-        await serviceClient
-          .from("bank_transactions")
-          .update({
-            embedding_status: "error",
-            embedding_model: `gemini:${GEMINI_EMBEDDING_MODEL}`,
-            embedding_error: "Embedding non disponibile o dimensione non valida",
-            embedding_updated_at: new Date().toISOString(),
-          })
-          .eq("id", tx.id)
-          .eq("company_id", tx.company_id);
+
+        ready += 1;
+      } catch (error) {
+        errors += 1;
+        await markRowError(serviceClient, tx.id, toErrorMessage(error));
       }
-    }
+    });
 
     const health = await fetchGlobalHealth(serviceClient);
     return jsonResponse({
       status: "completed",
-      processed: claimed.length,
+      mode: "skip_claim",
+      processed: txRows.length,
+      requested: batchIds.length,
       ready,
       errors,
       health,
       request_id: requestId,
     }, requestId, 200);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "Errore sconosciuto";
+  } catch (error) {
     return jsonResponse({
-      error: msg,
+      error: toErrorMessage(error),
       status: "failed",
       request_id: requestId,
     }, requestId, 500);
