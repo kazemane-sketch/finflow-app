@@ -42,6 +42,7 @@ type CandidateTx = {
   reference: string | null;
   invoice_ref: string | null;
   direction: "in" | "out" | null;
+  raw_text?: string | null;
   similarity?: number | null;
 };
 
@@ -345,14 +346,7 @@ async function callGeminiEmbedding(apiKey: string, query: string): Promise<numbe
   return parsed;
 }
 
-async function callBankAiSearchCandidatesRpc(
-  companyId: string,
-  queryVector: string,
-  limit: number,
-  direction: DirectionFilter,
-  dateFrom: string | null,
-  dateTo: string | null,
-): Promise<CandidateTx[]> {
+function getDbUrlOrThrow(): string {
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
   if (!dbUrl) {
     throw {
@@ -361,8 +355,15 @@ async function callBankAiSearchCandidatesRpc(
       details: "Configura SUPABASE_DB_URL nei secrets delle Edge Functions.",
     } satisfies RpcError;
   }
+  return dbUrl;
+}
 
-  const sql = postgres(dbUrl);
+async function callBankAiSearchCandidatesText(
+  companyId: string,
+  query: string,
+  limit: number,
+): Promise<CandidateTx[]> {
+  const sql = postgres(getDbUrlOrThrow());
   try {
     const rows = await sql<CandidateTx[]>`
       SELECT
@@ -376,6 +377,65 @@ async function callBankAiSearchCandidatesRpc(
         reference,
         invoice_ref,
         direction,
+        raw_text,
+        0::numeric AS similarity
+      FROM public.bank_transactions
+      WHERE company_id = ${companyId}
+        AND (
+          raw_text ILIKE '%' || ${query} || '%'
+          OR description ILIKE '%' || ${query} || '%'
+          OR reference ILIKE '%' || ${query} || '%'
+          OR invoice_ref ILIKE '%' || ${query} || '%'
+          OR counterparty_name ILIKE '%' || ${query} || '%'
+        )
+      ORDER BY date DESC
+      LIMIT ${limit}
+    `;
+
+    if (!Array.isArray(rows)) {
+      throw {
+        status: 500,
+        message: "Payload SQL non valido",
+        details: typeof rows === "string" ? rows : JSON.stringify(rows),
+      } satisfies RpcError;
+    }
+    return rows as CandidateTx[];
+  } catch (e) {
+    const pgErr = e as { message?: string; detail?: string; hint?: string; code?: string };
+    const details = [pgErr?.detail, pgErr?.hint, pgErr?.code].filter(Boolean).join(" | ") || undefined;
+    throw {
+      status: 500,
+      message: pgErr?.message || "Errore query candidati testuali",
+      details,
+    } satisfies RpcError;
+  } finally {
+    await sql.end();
+  }
+}
+
+async function callBankAiSearchCandidatesRpc(
+  companyId: string,
+  queryVector: string,
+  limit: number,
+  direction: DirectionFilter,
+  dateFrom: string | null,
+  dateTo: string | null,
+): Promise<CandidateTx[]> {
+  const sql = postgres(getDbUrlOrThrow());
+  try {
+    const rows = await sql<CandidateTx[]>`
+      SELECT
+        id,
+        date,
+        value_date,
+        amount,
+        description,
+        counterparty_name,
+        transaction_type,
+        reference,
+        invoice_ref,
+        direction,
+        raw_text,
         (embedding <=> ${queryVector}::vector(3072))::numeric AS similarity
       FROM public.bank_transactions
       WHERE company_id = ${companyId}
@@ -572,52 +632,22 @@ Deno.serve(async (req) => {
       ), requestId);
     }
 
-    if (!geminiKey) {
-      return errorResponse(appError(
-        503,
-        "GEMINI_API_KEY non configurata",
-        "CONFIG_GEMINI_API_KEY_MISSING",
-        "Configura il secret GEMINI_API_KEY nelle Edge Functions.",
-        undefined,
-        "analysis",
-      ), requestId);
-    }
-
-    let queryVector: string;
-    try {
-      const embedding = await callGeminiEmbedding(geminiKey, query);
-      queryVector = toVectorLiteral(embedding);
-    } catch (e) {
-      const providerError = e instanceof Error ? e.message : "Gemini errore sconosciuto";
-      return errorResponse(appError(
-        503,
-        "Provider embedding non disponibile",
-        "AI_PROVIDER_UNAVAILABLE",
-        "Verifica GEMINI_API_KEY e riprova.",
-        providerError,
-        "analysis",
-      ), requestId);
-    }
-
     let candidates: CandidateTx[] = [];
     try {
-      candidates = await callBankAiSearchCandidatesRpc(
+      candidates = await callBankAiSearchCandidatesText(
         companyId,
-        queryVector,
+        query,
         limit,
-        direction,
-        dateFrom,
-        dateTo,
       );
     } catch (e) {
       const status = isRpcErrorPayload(e) ? e.status : 500;
-      const msg = isRpcErrorPayload(e) ? e.message : (e instanceof Error ? e.message : "Errore RPC sconosciuto");
+      const msg = isRpcErrorPayload(e) ? e.message : (e instanceof Error ? e.message : "Errore SQL sconosciuto");
       const details = isRpcErrorPayload(e) ? e.details : undefined;
       const isJwtError = status === 401 || status === 403 || /jwt|auth|token|session|expired|invalid/i.test(msg);
       console.error(JSON.stringify({
         request_id: requestId,
         company_id: companyId,
-        auth_stage: "bank_ai_search_candidates_rpc",
+        auth_stage: "bank_ai_search_candidates_text",
         rpc_status: status,
         supabase_error: msg,
         supabase_details: details,
@@ -630,6 +660,67 @@ Deno.serve(async (req) => {
         details ? `${msg} | ${details}` : msg,
         "analysis",
       ), requestId);
+    }
+
+    if (!candidates.length) {
+      if (!geminiKey) {
+        return errorResponse(appError(
+          503,
+          "GEMINI_API_KEY non configurata",
+          "CONFIG_GEMINI_API_KEY_MISSING",
+          "Configura il secret GEMINI_API_KEY nelle Edge Functions.",
+          undefined,
+          "analysis",
+        ), requestId);
+      }
+
+      let queryVector: string;
+      try {
+        const embedding = await callGeminiEmbedding(geminiKey, query);
+        queryVector = toVectorLiteral(embedding);
+      } catch (e) {
+        const providerError = e instanceof Error ? e.message : "Gemini errore sconosciuto";
+        return errorResponse(appError(
+          503,
+          "Provider embedding non disponibile",
+          "AI_PROVIDER_UNAVAILABLE",
+          "Verifica GEMINI_API_KEY e riprova.",
+          providerError,
+          "analysis",
+        ), requestId);
+      }
+
+      try {
+        candidates = await callBankAiSearchCandidatesRpc(
+          companyId,
+          queryVector,
+          limit,
+          direction,
+          dateFrom,
+          dateTo,
+        );
+      } catch (e) {
+        const status = isRpcErrorPayload(e) ? e.status : 500;
+        const msg = isRpcErrorPayload(e) ? e.message : (e instanceof Error ? e.message : "Errore SQL sconosciuto");
+        const details = isRpcErrorPayload(e) ? e.details : undefined;
+        const isJwtError = status === 401 || status === 403 || /jwt|auth|token|session|expired|invalid/i.test(msg);
+        console.error(JSON.stringify({
+          request_id: requestId,
+          company_id: companyId,
+          auth_stage: "bank_ai_search_candidates_vector",
+          rpc_status: status,
+          supabase_error: msg,
+          supabase_details: details,
+        }));
+        return errorResponse(appError(
+          isJwtError ? 401 : 500,
+          isJwtError ? "JWT non valido o scaduto" : "Errore ricerca candidati",
+          isJwtError ? "AUTH_INVALID_JWT" : "AI_CANDIDATES_QUERY_FAILED",
+          isJwtError ? "Effettua nuovamente il login." : "Riprova tra pochi secondi.",
+          details ? `${msg} | ${details}` : msg,
+          "analysis",
+        ), requestId);
+      }
     }
     if (!candidates.length) {
       return jsonResponse({
