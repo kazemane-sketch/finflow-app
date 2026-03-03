@@ -1,5 +1,5 @@
 // src/pages/BancaPage.tsx
-import { useState, useEffect, useCallback, useRef, type MouseEvent } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef, type MouseEvent } from 'react'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useCompany } from '@/hooks/useCompany'
@@ -533,6 +533,20 @@ function TxDetail({
 // AI SEARCH
 // ============================================================
 const MAX_AI_TX = 1500
+const MAX_AI_PAYLOAD_BYTES = 350_000
+const AI_TEXT_CLIP = {
+  description: 180,
+  counterparty: 100,
+  reference: 80,
+  invoiceRef: 40,
+  txType: 40,
+}
+
+function clipAiText(v: unknown, max: number): string {
+  const s = String(v ?? '').replace(/\s+/g, ' ').trim()
+  if (!s) return ''
+  return s.length > max ? `${s.slice(0, max)}…` : s
+}
 
 type BankAiSearchResponse = {
   answer: string
@@ -562,29 +576,159 @@ async function askBankAiSearch(query: string, transactions: any[]): Promise<Bank
 }
 
 function buildLocalAiFallback(query: string, transactions: Array<{
+  date?: string | null
+  value_date?: string | null
   amount: number
+  direction?: 'in' | 'out' | null
   description?: string | null
   counterparty_name?: string | null
   reference?: string | null
   invoice_ref?: string | null
   transaction_type?: string | null
 }>): string {
-  const q = query.trim().toLowerCase()
+  const raw = query.trim()
+  const q = raw.toLowerCase()
   if (!q) return "Inserisci una query per avviare l'analisi."
 
-  const matched = transactions.filter((tx) => {
-    const hay = [
+  const normalizeText = (v: string): string =>
+    String(v || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+
+  const stopwords = new Set([
+    'e', 'ed', 'o', 'di', 'del', 'della', 'dello', 'dei', 'degli', 'delle',
+    'il', 'lo', 'la', 'i', 'gli', 'le', 'un', 'una', 'uno', 'per', 'con',
+    'su', 'da', 'al', 'alla', 'agli', 'ai', 'alle', 'nel', 'nella', 'nei',
+    'nelle', 'movimento', 'movimenti', 'cerca', 'cercare',
+  ])
+
+  const parseIsoDate = (dd: string, mm: string, yyyy: string): string | null => {
+    const d = Number(dd)
+    const m = Number(mm)
+    let y = Number(yyyy)
+    if (!Number.isFinite(d) || !Number.isFinite(m) || !Number.isFinite(y)) return null
+    if (yyyy.length === 2) y += y >= 70 ? 1900 : 2000
+    if (d < 1 || d > 31 || m < 1 || m > 12 || y < 1900 || y > 2100) return null
+    return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+  }
+
+  const dateMatches = Array.from(q.matchAll(/\b(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})\b/g))
+  const exactDates = dateMatches
+    .map((m) => parseIsoDate(m[1], m[2], m[3]))
+    .filter((d): d is string => Boolean(d))
+
+  const parseAmountToken = (token: string): number | null => {
+    const compact = token.replace(/\s+/g, '')
+    if (!compact) return null
+    const normalized = compact
+      .replace(/\.(?=\d{3}(?:\D|$))/g, '')
+      .replace(',', '.')
+      .replace(/[^0-9.-]/g, '')
+    const n = Number(normalized)
+    if (!Number.isFinite(n)) return null
+    return Math.abs(n)
+  }
+
+  const amountTokens = Array.from(q.matchAll(/(?:€\s*)?-?\d[\d.,]*/g))
+    .map((m) => m[0])
+    .filter((s) => /\d/.test(s))
+
+  const amountFilters = Array.from(
+    new Set(
+      amountTokens
+        .map(parseAmountToken)
+        .filter((n): n is number => n != null && n >= 1),
+    ),
+  )
+
+  const hasInKeyword = /\b(entrat[ae]?|incass[oi]|accredito|accrediti|ricevut[oa]|bonifico in)\b/.test(q)
+  const hasOutKeyword = /\b(uscit[ae]?|pagament[oi]|addebito|addebiti|bonifico out|spes[ae]|fornitor[ei])\b/.test(q)
+  const directionFilter: 'in' | 'out' | null = hasInKeyword && !hasOutKeyword
+    ? 'in'
+    : hasOutKeyword && !hasInKeyword
+      ? 'out'
+      : null
+
+  const textTokens = normalizeText(raw)
+    .split(/\s+/)
+    .filter((t) => t && !stopwords.has(t) && !/^\d+$/.test(t))
+
+  const hasStructuredFilter = exactDates.length > 0 || amountFilters.length > 0 || directionFilter != null
+
+  const withDiagnostics = transactions.map((tx) => {
+    const hay = normalizeText([
       tx.description || '',
       tx.counterparty_name || '',
       tx.reference || '',
       tx.invoice_ref || '',
       tx.transaction_type || '',
-    ].join(' ').toLowerCase()
-    return hay.includes(q)
+      txTypeLabel(tx.transaction_type || ''),
+    ].join(' '))
+    const txDirectionValue = tx.direction || (Number(tx.amount || 0) >= 0 ? 'in' : 'out')
+    const txDate = String(tx.date || '').slice(0, 10)
+    const txValueDate = String(tx.value_date || '').slice(0, 10)
+    const txAmountAbs = Math.abs(Number(tx.amount || 0))
+
+    const amountMatches = amountFilters.map((target) => {
+      const tolerance = Math.max(1, target * 0.1)
+      return Math.abs(txAmountAbs - target) <= tolerance
+    })
+    const amountMatch = amountFilters.length === 0 || amountMatches.some(Boolean)
+
+    const dateMatch = exactDates.length === 0
+      || exactDates.some((d) => d === txDate || d === txValueDate)
+
+    const directionMatch = !directionFilter || txDirectionValue === directionFilter
+    const textMatch = textTokens.length === 0 || textTokens.every((token) => hay.includes(token))
+
+    const include = hasStructuredFilter
+      ? amountMatch && dateMatch && directionMatch
+      : textMatch
+
+    let score = 0
+    if (amountFilters.length > 0 && amountMatch) {
+      const bestDelta = Math.min(...amountFilters.map((target) => Math.abs(txAmountAbs - target) / Math.max(target, 1)))
+      score += Math.max(0, 70 - bestDelta * 100)
+    }
+    if (exactDates.length > 0 && dateMatch) score += 40
+    if (directionFilter && directionMatch) score += 15
+    if (textTokens.length > 0 && textMatch) score += 25
+
+    return {
+      tx,
+      include: include && (hasStructuredFilter ? textTokens.length === 0 || textMatch : true),
+      amountMatch,
+      dateMatch,
+      directionMatch,
+      textMatch,
+      score,
+    }
   })
 
+  const matched = withDiagnostics
+    .filter((d) => d.include)
+    .sort((a, b) => b.score - a.score)
+    .map((d) => d.tx)
+
   if (matched.length === 0) {
-    return `Nessuna corrispondenza testuale per "${query}". Prova con termini più specifici (controparte, causale, riferimento, tipo).`
+    const amountHits = withDiagnostics.filter((d) => d.amountMatch).length
+    const dateHits = withDiagnostics.filter((d) => d.dateMatch).length
+    const dirHits = withDiagnostics.filter((d) => d.directionMatch).length
+    const criteria = [
+      amountFilters.length > 0 ? `importo ±10% (${amountFilters.map((a) => fmtEur(a)).join(', ')})` : null,
+      exactDates.length > 0 ? `data ${exactDates.join(', ')}` : null,
+      directionFilter ? `direzione ${directionFilter === 'in' ? 'entrata' : 'uscita'}` : null,
+      !hasStructuredFilter && textTokens.length > 0 ? `testo: ${textTokens.join(', ')}` : null,
+    ].filter(Boolean)
+
+    return [
+      `Nessun risultato per "${query}".`,
+      criteria.length > 0 ? `Criteri applicati: ${criteria.join(' · ')}` : 'Nessun criterio valido rilevato nella query.',
+      `Movimenti analizzati: ${transactions.length} · match importo: ${amountHits} · match data: ${dateHits} · match direzione: ${dirHits}`,
+    ].join('\n')
   }
 
   const totalIn = matched
@@ -608,6 +752,9 @@ function buildLocalAiFallback(query: string, transactions: Array<{
     `Risultati trovati: ${matched.length} movimento/i per "${query}".`,
     `Entrate: ${fmtEur(totalIn)} · Uscite: ${fmtEur(totalOut)} · Netto: ${fmtEur(totalIn - totalOut)}`,
   ]
+  if (amountFilters.length > 0) lines.push(`Filtro importo: ±10% su ${amountFilters.map((a) => fmtEur(a)).join(', ')}`)
+  if (exactDates.length > 0) lines.push(`Filtro data: ${exactDates.join(', ')}`)
+  if (directionFilter) lines.push(`Filtro direzione: ${directionFilter === 'in' ? 'entrate' : 'uscite'}`)
   if (top.length) lines.push(`Top controparti: ${top.join(' · ')}`)
   return lines.join('\n')
 }
@@ -1028,42 +1175,70 @@ export default function BancaPage() {
     return true
   })
 
-  const aiScopeTransactions = transactions
-    .slice(0, MAX_AI_TX)
-    .map((tx) => ({
-      id: tx.id,
-      date: tx.date,
-      value_date: tx.value_date ?? null,
-      amount: tx.amount,
-      description: tx.description ?? '',
-      counterparty_name: tx.counterparty_name ?? null,
-      transaction_type: tx.transaction_type ?? 'altro',
-      reference: tx.reference ?? null,
-      invoice_ref: tx.invoice_ref ?? null,
-      direction: tx.direction ?? txDirection(tx),
-    }))
-  const aiScopeTruncated = transactions.length > aiScopeTransactions.length
+  const aiScope = useMemo(() => {
+    const base = transactions
+      .slice(0, MAX_AI_TX)
+      .map((tx) => ({
+        id: tx.id,
+        date: tx.date,
+        value_date: tx.value_date ?? null,
+        amount: tx.amount,
+        description: clipAiText(tx.description, AI_TEXT_CLIP.description),
+        counterparty_name: clipAiText(tx.counterparty_name, AI_TEXT_CLIP.counterparty) || null,
+        transaction_type: clipAiText(tx.transaction_type || 'altro', AI_TEXT_CLIP.txType) || 'altro',
+        reference: clipAiText(tx.reference, AI_TEXT_CLIP.reference) || null,
+        invoice_ref: clipAiText(tx.invoice_ref, AI_TEXT_CLIP.invoiceRef) || null,
+        direction: tx.direction ?? txDirection(tx),
+      }))
+
+    const compact: typeof base = []
+    let payloadBytes = 0
+    for (const item of base) {
+      const rowBytes = JSON.stringify(item).length
+      if (compact.length > 0 && payloadBytes + rowBytes > MAX_AI_PAYLOAD_BYTES) break
+      compact.push(item)
+      payloadBytes += rowBytes
+    }
+
+    return {
+      transactions: compact,
+      payloadBytes,
+      truncatedByCount: transactions.length > base.length,
+      truncatedByPayload: base.length > compact.length,
+    }
+  }, [transactions])
 
   const handleAiSearch = async () => {
     if (!query.trim()) return
-    if (aiScopeTransactions.length === 0) {
+    if (aiScope.transactions.length === 0) {
       setAiResult("Nessun movimento disponibile per l'analisi AI.")
       return
     }
     setAiLoading(true); setAiResult(null)
     try {
-      const result = await askBankAiSearch(query, aiScopeTransactions)
+      const result = await askBankAiSearch(query, aiScope.transactions)
       const effectiveUsedCount = Number.isFinite(result.used_count) && result.used_count > 0
         ? result.used_count
-        : aiScopeTransactions.length
-      const isTruncated = result.truncated || aiScopeTruncated
+        : aiScope.transactions.length
+      const isTruncated = result.truncated || aiScope.truncatedByCount || aiScope.truncatedByPayload
       const scopeLine = `\n\nScope AI: ${effectiveUsedCount} movimenti analizzati (lista visibile: ${filtered.length} di ${transactions.length})` +
         `${isTruncated ? ` · limitati agli ultimi ${MAX_AI_TX}` : ''}` +
+        `${aiScope.truncatedByPayload ? ` · payload compattato a ~${Math.round(aiScope.payloadBytes / 1024)}KB` : ''}` +
         `${result.model ? ` · modello: ${result.model}` : ''}`
-      setAiResult(`${result.answer}${scopeLine}`)
+      if ((result.model || '').startsWith('fallback:')) {
+        const fallback = buildLocalAiFallback(query, aiScope.transactions)
+        setAiResult(`${result.answer}\n\n${fallback}${scopeLine}`)
+      } else {
+        setAiResult(`${result.answer}${scopeLine}`)
+      }
     } catch (e: any) {
-      const fallback = buildLocalAiFallback(query, aiScopeTransactions)
-      setAiResult(`${fallback}\n\n(Fallback locale attivato: servizio AI temporaneamente non disponibile)`)
+      console.error('[Banca AI] bank-ai-search failed', e)
+      const fallback = buildLocalAiFallback(query, aiScope.transactions)
+      const reason = String(e?.message || '').trim()
+      setAiResult(
+        `${fallback}\n\n(Fallback locale attivato: servizio AI temporaneamente non disponibile)` +
+        `${reason ? `\nDettaglio errore AI: ${reason}` : ''}`,
+      )
     }
     setAiLoading(false)
   }
