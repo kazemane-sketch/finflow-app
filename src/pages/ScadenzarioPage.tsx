@@ -29,6 +29,7 @@ interface BankCandidate {
   id: string
   date: string
   amount: number
+  commission_amount: number | null
   description: string | null
   counterparty_name: string | null
   transaction_type: string | null
@@ -308,7 +309,7 @@ export default function ScadenzarioPage() {
       }
     }
 
-    const selectCols = 'id, date, amount, description, counterparty_name, transaction_type, reconciliation_status, raw_text, invoice_ref'
+    const selectCols = 'id, date, amount, commission_amount, description, counterparty_name, transaction_type, reconciliation_status, raw_text, invoice_ref'
     const amountTarget = Math.max(round2(targetAmount), 0)
     const tolerancePct = 0.25
     const windowDays = 90
@@ -408,6 +409,7 @@ export default function ScadenzarioPage() {
       id: string
       date: string
       amount: number
+      commission_amount: number | null
       description: string | null
       counterparty_name: string | null
       transaction_type: string | null
@@ -437,6 +439,7 @@ export default function ScadenzarioPage() {
         id: tx.id,
         date: tx.date,
         amount: txAbs,
+        commission_amount: tx.commission_amount ?? null,
         description: tx.description,
         counterparty_name: tx.counterparty_name,
         transaction_type: tx.transaction_type,
@@ -485,6 +488,7 @@ export default function ScadenzarioPage() {
           id: tx.id,
           date: tx.date,
           amount: txAbs,
+          commission_amount: tx.commission_amount ?? null,
           description: tx.description,
           counterparty_name: tx.counterparty_name,
           transaction_type: tx.transaction_type,
@@ -934,7 +938,10 @@ export default function ScadenzarioPage() {
         saving: false,
         error: null,
       })
+      // Preserve scroll position after reload
+      const scrollY = window.scrollY
       await loadRows()
+      requestAnimationFrame(() => window.scrollTo(0, scrollY))
     } catch (e: any) {
       setPaymentModal((prev) => ({ ...prev, saving: false, error: e.message || 'Errore registrazione pagamento' }))
     }
@@ -1587,6 +1594,9 @@ export default function ScadenzarioPage() {
                         const rawExcerpt = tx.raw_text
                           ? tx.raw_text.replace(/\s+/g, ' ').trim().slice(0, 100) + (tx.raw_text.length > 100 ? '...' : '')
                           : null
+                        const grossAmt = Math.abs(tx.amount)
+                        const hasComm = tx.commission_amount != null && tx.commission_amount !== 0
+                        const netAmt = hasComm ? round2(grossAmt - Math.abs(Number(tx.commission_amount))) : grossAmt
                         return (
                           <button
                             type="button"
@@ -1595,16 +1605,19 @@ export default function ScadenzarioPage() {
                               ...prev,
                               selectedBankTxId: tx.id,
                               paymentDate: tx.date,
-                              amount: String(round2(Math.abs(tx.amount))),
+                              amount: String(round2(hasComm ? netAmt : grossAmt)),
                             }))}
                             onDoubleClick={(e) => {
-                              e.preventDefault()
+                              e.stopPropagation()
                               setDetailTxId(tx.id)
                             }}
                             className={`w-full text-left px-3 py-2 text-xs ${selected ? 'bg-sky-50 ring-1 ring-sky-300' : 'hover:bg-gray-50'}`}
                           >
                             <div className="flex items-center justify-between gap-2">
-                              <span className="font-medium">{fmtDate(tx.date)} · {fmtEur(Math.abs(tx.amount))}</span>
+                              <span className="font-medium">
+                                {fmtDate(tx.date)} · {fmtEur(hasComm ? netAmt : grossAmt)}
+                                {hasComm && <span className="text-gray-400 font-normal ml-1">(lordo {fmtEur(grossAmt)})</span>}
+                              </span>
                               <div className="flex items-center gap-1.5">
                                 {tx.matchType === 'invoice_ref' && (
                                   <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">Rif. fattura</span>

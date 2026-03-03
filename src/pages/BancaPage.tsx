@@ -524,12 +524,15 @@ async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: st
     })
   }
 
+  const responseMode = payload?.mode === 'filter' ? 'filter' : 'analysis'
+
   return {
-    mode: 'analysis' as BankAiMode,
+    mode: responseMode as BankAiSearchResponse['mode'],
     answer: typeof payload?.answer === 'string' ? payload.answer : undefined,
     used_count: Number(payload?.used_count || 0),
     candidate_count: Number(payload?.candidate_count || 0),
     candidate_ids: normalizeCandidateIds(payload?.candidate_ids ?? payload?.candidateIds),
+    filter: responseMode === 'filter' && payload?.filter ? payload.filter as BankAiFilterSpec : undefined,
     model: typeof payload?.model === 'string' ? payload.model : undefined,
     request_id: typeof payload?.request_id === 'string' ? payload.request_id : requestId,
   }
