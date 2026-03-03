@@ -1,4 +1,5 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
+import postgres from "https://deno.land/x/postgresjs@v3.4.5/mod.js";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -345,7 +346,6 @@ async function callGeminiEmbedding(apiKey: string, query: string): Promise<numbe
 }
 
 async function callBankAiSearchCandidatesRpc(
-  userClient: ReturnType<typeof createClient>,
   companyId: string,
   queryVector: string,
   limit: number,
@@ -353,33 +353,61 @@ async function callBankAiSearchCandidatesRpc(
   dateFrom: string | null,
   dateTo: string | null,
 ): Promise<CandidateTx[]> {
-  const { data, error } = await userClient.rpc("bank_ai_search_candidates", {
-    p_company_id: companyId,
-    p_query_vector: queryVector,
-    p_limit: limit,
-    p_direction: direction,
-    p_date_from: dateFrom,
-    p_date_to: dateTo,
-  });
-
-  if (error) {
-    const details = typeof error?.details === "string"
-      ? error.details
-      : typeof error?.hint === "string"
-        ? error.hint
-        : undefined;
-    throw { status: 500, message: error.message, details } satisfies RpcError;
-  }
-
-  if (!Array.isArray(data)) {
+  const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
+  if (!dbUrl) {
     throw {
       status: 500,
-      message: "Payload RPC non valido",
-      details: typeof data === "string" ? data : JSON.stringify(data),
+      message: "SUPABASE_DB_URL non configurato",
+      details: "Configura SUPABASE_DB_URL nei secrets delle Edge Functions.",
     } satisfies RpcError;
   }
 
-  return data as CandidateTx[];
+  const sql = postgres(dbUrl);
+  try {
+    const rows = await sql<CandidateTx[]>`
+      SELECT
+        id,
+        date,
+        value_date,
+        amount,
+        description,
+        counterparty_name,
+        transaction_type,
+        reference,
+        invoice_ref,
+        direction,
+        (embedding <=> ${queryVector}::vector(3072))::numeric AS similarity
+      FROM public.bank_transactions
+      WHERE company_id = ${companyId}
+        AND embedding IS NOT NULL
+        AND embedding_status = 'ready'
+        AND (${direction} = 'all' OR direction = ${direction})
+        AND (${dateFrom}::date IS NULL OR date >= ${dateFrom}::date)
+        AND (${dateTo}::date IS NULL OR date <= ${dateTo}::date)
+      ORDER BY embedding <=> ${queryVector}::vector(3072), date DESC, id
+      LIMIT ${limit}
+    `;
+
+    if (!Array.isArray(rows)) {
+      throw {
+        status: 500,
+        message: "Payload SQL non valido",
+        details: typeof rows === "string" ? rows : JSON.stringify(rows),
+      } satisfies RpcError;
+    }
+
+    return rows as CandidateTx[];
+  } catch (e) {
+    const pgErr = e as { message?: string; detail?: string; hint?: string; code?: string };
+    const details = [pgErr?.detail, pgErr?.hint, pgErr?.code].filter(Boolean).join(" | ") || undefined;
+    throw {
+      status: 500,
+      message: pgErr?.message || "Errore query candidati Postgres",
+      details,
+    } satisfies RpcError;
+  } finally {
+    await sql.end();
+  }
 }
 
 function getBearerToken(req: Request): string | null {
@@ -574,7 +602,6 @@ Deno.serve(async (req) => {
     let candidates: CandidateTx[] = [];
     try {
       candidates = await callBankAiSearchCandidatesRpc(
-        userClient,
         companyId,
         queryVector,
         limit,
