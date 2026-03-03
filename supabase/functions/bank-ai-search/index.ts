@@ -362,7 +362,6 @@ async function callBankAiSearchCandidatesRpc(
       Accept: "application/json",
       apikey: apiKey,
       Authorization: `Bearer ${token}`,
-      Prefer: "params=single-object",
       "Accept-Profile": "public",
       "Content-Profile": "public",
     },
@@ -620,7 +619,9 @@ Deno.serve(async (req) => {
         request_id: requestId,
         company_id: companyId,
         auth_stage: "bank_ai_search_candidates_rpc",
+        rpc_status: status,
         supabase_error: msg,
+        supabase_details: details,
       }));
       return errorResponse(appError(
         isJwtError ? 401 : 500,
