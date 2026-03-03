@@ -7,7 +7,7 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const SONNET_MODEL = "claude-sonnet-4-5-20250514";
+const SONNET_MODEL = "claude-sonnet-4-6";
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const MAX_TOOL_ROUNDS = 5;
 const MAX_CHAT_HISTORY = 20;
