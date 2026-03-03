@@ -345,9 +345,7 @@ async function callGeminiEmbedding(apiKey: string, query: string): Promise<numbe
 }
 
 async function callBankAiSearchCandidatesRpc(
-  supabaseUrl: string,
-  apiKey: string,
-  token: string,
+  userClient: ReturnType<typeof createClient>,
   companyId: string,
   queryVector: string,
   limit: number,
@@ -355,57 +353,33 @@ async function callBankAiSearchCandidatesRpc(
   dateFrom: string | null,
   dateTo: string | null,
 ): Promise<CandidateTx[]> {
-  const response = await fetchWithTimeout(`${supabaseUrl}/rest/v1/rpc/bank_ai_search_candidates`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      apikey: apiKey,
-      Authorization: `Bearer ${token}`,
-      "Accept-Profile": "public",
-      "Content-Profile": "public",
-    },
-    body: JSON.stringify({
-      p_company_id: companyId,
-      p_query_vector: queryVector,
-      p_limit: limit,
-      p_direction: direction,
-      p_date_from: dateFrom,
-      p_date_to: dateTo,
-    }),
-  }, REQUEST_TIMEOUT_MS);
+  const { data, error } = await userClient.rpc("bank_ai_search_candidates", {
+    p_company_id: companyId,
+    p_query_vector: queryVector,
+    p_limit: limit,
+    p_direction: direction,
+    p_date_from: dateFrom,
+    p_date_to: dateTo,
+  });
 
-  const raw = await response.text().catch(() => "");
-  let payload: any = null;
-  try {
-    payload = raw ? JSON.parse(raw) : null;
-  } catch {
-    payload = raw || null;
-  }
-
-  if (!response.ok) {
-    const message = typeof payload?.message === "string"
-      ? payload.message
-      : typeof payload?.error === "string"
-        ? payload.error
-        : raw || `HTTP ${response.status}`;
-    const details = typeof payload?.details === "string"
-      ? payload.details
-      : typeof payload?.hint === "string"
-        ? payload.hint
+  if (error) {
+    const details = typeof error?.details === "string"
+      ? error.details
+      : typeof error?.hint === "string"
+        ? error.hint
         : undefined;
-    throw { status: response.status, message, details } satisfies RpcError;
+    throw { status: 500, message: error.message, details } satisfies RpcError;
   }
 
-  if (!Array.isArray(payload)) {
+  if (!Array.isArray(data)) {
     throw {
       status: 500,
       message: "Payload RPC non valido",
-      details: typeof payload === "string" ? payload : JSON.stringify(payload),
+      details: typeof data === "string" ? data : JSON.stringify(data),
     } satisfies RpcError;
   }
 
-  return payload as CandidateTx[];
+  return data as CandidateTx[];
 }
 
 function getBearerToken(req: Request): string | null {
@@ -600,9 +574,7 @@ Deno.serve(async (req) => {
     let candidates: CandidateTx[] = [];
     try {
       candidates = await callBankAiSearchCandidatesRpc(
-        supabaseUrl,
-        apiKey,
-        token,
+        userClient,
         companyId,
         queryVector,
         limit,
