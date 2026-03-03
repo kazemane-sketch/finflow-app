@@ -17,7 +17,8 @@ import {
   type BankEmbeddingHealth,
   type BankImportStats, type BankParseProgress, type BankParseResult, type BankTransaction,
 } from '@/lib/bankParser'
-import { supabase, SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
+import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
+import { getValidAccessToken, type AccessTokenError } from '@/lib/getValidAccessToken'
 
 // ============================================================
 // UTILS
@@ -678,20 +679,18 @@ async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: st
 }
 
 async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchResponse> {
-  const readSessionToken = async (): Promise<string> => {
-    const { data: sessionData } = await supabase.auth.getSession()
-    const token = sessionData?.session?.access_token
-    if (!token) {
-      throw createBankAiError('Sessione assente: effettua nuovamente il login.', {
-        status: 401,
-        errorCode: 'AUTH_SESSION_MISSING',
-        hint: 'Rifai login e riprova.',
-      })
-    }
-    return token
+  let firstToken: string
+  try {
+    firstToken = await getValidAccessToken()
+  } catch (e: any) {
+    const authErr = e as AccessTokenError
+    throw createBankAiError(authErr?.message || 'Sessione assente: effettua nuovamente il login.', {
+      status: authErr?.status ?? 401,
+      errorCode: authErr?.errorCode || 'AUTH_SESSION_MISSING',
+      hint: authErr?.hint || 'Rifai login e riprova.',
+    })
   }
 
-  const firstToken = await readSessionToken()
   try {
     return await invokeBankAiWithBearer(body, firstToken)
   } catch (e: any) {
@@ -699,17 +698,20 @@ async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchR
     const shouldRetryAuth = shouldRetryBankAiAuth(parsed)
     if (!shouldRetryAuth) throw parsed
 
-    const { error: refreshError } = await supabase.auth.refreshSession().catch(() => ({ error: new Error('refresh_failed') }))
-    if (refreshError) {
-      throw createBankAiError(parsed?.message || 'Sessione non valida o scaduta.', {
-        status: parsed?.status ?? 401,
+    let refreshedToken: string
+    try {
+      refreshedToken = await getValidAccessToken({ forceRefresh: true })
+    } catch (eRefresh: any) {
+      const authErr = eRefresh as AccessTokenError
+      throw createBankAiError(parsed?.message || authErr?.message || 'Sessione non valida o scaduta.', {
+        status: authErr?.status ?? parsed?.status ?? 401,
         requestId: parsed?.requestId,
         details: parsed?.details,
-        errorCode: parsed?.errorCode || 'AUTH_REFRESH_FAILED',
-        hint: 'Sessione scaduta. Effettua nuovamente il login e riprova.',
+        errorCode: authErr?.errorCode || parsed?.errorCode || 'AUTH_REFRESH_FAILED',
+        hint: authErr?.hint || 'Sessione scaduta. Effettua nuovamente il login e riprova.',
       })
     }
-    const refreshedToken = await readSessionToken()
+
     try {
       return await invokeBankAiWithBearer(body, refreshedToken)
     } catch (e2: any) {

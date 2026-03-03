@@ -9,10 +9,7 @@ const corsHeaders = {
 
 const REQUEST_TIMEOUT_MS = Number(Deno.env.get("BANK_AI_SEARCH_TIMEOUT_MS") ?? "30000");
 const ANTHROPIC_MODEL = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-3-5-haiku-20241022";
-const GEMINI_TEXT_MODEL = Deno.env.get("GEMINI_TEXT_MODEL") ?? "gemini-2.5-flash";
-const GEMINI_EMBEDDING_MODEL = Deno.env.get("GEMINI_EMBEDDING_MODEL") ?? "gemini-embedding-001";
 const MAX_CANDIDATES = 50;
-const EXPECTED_EMBEDDING_DIMS = 3072;
 
 type DirectionFilter = "all" | "in" | "out";
 type AiMode = "filter" | "analysis";
@@ -36,7 +33,6 @@ type CandidateTx = {
   reference: string | null;
   invoice_ref: string | null;
   direction: "in" | "out" | null;
-  similarity: number | null;
 };
 
 type BankFilterSpec = {
@@ -239,33 +235,6 @@ function buildFilterSpec(rawQuery: string): BankFilterSpec {
   };
 }
 
-function enrichQueryWithMonthHints(query: string): string {
-  const q = query.toLowerCase();
-  const monthMap: Record<string, { full: string; num: string }> = {
-    gen: { full: "gennaio", num: "01" },
-    feb: { full: "febbraio", num: "02" },
-    mar: { full: "marzo", num: "03" },
-    apr: { full: "aprile", num: "04" },
-    mag: { full: "maggio", num: "05" },
-    giu: { full: "giugno", num: "06" },
-    lug: { full: "luglio", num: "07" },
-    ago: { full: "agosto", num: "08" },
-    set: { full: "settembre", num: "09" },
-    ott: { full: "ottobre", num: "10" },
-    nov: { full: "novembre", num: "11" },
-    dic: { full: "dicembre", num: "12" },
-  };
-
-  const hits: string[] = [];
-  for (const [abbr, def] of Object.entries(monthMap)) {
-    const rx = new RegExp(`\\b${abbr}\\b`, "i");
-    if (rx.test(q)) hits.push(`${def.full} (${def.num})`);
-  }
-
-  if (!hits.length) return query;
-  return `${query}\nContesto mesi: ${hits.join(", ")}`;
-}
-
 function buildPrompt(query: string, candidates: CandidateTx[]): string {
   return [
     "Sei un assistente contabile che risponde a domande su movimenti bancari.",
@@ -289,35 +258,6 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   } finally {
     clearTimeout(timeout);
   }
-}
-
-async function callGeminiEmbedding(apiKey: string, text: string, taskType: "RETRIEVAL_QUERY" | "RETRIEVAL_DOCUMENT"): Promise<number[]> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBEDDING_MODEL}:embedContent?key=${apiKey}`;
-  const response = await fetchWithTimeout(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: `models/${GEMINI_EMBEDDING_MODEL}`,
-      content: { parts: [{ text }] },
-      taskType,
-    }),
-  }, REQUEST_TIMEOUT_MS);
-
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const msg = payload?.error?.message || payload?.message || `HTTP ${response.status}`;
-    throw new Error(`Gemini embedding error: ${msg}`);
-  }
-
-  const values = payload?.embedding?.values;
-  if (!Array.isArray(values) || values.length !== EXPECTED_EMBEDDING_DIMS) {
-    throw new Error(`Gemini embedding dimensione inattesa (${Array.isArray(values) ? values.length : "n/a"})`);
-  }
-  return values.map((v: unknown) => Number(v));
-}
-
-function toVectorLiteral(values: number[]): string {
-  return `[${values.map((v) => Number.isFinite(v) ? v.toFixed(8) : "0").join(",")}]`;
 }
 
 async function callAnthropic(apiKey: string, prompt: string): Promise<string> {
@@ -349,34 +289,6 @@ async function callAnthropic(apiKey: string, prompt: string): Promise<string> {
     .join("\n")
     .trim();
   if (!text) throw new Error("Anthropic empty response");
-  return text;
-}
-
-async function callGeminiText(apiKey: string, prompt: string): Promise<string> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${apiKey}`;
-  const response = await fetchWithTimeout(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0,
-        maxOutputTokens: 2048,
-      },
-    }),
-  }, REQUEST_TIMEOUT_MS);
-
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const msg = payload?.error?.message || payload?.message || `HTTP ${response.status}`;
-    throw new Error(`Gemini text error: ${msg}`);
-  }
-
-  const text = (payload?.candidates?.[0]?.content?.parts ?? [])
-    .map((p: any) => typeof p?.text === "string" ? p.text : "")
-    .join("\n")
-    .trim();
-  if (!text) throw new Error("Gemini empty response");
   return text;
 }
 
@@ -469,7 +381,6 @@ Deno.serve(async (req) => {
 
   const supabaseUrl = resolveSupabaseUrl(req);
   const apiKey = getApiKey(req);
-  const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
   if (!supabaseUrl) {
     return errorResponse(appError(500, "Supabase non configurato", "CONFIG_SUPABASE_MISSING"), requestId);
@@ -531,41 +442,44 @@ Deno.serve(async (req) => {
       }, requestId, 200);
     }
 
-    if (!geminiKey) {
+    if (!anthropicKey) {
       return errorResponse(appError(
         503,
-        "GEMINI_API_KEY non configurata",
-        "CONFIG_GEMINI_API_KEY_MISSING",
-        "Configura il secret GEMINI_API_KEY nelle Edge Functions.",
+        "ANTHROPIC_API_KEY non configurata",
+        "CONFIG_ANTHROPIC_API_KEY_MISSING",
+        "Configura il secret ANTHROPIC_API_KEY nelle Edge Functions.",
         undefined,
         "analysis",
       ), requestId);
     }
 
-    const queryEmbedding = await callGeminiEmbedding(geminiKey, enrichQueryWithMonthHints(query), "RETRIEVAL_QUERY");
-    const queryVector = toVectorLiteral(queryEmbedding);
+    let candidateQuery = userClient
+      .from("bank_transactions")
+      .select("id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,direction")
+      .eq("company_id", companyId);
 
-    const { data: candidateData, error: candidateError } = await userClient.rpc("bank_ai_search_candidates", {
-      p_company_id: companyId,
-      p_query_vector: queryVector,
-      p_limit: limit,
-      p_direction: direction,
-      p_date_from: dateFrom,
-      p_date_to: dateTo,
-    });
+    if (direction !== "all") candidateQuery = candidateQuery.eq("direction", direction);
+    if (dateFrom) candidateQuery = candidateQuery.gte("date", dateFrom);
+    if (dateTo) candidateQuery = candidateQuery.lte("date", dateTo);
+
+    const { data: candidateData, error: candidateError } = await candidateQuery
+      .order("date", { ascending: false })
+      .limit(limit);
 
     if (candidateError) {
+      const msg = candidateError.message || "";
+      const isJwtError = /jwt|auth|token|session|expired|invalid/i.test(msg);
       console.error(JSON.stringify({
         request_id: requestId,
         company_id: companyId,
-        auth_stage: "candidate_query",
+        auth_stage: "bank_transactions_query",
         supabase_error: candidateError.message,
       }));
       return errorResponse(appError(
-        500,
-        "Errore ricerca candidati",
-        "AI_CANDIDATES_QUERY_FAILED",
-        "Riprova tra pochi secondi.",
+        isJwtError ? 401 : 500,
+        isJwtError ? "JWT non valido o scaduto" : "Errore ricerca candidati",
+        isJwtError ? "AUTH_INVALID_JWT" : "AI_CANDIDATES_QUERY_FAILED",
+        isJwtError ? "Effettua nuovamente il login." : "Riprova tra pochi secondi.",
         candidateError.message,
         "analysis",
       ), requestId);
@@ -585,34 +499,16 @@ Deno.serve(async (req) => {
 
     const prompt = buildPrompt(query, candidates);
     let answer = "";
-    let model = "";
-    const providerErrors: string[] = [];
-
-    if (anthropicKey) {
-      try {
-        answer = await callAnthropic(anthropicKey, prompt);
-        model = `anthropic:${ANTHROPIC_MODEL}`;
-      } catch (e) {
-        providerErrors.push(e instanceof Error ? e.message : "Anthropic errore sconosciuto");
-      }
-    }
-
-    if (!answer && geminiKey) {
-      try {
-        answer = await callGeminiText(geminiKey, prompt);
-        model = `gemini:${GEMINI_TEXT_MODEL}`;
-      } catch (e) {
-        providerErrors.push(e instanceof Error ? e.message : "Gemini errore sconosciuto");
-      }
-    }
-
-    if (!answer) {
+    try {
+      answer = await callAnthropic(anthropicKey, prompt);
+    } catch (e) {
+      const providerError = e instanceof Error ? e.message : "Anthropic errore sconosciuto";
       return errorResponse(appError(
         503,
-        "Nessun provider AI disponibile",
+        "Provider AI non disponibile",
         "AI_PROVIDER_UNAVAILABLE",
-        "Verifica i secret provider e riprova.",
-        providerErrors.join(" | ") || "errore sconosciuto",
+        "Verifica ANTHROPIC_API_KEY e riprova.",
+        providerError,
         "analysis",
       ), requestId);
     }
@@ -622,7 +518,7 @@ Deno.serve(async (req) => {
       answer,
       candidate_count: candidates.length,
       used_count: candidates.length,
-      model,
+      model: `anthropic:${ANTHROPIC_MODEL}`,
       request_id: requestId,
     }, requestId, 200);
   } catch (e) {
