@@ -24,6 +24,12 @@ type AppErrorPayload = {
   mode?: AiMode;
 };
 
+type RpcError = {
+  status: number;
+  message: string;
+  details?: string;
+};
+
 type CandidateTx = {
   id: string;
   date: string | null;
@@ -299,6 +305,11 @@ function toVectorLiteral(values: number[]): string {
   return `[${values.map((v) => Number.isFinite(v) ? v.toFixed(8) : "0").join(",")}]`;
 }
 
+function isRpcErrorPayload(e: unknown): e is RpcError {
+  const x = e as RpcError | null;
+  return !!x && typeof x.status === "number" && typeof x.message === "string";
+}
+
 async function callGeminiEmbedding(apiKey: string, query: string): Promise<number[]> {
   const response = await fetchWithTimeout(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBEDDING_MODEL}:embedContent?key=${apiKey}`,
@@ -331,6 +342,71 @@ async function callGeminiEmbedding(apiKey: string, query: string): Promise<numbe
     throw new Error(`Embedding dimensione inattesa (${parsed.length}, atteso ${EXPECTED_EMBEDDING_DIMS})`);
   }
   return parsed;
+}
+
+async function callBankAiSearchCandidatesRpc(
+  supabaseUrl: string,
+  apiKey: string,
+  token: string,
+  companyId: string,
+  queryVector: string,
+  limit: number,
+  direction: DirectionFilter,
+  dateFrom: string | null,
+  dateTo: string | null,
+): Promise<CandidateTx[]> {
+  const response = await fetchWithTimeout(`${supabaseUrl}/rest/v1/rpc/bank_ai_search_candidates`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      apikey: apiKey,
+      Authorization: `Bearer ${token}`,
+      Prefer: "params=single-object",
+      "Accept-Profile": "public",
+      "Content-Profile": "public",
+    },
+    body: JSON.stringify({
+      p_company_id: companyId,
+      p_query_vector: queryVector,
+      p_limit: limit,
+      p_direction: direction,
+      p_date_from: dateFrom,
+      p_date_to: dateTo,
+    }),
+  }, REQUEST_TIMEOUT_MS);
+
+  const raw = await response.text().catch(() => "");
+  let payload: any = null;
+  try {
+    payload = raw ? JSON.parse(raw) : null;
+  } catch {
+    payload = raw || null;
+  }
+
+  if (!response.ok) {
+    const message = typeof payload?.message === "string"
+      ? payload.message
+      : typeof payload?.error === "string"
+        ? payload.error
+        : raw || `HTTP ${response.status}`;
+    const details = typeof payload?.details === "string"
+      ? payload.details
+      : typeof payload?.hint === "string"
+        ? payload.hint
+        : undefined;
+    throw { status: response.status, message, details } satisfies RpcError;
+  }
+
+  if (!Array.isArray(payload)) {
+    throw {
+      status: 500,
+      message: "Payload RPC non valido",
+      details: typeof payload === "string" ? payload : JSON.stringify(payload),
+    } satisfies RpcError;
+  }
+
+  return payload as CandidateTx[];
 }
 
 function getBearerToken(req: Request): string | null {
@@ -522,35 +598,39 @@ Deno.serve(async (req) => {
       ), requestId);
     }
 
-    const { data: candidateData, error: candidateError } = await userClient.rpc("bank_ai_search_candidates", {
-      p_company_id: companyId,
-      p_query_vector: queryVector,
-      p_limit: limit,
-      p_direction: direction,
-      p_date_from: dateFrom,
-      p_date_to: dateTo,
-    });
-
-    if (candidateError) {
-      const msg = candidateError.message || "";
-      const isJwtError = /jwt|auth|token|session|expired|invalid/i.test(msg);
+    let candidates: CandidateTx[] = [];
+    try {
+      candidates = await callBankAiSearchCandidatesRpc(
+        supabaseUrl,
+        apiKey,
+        token,
+        companyId,
+        queryVector,
+        limit,
+        direction,
+        dateFrom,
+        dateTo,
+      );
+    } catch (e) {
+      const status = isRpcErrorPayload(e) ? e.status : 500;
+      const msg = isRpcErrorPayload(e) ? e.message : (e instanceof Error ? e.message : "Errore RPC sconosciuto");
+      const details = isRpcErrorPayload(e) ? e.details : undefined;
+      const isJwtError = status === 401 || status === 403 || /jwt|auth|token|session|expired|invalid/i.test(msg);
       console.error(JSON.stringify({
         request_id: requestId,
         company_id: companyId,
-        auth_stage: "bank_transactions_query",
-        supabase_error: candidateError.message,
+        auth_stage: "bank_ai_search_candidates_rpc",
+        supabase_error: msg,
       }));
       return errorResponse(appError(
         isJwtError ? 401 : 500,
         isJwtError ? "JWT non valido o scaduto" : "Errore ricerca candidati",
         isJwtError ? "AUTH_INVALID_JWT" : "AI_CANDIDATES_QUERY_FAILED",
         isJwtError ? "Effettua nuovamente il login." : "Riprova tra pochi secondi.",
-        candidateError.message,
+        details ? `${msg} | ${details}` : msg,
         "analysis",
       ), requestId);
     }
-
-    const candidates = (Array.isArray(candidateData) ? candidateData : []) as CandidateTx[];
     if (!candidates.length) {
       return jsonResponse({
         mode: "analysis" as AiMode,
