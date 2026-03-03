@@ -1,5 +1,5 @@
 // src/pages/BancaPage.tsx
-import { useState, useEffect, useCallback, useMemo, useRef, type MouseEvent } from 'react'
+import { useState, useEffect, useCallback, useRef, type MouseEvent } from 'react'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useCompany } from '@/hooks/useCompany'
@@ -13,9 +13,11 @@ import {
   updateImportBatch, loadBankTransactions, loadBankAccounts, getClaudeApiKey,
   updateBankAccountBalance,
   deleteBankTransactions, deleteAllBankTransactions, updateBankTransactionDirection,
+  getBankEmbeddingHealth, triggerBankEmbeddingBackfill,
+  type BankEmbeddingHealth,
   type BankImportStats, type BankParseProgress, type BankParseResult, type BankTransaction,
 } from '@/lib/bankParser'
-import { supabase } from '@/integrations/supabase/client'
+import { supabase, SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
 
 // ============================================================
 // UTILS
@@ -532,231 +534,177 @@ function TxDetail({
 // ============================================================
 // AI SEARCH
 // ============================================================
-const MAX_AI_TX = 1500
-const MAX_AI_PAYLOAD_BYTES = 350_000
-const AI_TEXT_CLIP = {
-  description: 180,
-  counterparty: 100,
-  reference: 80,
-  invoiceRef: 40,
-  txType: 40,
+type BankAiMode = 'filter' | 'analysis'
+
+type BankAiStructuredFilter = {
+  counterparty: string | null
+  direction: 'all' | 'in' | 'out'
+  transaction_types: string[]
+  amount_min: number | null
+  amount_max: number | null
+  date_from: string | null
+  date_to: string | null
 }
 
-function clipAiText(v: unknown, max: number): string {
-  const s = String(v ?? '').replace(/\s+/g, ' ').trim()
-  if (!s) return ''
-  return s.length > max ? `${s.slice(0, max)}…` : s
+type BankAiSearchRequest = {
+  query: string
+  company_id: string
+  direction?: 'all' | 'in' | 'out'
+  date_from?: string | null
+  date_to?: string | null
+  limit?: number
 }
 
 type BankAiSearchResponse = {
-  answer: string
-  used_count: number
-  truncated: boolean
+  mode: BankAiMode
+  answer?: string
+  filters?: BankAiStructuredFilter
+  used_count?: number
+  candidate_count?: number
   model?: string
+  request_id?: string
 }
 
-async function askBankAiSearch(query: string, transactions: any[]): Promise<BankAiSearchResponse> {
-  const { data, error } = await supabase.functions.invoke('bank-ai-search', {
-    body: { query, transactions },
-  })
+function normalizeBankAiFilters(raw: any): BankAiStructuredFilter | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const direction = raw.direction === 'in' || raw.direction === 'out' ? raw.direction : 'all'
+  const txTypes = Array.isArray(raw.transaction_types)
+    ? raw.transaction_types.map((v: any) => String(v || '').trim()).filter(Boolean)
+    : []
+  const amountMin = raw.amount_min != null && Number.isFinite(Number(raw.amount_min)) ? Number(raw.amount_min) : null
+  const amountMax = raw.amount_max != null && Number.isFinite(Number(raw.amount_max)) ? Number(raw.amount_max) : null
+  const dateFrom = typeof raw.date_from === 'string' && raw.date_from ? raw.date_from : null
+  const dateTo = typeof raw.date_to === 'string' && raw.date_to ? raw.date_to : null
+  const counterparty = typeof raw.counterparty === 'string' && raw.counterparty.trim() ? raw.counterparty.trim() : null
 
-  if (error) {
-    throw new Error(error.message || 'Errore AI search')
+  return {
+    counterparty,
+    direction,
+    transaction_types: txTypes,
+    amount_min: amountMin,
+    amount_max: amountMax,
+    date_from: dateFrom,
+    date_to: dateTo,
   }
-  if (data?.error) {
-    throw new Error(String(data.error))
+}
+
+type BankAiErrorPayload = Error & {
+  status?: number
+  requestId?: string
+  details?: string
+}
+
+function createBankAiError(message: string, extra?: Partial<BankAiErrorPayload>): BankAiErrorPayload {
+  const err = new Error(message) as BankAiErrorPayload
+  if (extra?.status != null) err.status = extra.status
+  if (extra?.requestId) err.requestId = extra.requestId
+  if (extra?.details) err.details = extra.details
+  return err
+}
+
+async function parseResponsePayload(res: Response): Promise<{ payload: any; rawText: string }> {
+  const rawText = await res.text().catch(() => '')
+  if (!rawText) return { payload: {}, rawText: '' }
+  try {
+    return { payload: JSON.parse(rawText), rawText }
+  } catch {
+    return { payload: {}, rawText }
+  }
+}
+
+async function parseInvokeError(error: any): Promise<BankAiErrorPayload> {
+  const baseMessage = String(error?.message || 'Errore AI search')
+  const context = error?.context
+  if (!(context instanceof Response)) {
+    return createBankAiError(baseMessage)
+  }
+
+  const status = context.status
+  const requestId = context.headers.get('x-request-id') || context.headers.get('sb-request-id') || undefined
+  const { payload, rawText } = await parseResponsePayload(context)
+  const details = String(payload?.error || payload?.message || rawText || '').trim()
+  return createBankAiError(details || baseMessage, {
+    status,
+    requestId,
+    details: details || undefined,
+  })
+}
+
+async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: string): Promise<BankAiSearchResponse> {
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/bank-ai-search`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': SUPABASE_ANON_KEY,
+      'Authorization': `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify(body),
+  })
+  const requestId = res.headers.get('x-request-id') || res.headers.get('sb-request-id') || undefined
+  const { payload, rawText } = await parseResponsePayload(res)
+
+  if (!res.ok) {
+    const msg = String(payload?.error || payload?.message || rawText || `HTTP ${res.status}`).trim()
+    throw createBankAiError(msg || 'Errore funzione AI', {
+      status: res.status,
+      requestId,
+      details: msg || undefined,
+    })
+  }
+
+  if (payload?.error) {
+    throw createBankAiError(String(payload.error), {
+      status: res.status,
+      requestId: String(payload?.request_id || requestId || ''),
+      details: String(payload.error),
+    })
   }
 
   return {
-    answer: typeof data.answer === 'string' && data.answer.trim() ? data.answer.trim() : 'Nessuna risposta',
-    used_count: Number(data.used_count || transactions.length || 0),
-    truncated: Boolean(data.truncated),
-    model: typeof data.model === 'string' ? data.model : undefined,
+    mode: payload?.mode === 'filter' ? 'filter' : 'analysis',
+    answer: typeof payload?.answer === 'string' ? payload.answer : undefined,
+    filters: normalizeBankAiFilters(payload?.filters),
+    used_count: Number(payload?.used_count || 0),
+    candidate_count: Number(payload?.candidate_count || 0),
+    model: typeof payload?.model === 'string' ? payload.model : undefined,
+    request_id: typeof payload?.request_id === 'string' ? payload.request_id : requestId,
   }
 }
 
-function buildLocalAiFallback(query: string, transactions: Array<{
-  date?: string | null
-  value_date?: string | null
-  amount: number
-  direction?: 'in' | 'out' | null
-  description?: string | null
-  counterparty_name?: string | null
-  reference?: string | null
-  invoice_ref?: string | null
-  transaction_type?: string | null
-}>): string {
-  const raw = query.trim()
-  const q = raw.toLowerCase()
-  if (!q) return "Inserisci una query per avviare l'analisi."
-
-  const normalizeText = (v: string): string =>
-    String(v || '')
-      .toLowerCase()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/[^a-z0-9]+/g, ' ')
-      .trim()
-
-  const stopwords = new Set([
-    'e', 'ed', 'o', 'di', 'del', 'della', 'dello', 'dei', 'degli', 'delle',
-    'il', 'lo', 'la', 'i', 'gli', 'le', 'un', 'una', 'uno', 'per', 'con',
-    'su', 'da', 'al', 'alla', 'agli', 'ai', 'alle', 'nel', 'nella', 'nei',
-    'nelle', 'movimento', 'movimenti', 'cerca', 'cercare',
-  ])
-
-  const parseIsoDate = (dd: string, mm: string, yyyy: string): string | null => {
-    const d = Number(dd)
-    const m = Number(mm)
-    let y = Number(yyyy)
-    if (!Number.isFinite(d) || !Number.isFinite(m) || !Number.isFinite(y)) return null
-    if (yyyy.length === 2) y += y >= 70 ? 1900 : 2000
-    if (d < 1 || d > 31 || m < 1 || m > 12 || y < 1900 || y > 2100) return null
-    return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`
-  }
-
-  const dateMatches = Array.from(q.matchAll(/\b(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})\b/g))
-  const exactDates = dateMatches
-    .map((m) => parseIsoDate(m[1], m[2], m[3]))
-    .filter((d): d is string => Boolean(d))
-
-  const parseAmountToken = (token: string): number | null => {
-    const compact = token.replace(/\s+/g, '')
-    if (!compact) return null
-    const normalized = compact
-      .replace(/\.(?=\d{3}(?:\D|$))/g, '')
-      .replace(',', '.')
-      .replace(/[^0-9.-]/g, '')
-    const n = Number(normalized)
-    if (!Number.isFinite(n)) return null
-    return Math.abs(n)
-  }
-
-  const amountTokens = Array.from(q.matchAll(/(?:€\s*)?-?\d[\d.,]*/g))
-    .map((m) => m[0])
-    .filter((s) => /\d/.test(s))
-
-  const amountFilters = Array.from(
-    new Set(
-      amountTokens
-        .map(parseAmountToken)
-        .filter((n): n is number => n != null && n >= 1),
-    ),
-  )
-
-  const hasInKeyword = /\b(entrat[ae]?|incass[oi]|accredito|accrediti|ricevut[oa]|bonifico in)\b/.test(q)
-  const hasOutKeyword = /\b(uscit[ae]?|pagament[oi]|addebito|addebiti|bonifico out|spes[ae]|fornitor[ei])\b/.test(q)
-  const directionFilter: 'in' | 'out' | null = hasInKeyword && !hasOutKeyword
-    ? 'in'
-    : hasOutKeyword && !hasInKeyword
-      ? 'out'
-      : null
-
-  const textTokens = normalizeText(raw)
-    .split(/\s+/)
-    .filter((t) => t && !stopwords.has(t) && !/^\d+$/.test(t))
-
-  const hasStructuredFilter = exactDates.length > 0 || amountFilters.length > 0 || directionFilter != null
-
-  const withDiagnostics = transactions.map((tx) => {
-    const hay = normalizeText([
-      tx.description || '',
-      tx.counterparty_name || '',
-      tx.reference || '',
-      tx.invoice_ref || '',
-      tx.transaction_type || '',
-      txTypeLabel(tx.transaction_type || ''),
-    ].join(' '))
-    const txDirectionValue = tx.direction || (Number(tx.amount || 0) >= 0 ? 'in' : 'out')
-    const txDate = String(tx.date || '').slice(0, 10)
-    const txValueDate = String(tx.value_date || '').slice(0, 10)
-    const txAmountAbs = Math.abs(Number(tx.amount || 0))
-
-    const amountMatches = amountFilters.map((target) => {
-      const tolerance = Math.max(1, target * 0.1)
-      return Math.abs(txAmountAbs - target) <= tolerance
-    })
-    const amountMatch = amountFilters.length === 0 || amountMatches.some(Boolean)
-
-    const dateMatch = exactDates.length === 0
-      || exactDates.some((d) => d === txDate || d === txValueDate)
-
-    const directionMatch = !directionFilter || txDirectionValue === directionFilter
-    const textMatch = textTokens.length === 0 || textTokens.every((token) => hay.includes(token))
-
-    const include = hasStructuredFilter
-      ? amountMatch && dateMatch && directionMatch
-      : textMatch
-
-    let score = 0
-    if (amountFilters.length > 0 && amountMatch) {
-      const bestDelta = Math.min(...amountFilters.map((target) => Math.abs(txAmountAbs - target) / Math.max(target, 1)))
-      score += Math.max(0, 70 - bestDelta * 100)
+async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchResponse> {
+  const firstAttempt = async (): Promise<BankAiSearchResponse> => {
+    const { data, error } = await supabase.functions.invoke('bank-ai-search', { body })
+    if (error) throw await parseInvokeError(error)
+    if (!data) throw createBankAiError('Risposta AI vuota')
+    if (data?.error) {
+      throw createBankAiError(String(data.error), {
+        requestId: typeof data?.request_id === 'string' ? data.request_id : undefined,
+      })
     }
-    if (exactDates.length > 0 && dateMatch) score += 40
-    if (directionFilter && directionMatch) score += 15
-    if (textTokens.length > 0 && textMatch) score += 25
-
     return {
-      tx,
-      include: include && (hasStructuredFilter ? textTokens.length === 0 || textMatch : true),
-      amountMatch,
-      dateMatch,
-      directionMatch,
-      textMatch,
-      score,
+      mode: data?.mode === 'filter' ? 'filter' : 'analysis',
+      answer: typeof data?.answer === 'string' ? data.answer : undefined,
+      filters: normalizeBankAiFilters(data?.filters),
+      used_count: Number(data?.used_count || 0),
+      candidate_count: Number(data?.candidate_count || 0),
+      model: typeof data?.model === 'string' ? data.model : undefined,
+      request_id: typeof data?.request_id === 'string' ? data.request_id : undefined,
     }
-  })
-
-  const matched = withDiagnostics
-    .filter((d) => d.include)
-    .sort((a, b) => b.score - a.score)
-    .map((d) => d.tx)
-
-  if (matched.length === 0) {
-    const amountHits = withDiagnostics.filter((d) => d.amountMatch).length
-    const dateHits = withDiagnostics.filter((d) => d.dateMatch).length
-    const dirHits = withDiagnostics.filter((d) => d.directionMatch).length
-    const criteria = [
-      amountFilters.length > 0 ? `importo ±10% (${amountFilters.map((a) => fmtEur(a)).join(', ')})` : null,
-      exactDates.length > 0 ? `data ${exactDates.join(', ')}` : null,
-      directionFilter ? `direzione ${directionFilter === 'in' ? 'entrata' : 'uscita'}` : null,
-      !hasStructuredFilter && textTokens.length > 0 ? `testo: ${textTokens.join(', ')}` : null,
-    ].filter(Boolean)
-
-    return [
-      `Nessun risultato per "${query}".`,
-      criteria.length > 0 ? `Criteri applicati: ${criteria.join(' · ')}` : 'Nessun criterio valido rilevato nella query.',
-      `Movimenti analizzati: ${transactions.length} · match importo: ${amountHits} · match data: ${dateHits} · match direzione: ${dirHits}`,
-    ].join('\n')
   }
 
-  const totalIn = matched
-    .filter((tx) => Number(tx.amount || 0) >= 0)
-    .reduce((s, tx) => s + Math.abs(Number(tx.amount || 0)), 0)
-  const totalOut = matched
-    .filter((tx) => Number(tx.amount || 0) < 0)
-    .reduce((s, tx) => s + Math.abs(Number(tx.amount || 0)), 0)
+  try {
+    return await firstAttempt()
+  } catch (e: any) {
+    const parsed = e as BankAiErrorPayload
+    const shouldRetryAuth = parsed?.status === 401 || parsed?.status === 403
+    if (!shouldRetryAuth) throw parsed
 
-  const byCounterparty = new Map<string, number>()
-  for (const tx of matched) {
-    const name = (tx.counterparty_name || 'N.D.').trim()
-    byCounterparty.set(name, (byCounterparty.get(name) || 0) + Math.abs(Number(tx.amount || 0)))
+    await supabase.auth.refreshSession().catch(() => null)
+    const { data: sessionData } = await supabase.auth.getSession()
+    const accessToken = sessionData?.session?.access_token
+    if (!accessToken) throw parsed
+    return await invokeBankAiWithBearer(body, accessToken)
   }
-  const top = Array.from(byCounterparty.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 3)
-    .map(([name, amount]) => `${name}: ${fmtEur(amount)}`)
-
-  const lines = [
-    `Risultati trovati: ${matched.length} movimento/i per "${query}".`,
-    `Entrate: ${fmtEur(totalIn)} · Uscite: ${fmtEur(totalOut)} · Netto: ${fmtEur(totalIn - totalOut)}`,
-  ]
-  if (amountFilters.length > 0) lines.push(`Filtro importo: ±10% su ${amountFilters.map((a) => fmtEur(a)).join(', ')}`)
-  if (exactDates.length > 0) lines.push(`Filtro data: ${exactDates.join(', ')}`)
-  if (directionFilter) lines.push(`Filtro direzione: ${directionFilter === 'in' ? 'entrate' : 'uscite'}`)
-  if (top.length) lines.push(`Top controparti: ${top.join(' · ')}`)
-  return lines.join('\n')
 }
 
 // ============================================================
@@ -782,9 +730,12 @@ export default function BancaPage() {
   const [directionDraft, setDirectionDraft] = useState<'in' | 'out'>('in')
   const [directionSaving, setDirectionSaving] = useState(false)
 
-  // AI search (usa query come input unificato)
-  const [aiResult, setAiResult] = useState<string | null>(null)
+  // AI search
+  const [aiResult, setAiResult] = useState<{ text: string; mode: BankAiMode; isError: boolean; requestId?: string } | null>(null)
   const [aiLoading, setAiLoading] = useState(false)
+  const [aiStructuredFilter, setAiStructuredFilter] = useState<BankAiStructuredFilter | null>(null)
+  const [embeddingHealth, setEmbeddingHealth] = useState<BankEmbeddingHealth | null>(null)
+  const embeddingAutoKickRef = useRef(false)
 
   // Import
   const [importing, setImporting] = useState(false)
@@ -807,6 +758,17 @@ export default function BancaPage() {
   const [summaryConfirming, setSummaryConfirming] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
+  const refreshEmbeddingHealth = useCallback(async () => {
+    if (!companyId) return null
+    try {
+      const health = await getBankEmbeddingHealth(companyId)
+      setEmbeddingHealth(health)
+      return health
+    } catch (e: any) {
+      console.warn('[Bank Embedding] health unavailable', e?.message || e)
+      return null
+    }
+  }, [companyId])
 
   const loadData = useCallback(async () => {
     if (!companyId) return
@@ -817,9 +779,45 @@ export default function BancaPage() {
       setBankAccounts(accs)
     } catch (e: any) { console.error(e) }
     setLoading(false)
-  }, [companyId])
+    void refreshEmbeddingHealth()
+  }, [companyId, refreshEmbeddingHealth])
 
   useEffect(() => { loadData() }, [loadData])
+
+  useEffect(() => {
+    embeddingAutoKickRef.current = false
+  }, [companyId])
+
+  useEffect(() => {
+    if (!companyId) return
+    if (embeddingAutoKickRef.current) return
+    embeddingAutoKickRef.current = true
+
+    void (async () => {
+      let health = await refreshEmbeddingHealth()
+      if (!health || health.pending_rows <= 0) return
+
+      let safety = 0
+      while (health && health.pending_rows > 0 && safety < 10) {
+        try {
+          const run = await triggerBankEmbeddingBackfill(companyId, { maxRows: 500, batchSize: 80, ttlSeconds: 180 })
+          console.info('[Bank Embedding] auto-run', { company_id: companyId, attempt: safety + 1, ...run })
+        } catch (e: any) {
+          console.warn('[Bank Embedding] auto-run failed', e?.message || e)
+          break
+        }
+
+        const nextHealth = await refreshEmbeddingHealth()
+        if (!nextHealth) break
+        if (nextHealth.pending_rows >= health.pending_rows) {
+          health = nextHealth
+          break
+        }
+        health = nextHealth
+        safety += 1
+      }
+    })()
+  }, [companyId, refreshEmbeddingHealth])
 
   // Quick date filters
   const setQuickDate = (type: string) => {
@@ -1165,6 +1163,23 @@ export default function BancaPage() {
     if (typeFilter !== 'all' && tx.transaction_type !== typeFilter) return false
     if (dateFrom && tx.date < dateFrom) return false
     if (dateTo && tx.date > dateTo) return false
+
+    if (aiStructuredFilter) {
+      const amountAbs = Math.abs(Number(tx.amount || 0))
+      if (aiStructuredFilter.amount_min != null && amountAbs < aiStructuredFilter.amount_min) return false
+      if (aiStructuredFilter.amount_max != null && amountAbs > aiStructuredFilter.amount_max) return false
+
+      if (aiStructuredFilter.transaction_types.length > 0) {
+        const txType = String(tx.transaction_type || '')
+        if (!aiStructuredFilter.transaction_types.includes(txType)) return false
+      }
+
+      if (aiStructuredFilter.counterparty) {
+        const cp = String(tx.counterparty_name || '').toLowerCase()
+        if (!cp.includes(aiStructuredFilter.counterparty.toLowerCase())) return false
+      }
+    }
+
     if (query) {
       const q = query.toLowerCase()
       return (tx.description?.toLowerCase().includes(q)) ||
@@ -1175,70 +1190,93 @@ export default function BancaPage() {
     return true
   })
 
-  const aiScope = useMemo(() => {
-    const base = transactions
-      .slice(0, MAX_AI_TX)
-      .map((tx) => ({
-        id: tx.id,
-        date: tx.date,
-        value_date: tx.value_date ?? null,
-        amount: tx.amount,
-        description: clipAiText(tx.description, AI_TEXT_CLIP.description),
-        counterparty_name: clipAiText(tx.counterparty_name, AI_TEXT_CLIP.counterparty) || null,
-        transaction_type: clipAiText(tx.transaction_type || 'altro', AI_TEXT_CLIP.txType) || 'altro',
-        reference: clipAiText(tx.reference, AI_TEXT_CLIP.reference) || null,
-        invoice_ref: clipAiText(tx.invoice_ref, AI_TEXT_CLIP.invoiceRef) || null,
-        direction: tx.direction ?? txDirection(tx),
-      }))
-
-    const compact: typeof base = []
-    let payloadBytes = 0
-    for (const item of base) {
-      const rowBytes = JSON.stringify(item).length
-      if (compact.length > 0 && payloadBytes + rowBytes > MAX_AI_PAYLOAD_BYTES) break
-      compact.push(item)
-      payloadBytes += rowBytes
-    }
-
-    return {
-      transactions: compact,
-      payloadBytes,
-      truncatedByCount: transactions.length > base.length,
-      truncatedByPayload: base.length > compact.length,
-    }
-  }, [transactions])
-
   const handleAiSearch = async () => {
     if (!query.trim()) return
-    if (aiScope.transactions.length === 0) {
-      setAiResult("Nessun movimento disponibile per l'analisi AI.")
+    if (!companyId) {
+      setAiResult({ text: 'Azienda non selezionata.', mode: 'analysis', isError: true })
+      return
+    }
+    if (transactions.length === 0) {
+      setAiResult({ text: "Nessun movimento disponibile per l'analisi AI.", mode: 'analysis', isError: true })
       return
     }
     setAiLoading(true); setAiResult(null)
     try {
-      const result = await askBankAiSearch(query, aiScope.transactions)
-      const effectiveUsedCount = Number.isFinite(result.used_count) && result.used_count > 0
-        ? result.used_count
-        : aiScope.transactions.length
-      const isTruncated = result.truncated || aiScope.truncatedByCount || aiScope.truncatedByPayload
-      const scopeLine = `\n\nScope AI: ${effectiveUsedCount} movimenti analizzati (lista visibile: ${filtered.length} di ${transactions.length})` +
-        `${isTruncated ? ` · limitati agli ultimi ${MAX_AI_TX}` : ''}` +
-        `${aiScope.truncatedByPayload ? ` · payload compattato a ~${Math.round(aiScope.payloadBytes / 1024)}KB` : ''}` +
-        `${result.model ? ` · modello: ${result.model}` : ''}`
-      if ((result.model || '').startsWith('fallback:')) {
-        const fallback = buildLocalAiFallback(query, aiScope.transactions)
-        setAiResult(`${result.answer}\n\n${fallback}${scopeLine}`)
+      const payload: BankAiSearchRequest = {
+        query,
+        company_id: companyId,
+        direction: dirFilter === 'in' || dirFilter === 'out' ? dirFilter : 'all',
+        date_from: dateFrom || null,
+        date_to: dateTo || null,
+        limit: 50,
+      }
+
+      const result = await askBankAiSearch(payload)
+      if (result.mode === 'filter') {
+        const filters = result.filters || null
+        setAiStructuredFilter(filters)
+        if (filters) {
+          setDirFilter(filters.direction || 'all')
+          if (filters.date_from || filters.date_to) {
+            setDateFrom(filters.date_from || '')
+            setDateTo(filters.date_to || '')
+          }
+          if (filters.transaction_types.length === 1) {
+            setTypeFilter(filters.transaction_types[0])
+          } else {
+            setTypeFilter('all')
+          }
+          if (filters.counterparty) {
+            setQuery(filters.counterparty)
+          } else if (
+            filters.amount_min != null ||
+            filters.amount_max != null ||
+            filters.transaction_types.length > 0 ||
+            filters.date_from ||
+            filters.date_to
+          ) {
+            setQuery('')
+          }
+        }
+
+        const filterLines = [
+          result.answer || 'Filtri AI applicati.',
+          `Direzione: ${filters?.direction || 'all'} · Tipi: ${filters?.transaction_types?.length ? filters.transaction_types.join(', ') : 'tutti'}`,
+          `Importi: min ${filters?.amount_min != null ? fmtEur(filters.amount_min) : '—'} · max ${filters?.amount_max != null ? fmtEur(filters.amount_max) : '—'}`,
+          `Periodo: ${filters?.date_from || '—'} → ${filters?.date_to || '—'}`,
+          `Request ID: ${result.request_id || 'n.d.'}`,
+        ]
+        setAiResult({ text: filterLines.join('\n'), mode: 'filter', isError: false, requestId: result.request_id })
       } else {
-        setAiResult(`${result.answer}${scopeLine}`)
+        setAiStructuredFilter(null)
+        const scopeLine = `\n\nScope AI: ${Number(result.candidate_count || 0)} candidati pgvector · ${Number(result.used_count || 0)} usati nel prompt` +
+          `${result.model ? ` · modello: ${result.model}` : ''}` +
+          `${result.request_id ? ` · request: ${result.request_id}` : ''}`
+        setAiResult({
+          text: `${result.answer || 'Nessuna risposta AI.'}${scopeLine}`,
+          mode: 'analysis',
+          isError: false,
+          requestId: result.request_id,
+        })
       }
     } catch (e: any) {
-      console.error('[Banca AI] bank-ai-search failed', e)
-      const fallback = buildLocalAiFallback(query, aiScope.transactions)
-      const reason = String(e?.message || '').trim()
-      setAiResult(
-        `${fallback}\n\n(Fallback locale attivato: servizio AI temporaneamente non disponibile)` +
-        `${reason ? `\nDettaglio errore AI: ${reason}` : ''}`,
-      )
+      const err = e as BankAiErrorPayload
+      const reason = String(err?.message || 'Errore AI non disponibile').trim()
+      const statusLine = err?.status ? `HTTP ${err.status}` : 'HTTP n.d.'
+      const reqLine = err?.requestId ? ` · request: ${err.requestId}` : ''
+      console.error('[Banca AI] bank-ai-search failed', {
+        company_id: companyId,
+        operation: 'bank-ai-search',
+        code: statusLine,
+        details: reason,
+        request_id: err?.requestId,
+      })
+      setAiResult({
+        text: `Errore ricerca AI remota.\n${statusLine}${reqLine}\nDettaglio: ${reason}\nUsa "Riprova" per rilanciare la richiesta.`,
+        mode: 'analysis',
+        isError: true,
+        requestId: err?.requestId,
+      })
     }
     setAiLoading(false)
   }
@@ -1430,6 +1468,15 @@ export default function BancaPage() {
             </div>
           )}
 
+          {embeddingHealth && (
+            <div className="text-xs text-slate-500">
+              Indicizzazione AI: pronti {embeddingHealth.ready_rows}/{embeddingHealth.total_rows}
+              {embeddingHealth.pending_rows > 0 ? ` · pending ${embeddingHealth.pending_rows}` : ''}
+              {embeddingHealth.processing_rows > 0 ? ` · processing ${embeddingHealth.processing_rows}` : ''}
+              {embeddingHealth.error_rows > 0 ? ` · error ${embeddingHealth.error_rows}` : ''}
+            </div>
+          )}
+
           {/* FILTERS */}
           {transactions.length > 0 && (
             <div className="space-y-2">
@@ -1445,10 +1492,10 @@ export default function BancaPage() {
                     onKeyDown={e => e.key === 'Enter' && handleAiSearch()}
                     placeholder="Cerca... · Premi Invio per ricerca AI 🤖"
                     className={`w-full pl-8 pr-8 py-1.5 text-sm border rounded-md focus:outline-none focus:ring-2 ${
-                      aiResult ? 'border-purple-300 focus:ring-purple-400 bg-purple-50' : 'border-gray-200 focus:ring-sky-500'
+                      aiResult ? (aiResult.isError ? 'border-red-300 focus:ring-red-400 bg-red-50' : 'border-purple-300 focus:ring-purple-400 bg-purple-50') : 'border-gray-200 focus:ring-sky-500'
                     }`}
                   />
-                  {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => { setQuery(''); setAiResult(null) }}><X className="h-3.5 w-3.5" /></button>}
+                  {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => { setQuery(''); setAiResult(null); setAiStructuredFilter(null) }}><X className="h-3.5 w-3.5" /></button>}
                 </div>
                 {(['all', 'in', 'out', 'review'] as const).map(d => (
                   <button key={d} onClick={() => setDirFilter(d)}
@@ -1494,12 +1541,36 @@ export default function BancaPage() {
 
               {/* AI result */}
               {aiResult && (
-                <div className="flex items-start gap-2 p-3 bg-purple-50 border border-purple-100 rounded-lg">
-                  <Sparkles className="h-3.5 w-3.5 text-purple-500 flex-shrink-0 mt-0.5" />
-                  <p className="flex-1 text-xs text-purple-900 whitespace-pre-wrap">{aiResult}</p>
-                  <button onClick={() => setAiResult(null)} className="text-purple-300 hover:text-purple-500 flex-shrink-0">
-                    <X className="h-3.5 w-3.5" />
-                  </button>
+                <div className={`flex items-start gap-2 p-3 rounded-lg border ${
+                  aiResult.isError ? 'bg-red-50 border-red-200' : 'bg-purple-50 border-purple-100'
+                }`}>
+                  <Sparkles className={`h-3.5 w-3.5 flex-shrink-0 mt-0.5 ${aiResult.isError ? 'text-red-500' : 'text-purple-500'}`} />
+                  <p className={`flex-1 text-xs whitespace-pre-wrap ${aiResult.isError ? 'text-red-900' : 'text-purple-900'}`}>{aiResult.text}</p>
+                  <div className="flex items-center gap-1 flex-shrink-0">
+                    {aiResult.isError && (
+                      <Button variant="outline" size="sm" onClick={handleAiSearch} disabled={aiLoading}>
+                        {aiLoading ? 'Riprovo...' : 'Riprova'}
+                      </Button>
+                    )}
+                    {aiResult.mode === 'filter' && aiStructuredFilter && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          setAiStructuredFilter(null)
+                          setAiResult(null)
+                        }}
+                      >
+                        Rimuovi filtro AI
+                      </Button>
+                    )}
+                    <button
+                      onClick={() => setAiResult(null)}
+                      className={`${aiResult.isError ? 'text-red-300 hover:text-red-500' : 'text-purple-300 hover:text-purple-500'} flex-shrink-0`}
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
                 </div>
               )}
             </div>

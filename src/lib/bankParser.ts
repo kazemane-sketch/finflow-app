@@ -641,6 +641,24 @@ async function hashTx(t: BankTransaction): Promise<string> {
 // ============================================================
 export interface SaveBankResult { saved: number; duplicates: number; dedup_db_count: number; errors: string[] }
 
+export interface BankEmbeddingHealth {
+  total_rows: number;
+  ready_rows: number;
+  processing_rows: number;
+  pending_rows: number;
+  error_rows: number;
+}
+
+export interface BankEmbeddingRunResult {
+  status: 'completed' | 'already_running' | 'failed';
+  run_id?: string | null;
+  processed?: number;
+  ready?: number;
+  errors?: number;
+  health?: BankEmbeddingHealth | null;
+  request_id?: string;
+}
+
 export async function saveBankTransactions(
   companyId: string,
   bankAccountId: string,
@@ -691,6 +709,12 @@ export async function saveBankTransactions(
     }
     onProgress?.(Math.min(i + CHUNK, transactions.length), transactions.length);
   }
+  if (saved > 0) {
+    void triggerBankEmbeddingBackfill(companyId).catch((e) => {
+      console.warn('[Bank Embedding] trigger async fallito:', e?.message || e);
+    });
+  }
+
   return { saved, duplicates, dedup_db_count: duplicates, errors };
 }
 
@@ -758,9 +782,49 @@ export async function updateImportBatch(
 
 export async function loadBankTransactions(companyId: string): Promise<any[]> {
   const { data, error } = await supabase.from('bank_transactions').select('*')
-    .eq('company_id', companyId).order('date', { ascending: false }).limit(3000);
+    .eq('company_id', companyId).order('date', { ascending: false });
   if (error) throw new Error(error.message);
   return data || [];
+}
+
+export async function getBankEmbeddingHealth(companyId: string): Promise<BankEmbeddingHealth | null> {
+  const { data, error } = await supabase.rpc('bank_embedding_health', { p_company_id: companyId });
+  if (error) throw new Error(error.message);
+  if (!Array.isArray(data) || data.length === 0) return null;
+  const row = data[0];
+  return {
+    total_rows: Number(row.total_rows || 0),
+    ready_rows: Number(row.ready_rows || 0),
+    processing_rows: Number(row.processing_rows || 0),
+    pending_rows: Number(row.pending_rows || 0),
+    error_rows: Number(row.error_rows || 0),
+  };
+}
+
+export async function triggerBankEmbeddingBackfill(
+  companyId: string,
+  opts?: { maxRows?: number; batchSize?: number; ttlSeconds?: number }
+): Promise<BankEmbeddingRunResult | null> {
+  const body = {
+    company_id: companyId,
+    max_rows: opts?.maxRows ?? 400,
+    batch_size: opts?.batchSize ?? 60,
+    ttl_seconds: opts?.ttlSeconds ?? 180,
+  };
+
+  const { data, error } = await supabase.functions.invoke('bank-embed-transactions', { body });
+  if (error) throw new Error(error.message || 'Errore invoke bank-embed-transactions');
+  if (!data) return null;
+
+  return {
+    status: (data.status || 'completed') as BankEmbeddingRunResult['status'],
+    run_id: data.run_id ?? null,
+    processed: Number(data.processed || 0),
+    ready: Number(data.ready || 0),
+    errors: Number(data.errors || 0),
+    health: data.health ?? null,
+    request_id: typeof data.request_id === 'string' ? data.request_id : undefined,
+  };
 }
 
 export async function loadBankAccounts(companyId: string): Promise<any[]> {
