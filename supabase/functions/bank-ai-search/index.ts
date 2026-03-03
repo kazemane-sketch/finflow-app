@@ -9,6 +9,8 @@ const corsHeaders = {
 
 const REQUEST_TIMEOUT_MS = Number(Deno.env.get("BANK_AI_SEARCH_TIMEOUT_MS") ?? "30000");
 const ANTHROPIC_MODEL = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001";
+const GEMINI_EMBEDDING_MODEL = "gemini-embedding-001";
+const EXPECTED_EMBEDDING_DIMS = Math.max(1, Number(Deno.env.get("BANK_AI_EMBEDDING_DIMS") ?? "3072") || 3072);
 const MAX_CANDIDATES = 50;
 
 type DirectionFilter = "all" | "in" | "out";
@@ -33,6 +35,7 @@ type CandidateTx = {
   reference: string | null;
   invoice_ref: string | null;
   direction: "in" | "out" | null;
+  similarity?: number | null;
 };
 
 type BankFilterSpec = {
@@ -292,6 +295,44 @@ async function callAnthropic(apiKey: string, prompt: string): Promise<string> {
   return text;
 }
 
+function toVectorLiteral(values: number[]): string {
+  return `[${values.map((v) => Number.isFinite(v) ? v.toFixed(8) : "0").join(",")}]`;
+}
+
+async function callGeminiEmbedding(apiKey: string, query: string): Promise<number[]> {
+  const response = await fetchWithTimeout(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBEDDING_MODEL}:embedContent?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: `models/${GEMINI_EMBEDDING_MODEL}`,
+        content: { parts: [{ text: query }] },
+        taskType: "RETRIEVAL_QUERY",
+        outputDimensionality: EXPECTED_EMBEDDING_DIMS,
+      }),
+    },
+    REQUEST_TIMEOUT_MS,
+  );
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const msg = payload?.error?.message || payload?.message || `HTTP ${response.status}`;
+    throw new Error(`Gemini embedding error: ${msg}`);
+  }
+
+  const values = payload?.embedding?.values;
+  if (!Array.isArray(values) || !values.length) {
+    throw new Error("Gemini embedding vuoto");
+  }
+
+  const parsed = values.map((v: unknown) => Number(v));
+  if (parsed.length !== EXPECTED_EMBEDDING_DIMS) {
+    throw new Error(`Embedding dimensione inattesa (${parsed.length}, atteso ${EXPECTED_EMBEDDING_DIMS})`);
+  }
+  return parsed;
+}
+
 function getBearerToken(req: Request): string | null {
   const auth = req.headers.get("authorization") ?? req.headers.get("Authorization");
   if (!auth) return null;
@@ -382,6 +423,7 @@ Deno.serve(async (req) => {
   const supabaseUrl = resolveSupabaseUrl(req);
   const apiKey = getApiKey(req);
   const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
+  const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   if (!supabaseUrl) {
     return errorResponse(appError(500, "Supabase non configurato", "CONFIG_SUPABASE_MISSING"), requestId);
   }
@@ -453,18 +495,41 @@ Deno.serve(async (req) => {
       ), requestId);
     }
 
-    let candidateQuery = userClient
-      .from("bank_transactions")
-      .select("id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,direction")
-      .eq("company_id", companyId);
+    if (!geminiKey) {
+      return errorResponse(appError(
+        503,
+        "GEMINI_API_KEY non configurata",
+        "CONFIG_GEMINI_API_KEY_MISSING",
+        "Configura il secret GEMINI_API_KEY nelle Edge Functions.",
+        undefined,
+        "analysis",
+      ), requestId);
+    }
 
-    if (direction !== "all") candidateQuery = candidateQuery.eq("direction", direction);
-    if (dateFrom) candidateQuery = candidateQuery.gte("date", dateFrom);
-    if (dateTo) candidateQuery = candidateQuery.lte("date", dateTo);
+    let queryVector: string;
+    try {
+      const embedding = await callGeminiEmbedding(geminiKey, query);
+      queryVector = toVectorLiteral(embedding);
+    } catch (e) {
+      const providerError = e instanceof Error ? e.message : "Gemini errore sconosciuto";
+      return errorResponse(appError(
+        503,
+        "Provider embedding non disponibile",
+        "AI_PROVIDER_UNAVAILABLE",
+        "Verifica GEMINI_API_KEY e riprova.",
+        providerError,
+        "analysis",
+      ), requestId);
+    }
 
-    const { data: candidateData, error: candidateError } = await candidateQuery
-      .order("date", { ascending: false })
-      .limit(limit);
+    const { data: candidateData, error: candidateError } = await userClient.rpc("bank_ai_search_candidates", {
+      p_company_id: companyId,
+      p_query_vector: queryVector,
+      p_limit: limit,
+      p_direction: direction,
+      p_date_from: dateFrom,
+      p_date_to: dateTo,
+    });
 
     if (candidateError) {
       const msg = candidateError.message || "";
