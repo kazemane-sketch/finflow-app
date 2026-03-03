@@ -392,6 +392,15 @@ function getApiKey(req: Request): string | null {
   return raw?.trim() || null;
 }
 
+function resolveSupabaseUrl(req: Request): string {
+  try {
+    const url = new URL(req.url);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return (Deno.env.get("SUPABASE_URL") ?? "").trim();
+  }
+}
+
 async function requireCompanyAccess(
   userClient: ReturnType<typeof createClient>,
   token: string,
@@ -458,7 +467,7 @@ Deno.serve(async (req) => {
     return errorResponse(appError(405, "Method not allowed", "METHOD_NOT_ALLOWED"), requestId);
   }
 
-  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const supabaseUrl = resolveSupabaseUrl(req);
   const apiKey = getApiKey(req);
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();

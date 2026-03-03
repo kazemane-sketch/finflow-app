@@ -53,6 +53,15 @@ function getApiKey(req: Request): string | null {
   return raw?.trim() || null;
 }
 
+function resolveSupabaseUrl(req: Request): string {
+  try {
+    const url = new URL(req.url);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return (Deno.env.get("SUPABASE_URL") ?? "").trim();
+  }
+}
+
 function parseJwtRole(token: string): string | null {
   try {
     const parts = token.split(".");
@@ -188,11 +197,10 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: "Method not allowed", request_id: requestId }, requestId, 405);
   }
 
-  const supabaseUrl = Deno.env.get("SUPABASE_URL");
-  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const supabaseUrl = resolveSupabaseUrl(req);
   const apiKey = getApiKey(req);
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
-  if (!supabaseUrl || !serviceRoleKey) {
+  if (!supabaseUrl) {
     return jsonResponse({ error: "Supabase non configurato", request_id: requestId }, requestId, 500);
   }
   if (!apiKey) {
@@ -210,6 +218,7 @@ Deno.serve(async (req) => {
   let runId: string | null = null;
   let lockAcquired = false;
   let targetCompanyId: string | null = null;
+  let callerClient: ReturnType<typeof createClient> | null = null;
 
   try {
     const body = await req.json().catch(() => ({}));
@@ -224,20 +233,18 @@ Deno.serve(async (req) => {
     }
     targetCompanyId = companyId;
 
-    const admin = createClient(supabaseUrl, serviceRoleKey, {
-      auth: { persistSession: false, autoRefreshToken: false },
-    });
     const userClient = createClient(supabaseUrl, apiKey, {
       auth: { persistSession: false, autoRefreshToken: false },
       global: {
         headers: { Authorization: `Bearer ${token}` },
       },
     });
+    callerClient = userClient;
 
     await requireCompanyAccess(userClient, token, companyId);
     runId = crypto.randomUUID();
 
-    const { data: lockRows, error: lockError } = await admin.rpc("bank_embedding_acquire_lock", {
+    const { data: lockRows, error: lockError } = await userClient.rpc("bank_embedding_acquire_lock", {
       p_company_id: companyId,
       p_run_id: runId,
       p_ttl_seconds: ttlSeconds,
@@ -261,7 +268,7 @@ Deno.serve(async (req) => {
     lockAcquired = true;
 
     const staleIso = new Date(Date.now() - (staleSeconds * 1000)).toISOString();
-    await admin
+    await userClient
       .from("bank_transactions")
       .update({
         embedding_status: "pending",
@@ -272,7 +279,7 @@ Deno.serve(async (req) => {
       .eq("embedding_status", "processing")
       .lt("embedding_updated_at", staleIso);
 
-    await admin
+    await userClient
       .from("bank_transactions")
       .update({
         embedding_status: "pending",
@@ -288,14 +295,14 @@ Deno.serve(async (req) => {
     let errors = 0;
 
     while (processed < maxRows) {
-      await admin.rpc("bank_embedding_heartbeat_lock", {
+      await userClient.rpc("bank_embedding_heartbeat_lock", {
         p_company_id: companyId,
         p_run_id: runId,
         p_ttl_seconds: ttlSeconds,
       });
 
       const currentBatch = Math.min(batchSize, maxRows - processed);
-      const { data: claimRows, error: claimError } = await admin.rpc("bank_embedding_claim_pending", {
+      const { data: claimRows, error: claimError } = await userClient.rpc("bank_embedding_claim_pending", {
         p_company_id: companyId,
         p_batch_size: currentBatch,
       });
@@ -330,7 +337,7 @@ Deno.serve(async (req) => {
         const tx = claimed[i];
         const vec = batchEmbeddings[i] ?? [];
         if (vec.length === EXPECTED_EMBEDDING_DIMS) {
-          const { error: applyError } = await admin.rpc("bank_embedding_apply_result", {
+          const { error: applyError } = await userClient.rpc("bank_embedding_apply_result", {
             p_company_id: companyId,
             p_tx_id: tx.id,
             p_embedding_text: toVectorLiteral(vec),
@@ -339,7 +346,7 @@ Deno.serve(async (req) => {
           });
           if (applyError) {
             errors++;
-            await admin.rpc("bank_embedding_apply_result", {
+            await userClient.rpc("bank_embedding_apply_result", {
               p_company_id: companyId,
               p_tx_id: tx.id,
               p_embedding_text: null,
@@ -351,7 +358,7 @@ Deno.serve(async (req) => {
           }
         } else {
           errors++;
-          await admin.rpc("bank_embedding_apply_result", {
+          await userClient.rpc("bank_embedding_apply_result", {
             p_company_id: companyId,
             p_tx_id: tx.id,
             p_embedding_text: null,
@@ -364,7 +371,7 @@ Deno.serve(async (req) => {
       processed += claimed.length;
     }
 
-    const { data: healthRows } = await admin.rpc("bank_embedding_health", { p_company_id: companyId });
+    const { data: healthRows } = await userClient.rpc("bank_embedding_health", { p_company_id: companyId });
     const health = Array.isArray(healthRows) && healthRows.length > 0 ? healthRows[0] : null;
 
     return jsonResponse({
@@ -399,18 +406,11 @@ Deno.serve(async (req) => {
   } finally {
     if (lockAcquired && runId) {
       try {
-        const supabaseUrlInner = Deno.env.get("SUPABASE_URL");
-        const serviceRoleKeyInner = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-        if (supabaseUrlInner && serviceRoleKeyInner) {
-          const adminInner = createClient(supabaseUrlInner, serviceRoleKeyInner, {
-            auth: { persistSession: false, autoRefreshToken: false },
+        if (callerClient && targetCompanyId) {
+          await callerClient.rpc("bank_embedding_release_lock", {
+            p_company_id: targetCompanyId,
+            p_run_id: runId,
           });
-          if (targetCompanyId) {
-            await adminInner.rpc("bank_embedding_release_lock", {
-              p_company_id: targetCompanyId,
-              p_run_id: runId,
-            });
-          }
         }
       } catch {
         // best effort
