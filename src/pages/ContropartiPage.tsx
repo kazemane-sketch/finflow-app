@@ -12,9 +12,11 @@ import {
   verifyCounterparty,
   rejectCounterparty,
   loadInvoicesByCounterparty,
+  loadInstallmentFlowsByCounterparty,
   buildCounterpartyAnalytics,
   syncCounterpartyRoles,
   type Counterparty,
+  type CounterpartyInstallmentFlowRow,
   type CounterpartyLegalType,
   type CounterpartyRole,
   type CounterpartyStatus,
@@ -77,6 +79,8 @@ const MONTH_LABELS_EN = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug',
 
 type VatMode = 'IT' | 'INT'
 type AnalyticsVatMode = 'excl' | 'incl'
+type AnalyticsDateMode = 'invoice_date' | 'payment_date'
+type AnalyticsPaymentAmountMode = 'net_paid' | 'total_installment'
 
 function sanitizeVatInput(value: string): string {
   return value.toUpperCase().replace(/[^A-Z0-9]/g, '')
@@ -370,12 +374,15 @@ export default function ContropartiPage() {
   const [roleFilter, setRoleFilter] = useState<'all' | CounterpartyRole>('all')
   const [statusFilter, setStatusFilter] = useState<'all' | CounterpartyStatus>('all')
   const [legalTypeFilter, setLegalTypeFilter] = useState<'all' | CounterpartyLegalType>('all')
+  const [queryInput, setQueryInput] = useState('')
   const [query, setQuery] = useState('')
 
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
   const [invoiceDirectionFilter, setInvoiceDirectionFilter] = useState<'all' | 'in' | 'out'>('all')
   const [analyticsVatMode, setAnalyticsVatMode] = useState<AnalyticsVatMode>('excl')
+  const [analyticsDateMode, setAnalyticsDateMode] = useState<AnalyticsDateMode>('invoice_date')
+  const [analyticsPaymentAmountMode, setAnalyticsPaymentAmountMode] = useState<AnalyticsPaymentAmountMode>('net_paid')
 
   const [focusedId, setFocusedId] = useState<string | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
@@ -392,6 +399,7 @@ export default function ContropartiPage() {
     payment_status: string
     counterparty_status_snapshot: string | null
   }>>([])
+  const [linkedInstallments, setLinkedInstallments] = useState<CounterpartyInstallmentFlowRow[]>([])
 
   const [draft, setDraft] = useState<{
     name: string
@@ -414,7 +422,14 @@ export default function ContropartiPage() {
 
     try {
       if (!rolesSynced) {
-        await syncCounterpartyRoles(companyId)
+        const syncKey = `counterparty_roles_synced_at:${companyId}`
+        const lastSyncedAt = Number(window.sessionStorage.getItem(syncKey) || 0)
+        const sixHoursMs = 6 * 60 * 60 * 1000
+
+        if (!lastSyncedAt || (Date.now() - lastSyncedAt) > sixHoursMs) {
+          await syncCounterpartyRoles(companyId)
+          window.sessionStorage.setItem(syncKey, String(Date.now()))
+        }
         setRolesSynced(true)
       }
 
@@ -448,6 +463,13 @@ export default function ContropartiPage() {
   useEffect(() => {
     setRolesSynced(false)
   }, [companyId])
+
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      setQuery(queryInput.trim())
+    }, 250)
+    return () => window.clearTimeout(t)
+  }, [queryInput])
 
   useEffect(() => {
     const paramId = searchParams.get('counterpartyId')
@@ -514,19 +536,74 @@ export default function ContropartiPage() {
     }
   }, [companyId, analyticsTargetIds, invoiceDirectionFilter, dateFrom, dateTo])
 
+  const reloadLinkedInstallments = useCallback(async () => {
+    if (!companyId || analyticsTargetIds.length === 0 || analyticsDateMode !== 'payment_date') {
+      setLinkedInstallments([])
+      return
+    }
+
+    try {
+      const rows = await loadInstallmentFlowsByCounterparty(companyId, analyticsTargetIds, {
+        direction: invoiceDirectionFilter,
+        dateFrom: dateFrom || undefined,
+        dateTo: dateTo || undefined,
+        onlyPaidDates: true,
+      })
+      setLinkedInstallments(rows)
+    } catch (e: any) {
+      setError(e.message || 'Errore caricamento pagamenti scadenzario')
+    }
+  }, [companyId, analyticsTargetIds, analyticsDateMode, invoiceDirectionFilter, dateFrom, dateTo])
+
   useEffect(() => {
     reloadLinkedInvoices()
   }, [reloadLinkedInvoices])
 
-  const analytics = useMemo(() => {
-    const rows = linkedInvoices.map((r) => ({
+  useEffect(() => {
+    reloadLinkedInstallments()
+  }, [reloadLinkedInstallments])
+
+  const analyticsSourceRows = useMemo(() => {
+    if (analyticsDateMode === 'payment_date') {
+      return linkedInstallments
+        .filter((row) => Boolean(row.last_payment_date))
+        .map((row) => {
+          const sign = Number(row.amount_due || 0) < 0 ? -1 : 1
+          const rawAmount = analyticsPaymentAmountMode === 'net_paid'
+            ? Number(row.paid_amount || 0)
+            : Math.abs(Number(row.amount_due || 0))
+          return {
+            counterparty_id: row.counterparty_id,
+            direction: row.direction,
+            date: String(row.last_payment_date || ''),
+            total_amount: Number((rawAmount * sign).toFixed(2)),
+          }
+        })
+    }
+
+    return linkedInvoices.map((r) => ({
       counterparty_id: r.counterparty_id,
       direction: r.direction,
       date: r.date,
       total_amount: analyticsAmountByVatMode(r, analyticsVatMode),
     }))
-    return buildCounterpartyAnalytics(rows, counterparties)
-  }, [linkedInvoices, counterparties, analyticsVatMode])
+  }, [analyticsDateMode, linkedInstallments, analyticsPaymentAmountMode, linkedInvoices, analyticsVatMode])
+
+  const analytics = useMemo(
+    () => buildCounterpartyAnalytics(analyticsSourceRows, counterparties, {
+      useSignedAmounts: analyticsDateMode === 'payment_date',
+    }),
+    [analyticsSourceRows, counterparties, analyticsDateMode],
+  )
+
+  const analyticsAmountLabel = useMemo(() => {
+    if (analyticsDateMode === 'payment_date') {
+      return analyticsPaymentAmountMode === 'net_paid'
+        ? 'Pagamenti netti'
+        : 'Totale rate saldate'
+    }
+    return analyticsVatMode === 'excl' ? 'IVA Excl' : 'IVA Incl'
+  }, [analyticsDateMode, analyticsPaymentAmountMode, analyticsVatMode])
 
   const trendChartData = useMemo(
     () =>
@@ -539,11 +616,11 @@ export default function ContropartiPage() {
 
   const analyticsMonths = useMemo(() => {
     const months = new Set<string>()
-    for (const row of linkedInvoices) {
+    for (const row of analyticsSourceRows) {
       if (row.date) months.add(row.date.slice(0, 7))
     }
     return Array.from(months).sort((a, b) => a.localeCompare(b))
-  }, [linkedInvoices])
+  }, [analyticsSourceRows])
 
   const analyticsTableRows = useMemo(() => {
     const cpMap = new Map(counterparties.map((cp) => [cp.id, cp]))
@@ -583,12 +660,12 @@ export default function ContropartiPage() {
       ensureRow(id)
     }
 
-    for (const inv of linkedInvoices) {
-      const amount = Math.abs(analyticsAmountByVatMode(inv, analyticsVatMode))
-      const month = inv.date?.slice(0, 7)
-      const row = ensureRow(inv.counterparty_id)
+    for (const metricRow of analyticsSourceRows) {
+      const amount = Number(metricRow.total_amount || 0)
+      const month = metricRow.date?.slice(0, 7)
+      const row = ensureRow(metricRow.counterparty_id)
 
-      if (inv.direction === 'out') {
+      if (metricRow.direction === 'out') {
         row.activeAmount += amount
         row.activeCount += 1
       } else {
@@ -603,14 +680,14 @@ export default function ContropartiPage() {
     }
 
     return Array.from(rowMap.values())
-      .sort((a, b) => b.totalAmount - a.totalAmount)
+      .sort((a, b) => Math.abs(b.totalAmount) - Math.abs(a.totalAmount))
       .map((row) => ({
         ...row,
         activeAmount: Number(row.activeAmount.toFixed(2)),
         passiveAmount: Number(row.passiveAmount.toFixed(2)),
         totalAmount: Number(row.totalAmount.toFixed(2)),
       }))
-  }, [counterparties, linkedInvoices, analyticsTargetIds, analyticsMonths, analyticsVatMode])
+  }, [counterparties, analyticsSourceRows, analyticsTargetIds, analyticsMonths])
 
   const toggleSelect = (id: string) => {
     setSelectedIds((prev) => {
@@ -657,7 +734,7 @@ export default function ContropartiPage() {
         notes: draft.notes || null,
       })
       await reloadCounterparties()
-      await reloadLinkedInvoices()
+      await Promise.all([reloadLinkedInvoices(), reloadLinkedInstallments()])
     } catch (e: any) {
       setError(e.message || 'Errore salvataggio')
     }
@@ -674,7 +751,7 @@ export default function ContropartiPage() {
     try {
       await verifyCounterparty(focused.id)
       await reloadCounterparties()
-      await reloadLinkedInvoices()
+      await Promise.all([reloadLinkedInvoices(), reloadLinkedInstallments()])
     } catch (e: any) {
       setError(e.message || 'Errore verifica')
     }
@@ -703,7 +780,7 @@ export default function ContropartiPage() {
     }
 
     await reloadCounterparties()
-    await reloadLinkedInvoices()
+    await Promise.all([reloadLinkedInvoices(), reloadLinkedInstallments()])
 
     if (failures.length) {
       const preview = failures.slice(0, 3).join(' | ')
@@ -723,7 +800,7 @@ export default function ContropartiPage() {
     try {
       await rejectCounterparty(focused.id, reason)
       await reloadCounterparties()
-      await reloadLinkedInvoices()
+      await Promise.all([reloadLinkedInvoices(), reloadLinkedInstallments()])
     } catch (e: any) {
       setError(e.message || 'Errore rifiuto')
     }
@@ -795,8 +872,8 @@ export default function ContropartiPage() {
               <div className="flex items-center gap-2">
                 <Search className="h-3.5 w-3.5 text-gray-400" />
                 <Input
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
+                  value={queryInput}
+                  onChange={(e) => setQueryInput(e.target.value)}
                   placeholder="Ricerca nome, P.IVA o CF"
                   className="h-8 text-xs"
                 />
@@ -1083,6 +1160,24 @@ export default function ContropartiPage() {
                   <option value="in">Solo Passive</option>
                 </select>
                 <select
+                  value={analyticsDateMode}
+                  onChange={(e) => setAnalyticsDateMode(e.target.value as AnalyticsDateMode)}
+                  className="border rounded-md px-2 py-1 text-xs"
+                >
+                  <option value="invoice_date">Valori per data fattura</option>
+                  <option value="payment_date">Valori per data pagamento (scadenzario)</option>
+                </select>
+                {analyticsDateMode === 'payment_date' ? (
+                  <select
+                    value={analyticsPaymentAmountMode}
+                    onChange={(e) => setAnalyticsPaymentAmountMode(e.target.value as AnalyticsPaymentAmountMode)}
+                    className="border rounded-md px-2 py-1 text-xs"
+                  >
+                    <option value="net_paid">Importi netti pagati/incassati</option>
+                    <option value="total_installment">Importi totali rate</option>
+                  </select>
+                ) : (
+                <select
                   value={analyticsVatMode}
                   onChange={(e) => setAnalyticsVatMode(e.target.value as AnalyticsVatMode)}
                   className="border rounded-md px-2 py-1 text-xs"
@@ -1090,20 +1185,21 @@ export default function ContropartiPage() {
                   <option value="excl">IVA Excl</option>
                   <option value="incl">IVA Incl</option>
                 </select>
+                )}
                 <span className="text-xs text-gray-500 ml-auto">Target: {analyticsTargetIds.length || 0} controparti</span>
               </div>
 
               <div className="grid grid-cols-2 lg:grid-cols-5 gap-2">
                 <div className="p-2 rounded border bg-emerald-50">
-                  <p className="text-[10px] text-emerald-700 uppercase">Totale attive ({analyticsVatMode === 'excl' ? 'IVA Excl' : 'IVA Incl'})</p>
+                  <p className="text-[10px] text-emerald-700 uppercase">Totale attive ({analyticsAmountLabel})</p>
                   <p className="text-sm font-bold text-emerald-700">{fmtEur(analytics.totalActiveAmount)}</p>
                 </div>
                 <div className="p-2 rounded border bg-red-50">
-                  <p className="text-[10px] text-red-700 uppercase">Totale passive ({analyticsVatMode === 'excl' ? 'IVA Excl' : 'IVA Incl'})</p>
+                  <p className="text-[10px] text-red-700 uppercase">Totale passive ({analyticsAmountLabel})</p>
                   <p className="text-sm font-bold text-red-700">{fmtEur(analytics.totalPassiveAmount)}</p>
                 </div>
                 <div className="p-2 rounded border bg-blue-50">
-                  <p className="text-[10px] text-blue-700 uppercase">Saldo netto ({analyticsVatMode === 'excl' ? 'IVA Excl' : 'IVA Incl'})</p>
+                  <p className="text-[10px] text-blue-700 uppercase">Saldo netto ({analyticsAmountLabel})</p>
                   <p className="text-sm font-bold text-blue-700">{fmtEur(analytics.totalNetAmount)}</p>
                 </div>
                 <div className="p-2 rounded border bg-gray-50">

@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { CalendarClock, Receipt, ArrowDownLeft, ArrowUpRight, Search, Filter } from 'lucide-react'
+import { CalendarClock, Receipt, ArrowDownLeft, ArrowUpRight, Search, Filter, Landmark, PencilLine, Sparkles } from 'lucide-react'
 import { toast } from 'sonner'
 import { useCompany } from '@/hooks/useCompany'
 import { supabase } from '@/integrations/supabase/client'
@@ -13,14 +13,34 @@ import { fmtDate, fmtEur } from '@/lib/utils'
 import {
   buildAging,
   listScadenzarioRows,
-  rebuildInstallmentsFull,
   settleInstallment,
+  rebuildInstallmentsFull,
   touchOverdueInstallments,
   type AgingResult,
   type InstallmentStatus,
   type ScadenzarioFilters,
   type ScadenzarioRow,
 } from '@/lib/scadenzario'
+
+type SettleUiMode = 'bank' | 'manual' | 'nc'
+
+interface BankCandidate {
+  id: string
+  date: string
+  amount: number
+  description: string | null
+  counterparty_name: string | null
+  transaction_type: string | null
+  reconciliation_status: string | null
+  score: number
+}
+
+interface NcCandidate {
+  id: string
+  reference: string
+  due_date: string
+  remaining_credit: number
+}
 
 const STATUS_OPTIONS: Array<{ value: InstallmentStatus; label: string }> = [
   { value: 'pending', label: 'Da incassare/pagare' },
@@ -105,6 +125,18 @@ function isApproxEqual(a: number, b: number, epsilon = 0.01): boolean {
   return Math.abs(round2(a) - round2(b)) <= epsilon
 }
 
+function addDays(isoDate: string, delta: number): string {
+  const d = new Date(`${isoDate}T00:00:00`)
+  d.setDate(d.getDate() + delta)
+  return d.toISOString().slice(0, 10)
+}
+
+function daysDiffAbs(fromIso: string, toIso: string): number {
+  const from = new Date(`${fromIso}T00:00:00`).getTime()
+  const to = new Date(`${toIso}T00:00:00`).getTime()
+  return Math.abs(Math.round((to - from) / (24 * 60 * 60 * 1000)))
+}
+
 export default function ScadenzarioPage() {
   const { company } = useCompany()
   const navigate = useNavigate()
@@ -122,7 +154,8 @@ export default function ScadenzarioPage() {
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [backfillTried, setBackfillTried] = useState(false)
+  const [backfillRunning, setBackfillRunning] = useState(false)
+  const [health, setHealth] = useState<{ invoicesCount: number; installmentsCount: number } | null>(null)
   const [rows, setRows] = useState<ScadenzarioRow[]>([])
   const [aging, setAging] = useState<AgingResult | null>(null)
   const [showAging, setShowAging] = useState(true)
@@ -132,15 +165,25 @@ export default function ScadenzarioPage() {
   const [paymentModal, setPaymentModal] = useState<{
     open: boolean
     row: ScadenzarioRow | null
+    settleMode: SettleUiMode
     paymentDate: string
     amount: string
+    bankCandidates: BankCandidate[]
+    ncCandidates: NcCandidate[]
+    loadingCandidates: boolean
+    selectedBankTxId: string | null
     saving: boolean
     error: string | null
   }>({
     open: false,
     row: null,
+    settleMode: 'manual',
     paymentDate: new Date().toISOString().slice(0, 10),
     amount: '0',
+    bankCandidates: [],
+    ncCandidates: [],
+    loadingCandidates: false,
+    selectedBankTxId: null,
     saving: false,
     error: null,
   })
@@ -161,10 +204,6 @@ export default function ScadenzarioPage() {
   )
 
   useEffect(() => {
-    setBackfillTried(false)
-  }, [company?.id])
-
-  useEffect(() => {
     const tab = String(searchParams.get('tab') || '').toLowerCase()
     if (tab === 'tutte') setActiveTab('all')
     if (tab === 'all') setActiveTab('all')
@@ -180,6 +219,12 @@ export default function ScadenzarioPage() {
     if (period === 'next_month') setPeriodPreset('next_month')
     if (period === 'custom') setPeriodPreset('custom')
     if (period === 'all') setPeriodPreset('all')
+
+    const q = String(searchParams.get('query') || '')
+    if (q) setQuery(q)
+
+    const cp = String(searchParams.get('counterpartyId') || '')
+    if (cp) setCounterpartyId(cp)
   }, [searchParams])
 
   const filters = useMemo<ScadenzarioFilters>(() => ({
@@ -206,10 +251,115 @@ export default function ScadenzarioPage() {
     setCounterparties((data || []) as Array<{ id: string; name: string; email: string | null }>)
   }, [company?.id])
 
+  const loadBankCandidates = useCallback(async (row: ScadenzarioRow, targetAmount: number): Promise<BankCandidate[]> => {
+    if (!company?.id || row.kind !== 'installment') return []
+    const amountTarget = Math.max(round2(targetAmount), 0)
+    if (amountTarget <= 0.01) return []
+
+    const txDirection = row.type === 'incasso' ? 'in' : 'out'
+    const dateFrom = addDays(row.due_date, -30)
+    const dateTo = addDays(row.due_date, 30)
+
+    const { data, error: txErr } = await supabase
+      .from('bank_transactions')
+      .select('id, date, amount, description, counterparty_name, transaction_type, reconciliation_status, raw_text')
+      .eq('company_id', company.id)
+      .eq('direction', txDirection)
+      .gte('date', dateFrom)
+      .lte('date', dateTo)
+      .limit(300)
+
+    if (txErr) throw new Error(txErr.message)
+
+    const cpNeedle = (row.counterparty_name || '').toLowerCase()
+    const scored = ((data || []) as Array<{
+      id: string
+      date: string
+      amount: number
+      description: string | null
+      counterparty_name: string | null
+      transaction_type: string | null
+      reconciliation_status: string | null
+      raw_text: string | null
+    }>)
+      .map((tx) => {
+        const txAbs = Math.abs(Number(tx.amount || 0))
+        if (txAbs <= 0) return null
+        const amountDeltaPct = amountTarget > 0 ? Math.abs(txAbs - amountTarget) / amountTarget : 1
+        if (amountDeltaPct > 0.05) return null
+
+        const dateDistance = daysDiffAbs(tx.date, row.due_date)
+        if (dateDistance > 30) return null
+
+        const hay = `${tx.counterparty_name || ''} ${tx.description || ''} ${tx.raw_text || ''}`.toLowerCase()
+        const cpScore = cpNeedle && hay.includes(cpNeedle) ? 10 : 0
+        const score = round2((100 - amountDeltaPct * 70 - (dateDistance / 30) * 25 + cpScore))
+
+        return {
+          id: tx.id,
+          date: tx.date,
+          amount: txAbs,
+          description: tx.description,
+          counterparty_name: tx.counterparty_name,
+          transaction_type: tx.transaction_type,
+          reconciliation_status: tx.reconciliation_status,
+          score,
+        } as BankCandidate
+      })
+      .filter(Boolean) as BankCandidate[]
+
+    return scored
+      .sort((a, b) => b.score - a.score || a.date.localeCompare(b.date))
+      .slice(0, 25)
+  }, [company?.id])
+
+  const loadNcCandidates = useCallback(async (counterpartyKey: string | null): Promise<NcCandidate[]> => {
+    if (!company?.id || !counterpartyKey) return []
+
+    const { data, error: ncErr } = await supabase
+      .from('invoice_installments')
+      .select('id, due_date, amount_due, paid_amount, invoice:invoices(number)')
+      .eq('company_id', company.id)
+      .eq('direction', 'in')
+      .eq('counterparty_id', counterpartyKey)
+      .eq('is_credit_note', true)
+      .in('status', ['pending', 'overdue', 'partial'])
+      .order('due_date', { ascending: true })
+      .limit(50)
+
+    if (ncErr) throw new Error(ncErr.message)
+
+    const first = <T,>(v: T | T[] | null | undefined): T | null => {
+      if (!v) return null
+      return Array.isArray(v) ? (v[0] || null) : v
+    }
+
+    return ((data || []) as Array<{
+      id: string
+      due_date: string
+      amount_due: number
+      paid_amount: number
+      invoice?: { number: string | null } | Array<{ number: string | null }> | null
+    }>)
+      .map((row) => {
+        const remainingCredit = round2(Math.max(Math.abs(Number(row.amount_due || 0)) - Number(row.paid_amount || 0), 0))
+        if (remainingCredit <= 0.01) return null
+        const invoice = first(row.invoice)
+        return {
+          id: row.id,
+          reference: `NC ${invoice?.number || row.id.slice(0, 8)}`,
+          due_date: row.due_date,
+          remaining_credit: remainingCredit,
+        } as NcCandidate
+      })
+      .filter(Boolean) as NcCandidate[]
+  }, [company?.id])
+
   const loadRows = useCallback(async () => {
     if (!company?.id) {
       setRows([])
       setAging(null)
+      setHealth(null)
       return
     }
 
@@ -218,30 +368,23 @@ export default function ScadenzarioPage() {
 
     try {
       await touchOverdueInstallments(company.id)
+      const [installmentsCountRes, invoicesCountRes] = await Promise.all([
+        supabase
+          .from('invoice_installments')
+          .select('id', { count: 'exact', head: true })
+          .eq('company_id', company.id),
+        supabase
+          .from('invoices')
+          .select('id', { count: 'exact', head: true })
+          .eq('company_id', company.id),
+      ])
 
-      if (!backfillTried) {
-        const [installmentsCountRes, invoicesCountRes] = await Promise.all([
-          supabase
-            .from('invoice_installments')
-            .select('id', { count: 'exact', head: true })
-            .eq('company_id', company.id),
-          supabase
-            .from('invoices')
-            .select('id', { count: 'exact', head: true })
-            .eq('company_id', company.id),
-        ])
-
-        if (installmentsCountRes.error) throw new Error(installmentsCountRes.error.message)
-        if (invoicesCountRes.error) throw new Error(invoicesCountRes.error.message)
-
-        const installmentsCount = Number(installmentsCountRes.count || 0)
-        const invoicesCount = Number(invoicesCountRes.count || 0)
-        if (installmentsCount === 0 && invoicesCount > 0) {
-          await rebuildInstallmentsFull(company.id)
-        }
-
-        setBackfillTried(true)
-      }
+      if (installmentsCountRes.error) throw new Error(installmentsCountRes.error.message)
+      if (invoicesCountRes.error) throw new Error(invoicesCountRes.error.message)
+      setHealth({
+        invoicesCount: Number(invoicesCountRes.count || 0),
+        installmentsCount: Number(installmentsCountRes.count || 0),
+      })
 
       const scadenzarioRows = await listScadenzarioRows(company.id, filters)
       setRows(scadenzarioRows)
@@ -260,7 +403,7 @@ export default function ScadenzarioPage() {
     } finally {
       setLoading(false)
     }
-  }, [company?.id, filters, activeTab, query, counterpartyId, backfillTried])
+  }, [company?.id, filters, activeTab, query, counterpartyId])
 
   useEffect(() => {
     loadRows()
@@ -269,6 +412,21 @@ export default function ScadenzarioPage() {
   useEffect(() => {
     loadCounterparties()
   }, [loadCounterparties])
+
+  const runInstallmentBackfill = useCallback(async () => {
+    if (!company?.id) return
+    setBackfillRunning(true)
+    setError(null)
+    try {
+      await rebuildInstallmentsFull(company.id)
+      toast.success('Backfill rate completato')
+      await loadRows()
+    } catch (e: any) {
+      setError(e.message || 'Errore backfill rate storico')
+    } finally {
+      setBackfillRunning(false)
+    }
+  }, [company?.id, loadRows])
 
   const toggleStatusFilter = (status: InstallmentStatus) => {
     setStatusFilters((prev) => {
@@ -292,17 +450,63 @@ export default function ScadenzarioPage() {
 
   const today = new Date().toISOString().slice(0, 10)
 
-  const openPaymentModal = (row: ScadenzarioRow) => {
+  const openPaymentModal = async (row: ScadenzarioRow) => {
     const netSuggested = round2(Math.max(row.nc_net_amount || Math.max(row.remaining_amount, 0), 0))
     const isZeroNetCase = row.type === 'pagamento' && !row.is_credit_note && row.nc_available_amount > 0.01 && netSuggested <= 0.01
+    const defaultMode: SettleUiMode = isZeroNetCase ? 'nc' : 'bank'
+
     setPaymentModal({
       open: true,
       row,
+      settleMode: defaultMode,
       paymentDate: today,
       amount: String(isZeroNetCase ? 0 : (row.remaining_amount || row.amount || 0)),
+      bankCandidates: [],
+      ncCandidates: [],
+      loadingCandidates: defaultMode === 'bank',
+      selectedBankTxId: null,
       saving: false,
       error: null,
     })
+
+    if (row.type === 'pagamento' && !row.is_credit_note && row.counterparty_id) {
+      try {
+        const ncCandidates = await loadNcCandidates(row.counterparty_id)
+        setPaymentModal((prev) => {
+          if (!prev.open || prev.row?.id !== row.id) return prev
+          return { ...prev, ncCandidates }
+        })
+      } catch (e: any) {
+        setPaymentModal((prev) => ({
+          ...prev,
+          error: prev.error || e.message || 'Errore caricamento note di credito',
+        }))
+      }
+    }
+
+    if (defaultMode === 'bank') {
+      try {
+        const candidates = await loadBankCandidates(row, Math.max(row.nc_net_amount || row.remaining_amount, 0))
+        const first = candidates[0] || null
+        setPaymentModal((prev) => {
+          if (!prev.open || prev.row?.id !== row.id) return prev
+          return {
+            ...prev,
+            bankCandidates: candidates,
+            selectedBankTxId: first?.id || null,
+            loadingCandidates: false,
+            paymentDate: first?.date || prev.paymentDate,
+            amount: first ? String(round2(Math.abs(first.amount))) : prev.amount,
+          }
+        })
+      } catch (e: any) {
+        setPaymentModal((prev) => ({
+          ...prev,
+          loadingCandidates: false,
+          error: e.message || 'Errore caricamento movimenti banca',
+        }))
+      }
+    }
   }
 
   const submitPayment = async () => {
@@ -315,29 +519,92 @@ export default function ScadenzarioPage() {
     const hasNcHint = row.type === 'pagamento' && !row.is_credit_note && (row.nc_available_amount || 0) > 0
     const isZeroNetCase = hasNcHint && netSuggested <= 0.01
 
-    const amount = isZeroNetCase ? 0 : Number(paymentModal.amount)
-    if (!Number.isFinite(amount) || amount < 0) {
-      setPaymentModal((prev) => ({ ...prev, error: 'Importo pagamento non valido' }))
-      return
-    }
-    if (!isZeroNetCase && amount <= 0) {
-      setPaymentModal((prev) => ({ ...prev, error: 'Importo pagamento non valido' }))
-      return
+    let cashAmount = 0
+    let paymentDate = paymentModal.paymentDate
+
+    if (paymentModal.settleMode === 'bank') {
+      const selected = paymentModal.bankCandidates.find((tx) => tx.id === paymentModal.selectedBankTxId)
+      if (!selected) {
+        setPaymentModal((prev) => ({ ...prev, error: 'Seleziona un movimento banca candidato' }))
+        return
+      }
+      cashAmount = round2(Math.abs(selected.amount))
+      paymentDate = selected.date
+    } else if (paymentModal.settleMode === 'manual') {
+      const amount = Number(paymentModal.amount)
+      if (!Number.isFinite(amount) || amount <= 0) {
+        setPaymentModal((prev) => ({ ...prev, error: 'Importo pagamento non valido' }))
+        return
+      }
+      cashAmount = round2(amount)
+    } else {
+      if (!hasNcHint) {
+        setPaymentModal((prev) => ({ ...prev, error: 'Nessuna nota di credito disponibile per compensazione' }))
+        return
+      }
+      if (!isZeroNetCase) {
+        setPaymentModal((prev) => ({ ...prev, error: `NC insufficiente: residuo cassa richiesto ${fmtEur(netSuggested)}` }))
+        return
+      }
+      cashAmount = 0
     }
 
-    const mode: 'cash' | 'net' = hasNcHint && (isZeroNetCase || isApproxEqual(amount, netSuggested))
+    const mode: 'cash' | 'net' = paymentModal.settleMode === 'nc'
       ? 'net'
-      : 'cash'
+      : (hasNcHint && isApproxEqual(cashAmount, netSuggested) ? 'net' : 'cash')
 
     setPaymentModal((prev) => ({ ...prev, saving: true, error: null }))
     try {
       const result = await settleInstallment({
         companyId: company.id,
         installmentId: row.id,
-        paymentDate: paymentModal.paymentDate,
-        cashAmount: round2(amount),
+        paymentDate,
+        cashAmount,
         mode,
       })
+
+      if (paymentModal.settleMode === 'bank' && row.invoice_id && paymentModal.selectedBankTxId) {
+        const { data: authData } = await supabase.auth.getUser()
+        const userId = authData?.user?.id || null
+
+        const { data: existingRec, error: existingRecErr } = await supabase
+          .from('reconciliations')
+          .select('id')
+          .eq('company_id', company.id)
+          .eq('invoice_id', row.invoice_id)
+          .eq('bank_transaction_id', paymentModal.selectedBankTxId)
+          .limit(1)
+
+        if (existingRecErr) throw new Error(existingRecErr.message)
+
+        if (!existingRec || existingRec.length === 0) {
+          const { error: recErr } = await supabase
+            .from('reconciliations')
+            .insert({
+              company_id: company.id,
+              invoice_id: row.invoice_id,
+              bank_transaction_id: paymentModal.selectedBankTxId,
+              match_type: 'manual',
+              confidence: 0.95,
+              match_reason: 'scadenzario_bank_match',
+              confirmed_by: userId,
+              confirmed_at: new Date().toISOString(),
+            })
+          if (recErr) throw new Error(recErr.message)
+        }
+
+        await supabase
+          .from('bank_transactions')
+          .update({ reconciliation_status: 'matched' })
+          .eq('company_id', company.id)
+          .eq('id', paymentModal.selectedBankTxId)
+
+        await supabase
+          .from('invoices')
+          .update({ reconciliation_status: 'matched' })
+          .eq('company_id', company.id)
+          .eq('id', row.invoice_id)
+      }
 
       if (result.mode === 'net') {
         toast.success(`Compensazione NC applicata: usato ${fmtEur(result.credit_used)} · cassa ${fmtEur(result.cash_paid)} · credito residuo ${fmtEur(result.credit_residual)}`)
@@ -348,14 +615,57 @@ export default function ScadenzarioPage() {
       setPaymentModal({
         open: false,
         row: null,
+        settleMode: 'manual',
         paymentDate: today,
         amount: '0',
+        bankCandidates: [],
+        ncCandidates: [],
+        loadingCandidates: false,
+        selectedBankTxId: null,
         saving: false,
         error: null,
       })
       await loadRows()
     } catch (e: any) {
       setPaymentModal((prev) => ({ ...prev, saving: false, error: e.message || 'Errore registrazione pagamento' }))
+    }
+  }
+
+  const switchPaymentMode = async (nextMode: SettleUiMode) => {
+    if (!paymentModal.row) return
+
+    const row = paymentModal.row
+    const netSuggested = round2(Math.max(row.nc_net_amount || Math.max(row.remaining_amount, 0), 0))
+    const fallbackAmount = round2(Math.max(row.remaining_amount || row.amount || 0, 0))
+
+    setPaymentModal((prev) => ({
+      ...prev,
+      settleMode: nextMode,
+      error: null,
+      amount: nextMode === 'nc' ? '0' : nextMode === 'manual' ? String(fallbackAmount) : prev.amount,
+    }))
+
+    if (nextMode !== 'bank') return
+    if (paymentModal.bankCandidates.length > 0) return
+
+    setPaymentModal((prev) => ({ ...prev, loadingCandidates: true }))
+    try {
+      const candidates = await loadBankCandidates(row, Math.max(netSuggested, 0))
+      const first = candidates[0] || null
+      setPaymentModal((prev) => ({
+        ...prev,
+        bankCandidates: candidates,
+        selectedBankTxId: first?.id || null,
+        loadingCandidates: false,
+        paymentDate: first?.date || prev.paymentDate,
+        amount: first ? String(round2(Math.abs(first.amount))) : prev.amount,
+      }))
+    } catch (e: any) {
+      setPaymentModal((prev) => ({
+        ...prev,
+        loadingCandidates: false,
+        error: e.message || 'Errore caricamento movimenti banca',
+      }))
     }
   }
 
@@ -540,6 +850,15 @@ export default function ScadenzarioPage() {
       {error && (
         <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
           {error}
+        </div>
+      )}
+
+      {health && health.invoicesCount > 0 && health.installmentsCount === 0 && (
+        <div className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 flex items-center justify-between gap-3">
+          <span>Backfill rate necessario: trovate {health.invoicesCount} fatture ma 0 rate nello scadenzario.</span>
+          <Button size="sm" variant="outline" disabled={backfillRunning} onClick={runInstallmentBackfill}>
+            {backfillRunning ? 'Rigenerazione...' : 'Rigenera rate storico'}
+          </Button>
         </div>
       )}
 
@@ -885,9 +1204,17 @@ export default function ScadenzarioPage() {
 
       {paymentModal.open && paymentModal.row && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setPaymentModal((prev) => ({ ...prev, open: false }))}>
-          <div className="bg-white rounded-xl shadow-xl p-6 max-w-md w-full mx-4" onClick={(e) => e.stopPropagation()}>
+          <div className="bg-white rounded-xl shadow-xl p-6 max-w-2xl w-full mx-4" onClick={(e) => e.stopPropagation()}>
             <h3 className="text-base font-semibold mb-3">{paymentModal.row.type === 'incasso' ? 'Registra incasso' : 'Registra pagamento'}</h3>
-            <p className="text-sm text-gray-600 mb-4">{paymentModal.row.reference} - residuo {fmtEur(paymentModal.row.remaining_amount)}</p>
+            <div className="grid grid-cols-2 gap-2 text-xs bg-gray-50 border rounded-md px-3 py-2 mb-3">
+              <div><span className="text-gray-500">Controparte:</span> <span className="font-medium">{paymentModal.row.counterparty_name}</span></div>
+              <div><span className="text-gray-500">Riferimento:</span> <span className="font-medium">{paymentModal.row.reference}</span></div>
+              <div><span className="text-gray-500">Importo rata:</span> <span className="font-medium">{fmtEur(paymentModal.row.amount)}</span></div>
+              <div><span className="text-gray-500">Scadenza:</span> <span className="font-medium">{fmtDate(paymentModal.row.due_date)}</span></div>
+            </div>
+
+            <p className="text-sm text-gray-600 mb-4">Residuo da saldare: {fmtEur(paymentModal.row.remaining_amount)}</p>
+
             <div className="space-y-3">
               {paymentPreview?.canNet && (
                 <div className="text-xs rounded-md border border-indigo-200 bg-indigo-50 px-2.5 py-2 text-indigo-800">
@@ -897,34 +1224,154 @@ export default function ScadenzarioPage() {
                   )}
                 </div>
               )}
-              <div>
-                <Label className="text-xs">Data</Label>
-                <Input
-                  type="date"
-                  value={paymentModal.paymentDate}
-                  onChange={(e) => setPaymentModal((prev) => ({ ...prev, paymentDate: e.target.value }))}
-                  className="mt-1"
-                />
+
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant={paymentModal.settleMode === 'bank' ? 'default' : 'outline'}
+                  onClick={() => switchPaymentMode('bank')}
+                >
+                  <Landmark className="h-3.5 w-3.5 mr-1.5" /> Da conto banca
+                </Button>
+                <Button
+                  size="sm"
+                  variant={paymentModal.settleMode === 'manual' ? 'default' : 'outline'}
+                  onClick={() => switchPaymentMode('manual')}
+                >
+                  <PencilLine className="h-3.5 w-3.5 mr-1.5" /> Manuale
+                </Button>
+                {paymentPreview?.canNet && (
+                  <Button
+                    size="sm"
+                    variant={paymentModal.settleMode === 'nc' ? 'default' : 'outline'}
+                    onClick={() => switchPaymentMode('nc')}
+                  >
+                    <Sparkles className="h-3.5 w-3.5 mr-1.5" /> Compensa NC
+                  </Button>
+                )}
               </div>
-              {!paymentPreview?.isZeroNetCase && (
-                <div>
-                  <Label className="text-xs">Importo</Label>
-                  <Input
-                    type="number"
-                    step="0.01"
-                    min={0}
-                    value={paymentModal.amount}
-                    onChange={(e) => setPaymentModal((prev) => ({ ...prev, amount: e.target.value }))}
-                    className="mt-1"
-                  />
+
+              {paymentModal.settleMode === 'bank' && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <Label className="text-xs">Movimenti banca candidati (±5% importo, ±30 giorni)</Label>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={async () => {
+                        if (!paymentModal.row) return
+                        setPaymentModal((prev) => ({ ...prev, loadingCandidates: true, error: null }))
+                        try {
+                          const candidates = await loadBankCandidates(paymentModal.row, Math.max(paymentModal.row.nc_net_amount || paymentModal.row.remaining_amount, 0))
+                          const first = candidates[0] || null
+                          setPaymentModal((prev) => ({
+                            ...prev,
+                            loadingCandidates: false,
+                            bankCandidates: candidates,
+                            selectedBankTxId: first?.id || null,
+                            paymentDate: first?.date || prev.paymentDate,
+                            amount: first ? String(round2(Math.abs(first.amount))) : prev.amount,
+                          }))
+                        } catch (e: any) {
+                          setPaymentModal((prev) => ({ ...prev, loadingCandidates: false, error: e.message || 'Errore aggiornamento candidati' }))
+                        }
+                      }}
+                    >
+                      Aggiorna candidati
+                    </Button>
+                  </div>
+                  {paymentModal.loadingCandidates ? (
+                    <div className="text-xs text-gray-500 border rounded-md px-3 py-2">Caricamento candidati...</div>
+                  ) : paymentModal.bankCandidates.length === 0 ? (
+                    <div className="text-xs text-gray-500 border rounded-md px-3 py-2">Nessun movimento candidato trovato. Usa modalità Manuale o Compensa NC.</div>
+                  ) : (
+                    <div className="max-h-56 overflow-y-auto border rounded-md divide-y">
+                      {paymentModal.bankCandidates.map((tx) => {
+                        const selected = paymentModal.selectedBankTxId === tx.id
+                        return (
+                          <button
+                            type="button"
+                            key={tx.id}
+                            onClick={() => setPaymentModal((prev) => ({
+                              ...prev,
+                              selectedBankTxId: tx.id,
+                              paymentDate: tx.date,
+                              amount: String(round2(Math.abs(tx.amount))),
+                            }))}
+                            className={`w-full text-left px-3 py-2 text-xs ${selected ? 'bg-sky-50' : 'hover:bg-gray-50'}`}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-medium">{fmtDate(tx.date)} · {fmtEur(Math.abs(tx.amount))}</span>
+                              <span className="text-[10px] text-sky-700">score {tx.score}</span>
+                            </div>
+                            <div className="text-gray-600 truncate">{tx.counterparty_name || tx.description || 'Movimento banca'}</div>
+                            <div className="text-[10px] text-gray-500">{tx.transaction_type || 'n/d'} · {tx.reconciliation_status || 'n/d'}</div>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
+
+              {paymentModal.settleMode === 'manual' && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div>
+                    <Label className="text-xs">Data</Label>
+                    <Input
+                      type="date"
+                      value={paymentModal.paymentDate}
+                      onChange={(e) => setPaymentModal((prev) => ({ ...prev, paymentDate: e.target.value }))}
+                      className="mt-1"
+                    />
+                  </div>
+                  <div>
+                    <Label className="text-xs">Importo</Label>
+                    <Input
+                      type="number"
+                      step="0.01"
+                      min={0}
+                      value={paymentModal.amount}
+                      onChange={(e) => setPaymentModal((prev) => ({ ...prev, amount: e.target.value }))}
+                      className="mt-1"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {paymentModal.settleMode === 'nc' && (
+                <div className="space-y-2">
+                  <div className="text-xs border rounded-md px-3 py-2 bg-indigo-50 text-indigo-800">
+                    Compensazione senza movimento banca.
+                    {paymentPreview?.isZeroNetCase
+                      ? ` Netto da saldare ${fmtEur(0)}.`
+                      : ` NC non sufficiente: residuo cassa richiesto ${fmtEur(paymentPreview?.net || 0)}.`}
+                  </div>
+                  {paymentModal.ncCandidates.length > 0 && (
+                    <div className="border rounded-md max-h-44 overflow-y-auto divide-y">
+                      {paymentModal.ncCandidates.map((nc) => (
+                        <div key={nc.id} className="px-3 py-2 text-xs flex items-center justify-between gap-2">
+                          <span>{nc.reference} · {fmtDate(nc.due_date)}</span>
+                          <span className="font-medium text-indigo-700">{fmtEur(nc.remaining_credit)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {paymentModal.error && <p className="text-xs text-red-600">{paymentModal.error}</p>}
             </div>
             <div className="mt-5 flex justify-end gap-2">
               <Button variant="outline" onClick={() => setPaymentModal((prev) => ({ ...prev, open: false }))}>Annulla</Button>
               <Button onClick={submitPayment} disabled={paymentModal.saving}>
-                {paymentModal.saving ? 'Salvataggio...' : paymentPreview?.isZeroNetCase ? 'Compensa con NC' : 'Conferma'}
+                {paymentModal.saving
+                  ? 'Salvataggio...'
+                  : paymentModal.settleMode === 'bank'
+                    ? 'Conferma e abbina movimento'
+                    : paymentModal.settleMode === 'nc'
+                      ? 'Compensa con NC'
+                      : (paymentModal.row.type === 'incasso' ? 'Segna incassato' : 'Segna pagato')}
               </Button>
             </div>
           </div>

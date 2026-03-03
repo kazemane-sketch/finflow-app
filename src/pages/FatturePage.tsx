@@ -194,7 +194,7 @@ function ConfirmDeleteModal({ open, count, onConfirm, onCancel }: { open: boolea
 // EDIT FORM
 // ============================================================
 function EditForm({ invoice, onSave, onCancel }: { invoice: DBInvoice; onSave: (u: InvoiceUpdate) => Promise<void>; onCancel: () => void }) {
-  const [form, setForm] = useState<InvoiceUpdate>({ number: invoice.number, date: invoice.date, total_amount: invoice.total_amount, payment_status: invoice.payment_status, payment_due_date: invoice.payment_due_date || '', payment_method: invoice.payment_method, notes: invoice.notes });
+  const [form, setForm] = useState<InvoiceUpdate>({ number: invoice.number, date: invoice.date, total_amount: invoice.total_amount, payment_due_date: invoice.payment_due_date || '', payment_method: invoice.payment_method, notes: invoice.notes });
   const [saving, setSaving] = useState(false);
   const handleSave = async () => { setSaving(true); try { await onSave(form); } finally { setSaving(false); } };
   return (
@@ -204,7 +204,7 @@ function EditForm({ invoice, onSave, onCancel }: { invoice: DBInvoice; onSave: (
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Numero</label><input value={form.number || ''} onChange={e => setForm({ ...form, number: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Data</label><input type="date" value={form.date || ''} onChange={e => setForm({ ...form, date: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Totale (€)</label><input type="number" step="0.01" value={form.total_amount ?? ''} onChange={e => setForm({ ...form, total_amount: parseFloat(e.target.value) || 0 })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
-        <div><label className="block text-xs font-medium text-gray-600 mb-1">Stato</label><select value={form.payment_status || 'pending'} onChange={e => setForm({ ...form, payment_status: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"><option value="pending">Da Pagare</option><option value="overdue">Scaduta</option><option value="paid">Pagata</option></select></div>
+        <div><label className="block text-xs font-medium text-gray-600 mb-1">Stato</label><div className="w-full px-2 py-1.5 text-sm border rounded bg-gray-100 text-gray-600">{STATUS_LABELS[invoice.payment_status] || invoice.payment_status}</div></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Scadenza</label><input type="date" value={form.payment_due_date || ''} onChange={e => setForm({ ...form, payment_due_date: e.target.value || null })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Modalità Pag.</label><select value={form.payment_method || ''} onChange={e => setForm({ ...form, payment_method: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"><option value="">—</option>{Object.entries(MP).map(([k, v]) => <option key={k} value={k}>{k} — {v}</option>)}</select></div>
       </div>
@@ -258,10 +258,11 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck }: 
 // ============================================================
 // FULL INVOICE DETAIL — matches artifact output
 // ============================================================
-function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, onDelete, onReload, onOpenCounterparty }: {
+function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, onDelete, onReload, onOpenCounterparty, onOpenScadenzario }: {
   invoice: DBInvoice; detail: DBInvoiceDetail | null; installments: InvoiceInstallment[]; loadingDetail: boolean;
   onEdit: (u: InvoiceUpdate) => Promise<void>; onDelete: () => void; onReload: () => void;
   onOpenCounterparty: (mode: 'verify' | 'edit') => void;
+  onOpenScadenzario: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [showXml, setShowXml] = useState(false);
@@ -315,6 +316,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       <div className="flex justify-end gap-2 mb-3 print:hidden">
         {detail?.raw_xml && <button onClick={() => setShowXml(!showXml)} className={`px-3 py-1.5 text-xs font-semibold rounded-lg border ${showXml ? 'bg-sky-600 text-white border-sky-600' : 'bg-white text-sky-600 border-sky-300 hover:bg-sky-50'}`}>{showXml ? '✕ Chiudi XML' : '〈/〉 Vedi XML'}</button>}
         {detail?.raw_xml && <button onClick={downloadXml} className="px-3 py-1.5 text-xs font-semibold rounded-lg border bg-white text-sky-600 border-sky-300 hover:bg-sky-50">⬇ Scarica XML</button>}
+        <button onClick={onOpenScadenzario} className="px-3 py-1.5 text-xs font-semibold rounded-lg border bg-white text-violet-600 border-violet-300 hover:bg-violet-50">🗓 Visualizza in Scadenzario</button>
         <button onClick={() => window.print()} className="px-3 py-1.5 text-xs font-semibold rounded-lg border bg-white text-gray-600 border-gray-300 hover:bg-gray-50">🖨 Stampa PDF</button>
         <button onClick={() => setEditing(!editing)} className={`px-3 py-1.5 text-xs font-semibold rounded-lg border ${editing ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-blue-600 border-blue-300 hover:bg-blue-50'}`}>{editing ? '✕ Chiudi' : '✏️ Modifica'}</button>
         <button onClick={onDelete} className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-red-300 text-red-600 bg-white hover:bg-red-50">🗑 Elimina</button>
@@ -334,6 +336,14 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       {editing && <EditForm invoice={invoice} onSave={handleSave} onCancel={() => setEditing(false)} />}
 
       <Sec title="Rate / Scadenze">
+        <div className="mb-2 flex justify-end">
+          <button
+            onClick={onOpenScadenzario}
+            className="px-2.5 py-1 text-xs font-semibold rounded border border-violet-300 text-violet-700 bg-white hover:bg-violet-50"
+          >
+            Gestisci pagamenti da Scadenzario
+          </button>
+        </div>
         {!installments.length ? (
           <div className="text-xs text-gray-500">Nessuna rata disponibile per questa fattura.</div>
         ) : (
@@ -920,6 +930,11 @@ export default function FatturePage() {
               } else {
                 navigate('/controparti');
               }
+            }}
+            onOpenScadenzario={() => {
+              const tab = selectedInvoice.direction === 'out' ? 'incassi' : 'pagamenti';
+              const q = encodeURIComponent(selectedInvoice.number || '');
+              navigate(`/scadenzario?tab=${tab}&query=${q}`);
             }}
           />
             : <div className="flex items-center justify-center h-full text-gray-400 text-sm">Seleziona una fattura dalla lista</div>}

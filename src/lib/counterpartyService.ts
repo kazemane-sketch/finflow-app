@@ -68,6 +68,20 @@ export interface CounterpartyAnalytics {
   }>
 }
 
+export interface CounterpartyInstallmentFlowRow {
+  installment_id: string
+  invoice_id: string
+  counterparty_id: string
+  direction: 'in' | 'out'
+  due_date: string
+  last_payment_date: string | null
+  amount_due: number
+  paid_amount: number
+  status: string
+  invoice_doc_type: string | null
+  invoice_number: string | null
+}
+
 const PA_KEYWORDS = [
   'comune', 'ministero', 'regione', 'provincia', 'asl', 'azienda sanitaria', 'universita',
   'istituto comprensivo', 'ente', 'agenzia delle entrate', 'inps', 'inail', 'camera di commercio',
@@ -364,21 +378,16 @@ export async function loadCounterparties(
   if (filters.status && filters.status !== 'all') query = query.eq('status', filters.status)
   if (filters.legalType && filters.legalType !== 'all') query = query.eq('legal_type', filters.legalType)
 
-  const { data, error } = await query
-  if (error) throw new Error(error.message)
-
-  let out = (data || []) as Counterparty[]
-
-  if (filters.query?.trim()) {
-    const q = filters.query.trim().toLowerCase()
-    out = out.filter((cp) =>
-      cp.name?.toLowerCase().includes(q) ||
-      cp.vat_number?.toLowerCase().includes(q) ||
-      cp.fiscal_code?.toLowerCase().includes(q)
+  const q = filters.query?.trim()
+  if (q) {
+    query = query.or(
+      `name.ilike.%${q}%,vat_number.ilike.%${q}%,fiscal_code.ilike.%${q}%`,
     )
   }
 
-  return out
+  const { data, error } = await query
+  if (error) throw new Error(error.message)
+  return (data || []) as Counterparty[]
 }
 
 export async function createManualCounterparty(
@@ -664,7 +673,10 @@ export function buildCounterpartyAnalytics(
     date: string
     total_amount: number
   }>,
-  counterparties: Counterparty[]
+  counterparties: Counterparty[],
+  options: {
+    useSignedAmounts?: boolean
+  } = {},
 ): CounterpartyAnalytics {
   const monthMap = new Map<string, { activeAmount: number; passiveAmount: number }>()
   const perCounterparty = new Map<string, {
@@ -684,7 +696,8 @@ export function buildCounterpartyAnalytics(
   const cpNameMap = new Map(counterparties.map((c) => [c.id, c.name]))
 
   for (const row of rows) {
-    const amount = Math.abs(safeNum(row.total_amount))
+    const rawAmount = safeNum(row.total_amount)
+    const amount = options.useSignedAmounts ? rawAmount : Math.abs(rawAmount)
     const month = row.date?.slice(0, 7) || 'n/a'
     const monthEntry = monthMap.get(month) || { activeAmount: 0, passiveAmount: 0 }
 
@@ -735,6 +748,70 @@ export function buildCounterpartyAnalytics(
     trend,
     byCounterparty,
   }
+}
+
+export async function loadInstallmentFlowsByCounterparty(
+  companyId: string,
+  counterpartyIds: string[],
+  options: {
+    direction?: 'all' | 'in' | 'out'
+    dateFrom?: string
+    dateTo?: string
+    onlyPaidDates?: boolean
+  } = {},
+): Promise<CounterpartyInstallmentFlowRow[]> {
+  if (!counterpartyIds.length) return []
+
+  let query = supabase
+    .from('invoice_installments')
+    .select('id, invoice_id, counterparty_id, direction, due_date, last_payment_date, amount_due, paid_amount, status, invoice:invoices(doc_type, number)')
+    .eq('company_id', companyId)
+    .in('counterparty_id', counterpartyIds)
+
+  if (options.direction && options.direction !== 'all') query = query.eq('direction', options.direction)
+  if (options.onlyPaidDates ?? true) {
+    query = query.not('last_payment_date', 'is', null)
+  }
+  if (options.dateFrom) query = query.gte('last_payment_date', options.dateFrom)
+  if (options.dateTo) query = query.lte('last_payment_date', options.dateTo)
+
+  const { data, error } = await query.order('last_payment_date', { ascending: false })
+  if (error) throw new Error(error.message)
+
+  const rows = (data || []) as Array<{
+    id: string
+    invoice_id: string
+    counterparty_id: string
+    direction: 'in' | 'out'
+    due_date: string
+    last_payment_date: string | null
+    amount_due: number
+    paid_amount: number
+    status: string
+    invoice?: { doc_type: string | null; number: string | null } | Array<{ doc_type: string | null; number: string | null }> | null
+  }>
+
+  const first = <T>(v: T | T[] | null | undefined): T | null => {
+    if (!v) return null
+    return Array.isArray(v) ? (v[0] || null) : v
+  }
+
+  return rows.map((row) => {
+    const invoice = first(row.invoice)
+    return {
+      installment_id: row.id,
+      invoice_id: row.invoice_id,
+      counterparty_id: row.counterparty_id,
+      direction: row.direction,
+      due_date: row.due_date,
+      last_payment_date: row.last_payment_date,
+      amount_due: Number(row.amount_due || 0),
+      paid_amount: Number(row.paid_amount || 0),
+      status: row.status,
+      invoice_doc_type: invoice?.doc_type || null,
+      invoice_number: invoice?.number || null,
+    }
+  })
 }
 
 export async function syncInvoiceCounterpartySnapshots(companyId: string): Promise<void> {
