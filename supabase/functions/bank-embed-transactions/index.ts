@@ -48,6 +48,24 @@ function getBearerToken(req: Request): string | null {
   return m?.[1]?.trim() || null;
 }
 
+function getApiKey(req: Request): string | null {
+  const raw = req.headers.get("apikey") ?? req.headers.get("x-api-key");
+  return raw?.trim() || null;
+}
+
+function parseJwtRole(token: string): string | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = `${base64}${"=".repeat((4 - (base64.length % 4)) % 4)}`;
+    const payload = JSON.parse(atob(padded));
+    return typeof payload?.role === "string" ? payload.role : null;
+  } catch {
+    return null;
+  }
+}
+
 function toVectorLiteral(values: number[]): string {
   return `[${values.map((v) => Number.isFinite(v) ? v.toFixed(8) : "0").join(",")}]`;
 }
@@ -135,23 +153,30 @@ async function callGeminiEmbeddingBatch(apiKey: string, texts: string[]): Promis
 }
 
 async function requireCompanyAccess(
-  admin: ReturnType<typeof createClient>,
+  userClient: ReturnType<typeof createClient>,
   token: string,
   companyId: string,
 ): Promise<void> {
-  const { data: userData, error: userError } = await admin.auth.getUser(token);
-  if (userError || !userData?.user?.id) {
-    throw new Response(JSON.stringify({ error: "Sessione non valida" }), { status: 401 });
+  const role = parseJwtRole(token);
+  if (role === "anon") {
+    throw new Response(JSON.stringify({ error: "Token anon non valido per questa operazione" }), { status: 401 });
   }
 
-  const { data: membership, error: membershipError } = await admin
+  const { data: membership, error: membershipError } = await userClient
     .from("company_members")
     .select("company_id")
     .eq("company_id", companyId)
-    .eq("user_id", userData.user.id)
     .maybeSingle();
 
-  if (membershipError || !membership?.company_id) {
+  if (membershipError) {
+    const msg = membershipError.message || "";
+    const isJwtError = /jwt|auth|token|session|expired|invalid/i.test(msg);
+    throw new Response(JSON.stringify({ error: isJwtError ? "JWT non valido o scaduto" : `Errore verifica permessi: ${msg}` }), {
+      status: isJwtError ? 401 : 500,
+    });
+  }
+
+  if (!membership?.company_id) {
     throw new Response(JSON.stringify({ error: "Permesso negato su azienda" }), { status: 403 });
   }
 }
@@ -165,9 +190,13 @@ Deno.serve(async (req) => {
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const apiKey = getApiKey(req);
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   if (!supabaseUrl || !serviceRoleKey) {
     return jsonResponse({ error: "Supabase non configurato", request_id: requestId }, requestId, 500);
+  }
+  if (!apiKey) {
+    return jsonResponse({ error: "API key mancante", request_id: requestId }, requestId, 401);
   }
   if (!geminiKey) {
     return jsonResponse({ error: "GEMINI_API_KEY non configurata", request_id: requestId }, requestId, 503);
@@ -198,8 +227,14 @@ Deno.serve(async (req) => {
     const admin = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
+    const userClient = createClient(supabaseUrl, apiKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+      global: {
+        headers: { Authorization: `Bearer ${token}` },
+      },
+    });
 
-    await requireCompanyAccess(admin, token, companyId);
+    await requireCompanyAccess(userClient, token, companyId);
     runId = crypto.randomUUID();
 
     const { data: lockRows, error: lockError } = await admin.rpc("bank_embedding_acquire_lock", {

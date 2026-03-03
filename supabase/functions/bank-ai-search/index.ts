@@ -387,12 +387,17 @@ function getBearerToken(req: Request): string | null {
   return m?.[1]?.trim() || null;
 }
 
+function getApiKey(req: Request): string | null {
+  const raw = req.headers.get("apikey") ?? req.headers.get("x-api-key");
+  return raw?.trim() || null;
+}
+
 async function requireCompanyAccess(
-  admin: ReturnType<typeof createClient>,
+  userClient: ReturnType<typeof createClient>,
   token: string,
   companyId: string,
   requestId: string,
-): Promise<{ userId: string }> {
+): Promise<void> {
   const role = parseJwtRole(token);
   if (role === "anon") {
     throw appError(
@@ -403,48 +408,47 @@ async function requireCompanyAccess(
     );
   }
 
-  const { data: userData, error: userError } = await admin.auth.getUser(token);
-  if (userError || !userData?.user?.id) {
-    console.error(JSON.stringify({
-      request_id: requestId,
-      company_id: companyId,
-      auth_stage: "get_user",
-      supabase_error: userError?.message ?? null,
-    }));
-    throw appError(
-      401,
-      "JWT non valido o scaduto",
-      "AUTH_INVALID_JWT",
-      "Rifai login e riprova.",
-      userError?.message ?? undefined,
-    );
-  }
-
-  const { data: membership, error: membershipError } = await admin
+  const { data: membership, error: membershipError } = await userClient
     .from("company_members")
     .select("company_id")
     .eq("company_id", companyId)
-    .eq("user_id", userData.user.id)
     .maybeSingle();
 
-  if (membershipError || !membership?.company_id) {
+  if (membershipError) {
+    const msg = membershipError.message || "";
+    const isJwtError = /jwt|auth|token|session|expired|invalid/i.test(msg);
     console.error(JSON.stringify({
       request_id: requestId,
       company_id: companyId,
-      auth_stage: "company_membership",
-      supabase_error: membershipError?.message ?? null,
-      user_id: userData.user.id,
+      auth_stage: "company_membership_query",
+      supabase_error: membershipError.message,
     }));
+    if (isJwtError) {
+      throw appError(
+        401,
+        "JWT non valido o scaduto",
+        "AUTH_INVALID_JWT",
+        "Effettua nuovamente il login.",
+        membershipError.message,
+      );
+    }
+    throw appError(
+      500,
+      "Errore verifica permessi azienda",
+      "AUTH_MEMBERSHIP_QUERY_FAILED",
+      "Riprova tra pochi secondi.",
+      membershipError.message,
+    );
+  }
+
+  if (!membership?.company_id) {
     throw appError(
       403,
       "Permesso negato su azienda",
       "AUTH_COMPANY_FORBIDDEN",
       "Verifica di essere membro dell'azienda selezionata.",
-      membershipError?.message ?? undefined,
     );
   }
-
-  return { userId: userData.user.id };
 }
 
 Deno.serve(async (req) => {
@@ -455,11 +459,19 @@ Deno.serve(async (req) => {
   }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
-  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const apiKey = getApiKey(req);
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
-  if (!supabaseUrl || !serviceRoleKey) {
+  if (!supabaseUrl) {
     return errorResponse(appError(500, "Supabase non configurato", "CONFIG_SUPABASE_MISSING"), requestId);
+  }
+  if (!apiKey) {
+    return errorResponse(appError(
+      401,
+      "API key mancante",
+      "AUTH_APIKEY_MISSING",
+      "Invia header apikey con la anon key del progetto.",
+    ), requestId);
   }
 
   const token = getBearerToken(req);
@@ -488,11 +500,14 @@ Deno.serve(async (req) => {
       return errorResponse(appError(400, "company_id obbligatorio", "VALIDATION_COMPANY_REQUIRED"), requestId);
     }
 
-    const admin = createClient(supabaseUrl, serviceRoleKey, {
+    const userClient = createClient(supabaseUrl, apiKey, {
       auth: { persistSession: false, autoRefreshToken: false },
+      global: {
+        headers: { Authorization: `Bearer ${token}` },
+      },
     });
 
-    await requireCompanyAccess(admin, token, companyId, requestId);
+    await requireCompanyAccess(userClient, token, companyId, requestId);
 
     if (isFilterMode(query)) {
       const filters = buildFilterSpec(query);
@@ -521,7 +536,7 @@ Deno.serve(async (req) => {
     const queryEmbedding = await callGeminiEmbedding(geminiKey, enrichQueryWithMonthHints(query), "RETRIEVAL_QUERY");
     const queryVector = toVectorLiteral(queryEmbedding);
 
-    const { data: candidateData, error: candidateError } = await admin.rpc("bank_ai_search_candidates", {
+    const { data: candidateData, error: candidateError } = await userClient.rpc("bank_ai_search_candidates", {
       p_company_id: companyId,
       p_query_vector: queryVector,
       p_limit: limit,
