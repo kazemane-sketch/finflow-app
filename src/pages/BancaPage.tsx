@@ -630,10 +630,6 @@ function shouldRetryBankAiAuth(err?: Partial<BankAiErrorPayload> | null): boolea
   return hasJwtAuthSignal(err)
 }
 
-async function forceLocalRelogin(): Promise<void> {
-  await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined)
-}
-
 async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: string): Promise<BankAiSearchResponse> {
   const res = await fetch(`${SUPABASE_URL}/functions/v1/bank-ai-search`, {
     method: 'POST',
@@ -686,7 +682,6 @@ async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchR
     const { data: sessionData } = await supabase.auth.getSession()
     const token = sessionData?.session?.access_token
     if (!token) {
-      await forceLocalRelogin()
       throw createBankAiError('Sessione assente: effettua nuovamente il login.', {
         status: 401,
         errorCode: 'AUTH_SESSION_MISSING',
@@ -706,13 +701,12 @@ async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchR
 
     const { error: refreshError } = await supabase.auth.refreshSession().catch(() => ({ error: new Error('refresh_failed') }))
     if (refreshError) {
-      await forceLocalRelogin()
       throw createBankAiError(parsed?.message || 'Sessione non valida o scaduta.', {
         status: parsed?.status ?? 401,
         requestId: parsed?.requestId,
         details: parsed?.details,
         errorCode: parsed?.errorCode || 'AUTH_REFRESH_FAILED',
-        hint: 'Sessione scaduta. Effettua logout/login e riprova.',
+        hint: 'Sessione scaduta. Effettua nuovamente il login e riprova.',
       })
     }
     const refreshedToken = await readSessionToken()
@@ -720,8 +714,8 @@ async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchR
       return await invokeBankAiWithBearer(body, refreshedToken)
     } catch (e2: any) {
       const parsedSecond = e2 as BankAiErrorPayload
-      if (parsedSecond?.status === 401 && hasJwtAuthSignal(parsedSecond)) {
-        await forceLocalRelogin()
+      const isAuthFailure = (parsedSecond?.status === 401 || parsedSecond?.status === 403) && hasJwtAuthSignal(parsedSecond)
+      if (isAuthFailure) {
         throw createBankAiError(parsedSecond.message || 'Sessione non valida o scaduta.', {
           status: parsedSecond.status,
           requestId: parsedSecond.requestId,

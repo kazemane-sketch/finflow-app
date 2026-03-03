@@ -2,6 +2,17 @@ import { useEffect, useState } from 'react'
 import { supabase } from '@/integrations/supabase/client'
 import type { User, Session } from '@supabase/supabase-js'
 
+function isAuthFailure(error: any): boolean {
+  const status = Number(error?.status || error?.statusCode || 0)
+  if (status === 401 || status === 403) return true
+
+  const code = String(error?.code || error?.name || '').toLowerCase()
+  if (/auth|jwt|token|session|expired|invalid/.test(code)) return true
+
+  const message = String(error?.message || '').toLowerCase()
+  return /auth|jwt|token|session|expired|invalid/.test(message)
+}
+
 export function useAuth() {
   const [user, setUser] = useState<User | null>(null)
   const [session, setSession] = useState<Session | null>(null)
@@ -29,11 +40,14 @@ export function useAuth() {
         applySession(rawSession)
         return
       }
+      if (userError && !isAuthFailure(userError)) {
+        applySession(rawSession)
+        return
+      }
 
       const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession()
       const refreshedSession = refreshed?.session ?? null
       if (refreshError || !refreshedSession?.access_token) {
-        await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined)
         applySession(null)
         return
       }
