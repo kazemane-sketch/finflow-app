@@ -8,7 +8,7 @@ const corsHeaders = {
 };
 
 const REQUEST_TIMEOUT_MS = Number(Deno.env.get("BANK_EMBED_TIMEOUT_MS") ?? "30000");
-const EMBEDDING_MODEL = Deno.env.get("GEMINI_EMBEDDING_MODEL") ?? "text-embedding-004";
+const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_EMBEDDING_DIMS = Math.max(1, Number(Deno.env.get("BANK_EMBEDDING_DIMS") ?? "3072") || 3072);
 const MAX_ERROR_LEN = 500;
 const EMBED_CONCURRENCY = Math.max(1, Math.min(Number(Deno.env.get("BANK_EMBED_CONCURRENCY") ?? "8") || 8, 20));
@@ -137,7 +137,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 }
 
 async function callGeminiEmbeddingSingle(apiKey: string, text: string): Promise<number[]> {
-  const url = `https://generativelanguage.googleapis.com/v1/models/${EMBEDDING_MODEL}:embedContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${apiKey}`;
   const response = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
