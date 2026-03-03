@@ -1059,6 +1059,9 @@ export default function BancaPage() {
         if (f.date_from) setDateFrom(f.date_from)
         if (f.date_to) setDateTo(f.date_to)
         if (f.direction === 'in' || f.direction === 'out') setDirFilter(f.direction)
+        // Clear text query — AI has converted it to structured filters;
+        // leaving it would cause the text filter to exclude all transactions
+        setQuery('')
         // Show AI answer without candidateIds (let regular filters work)
         setAiResult({
           text: result.answer || 'Filtri applicati.',
