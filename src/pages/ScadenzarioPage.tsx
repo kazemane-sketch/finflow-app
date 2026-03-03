@@ -388,19 +388,17 @@ export default function ScadenzarioPage() {
       invoice_num: invoiceNum || null,
     })
 
-    const queries: Promise<any>[] = [
-      supabase
-        .from('bank_transactions')
-        .select('id', { count: 'exact', head: true })
-        .eq('company_id', company.id),
+    const totalCountQuery = supabase
+      .from('bank_transactions')
+      .select('id', { count: 'exact', head: true })
+      .eq('company_id', company.id)
+
+    const [totalCountRes, sameDirectionRes, windowRes, invoiceRefRes] = await Promise.all([
+      totalCountQuery,
       sameDirectionCountQuery,
       windowQuery,
-    ]
-    if (invoiceRefQuery) queries.push(invoiceRefQuery)
-
-    const results = await Promise.all(queries)
-    const [totalCountRes, sameDirectionRes, windowRes] = results
-    const invoiceRefRes = invoiceRefQuery ? results[3] : null
+      invoiceRefQuery ?? Promise.resolve({ data: [], error: null }),
+    ])
 
     if (totalCountRes.error) throw new Error(totalCountRes.error.message)
     if (sameDirectionRes.error) throw new Error(sameDirectionRes.error.message)
