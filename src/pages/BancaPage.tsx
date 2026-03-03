@@ -648,10 +648,11 @@ async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: st
 
   if (!res.ok) {
     const msg = String(payload?.error || payload?.message || rawText || `HTTP ${res.status}`).trim()
+    const details = typeof payload?.details === 'string' ? payload.details.trim() : ''
     throw createBankAiError(msg || 'Errore funzione AI', {
       status: res.status,
       requestId,
-      details: msg || undefined,
+      details: details || msg || undefined,
       errorCode,
       hint,
     })
