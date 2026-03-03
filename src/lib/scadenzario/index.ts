@@ -952,7 +952,7 @@ function toScadenzarioInstallmentRow(item: ListInstallmentJoinRow): ScadenzarioR
   const dueDate = String(item.due_date)
   const today = todayIso()
   const days = daysBetween(dueDate, today)
-  const type = item.direction === 'in' ? 'incasso' : 'pagamento'
+  const type = item.direction === 'out' ? 'incasso' : 'pagamento'
   const status = computeStatusFromAmounts(amountDue, paidAmount, dueDate, today)
   const isCreditNote = Boolean(item.is_credit_note || isCreditNoteDocType(invoice?.doc_type))
 

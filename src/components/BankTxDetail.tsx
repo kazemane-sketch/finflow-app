@@ -1,0 +1,197 @@
+// Shared bank transaction detail component — extracted from BancaPage.tsx
+// Used in: BancaPage (sidebar), ScadenzarioPage (popup dialog)
+
+import { X } from 'lucide-react'
+import { fmtDate, fmtEur } from '@/lib/utils'
+
+// ---- helpers ----
+
+export function txTypeLabel(type?: string) {
+  const map: Record<string, string> = {
+    bonifico_in: 'Bonifico entrata', bonifico_out: 'Bonifico uscita',
+    riba: 'RIBA', sdd: 'SDD/RID', pos: 'POS', prelievo: 'Prelievo ATM',
+    commissione: 'Commissione/Spese', stipendio: 'Stipendio', f24: 'F24', altro: 'Altro',
+  }
+  return map[type || 'altro'] || type || 'Altro'
+}
+
+export function txTypeBadge(type?: string) {
+  if (!type) return 'bg-gray-100 text-gray-600'
+  if (type === 'bonifico_in' || type === 'stipendio') return 'bg-emerald-100 text-emerald-700'
+  if (type === 'bonifico_out' || type === 'f24' || type === 'commissione') return 'bg-red-100 text-red-700'
+  if (type === 'riba') return 'bg-blue-100 text-blue-700'
+  if (type === 'sdd') return 'bg-purple-100 text-purple-700'
+  if (type === 'pos') return 'bg-amber-100 text-amber-700'
+  if (type === 'prelievo') return 'bg-orange-100 text-orange-700'
+  return 'bg-gray-100 text-gray-600'
+}
+
+export function txDirection(tx: any): 'in' | 'out' {
+  if (tx?.direction === 'in' || tx?.direction === 'out') return tx.direction
+  return Number(tx?.amount || 0) >= 0 ? 'in' : 'out'
+}
+
+export function txDirectionSourceLabel(source?: string) {
+  if (source === 'side_rule') return 'Regola DARE/AVERE'
+  if (source === 'semantic_rule') return 'Regola semantica'
+  if (source === 'manual') return 'Correzione manuale'
+  return 'Fallback importo'
+}
+
+export function txDirectionConfidenceLabel(conf?: number) {
+  if (conf == null || Number.isNaN(Number(conf))) return '—'
+  return `${Math.round(Number(conf) * 100)}%`
+}
+
+// ---- component ----
+
+export interface BankTxDetailProps {
+  tx: any
+  onClose: () => void
+  /** If true, show direction edit controls */
+  editable?: boolean
+  directionEditMode?: boolean
+  directionDraft?: 'in' | 'out'
+  directionSaving?: boolean
+  onDirectionDraftChange?: (d: 'in' | 'out') => void
+  onDirectionSave?: () => void
+  onEnableDirectionEdit?: () => void
+}
+
+export default function BankTxDetail({
+  tx,
+  onClose,
+  editable = false,
+  directionEditMode = false,
+  directionDraft = 'in',
+  directionSaving = false,
+  onDirectionDraftChange,
+  onDirectionSave,
+  onEnableDirectionEdit,
+}: BankTxDetailProps) {
+  if (!tx) return null
+  const currentDirection = txDirection(tx)
+  const isIn = currentDirection === 'in'
+  const rawAmount = Number(tx.amount || 0)
+  const signedAmount = isIn ? Math.abs(rawAmount) : -Math.abs(rawAmount)
+  const hasCommission = tx.commission_amount != null && tx.commission_amount !== 0
+  const netAmount = hasCommission ? signedAmount - Number(tx.commission_amount || 0) : signedAmount
+
+  const Row = ({ l, v, mono }: { l: string; v?: any; mono?: boolean }) => {
+    if (v == null || v === '' || v === '—') return null
+    return (
+      <div>
+        <p className="text-[10px] text-gray-400 uppercase tracking-wide">{l}</p>
+        <p className={`text-xs text-gray-800 mt-0.5 break-words ${mono ? 'font-mono bg-gray-50 p-1.5 rounded text-[10px]' : ''}`}>{v}</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="h-full flex flex-col bg-white">
+      <div className="flex items-center justify-between px-4 py-3 border-b flex-shrink-0">
+        <span className="text-sm font-semibold">Dettaglio movimento</span>
+        <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1">
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      <div className={`px-4 py-4 flex-shrink-0 ${isIn ? 'bg-emerald-50' : 'bg-red-50'}`}>
+        <p className={`text-2xl font-bold ${isIn ? 'text-emerald-700' : 'text-red-700'}`}>
+          {isIn ? '+' : '-'}{fmtEur(Math.abs(signedAmount))}
+        </p>
+        {hasCommission && (
+          <div className="mt-1.5 space-y-0.5">
+            <p className="text-xs text-orange-600">Commissione: {fmtEur(tx.commission_amount)}</p>
+            <p className="text-xs font-semibold text-gray-700">Importo netto: {fmtEur(netAmount)}</p>
+          </div>
+        )}
+        <div className="flex items-center gap-2 mt-2">
+          <span className="text-xs text-gray-500">{fmtDate(tx.date)}</span>
+          <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${txTypeBadge(tx.transaction_type)}`}>
+            {txTypeLabel(tx.transaction_type)}
+          </span>
+          {tx.direction_needs_review && (
+            <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">
+              Da verificare
+            </span>
+          )}
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+        <Row l="Direzione" v={currentDirection === 'in' ? 'Entrata' : 'Uscita'} />
+        <Row l="Origine decisione" v={txDirectionSourceLabel(tx.direction_source)} />
+        <Row l="Confidenza" v={txDirectionConfidenceLabel(tx.direction_confidence)} />
+        <Row l="Motivo" v={tx.direction_reason} />
+        <Row l="Data accredito" v={tx.date ? fmtDate(tx.date) : null} />
+        <Row l="Data valuta" v={tx.value_date ? fmtDate(tx.value_date) : null} />
+        <Row l="Controparte" v={tx.counterparty_name} />
+        <Row l="Origine controparte" v={tx.counterparty_source} />
+        <Row l="Confidenza controparte" v={tx.counterparty_confidence != null ? `${Math.round(Number(tx.counterparty_confidence) * 100)}%` : null} />
+        <Row l="Controparte da verificare" v={tx.counterparty_needs_review ? 'Si' : null} />
+        <Row l="IBAN / Conto controparte" v={tx.counterparty_account} />
+        <Row l="Saldo dopo" v={tx.balance != null ? fmtEur(tx.balance) : null} />
+        <Row l="Descrizione breve" v={tx.description} />
+        <Row l="Origine descrizione" v={tx.description_source} />
+        <Row l="Confidenza descrizione" v={tx.description_confidence != null ? `${Math.round(Number(tx.description_confidence) * 100)}%` : null} />
+        {tx.raw_text && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Testo operazione completo</p>
+            <pre className="mt-0.5 text-[10px] text-gray-800 bg-gray-50 p-2 rounded whitespace-pre-wrap font-mono">
+              {tx.raw_text}
+            </pre>
+          </div>
+        )}
+        <Row l="Rif. fattura" v={tx.invoice_ref} />
+        <Row l="ID flusso CBI" v={tx.cbi_flow_id} />
+        <Row l="Filiale disponente" v={tx.branch} />
+        <Row l="Riferimento" v={tx.reference} />
+        <Row l="Stato riconciliazione" v={tx.reconciliation_status} />
+      </div>
+      {editable && (
+        <div className="border-t px-4 py-3 bg-gray-50">
+          {!directionEditMode ? (
+            <button
+              onClick={onEnableDirectionEdit}
+              className="w-full text-xs px-3 py-1.5 rounded border border-gray-200 bg-white text-gray-700 hover:bg-gray-50"
+            >
+              Correggi direzione
+            </button>
+          ) : (
+            <div className="space-y-2">
+              <p className="text-xs font-medium text-gray-700">Correzione manuale direzione</p>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => onDirectionDraftChange?.('in')}
+                  className={`text-xs px-2 py-1.5 rounded border font-medium ${
+                    directionDraft === 'in'
+                      ? 'bg-emerald-600 border-emerald-600 text-white'
+                      : 'bg-white border-gray-200 text-gray-700'
+                  }`}
+                >
+                  Segna Entrata
+                </button>
+                <button
+                  onClick={() => onDirectionDraftChange?.('out')}
+                  className={`text-xs px-2 py-1.5 rounded border font-medium ${
+                    directionDraft === 'out'
+                      ? 'bg-red-600 border-red-600 text-white'
+                      : 'bg-white border-gray-200 text-gray-700'
+                  }`}
+                >
+                  Segna Uscita
+                </button>
+              </div>
+              <button
+                onClick={onDirectionSave}
+                disabled={directionSaving}
+                className="w-full text-xs px-3 py-1.5 rounded bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
+              >
+                {directionSaving ? 'Salvataggio...' : 'Conferma'}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

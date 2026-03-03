@@ -176,6 +176,83 @@ function parseAnthropicResponse(raw: string, allCandidateIds: string[]): { answe
   return { answer: raw, pertinentIds: allCandidateIds };
 }
 
+// ---- Filter mode: classify query as filter vs analysis ----
+
+type BankFilterResult = {
+  mode: "filter";
+  filter: {
+    date_from?: string | null;
+    date_to?: string | null;
+    direction?: "in" | "out" | null;
+    transaction_types?: string[] | null;
+    counterparty_pattern?: string | null;
+    amount_min?: number | null;
+    amount_max?: number | null;
+  };
+  answer: string;
+};
+
+function buildClassifyPrompt(query: string): string {
+  const today = new Date().toISOString().slice(0, 10);
+  return [
+    "Sei un classificatore di query bancarie. Analizza la domanda dell'utente e decidi se è:",
+    "",
+    "TIPO A - FILTRO: la query chiede di mostrare/filtrare movimenti per periodo, tipo, direzione, controparte o importo.",
+    "Esempi: 'movimenti di dicembre', 'ottobre fino a dicembre 2025', 'bonifici in entrata', 'movimenti sopra 1000 euro', 'pagamenti a Enel'",
+    "",
+    "TIPO B - ANALISI: la query chiede analisi, calcoli, totali, confronti, o cerca movimenti specifici per contenuto semantico.",
+    "Esempi: 'quanto ho pagato a Enel nel 2025', 'mostrami gli SDD di mandato 1234', 'trova il pagamento della fattura 230/FE'",
+    "",
+    `Data odierna: ${today}`,
+    "",
+    "Rispondi ESCLUSIVAMENTE con un JSON valido (senza markdown):",
+    "",
+    'Se FILTRO: {"type":"filter","filter":{"date_from":"YYYY-MM-DD o null","date_to":"YYYY-MM-DD o null","direction":"in o out o null","transaction_types":["bonifico_in","sdd",...] o null,"counterparty_pattern":"pattern o null","amount_min":numero o null,"amount_max":numero o null},"answer":"Ho applicato i filtri per ..."}',
+    "",
+    'Se ANALISI: {"type":"analysis"}',
+    "",
+    "Tipi transazione disponibili: bonifico_in, bonifico_out, riba, sdd, pos, prelievo, commissione, stipendio, f24, altro",
+    "",
+    `Domanda: ${query}`,
+  ].join("\n");
+}
+
+function parseClassifyResponse(raw: string): BankFilterResult | null {
+  const tryParse = (text: string): BankFilterResult | null => {
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed.type === "filter" && parsed.filter && typeof parsed.answer === "string") {
+        return {
+          mode: "filter",
+          filter: {
+            date_from: parsed.filter.date_from || null,
+            date_to: parsed.filter.date_to || null,
+            direction: (parsed.filter.direction === "in" || parsed.filter.direction === "out") ? parsed.filter.direction : null,
+            transaction_types: Array.isArray(parsed.filter.transaction_types) ? parsed.filter.transaction_types : null,
+            counterparty_pattern: parsed.filter.counterparty_pattern || null,
+            amount_min: typeof parsed.filter.amount_min === "number" ? parsed.filter.amount_min : null,
+            amount_max: typeof parsed.filter.amount_max === "number" ? parsed.filter.amount_max : null,
+          },
+          answer: parsed.answer,
+        };
+      }
+      if (parsed.type === "analysis") return null; // proceed to analysis mode
+    } catch { /* not valid JSON */ }
+    return null;
+  };
+
+  const direct = tryParse(raw);
+  if (direct) return direct;
+
+  const jsonMatch = raw.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+  if (jsonMatch?.[1]) {
+    const fromBlock = tryParse(jsonMatch[1].trim());
+    if (fromBlock) return fromBlock;
+  }
+
+  return null; // default: proceed to analysis mode
+}
+
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -539,6 +616,31 @@ Deno.serve(async (req) => {
         undefined,
         "analysis",
       ), requestId);
+    }
+
+    // ---- Step 0: Classify query as filter vs analysis ----
+    try {
+      const classifyPrompt = buildClassifyPrompt(query);
+      const classifyRaw = await callAnthropic(anthropicKey, classifyPrompt);
+      const filterResult = parseClassifyResponse(classifyRaw);
+
+      if (filterResult) {
+        console.log(`[classify] query "${query}" → filter mode`, JSON.stringify(filterResult.filter));
+        return jsonResponse({
+          mode: "filter",
+          answer: filterResult.answer,
+          filter: filterResult.filter,
+          candidate_count: 0,
+          candidate_ids: [],
+          used_count: 0,
+          model: `anthropic:${ANTHROPIC_MODEL}`,
+          request_id: requestId,
+        }, requestId, 200);
+      }
+      console.log(`[classify] query "${query}" → analysis mode`);
+    } catch (e) {
+      // Classification failed — fall through to analysis mode
+      console.warn(`[classify] failed for query "${query}":`, e instanceof Error ? e.message : e);
     }
 
     let candidates: CandidateTx[] = [];

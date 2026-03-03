@@ -20,6 +20,14 @@ import {
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
 import { getValidAccessToken, type AccessTokenError } from '@/lib/getValidAccessToken'
 
+import BankTxDetail, {
+  txTypeLabel as _txTypeLabel,
+  txTypeBadge as _txTypeBadge,
+  txDirection as _txDirection,
+  txDirectionSourceLabel as _txDirectionSourceLabel,
+  txDirectionConfidenceLabel as _txDirectionConfidenceLabel,
+} from '@/components/BankTxDetail'
+
 // ============================================================
 // UTILS
 // ============================================================
@@ -391,146 +399,9 @@ function TxRow({ tx, selected, onClick, onDoubleClick }: {
 }
 
 // ============================================================
-// DETAIL PANEL
+// DETAIL PANEL — uses shared BankTxDetail component
 // ============================================================
-function TxDetail({
-  tx,
-  onClose,
-  directionEditMode,
-  directionDraft,
-  directionSaving,
-  onDirectionDraftChange,
-  onDirectionSave,
-  onEnableDirectionEdit,
-}: {
-  tx: any;
-  onClose: () => void;
-  directionEditMode: boolean;
-  directionDraft: 'in' | 'out';
-  directionSaving: boolean;
-  onDirectionDraftChange: (d: 'in' | 'out') => void;
-  onDirectionSave: () => void;
-  onEnableDirectionEdit: () => void;
-}) {
-  if (!tx) return null
-  const currentDirection = txDirection(tx)
-  const isIn = currentDirection === 'in'
-  const rawAmount = Number(tx.amount || 0)
-  const signedAmount = isIn ? Math.abs(rawAmount) : -Math.abs(rawAmount)
-  const hasCommission = tx.commission_amount != null && tx.commission_amount !== 0
-  // Importo netto corretto: toglie la commissione dall'importo totale
-  // commission è negativo → amount - commission = amount + abs(commission)
-  const netAmount = hasCommission ? signedAmount - Number(tx.commission_amount || 0) : signedAmount
-
-  const Row = ({ l, v, mono }: { l: string; v?: any; mono?: boolean }) => {
-    if (v == null || v === '' || v === '—') return null
-    return (
-      <div>
-        <p className="text-[10px] text-gray-400 uppercase tracking-wide">{l}</p>
-        <p className={`text-xs text-gray-800 mt-0.5 break-words ${mono ? 'font-mono bg-gray-50 p-1.5 rounded text-[10px]' : ''}`}>{v}</p>
-      </div>
-    )
-  }
-
-  return (
-    <div className="h-full flex flex-col bg-white">
-      <div className="flex items-center justify-between px-4 py-3 border-b flex-shrink-0">
-        <span className="text-sm font-semibold">Dettaglio movimento</span>
-        <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1">
-          <X className="h-4 w-4" />
-        </button>
-      </div>
-      <div className={`px-4 py-4 flex-shrink-0 ${isIn ? 'bg-emerald-50' : 'bg-red-50'}`}>
-        <p className={`text-2xl font-bold ${isIn ? 'text-emerald-700' : 'text-red-700'}`}>
-          {isIn ? '+' : '-'}{fmtEur(Math.abs(signedAmount))}
-        </p>
-        {hasCommission && (
-          <div className="mt-1.5 space-y-0.5">
-            <p className="text-xs text-orange-600">Commissione: {fmtEur(tx.commission_amount)}</p>
-            <p className="text-xs font-semibold text-gray-700">Importo netto: {fmtEur(netAmount)}</p>
-          </div>
-        )}
-        <div className="flex items-center gap-2 mt-2">
-          <span className="text-xs text-gray-500">{fmtDate(tx.date)}</span>
-          <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${txTypeBadge(tx.transaction_type)}`}>
-            {txTypeLabel(tx.transaction_type)}
-          </span>
-          {tx.direction_needs_review && (
-            <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">
-              Da verificare
-            </span>
-          )}
-        </div>
-      </div>
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
-        <Row l="Direzione" v={currentDirection === 'in' ? 'Entrata' : 'Uscita'} />
-        <Row l="Origine decisione" v={txDirectionSourceLabel(tx.direction_source)} />
-        <Row l="Confidenza" v={txDirectionConfidenceLabel(tx.direction_confidence)} />
-        <Row l="Motivo" v={tx.direction_reason} />
-        <Row l="Data accredito" v={tx.date ? fmtDate(tx.date) : null} />
-        <Row l="Data valuta" v={tx.value_date ? fmtDate(tx.value_date) : null} />
-        <Row l="Controparte" v={tx.counterparty_name} />
-        <Row l="Origine controparte" v={tx.counterparty_source} />
-        <Row l="Confidenza controparte" v={tx.counterparty_confidence != null ? `${Math.round(Number(tx.counterparty_confidence) * 100)}%` : null} />
-        <Row l="Controparte da verificare" v={tx.counterparty_needs_review ? 'Sì' : null} />
-        <Row l="IBAN / Conto controparte" v={tx.counterparty_account} />
-        <Row l="Saldo dopo" v={tx.balance != null ? fmtEur(tx.balance) : null} />
-        <Row l="Descrizione breve" v={tx.description} />
-        <Row l="Origine descrizione" v={tx.description_source} />
-        <Row l="Confidenza descrizione" v={tx.description_confidence != null ? `${Math.round(Number(tx.description_confidence) * 100)}%` : null} />
-        {tx.raw_text && (
-          <div>
-            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Testo operazione completo</p>
-            <pre className="mt-0.5 text-[10px] text-gray-800 bg-gray-50 p-2 rounded whitespace-pre-wrap font-mono">
-              {tx.raw_text}
-            </pre>
-          </div>
-        )}
-        <Row l="Rif. fattura" v={tx.invoice_ref} />
-        <Row l="ID flusso CBI" v={tx.cbi_flow_id} />
-        <Row l="Filiale disponente" v={tx.branch} />
-        <Row l="Riferimento" v={tx.reference} />
-        <Row l="Stato riconciliazione" v={tx.reconciliation_status} />
-      </div>
-      <div className="border-t px-4 py-3 bg-gray-50">
-        {!directionEditMode ? (
-          <Button size="sm" variant="outline" onClick={onEnableDirectionEdit} className="w-full">
-            Correggi direzione
-          </Button>
-        ) : (
-          <div className="space-y-2">
-            <p className="text-xs font-medium text-gray-700">Correzione manuale direzione</p>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                onClick={() => onDirectionDraftChange('in')}
-                className={`text-xs px-2 py-1.5 rounded border font-medium ${
-                  directionDraft === 'in'
-                    ? 'bg-emerald-600 border-emerald-600 text-white'
-                    : 'bg-white border-gray-200 text-gray-700'
-                }`}
-              >
-                Segna Entrata
-              </button>
-              <button
-                onClick={() => onDirectionDraftChange('out')}
-                className={`text-xs px-2 py-1.5 rounded border font-medium ${
-                  directionDraft === 'out'
-                    ? 'bg-red-600 border-red-600 text-white'
-                    : 'bg-white border-gray-200 text-gray-700'
-                }`}
-              >
-                Segna Uscita
-              </button>
-            </div>
-            <Button size="sm" onClick={onDirectionSave} disabled={directionSaving} className="w-full">
-              {directionSaving ? 'Salvataggio...' : 'Conferma'}
-            </Button>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
+// TxDetail is now imported from @/components/BankTxDetail
 
 // ============================================================
 // AI SEARCH
@@ -546,12 +417,23 @@ type BankAiSearchRequest = {
   limit?: number
 }
 
+type BankAiFilterSpec = {
+  date_from?: string | null
+  date_to?: string | null
+  direction?: 'in' | 'out' | null
+  transaction_types?: string[] | null
+  counterparty_pattern?: string | null
+  amount_min?: number | null
+  amount_max?: number | null
+}
+
 type BankAiSearchResponse = {
-  mode: BankAiMode
+  mode: BankAiMode | 'filter'
   answer?: string
   used_count?: number
   candidate_count?: number
   candidate_ids?: string[]
+  filter?: BankAiFilterSpec
   model?: string
   request_id?: string
 }
@@ -1162,17 +1044,36 @@ export default function BancaPage() {
       }
 
       const result = await askBankAiSearch(payload)
-      console.log('AI result candidate_ids:', result.candidate_ids)
-      const scopeLine = `\n\nScope AI: ${Number(result.candidate_count || 0)} candidati · ${(result.candidate_ids || []).length} pertinenti` +
-        `${result.model ? ` · modello: ${result.model}` : ''}` +
-        `${result.request_id ? ` · request: ${result.request_id}` : ''}`
-      setAiResult({
-        text: `${result.answer || 'Nessuna risposta AI.'}${scopeLine}`,
-        mode: 'analysis',
-        isError: false,
-        requestId: result.request_id,
-        candidateIds: result.candidate_ids || [],
-      })
+
+      // Filter mode: AI returned structured filter params → apply locally
+      if (result.mode === 'filter' && result.filter) {
+        console.log('[Banca AI] filter mode:', result.filter)
+        const f = result.filter
+        if (f.date_from) setDateFrom(f.date_from)
+        if (f.date_to) setDateTo(f.date_to)
+        if (f.direction === 'in' || f.direction === 'out') setDirFilter(f.direction)
+        // Show AI answer without candidateIds (let regular filters work)
+        setAiResult({
+          text: result.answer || 'Filtri applicati.',
+          mode: 'analysis',
+          isError: false,
+          requestId: result.request_id,
+          candidateIds: [], // empty = use regular filters
+        })
+      } else {
+        // Analysis mode: use candidateIds as before
+        console.log('AI result candidate_ids:', result.candidate_ids)
+        const scopeLine = `\n\nScope AI: ${Number(result.candidate_count || 0)} candidati · ${(result.candidate_ids || []).length} pertinenti` +
+          `${result.model ? ` · modello: ${result.model}` : ''}` +
+          `${result.request_id ? ` · request: ${result.request_id}` : ''}`
+        setAiResult({
+          text: `${result.answer || 'Nessuna risposta AI.'}${scopeLine}`,
+          mode: 'analysis',
+          isError: false,
+          requestId: result.request_id,
+          candidateIds: result.candidate_ids || [],
+        })
+      }
     } catch (e: any) {
       const err = e as BankAiErrorPayload
       const reason = String(err?.message || 'Errore AI non disponibile').trim()
@@ -1525,9 +1426,10 @@ export default function BancaPage() {
       {/* RIGHT DETAIL PANEL */}
       {selectedTx && !isMultiSelect && (
         <div className="hidden lg:block w-72 xl:w-80 flex-shrink-0 overflow-hidden border-l h-full">
-          <TxDetail
+          <BankTxDetail
             tx={selectedTx}
             onClose={() => { setSelectedTx(null); setDirectionEditMode(false) }}
+            editable
             directionEditMode={directionEditMode}
             directionDraft={directionDraft}
             directionSaving={directionSaving}

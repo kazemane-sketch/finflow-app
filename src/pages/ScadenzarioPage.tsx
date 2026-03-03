@@ -5,11 +5,12 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { CalendarClock, Receipt, ArrowDownLeft, ArrowUpRight, Search, Filter, Landmark, PencilLine, Sparkles } from 'lucide-react'
+import { CalendarClock, Receipt, ArrowDownLeft, ArrowUpRight, Search, Filter, Landmark, PencilLine, Sparkles, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { useCompany } from '@/hooks/useCompany'
 import { supabase } from '@/integrations/supabase/client'
 import { fmtDate, fmtEur } from '@/lib/utils'
+import BankTxDetail from '@/components/BankTxDetail'
 import {
   buildAging,
   listScadenzarioRows,
@@ -32,7 +33,10 @@ interface BankCandidate {
   counterparty_name: string | null
   transaction_type: string | null
   reconciliation_status: string | null
+  invoice_ref: string | null
+  raw_text: string | null
   score: number
+  matchType?: 'amount' | 'invoice_ref'
 }
 
 interface BankSearchInfo {
@@ -216,6 +220,11 @@ export default function ScadenzarioPage() {
     text: '',
   })
 
+  // Bank transaction detail popup (double-click on candidate)
+  const [detailTxId, setDetailTxId] = useState<string | null>(null)
+  const [detailTxData, setDetailTxData] = useState<any>(null)
+  const [detailTxLoading, setDetailTxLoading] = useState(false)
+
   const counterpartyMap = useMemo(
     () => new Map(counterparties.map((cp) => [cp.id, cp])),
     [counterparties],
@@ -299,12 +308,16 @@ export default function ScadenzarioPage() {
       }
     }
 
+    const selectCols = 'id, date, amount, description, counterparty_name, transaction_type, reconciliation_status, raw_text, invoice_ref'
     const amountTarget = Math.max(round2(targetAmount), 0)
     const tolerancePct = 0.25
     const windowDays = 90
     const dateFrom = addDays(row.due_date, -windowDays)
     const dateTo = addDays(row.due_date, windowDays)
     const isIncasso = row.type === 'incasso'
+
+    // Extract invoice number for reference matching (e.g. "Fatt. 230/FE" → "230/FE")
+    const invoiceNum = (row.reference || '').replace(/^Fatt\.\s*/i, '').trim()
 
     const sameDirectionCountQuery = isIncasso
       ? supabase
@@ -321,7 +334,7 @@ export default function ScadenzarioPage() {
     const windowQuery = isIncasso
       ? supabase
         .from('bank_transactions')
-        .select('id, date, amount, description, counterparty_name, transaction_type, reconciliation_status, raw_text', { count: 'exact' })
+        .select(selectCols, { count: 'exact' })
         .eq('company_id', company.id)
         .gt('amount', 0)
         .gte('date', dateFrom)
@@ -330,13 +343,36 @@ export default function ScadenzarioPage() {
         .limit(1000)
       : supabase
         .from('bank_transactions')
-        .select('id, date, amount, description, counterparty_name, transaction_type, reconciliation_status, raw_text', { count: 'exact' })
+        .select(selectCols, { count: 'exact' })
         .eq('company_id', company.id)
         .lt('amount', 0)
         .gte('date', dateFrom)
         .lte('date', dateTo)
         .order('date', { ascending: false })
         .limit(1000)
+
+    // Invoice reference query — searches raw_text and invoice_ref for invoice number
+    // No amount/date filter — reference match is strong enough on its own
+    const invoiceRefQuery = invoiceNum.length >= 3
+      ? (isIncasso
+          ? supabase
+            .from('bank_transactions')
+            .select(selectCols)
+            .eq('company_id', company.id)
+            .gt('amount', 0)
+            .or(`raw_text.ilike.%${invoiceNum}%,invoice_ref.ilike.%${invoiceNum}%`)
+            .order('date', { ascending: false })
+            .limit(20)
+          : supabase
+            .from('bank_transactions')
+            .select(selectCols)
+            .eq('company_id', company.id)
+            .lt('amount', 0)
+            .or(`raw_text.ilike.%${invoiceNum}%,invoice_ref.ilike.%${invoiceNum}%`)
+            .order('date', { ascending: false })
+            .limit(20)
+        )
+      : null
 
     console.info('[Scadenzario][BankMatch] query', {
       company_id: company.id,
@@ -349,23 +385,28 @@ export default function ScadenzarioPage() {
       date_from: dateFrom,
       date_to: dateTo,
       amount_sign: isIncasso ? '> 0' : '< 0',
-      note: 'No counterparty-text filter and no reconciliation_status filter',
+      invoice_num: invoiceNum || null,
     })
 
-    const [totalCountRes, sameDirectionRes, windowRes] = await Promise.all([
+    const queries: Promise<any>[] = [
       supabase
         .from('bank_transactions')
         .select('id', { count: 'exact', head: true })
         .eq('company_id', company.id),
       sameDirectionCountQuery,
       windowQuery,
-    ])
+    ]
+    if (invoiceRefQuery) queries.push(invoiceRefQuery)
+
+    const results = await Promise.all(queries)
+    const [totalCountRes, sameDirectionRes, windowRes] = results
+    const invoiceRefRes = invoiceRefQuery ? results[3] : null
 
     if (totalCountRes.error) throw new Error(totalCountRes.error.message)
     if (sameDirectionRes.error) throw new Error(sameDirectionRes.error.message)
     if (windowRes.error) throw new Error(windowRes.error.message)
 
-    const rawRows = (windowRes.data || []) as Array<{
+    type BankRow = {
       id: string
       date: string
       amount: number
@@ -374,14 +415,45 @@ export default function ScadenzarioPage() {
       transaction_type: string | null
       reconciliation_status: string | null
       raw_text: string | null
-    }>
+      invoice_ref: string | null
+    }
+
+    const rawRows = (windowRes.data || []) as BankRow[]
+
+    // Invoice reference matches — high confidence, bypass amount/date filters
+    const invoiceRefRows = (invoiceRefRes?.data || []) as BankRow[]
+    const invoiceRefIds = new Set(invoiceRefRows.map(r => r.id))
 
     // Counterparty name for fuzzy matching
     const rowCpName = (row.counterparty_name || '').toLowerCase().trim()
     const cpWords = rowCpName.split(/\s+/).filter(w => w.length >= 3)
 
-    const scored = rawRows
+    // Score invoice-ref matched transactions (high base score)
+    const refScored: BankCandidate[] = invoiceRefRows.map((tx) => {
+      const txAbs = Math.abs(Number(tx.amount || 0))
+      const dateDistance = daysDiffAbs(tx.date, row.due_date)
+      const dateScore = dateDistance <= windowDays ? Math.max(0, 1 - dateDistance / windowDays) : 0
+      const score = round2(85 + dateScore * 15) // 85-100 range
+
+      return {
+        id: tx.id,
+        date: tx.date,
+        amount: txAbs,
+        description: tx.description,
+        counterparty_name: tx.counterparty_name,
+        transaction_type: tx.transaction_type,
+        reconciliation_status: tx.reconciliation_status,
+        invoice_ref: tx.invoice_ref,
+        raw_text: tx.raw_text,
+        score,
+        matchType: 'invoice_ref' as const,
+      }
+    })
+
+    // Score amount/date/counterparty matched transactions
+    const amountScored = rawRows
       .map((tx) => {
+        if (invoiceRefIds.has(tx.id)) return null // already in ref results
         const txAbs = Math.abs(Number(tx.amount || 0))
         if (txAbs <= 0) return null
 
@@ -419,12 +491,17 @@ export default function ScadenzarioPage() {
           counterparty_name: tx.counterparty_name,
           transaction_type: tx.transaction_type,
           reconciliation_status: tx.reconciliation_status,
+          invoice_ref: tx.invoice_ref,
+          raw_text: tx.raw_text,
           score,
+          matchType: 'amount' as const,
         } as BankCandidate
       })
       .filter(Boolean) as BankCandidate[]
 
-    const candidates = scored
+    // Merge: invoice_ref matches first, then amount-based
+    const allScored = [...refScored, ...amountScored]
+    const candidates = allScored
       .sort((a, b) => b.score - a.score || a.date.localeCompare(b.date))
       .slice(0, 25)
 
@@ -432,7 +509,7 @@ export default function ScadenzarioPage() {
       total_company: Number(totalCountRes.count || 0),
       same_direction: Number(sameDirectionRes.count || 0),
       in_date_window: Number(windowRes.count || 0),
-      in_amount_tolerance: scored.length,
+      in_amount_tolerance: amountScored.length + refScored.length,
       target_amount: amountTarget,
       tolerance_pct: tolerancePct,
       window_days: windowDays,
@@ -440,6 +517,7 @@ export default function ScadenzarioPage() {
 
     console.info('[Scadenzario][BankMatch] result', {
       ...searchInfo,
+      invoice_ref_matches: refScored.length,
       candidates_count: candidates.length,
       candidate_sample: candidates.slice(0, 5),
     })
@@ -635,6 +713,33 @@ export default function ScadenzarioPage() {
   useEffect(() => {
     loadCounterparties()
   }, [loadCounterparties])
+
+  // Fetch full bank transaction data for detail popup
+  useEffect(() => {
+    if (!detailTxId) {
+      setDetailTxData(null)
+      return
+    }
+    let cancelled = false
+    setDetailTxLoading(true)
+    supabase
+      .from('bank_transactions')
+      .select('*')
+      .eq('id', detailTxId)
+      .single()
+      .then(({ data, error: err }) => {
+        if (cancelled) return
+        if (err) {
+          console.error('[Scadenzario] Failed to load bank tx detail:', err.message)
+          toast.error('Errore caricamento dettaglio movimento')
+          setDetailTxId(null)
+        } else {
+          setDetailTxData(data)
+        }
+        setDetailTxLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [detailTxId])
 
   const runInstallmentBackfill = useCallback(async () => {
     if (!company?.id) return
@@ -1477,9 +1582,13 @@ export default function ScadenzarioPage() {
                       )}
                     </div>
                   ) : (
-                    <div className="max-h-56 overflow-y-auto border rounded-md divide-y">
+                    <>
+                    <div className="max-h-72 overflow-y-auto border rounded-md divide-y">
                       {paymentModal.bankCandidates.map((tx) => {
                         const selected = paymentModal.selectedBankTxId === tx.id
+                        const rawExcerpt = tx.raw_text
+                          ? tx.raw_text.replace(/\s+/g, ' ').trim().slice(0, 100) + (tx.raw_text.length > 100 ? '...' : '')
+                          : null
                         return (
                           <button
                             type="button"
@@ -1490,18 +1599,35 @@ export default function ScadenzarioPage() {
                               paymentDate: tx.date,
                               amount: String(round2(Math.abs(tx.amount))),
                             }))}
-                            className={`w-full text-left px-3 py-2 text-xs ${selected ? 'bg-sky-50' : 'hover:bg-gray-50'}`}
+                            onDoubleClick={(e) => {
+                              e.preventDefault()
+                              setDetailTxId(tx.id)
+                            }}
+                            className={`w-full text-left px-3 py-2 text-xs ${selected ? 'bg-sky-50 ring-1 ring-sky-300' : 'hover:bg-gray-50'}`}
                           >
                             <div className="flex items-center justify-between gap-2">
                               <span className="font-medium">{fmtDate(tx.date)} · {fmtEur(Math.abs(tx.amount))}</span>
-                              <span className="text-[10px] text-sky-700">score {tx.score}</span>
+                              <div className="flex items-center gap-1.5">
+                                {tx.matchType === 'invoice_ref' && (
+                                  <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">Rif. fattura</span>
+                                )}
+                                <span className="text-[10px] text-sky-700 font-medium">score {tx.score}</span>
+                              </div>
                             </div>
-                            <div className="text-gray-600 truncate">{tx.counterparty_name || tx.description || 'Movimento banca'}</div>
-                            <div className="text-[10px] text-gray-500">{tx.transaction_type || 'n/d'} · {tx.reconciliation_status || 'n/d'}</div>
+                            <div className="text-gray-700 truncate">{tx.counterparty_name || tx.description || 'Movimento banca'}</div>
+                            {tx.invoice_ref && (
+                              <div className="text-[10px] text-indigo-600 truncate">Rif: {tx.invoice_ref}</div>
+                            )}
+                            {rawExcerpt && (
+                              <div className="text-[10px] text-gray-400 truncate font-mono mt-0.5">{rawExcerpt}</div>
+                            )}
+                            <div className="text-[10px] text-gray-500 mt-0.5">{tx.transaction_type || 'n/d'} · {tx.reconciliation_status || 'n/d'}</div>
                           </button>
                         )
                       })}
                     </div>
+                    <p className="text-[10px] text-gray-400 mt-1">Doppio click su un candidato per vedere il dettaglio completo</p>
+                    </>
                   )}
                 </div>
               )}
@@ -1585,6 +1711,24 @@ export default function ScadenzarioPage() {
               <Button variant="outline" onClick={openReminderMail}>Apri in email</Button>
               <Button onClick={() => setReminderModal({ open: false, row: null, text: '' })}>Chiudi</Button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bank transaction detail popup (double-click on candidate) */}
+      {detailTxId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setDetailTxId(null)}>
+          <div
+            className="bg-white rounded-lg shadow-xl w-full max-w-md max-h-[85vh] overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {detailTxLoading ? (
+              <div className="p-8 text-center text-sm text-gray-500">Caricamento dettaglio...</div>
+            ) : detailTxData ? (
+              <BankTxDetail tx={detailTxData} onClose={() => setDetailTxId(null)} />
+            ) : (
+              <div className="p-8 text-center text-sm text-gray-500">Movimento non trovato</div>
+            )}
           </div>
         </div>
       )}
