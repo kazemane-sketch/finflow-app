@@ -934,7 +934,7 @@ export default function FatturePage() {
             onOpenScadenzario={() => {
               const tab = selectedInvoice.direction === 'out' ? 'incassi' : 'pagamenti';
               const q = encodeURIComponent(selectedInvoice.number || '');
-              navigate(`/scadenzario?tab=${tab}&query=${q}`);
+              navigate(`/scadenzario?tab=${tab}&period=all&status=all&invoiceId=${selectedInvoice.id}&query=${q}`);
             }}
           />
             : <div className="flex items-center justify-center h-full text-gray-400 text-sm">Seleziona una fattura dalla lista</div>}

@@ -149,6 +149,7 @@ export default function ScadenzarioPage() {
   const [statusFilters, setStatusFilters] = useState<Set<InstallmentStatus>>(new Set(['pending', 'overdue', 'partial']))
   const [counterpartyId, setCounterpartyId] = useState<string>('')
   const [query, setQuery] = useState('')
+  const [invoiceFocusId, setInvoiceFocusId] = useState<string>('')
   const [sortBy, setSortBy] = useState<ScadenzarioFilters['sortBy']>('due_date')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
 
@@ -221,10 +222,24 @@ export default function ScadenzarioPage() {
     if (period === 'all') setPeriodPreset('all')
 
     const q = String(searchParams.get('query') || '')
-    if (q) setQuery(q)
+    setQuery(q)
 
     const cp = String(searchParams.get('counterpartyId') || '')
-    if (cp) setCounterpartyId(cp)
+    setCounterpartyId(cp)
+
+    const invId = String(searchParams.get('invoiceId') || '')
+    setInvoiceFocusId(invId)
+
+    const statusParam = String(searchParams.get('status') || '').toLowerCase()
+    if (statusParam === 'all') {
+      setStatusFilters(new Set(['pending', 'overdue', 'partial', 'paid']))
+    } else if (statusParam) {
+      const parsed = statusParam
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s): s is InstallmentStatus => ['pending', 'overdue', 'partial', 'paid'].includes(s))
+      if (parsed.length > 0) setStatusFilters(new Set(parsed))
+    }
   }, [searchParams])
 
   const filters = useMemo<ScadenzarioFilters>(() => ({
@@ -387,7 +402,10 @@ export default function ScadenzarioPage() {
       })
 
       const scadenzarioRows = await listScadenzarioRows(company.id, filters)
-      setRows(scadenzarioRows)
+      const rowsWithFocus = invoiceFocusId
+        ? scadenzarioRows.filter((row) => row.invoice_id === invoiceFocusId)
+        : scadenzarioRows
+      setRows(rowsWithFocus)
 
       if (activeTab === 'incassi' || activeTab === 'pagamenti') {
         const nextAging = await buildAging(company.id, activeTab, {
@@ -403,7 +421,7 @@ export default function ScadenzarioPage() {
     } finally {
       setLoading(false)
     }
-  }, [company?.id, filters, activeTab, query, counterpartyId])
+  }, [company?.id, filters, activeTab, query, counterpartyId, invoiceFocusId])
 
   useEffect(() => {
     loadRows()
@@ -444,6 +462,7 @@ export default function ScadenzarioPage() {
     setStatusFilters(new Set(['pending', 'overdue', 'partial']))
     setCounterpartyId('')
     setQuery('')
+    setInvoiceFocusId('')
     setSortBy('due_date')
     setSortDir('asc')
   }

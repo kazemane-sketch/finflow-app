@@ -545,15 +545,13 @@ export default function ContropartiPage() {
     try {
       const rows = await loadInstallmentFlowsByCounterparty(companyId, analyticsTargetIds, {
         direction: invoiceDirectionFilter,
-        dateFrom: dateFrom || undefined,
-        dateTo: dateTo || undefined,
-        onlyPaidDates: true,
+        onlyPaidDates: analyticsPaymentAmountMode === 'net_paid',
       })
       setLinkedInstallments(rows)
     } catch (e: any) {
       setError(e.message || 'Errore caricamento pagamenti scadenzario')
     }
-  }, [companyId, analyticsTargetIds, analyticsDateMode, invoiceDirectionFilter, dateFrom, dateTo])
+  }, [companyId, analyticsTargetIds, analyticsDateMode, invoiceDirectionFilter, analyticsPaymentAmountMode])
 
   useEffect(() => {
     reloadLinkedInvoices()
@@ -565,17 +563,34 @@ export default function ContropartiPage() {
 
   const analyticsSourceRows = useMemo(() => {
     if (analyticsDateMode === 'payment_date') {
+      const inDateRange = (isoDate: string): boolean => {
+        if (!isoDate) return false
+        if (dateFrom && isoDate < dateFrom) return false
+        if (dateTo && isoDate > dateTo) return false
+        return true
+      }
+
       return linkedInstallments
-        .filter((row) => Boolean(row.last_payment_date))
+        .filter((row) => {
+          if (analyticsPaymentAmountMode === 'net_paid') {
+            const eventDate = String(row.last_payment_date || '')
+            return inDateRange(eventDate) && Number(row.paid_amount || 0) > 0
+          }
+          const eventDate = String(row.last_payment_date || row.due_date || '')
+          return inDateRange(eventDate)
+        })
         .map((row) => {
           const sign = Number(row.amount_due || 0) < 0 ? -1 : 1
+          const eventDate = analyticsPaymentAmountMode === 'net_paid'
+            ? String(row.last_payment_date || '')
+            : String(row.last_payment_date || row.due_date || '')
           const rawAmount = analyticsPaymentAmountMode === 'net_paid'
             ? Number(row.paid_amount || 0)
             : Math.abs(Number(row.amount_due || 0))
           return {
             counterparty_id: row.counterparty_id,
             direction: row.direction,
-            date: String(row.last_payment_date || ''),
+            date: eventDate,
             total_amount: Number((rawAmount * sign).toFixed(2)),
           }
         })
@@ -1150,6 +1165,16 @@ export default function ContropartiPage() {
                   onChange={(e) => setDateTo(e.target.value)}
                   className="border rounded-md px-2 py-1 text-xs"
                 />
+                {(dateFrom || dateTo) && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2 text-xs"
+                    onClick={() => { setDateFrom(''); setDateTo('') }}
+                  >
+                    Tutto periodo
+                  </Button>
+                )}
                 <select
                   value={invoiceDirectionFilter}
                   onChange={(e) => setInvoiceDirectionFilter(e.target.value as 'all' | 'in' | 'out')}
@@ -1174,7 +1199,7 @@ export default function ContropartiPage() {
                     className="border rounded-md px-2 py-1 text-xs"
                   >
                     <option value="net_paid">Importi netti pagati/incassati</option>
-                    <option value="total_installment">Importi totali rate</option>
+                    <option value="total_installment">Importi totali rate (aperte + saldate)</option>
                   </select>
                 ) : (
                 <select
