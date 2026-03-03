@@ -1,6 +1,5 @@
 // src/pages/BancaPage.tsx
 import { useState, useEffect, useCallback, useRef, type MouseEvent } from 'react'
-import { toast } from 'sonner'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useCompany } from '@/hooks/useCompany'
@@ -686,7 +685,16 @@ async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchR
     const shouldRetryAuth = parsed?.status === 401 || parsed?.status === 403
     if (!shouldRetryAuth) throw parsed
 
-    await supabase.auth.refreshSession().catch(() => null)
+    const { error: refreshError } = await supabase.auth.refreshSession().catch(() => ({ error: new Error('refresh_failed') }))
+    if (refreshError) {
+      throw createBankAiError(parsed?.message || 'Sessione non valida o scaduta.', {
+        status: parsed?.status ?? 401,
+        requestId: parsed?.requestId,
+        details: parsed?.details,
+        errorCode: parsed?.errorCode || 'AUTH_REFRESH_FAILED',
+        hint: 'Sessione scaduta. Effettua logout/login e riprova.',
+      })
+    }
     const refreshedToken = await readSessionToken()
     try {
       return await invokeBankAiWithBearer(body, refreshedToken)
@@ -1280,12 +1288,6 @@ export default function BancaPage() {
         requestId: err?.requestId,
       })
 
-      const isAuthFailure = err?.status === 401 || err?.status === 403 || String(err?.errorCode || '').startsWith('AUTH_')
-      if (isAuthFailure) {
-        toast.error('Sessione scaduta o non valida. Reindirizzamento al login...')
-        await supabase.auth.signOut().catch(() => null)
-        window.setTimeout(() => window.location.assign('/auth'), 300)
-      }
     }
     setAiLoading(false)
   }
