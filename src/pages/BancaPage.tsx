@@ -386,6 +386,11 @@ function TxRow({ tx, selected, onClick, onDoubleClick }: {
           Controparte da verificare
         </span>
       )}
+      {tx.reconciliation_status === 'matched' && (
+        <span title="Riconciliato" className="flex-shrink-0">
+          <CheckCircle className="h-3.5 w-3.5 text-emerald-500" />
+        </span>
+      )}
       <div className="text-right flex-shrink-0">
         <p className={`text-sm font-bold ${isIn ? 'text-emerald-700' : 'text-red-700'}`}>
           {isIn ? '+' : '-'}{fmtEur(Math.abs(signedAmount))}
@@ -619,6 +624,10 @@ export default function BancaPage() {
   const [aiLoading, setAiLoading] = useState(false)
   const [embeddingHealth, setEmbeddingHealth] = useState<BankEmbeddingHealth | null>(null)
 
+  // Extraction refs
+  const [extractionRunning, setExtractionRunning] = useState(false)
+  const [extractionProgress, setExtractionProgress] = useState<{ processed: number; total: number } | null>(null)
+
   // Import
   const [importing, setImporting] = useState(false)
   const [importProgress, setImportProgress] = useState<BankParseProgress | null>(null)
@@ -651,6 +660,30 @@ export default function BancaPage() {
       return null
     }
   }, [companyId])
+
+  const runExtraction = useCallback(async () => {
+    if (!companyId || extractionRunning) return
+    setExtractionRunning(true)
+    setExtractionProgress({ processed: 0, total: transactions.length })
+    let totalProcessed = 0
+    try {
+      while (true) {
+        const res = await fetch(`${SUPABASE_URL}/functions/v1/bank-extract-refs`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
+          body: JSON.stringify({ company_id: companyId, batch_size: 50 }),
+        })
+        const data = await res.json()
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+        totalProcessed += (data.processed || 0)
+        setExtractionProgress({ processed: totalProcessed, total: totalProcessed + (data.total_pending || 0) })
+        if ((data.total_pending || 0) <= 0) break
+      }
+    } catch (e: any) {
+      console.error('[Extraction]', e)
+    }
+    setExtractionRunning(false)
+  }, [companyId, extractionRunning, transactions.length])
 
   const loadData = useCallback(async () => {
     if (!companyId) return
@@ -1299,11 +1332,26 @@ export default function BancaPage() {
           )}
 
           {embeddingHealth && (
-            <div className="text-xs text-slate-500">
-              Indicizzazione AI: pronti {embeddingHealth.ready_rows}/{embeddingHealth.total_rows}
-              {embeddingHealth.pending_rows > 0 ? ` · pending ${embeddingHealth.pending_rows}` : ''}
-              {embeddingHealth.processing_rows > 0 ? ` · processing ${embeddingHealth.processing_rows}` : ''}
-              {embeddingHealth.error_rows > 0 ? ` · error ${embeddingHealth.error_rows}` : ''}
+            <div className="flex items-center gap-3 text-xs text-slate-500">
+              <span>
+                Indicizzazione AI: pronti {embeddingHealth.ready_rows}/{embeddingHealth.total_rows}
+                {embeddingHealth.pending_rows > 0 ? ` · pending ${embeddingHealth.pending_rows}` : ''}
+                {embeddingHealth.processing_rows > 0 ? ` · processing ${embeddingHealth.processing_rows}` : ''}
+                {embeddingHealth.error_rows > 0 ? ` · error ${embeddingHealth.error_rows}` : ''}
+              </span>
+              {transactions.length > 0 && (
+                <button
+                  onClick={runExtraction}
+                  disabled={extractionRunning}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium text-purple-700 bg-purple-50 border border-purple-200 rounded hover:bg-purple-100 disabled:opacity-50"
+                >
+                  {extractionRunning ? (
+                    <><RefreshCw className="h-3 w-3 animate-spin" /> Estrazione: {extractionProgress?.processed ?? 0}/{extractionProgress?.total ?? '?'}</>
+                  ) : (
+                    <><Sparkles className="h-3 w-3" /> Estrai riferimenti AI</>
+                  )}
+                </button>
+              )}
             </div>
           )}
 

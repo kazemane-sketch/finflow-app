@@ -1,5 +1,6 @@
 import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from '@/hooks/useAuth'
+import { useCompany } from '@/hooks/useCompany'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import {
@@ -14,10 +15,13 @@ import {
   LogOut,
   Menu,
   X,
+  Sparkles,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import { supabase } from '@/integrations/supabase/client'
 
 const nav = [
+  { to: '/ai', icon: Sparkles, label: 'Assistente AI', className: 'text-purple-600' },
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/fatture', icon: FileText, label: 'Fatture' },
   { to: '/scadenzario', icon: CalendarClock, label: 'Scadenzario' },
@@ -30,7 +34,20 @@ const nav = [
 
 export default function AppLayout() {
   const { user, signOut } = useAuth()
+  const { company } = useCompany()
   const [open, setOpen] = useState(false)
+  const [reconBadge, setReconBadge] = useState(0)
+
+  // Lightweight count of pending reconciliation suggestions for sidebar badge
+  useEffect(() => {
+    if (!company?.id) return
+    supabase
+      .from('reconciliation_suggestions')
+      .select('id', { count: 'exact', head: true })
+      .eq('company_id', company.id)
+      .eq('status', 'pending')
+      .then(({ count }) => setReconBadge(count || 0))
+  }, [company?.id])
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
@@ -55,7 +72,7 @@ export default function AppLayout() {
 
         {/* Nav links */}
         <nav className="flex-1 overflow-y-auto px-3 py-3 space-y-0.5">
-          {nav.map(({ to, icon: Icon, label }) => (
+          {nav.map(({ to, icon: Icon, label, className: iconClass }) => (
             <NavLink
               key={to}
               to={to}
@@ -69,8 +86,13 @@ export default function AppLayout() {
                 }`
               }
             >
-              <Icon className="h-4 w-4 shrink-0" />
+              <Icon className={`h-4 w-4 shrink-0 ${iconClass || ''}`} />
               {label}
+              {to === '/riconciliazione' && reconBadge > 0 && (
+                <span className="ml-auto text-[10px] font-bold bg-red-100 text-red-700 px-1.5 py-0.5 rounded-full min-w-[20px] text-center">
+                  {reconBadge > 99 ? '99+' : reconBadge}
+                </span>
+              )}
             </NavLink>
           ))}
         </nav>

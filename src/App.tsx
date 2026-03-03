@@ -11,6 +11,7 @@ import RiconciliazionePage from '@/pages/RiconciliazionePage'
 import ScadenzarioPage from '@/pages/ScadenzarioPage'
 import ImpostazioniPage from '@/pages/ImpostazioniPage'
 import IvaPage from '@/pages/IvaPage'
+import AiChatPage from '@/pages/AiChatPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth()
@@ -44,6 +45,7 @@ export default function App() {
             <AppLayout />
           </ProtectedRoute>
         }>
+          <Route path="/ai" element={<AiChatPage />} />
           <Route path="/" element={<DashboardPage />} />
           <Route path="/fatture" element={<FatturePage />} />
           <Route path="/controparti" element={<ContropartiPage />} />

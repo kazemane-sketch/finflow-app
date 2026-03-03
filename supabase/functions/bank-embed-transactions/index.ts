@@ -25,6 +25,8 @@ type EmbeddingTx = {
   reference: string | null;
   invoice_ref: string | null;
   direction: "in" | "out" | null;
+  raw_text: string | null;
+  extracted_refs: Record<string, unknown> | string | null;
 };
 
 type GlobalHealth = {
@@ -100,17 +102,30 @@ function toVectorLiteral(values: number[]): string {
 function buildEmbeddingText(tx: EmbeddingTx): string {
   const direction = tx.direction === "in" ? "entrata" : tx.direction === "out" ? "uscita" : "n.d.";
   const amount = typeof tx.amount === "number" ? tx.amount.toFixed(2) : "0.00";
-  return [
+  const parts = [
     `Data: ${clip(tx.date, 20) || "n.d."}`,
     `Data valuta: ${clip(tx.value_date, 20) || "n.d."}`,
     `Importo: ${amount}`,
     `Direzione: ${direction}`,
     `Tipo: ${clip(tx.transaction_type, 40) || "altro"}`,
     `Controparte: ${clip(tx.counterparty_name, 120) || "n.d."}`,
-    `Descrizione: ${clip(tx.description, 260) || "n.d."}`,
+    `Descrizione: ${clip(tx.description, 300) || "n.d."}`,
     `Riferimento: ${clip(tx.reference, 120) || "n.d."}`,
     `Rif fattura: ${clip(tx.invoice_ref, 80) || "n.d."}`,
-  ].join("\n");
+  ];
+  if (tx.raw_text) {
+    parts.push(`Testo operazione completo: ${clip(tx.raw_text, 1500)}`);
+  }
+  if (tx.extracted_refs) {
+    try {
+      const refs = typeof tx.extracted_refs === 'string' ? JSON.parse(tx.extracted_refs) : tx.extracted_refs;
+      if (refs.invoice_refs?.length) parts.push(`Fatture citate: ${refs.invoice_refs.join(', ')}`);
+      if (refs.mandate_id) parts.push(`Mandato: ${refs.mandate_id}`);
+      if (refs.contract_number) parts.push(`Contratto: ${refs.contract_number}`);
+      if (refs.causal_code) parts.push(`Causale: ${refs.causal_code}`);
+    } catch { /* ignore parse errors */ }
+  }
+  return parts.join("\n");
 }
 
 function toErrorMessage(error: unknown): string {
@@ -281,7 +296,7 @@ Deno.serve(async (req) => {
   try {
     const { data: rows, error: rowsError } = await serviceClient
       .from("bank_transactions")
-      .select("id,company_id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,direction")
+      .select("id,company_id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,direction,raw_text,extracted_refs")
       .in("id", batchIds);
 
     if (rowsError) {

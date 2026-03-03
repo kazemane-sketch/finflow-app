@@ -782,7 +782,10 @@ export default function ScadenzarioPage() {
   const today = new Date().toISOString().slice(0, 10)
 
   const openPaymentModal = async (row: ScadenzarioRow) => {
-    const netSuggested = round2(Math.max(row.nc_net_amount || Math.max(row.remaining_amount, 0), 0))
+    // Use Math.abs() because remaining_amount can be negative for passive invoices (pagamenti)
+    const absRemaining = Math.abs(row.remaining_amount || 0)
+    const absNcNet = Math.abs(row.nc_net_amount || 0)
+    const netSuggested = round2(absNcNet > 0.01 ? absNcNet : absRemaining)
     const isZeroNetCase = row.type === 'pagamento' && !row.is_credit_note && row.nc_available_amount > 0.01 && netSuggested <= 0.01
     const defaultMode: SettleUiMode = isZeroNetCase ? 'nc' : 'bank'
 
@@ -791,7 +794,7 @@ export default function ScadenzarioPage() {
       row,
       settleMode: defaultMode,
       paymentDate: today,
-      amount: String(isZeroNetCase ? 0 : (row.remaining_amount || row.amount || 0)),
+      amount: String(isZeroNetCase ? 0 : absRemaining),
       bankCandidates: [],
       bankSearchInfo: null,
       ncCandidates: [],
@@ -817,7 +820,8 @@ export default function ScadenzarioPage() {
     }
 
     if (defaultMode === 'bank') {
-      await refreshBankCandidates(row, Math.max(row.nc_net_amount || row.remaining_amount, 0))
+      const bankTarget = absNcNet > 0.01 ? absNcNet : absRemaining
+      await refreshBankCandidates(row, bankTarget)
     }
   }
 
@@ -826,8 +830,9 @@ export default function ScadenzarioPage() {
     if (!company?.id) return
 
     const row = paymentModal.row
-    const remaining = round2(Math.max(row.remaining_amount, 0))
-    const netSuggested = round2(Math.max(row.nc_net_amount || remaining, 0))
+    const remaining = round2(Math.abs(row.remaining_amount || 0))
+    const absNcNet = Math.abs(row.nc_net_amount || 0)
+    const netSuggested = round2(absNcNet > 0.01 ? absNcNet : remaining)
     const hasNcHint = row.type === 'pagamento' && !row.is_credit_note && (row.nc_available_amount || 0) > 0
     const isZeroNetCase = hasNcHint && netSuggested <= 0.01
 
@@ -951,8 +956,10 @@ export default function ScadenzarioPage() {
     if (!paymentModal.row) return
 
     const row = paymentModal.row
-    const netSuggested = round2(Math.max(row.nc_net_amount || Math.max(row.remaining_amount, 0), 0))
-    const fallbackAmount = round2(Math.max(row.remaining_amount || row.amount || 0, 0))
+    const absRemaining = Math.abs(row.remaining_amount || 0)
+    const absNcNet = Math.abs(row.nc_net_amount || 0)
+    const netSuggested = round2(absNcNet > 0.01 ? absNcNet : absRemaining)
+    const fallbackAmount = round2(absRemaining || Math.abs(row.amount || 0))
 
     setPaymentModal((prev) => ({
       ...prev,
@@ -962,7 +969,7 @@ export default function ScadenzarioPage() {
     }))
 
     if (nextMode !== 'bank') return
-    await refreshBankCandidates(row, Math.max(netSuggested, 0))
+    await refreshBankCandidates(row, netSuggested)
   }
 
   const openReminder = (row: ScadenzarioRow) => {
@@ -1120,7 +1127,7 @@ export default function ScadenzarioPage() {
     const row = paymentModal.row
     if (!row) return null
 
-    const remaining = round2(Math.max(row.remaining_amount, 0))
+    const remaining = round2(Math.abs(row.remaining_amount || 0))
     const ncAvailable = round2(Math.max(row.nc_available_amount || 0, 0))
     const canNet = row.kind === 'installment' && row.type === 'pagamento' && !row.is_credit_note && ncAvailable > 0.01
     const net = canNet ? round2(Math.max(remaining - ncAvailable, 0)) : remaining
@@ -1556,10 +1563,10 @@ export default function ScadenzarioPage() {
                       variant="outline"
                       onClick={async () => {
                         if (!paymentModal.row) return
-                        await refreshBankCandidates(
-                          paymentModal.row,
-                          Math.max(paymentModal.row.nc_net_amount || paymentModal.row.remaining_amount, 0),
-                        )
+                        const r = paymentModal.row
+                        const absNc = Math.abs(r.nc_net_amount || 0)
+                        const absRem = Math.abs(r.remaining_amount || 0)
+                        await refreshBankCandidates(r, absNc > 0.01 ? absNc : absRem)
                       }}
                     >
                       Aggiorna candidati
