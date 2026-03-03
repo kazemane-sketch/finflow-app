@@ -300,8 +300,8 @@ export default function ScadenzarioPage() {
     }
 
     const amountTarget = Math.max(round2(targetAmount), 0)
-    const tolerancePct = 0.1
-    const windowDays = 60
+    const tolerancePct = 0.25
+    const windowDays = 90
     const dateFrom = addDays(row.due_date, -windowDays)
     const dateTo = addDays(row.due_date, windowDays)
     const isIncasso = row.type === 'incasso'
@@ -376,20 +376,40 @@ export default function ScadenzarioPage() {
       raw_text: string | null
     }>
 
+    // Counterparty name for fuzzy matching
+    const rowCpName = (row.counterparty_name || '').toLowerCase().trim()
+    const cpWords = rowCpName.split(/\s+/).filter(w => w.length >= 3)
+
     const scored = rawRows
       .map((tx) => {
         const txAbs = Math.abs(Number(tx.amount || 0))
         if (txAbs <= 0) return null
 
         const amountDeltaPct = amountTarget > 0 ? Math.abs(txAbs - amountTarget) / amountTarget : 1
-        if (amountTarget > 0.01 && amountDeltaPct > tolerancePct) return null
-
         const dateDistance = daysDiffAbs(tx.date, row.due_date)
         if (dateDistance > windowDays) return null
 
+        // Counterparty name similarity (0-1)
+        const txCpName = (tx.counterparty_name || '').toLowerCase().trim()
+        const txRawText = (tx.raw_text || '').toLowerCase()
+        let cpScore = 0
+        if (rowCpName && txCpName) {
+          if (txCpName.includes(rowCpName) || rowCpName.includes(txCpName)) {
+            cpScore = 1
+          } else if (cpWords.length > 0) {
+            const matched = cpWords.filter(w => txCpName.includes(w) || txRawText.includes(w))
+            cpScore = matched.length / cpWords.length
+          }
+        }
+
+        // Allow wider amount tolerance if counterparty matches strongly
+        const effectiveTolerance = cpScore >= 0.5 ? Math.max(tolerancePct, 0.5) : tolerancePct
+        if (amountTarget > 0.01 && amountDeltaPct > effectiveTolerance) return null
+
         const amountScore = amountTarget > 0.01 ? Math.max(0, 1 - amountDeltaPct) : 0
         const dateScore = Math.max(0, 1 - dateDistance / windowDays)
-        const score = round2(amountScore * 70 + dateScore * 30)
+        // Weights: amount 50%, date 20%, counterparty 30%
+        const score = round2(amountScore * 50 + dateScore * 20 + cpScore * 30)
 
         return {
           id: tx.id,
@@ -482,8 +502,8 @@ export default function ScadenzarioPage() {
           in_date_window: 0,
           in_amount_tolerance: 0,
           target_amount: amountTarget,
-          tolerance_pct: 0.1,
-          window_days: 60,
+          tolerance_pct: 0.25,
+          window_days: 90,
         },
       }))
       return
@@ -1420,7 +1440,7 @@ export default function ScadenzarioPage() {
               {paymentModal.settleMode === 'bank' && (
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
-                    <Label className="text-xs">Movimenti banca candidati (±10% importo, ±60 giorni)</Label>
+                    <Label className="text-xs">Movimenti banca candidati (±25% importo, ±90gg, controparte)</Label>
                     <Button
                       size="sm"
                       variant="outline"
