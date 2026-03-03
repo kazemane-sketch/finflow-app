@@ -562,6 +562,7 @@ type BankAiSearchResponse = {
   filters?: BankAiStructuredFilter
   used_count?: number
   candidate_count?: number
+  candidate_ids?: string[]
   model?: string
   request_id?: string
 }
@@ -631,6 +632,13 @@ function shouldRetryBankAiAuth(err?: Partial<BankAiErrorPayload> | null): boolea
   return hasJwtAuthSignal(err)
 }
 
+function normalizeCandidateIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((v) => String(v || '').trim())
+    .filter(Boolean)
+}
+
 async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: string): Promise<BankAiSearchResponse> {
   const res = await fetch(`${SUPABASE_URL}/functions/v1/bank-ai-search`, {
     method: 'POST',
@@ -674,6 +682,7 @@ async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: st
     filters: normalizeBankAiFilters(payload?.filters),
     used_count: Number(payload?.used_count || 0),
     candidate_count: Number(payload?.candidate_count || 0),
+    candidate_ids: normalizeCandidateIds(payload?.candidate_ids ?? payload?.candidateIds),
     model: typeof payload?.model === 'string' ? payload.model : undefined,
     request_id: typeof payload?.request_id === 'string' ? payload.request_id : requestId,
   }
@@ -756,7 +765,7 @@ export default function BancaPage() {
   const [directionSaving, setDirectionSaving] = useState(false)
 
   // AI search
-  const [aiResult, setAiResult] = useState<{ text: string; mode: BankAiMode; isError: boolean; requestId?: string } | null>(null)
+  const [aiResult, setAiResult] = useState<{ text: string; mode: BankAiMode; isError: boolean; requestId?: string; candidateIds?: string[] } | null>(null)
   const [aiLoading, setAiLoading] = useState(false)
   const [aiStructuredFilter, setAiStructuredFilter] = useState<BankAiStructuredFilter | null>(null)
   const [embeddingHealth, setEmbeddingHealth] = useState<BankEmbeddingHealth | null>(null)
@@ -1145,6 +1154,10 @@ export default function BancaPage() {
 
   // Filters (defined before handleAiSearch so it can reference it)
   const filtered = transactions.filter(tx => {
+    if (aiResult?.candidateIds?.length) {
+      return aiResult.candidateIds.includes(String(tx.id || ''))
+    }
+
     const direction = txDirection(tx)
     if (dirFilter === 'in' && direction !== 'in') return false
     if (dirFilter === 'out' && direction !== 'out') return false
@@ -1201,6 +1214,7 @@ export default function BancaPage() {
       }
 
       const result = await askBankAiSearch(payload)
+      console.log('AI result candidate_ids:', result.candidate_ids)
       if (result.mode === 'filter') {
         const filters = result.filters || null
         setAiStructuredFilter(filters)
@@ -1235,7 +1249,13 @@ export default function BancaPage() {
           `Periodo: ${filters?.date_from || '—'} → ${filters?.date_to || '—'}`,
           `Request ID: ${result.request_id || 'n.d.'}`,
         ]
-        setAiResult({ text: filterLines.join('\n'), mode: 'filter', isError: false, requestId: result.request_id })
+        setAiResult({
+          text: filterLines.join('\n'),
+          mode: 'filter',
+          isError: false,
+          requestId: result.request_id,
+          candidateIds: result.candidate_ids || [],
+        })
       } else {
         setAiStructuredFilter(null)
         const scopeLine = `\n\nScope AI: ${Number(result.candidate_count || 0)} candidati pgvector · ${Number(result.used_count || 0)} usati nel prompt` +
@@ -1246,6 +1266,7 @@ export default function BancaPage() {
           mode: 'analysis',
           isError: false,
           requestId: result.request_id,
+          candidateIds: result.candidate_ids || [],
         })
       }
     } catch (e: any) {
