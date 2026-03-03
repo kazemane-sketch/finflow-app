@@ -80,7 +80,7 @@ const MONTH_LABELS_EN = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug',
 type VatMode = 'IT' | 'INT'
 type AnalyticsVatMode = 'excl' | 'incl'
 type AnalyticsDateMode = 'invoice_date' | 'payment_date'
-type AnalyticsPaymentAmountMode = 'net_paid' | 'total_installment'
+type AnalyticsPaymentAmountMode = 'residual_open' | 'paid_amount'
 
 function sanitizeVatInput(value: string): string {
   return value.toUpperCase().replace(/[^A-Z0-9]/g, '')
@@ -382,7 +382,7 @@ export default function ContropartiPage() {
   const [invoiceDirectionFilter, setInvoiceDirectionFilter] = useState<'all' | 'in' | 'out'>('all')
   const [analyticsVatMode, setAnalyticsVatMode] = useState<AnalyticsVatMode>('excl')
   const [analyticsDateMode, setAnalyticsDateMode] = useState<AnalyticsDateMode>('invoice_date')
-  const [analyticsPaymentAmountMode, setAnalyticsPaymentAmountMode] = useState<AnalyticsPaymentAmountMode>('net_paid')
+  const [analyticsPaymentAmountMode, setAnalyticsPaymentAmountMode] = useState<AnalyticsPaymentAmountMode>('residual_open')
 
   const [focusedId, setFocusedId] = useState<string | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
@@ -545,7 +545,7 @@ export default function ContropartiPage() {
     try {
       const rows = await loadInstallmentFlowsByCounterparty(companyId, analyticsTargetIds, {
         direction: invoiceDirectionFilter,
-        onlyPaidDates: analyticsPaymentAmountMode === 'net_paid',
+        onlyPaidDates: analyticsPaymentAmountMode === 'paid_amount',
       })
       setLinkedInstallments(rows)
     } catch (e: any) {
@@ -572,21 +572,23 @@ export default function ContropartiPage() {
 
       return linkedInstallments
         .filter((row) => {
-          if (analyticsPaymentAmountMode === 'net_paid') {
+          if (analyticsPaymentAmountMode === 'paid_amount') {
             const eventDate = String(row.last_payment_date || '')
             return inDateRange(eventDate) && Number(row.paid_amount || 0) > 0
           }
-          const eventDate = String(row.last_payment_date || row.due_date || '')
-          return inDateRange(eventDate)
+          const eventDate = String(row.due_date || '')
+          if (!inDateRange(eventDate)) return false
+          const openAbs = Math.max(Math.abs(Number(row.amount_due || 0)) - Number(row.paid_amount || 0), 0)
+          return openAbs > 0.005
         })
         .map((row) => {
           const sign = Number(row.amount_due || 0) < 0 ? -1 : 1
-          const eventDate = analyticsPaymentAmountMode === 'net_paid'
+          const eventDate = analyticsPaymentAmountMode === 'paid_amount'
             ? String(row.last_payment_date || '')
-            : String(row.last_payment_date || row.due_date || '')
-          const rawAmount = analyticsPaymentAmountMode === 'net_paid'
+            : String(row.due_date || '')
+          const rawAmount = analyticsPaymentAmountMode === 'paid_amount'
             ? Number(row.paid_amount || 0)
-            : Math.abs(Number(row.amount_due || 0))
+            : Math.max(Math.abs(Number(row.amount_due || 0)) - Number(row.paid_amount || 0), 0)
           return {
             counterparty_id: row.counterparty_id,
             direction: row.direction,
@@ -613,9 +615,9 @@ export default function ContropartiPage() {
 
   const analyticsAmountLabel = useMemo(() => {
     if (analyticsDateMode === 'payment_date') {
-      return analyticsPaymentAmountMode === 'net_paid'
-        ? 'Pagamenti netti'
-        : 'Totale rate saldate'
+      return analyticsPaymentAmountMode === 'paid_amount'
+        ? 'Importi pagati'
+        : 'Importi residui'
     }
     return analyticsVatMode === 'excl' ? 'IVA Excl' : 'IVA Incl'
   }, [analyticsDateMode, analyticsPaymentAmountMode, analyticsVatMode])
@@ -1198,8 +1200,8 @@ export default function ContropartiPage() {
                     onChange={(e) => setAnalyticsPaymentAmountMode(e.target.value as AnalyticsPaymentAmountMode)}
                     className="border rounded-md px-2 py-1 text-xs"
                   >
-                    <option value="net_paid">Importi netti pagati/incassati</option>
-                    <option value="total_installment">Importi totali rate (aperte + saldate)</option>
+                    <option value="residual_open">Importi residui</option>
+                    <option value="paid_amount">Importi pagati</option>
                   </select>
                 ) : (
                 <select

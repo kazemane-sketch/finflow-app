@@ -35,6 +35,21 @@ interface BankCandidate {
   score: number
 }
 
+interface BankSearchInfo {
+  total_company: number
+  same_direction: number
+  in_date_window: number
+  in_amount_tolerance: number
+  target_amount: number
+  tolerance_pct: number
+  window_days: number
+}
+
+interface BankCandidatesResult {
+  candidates: BankCandidate[]
+  searchInfo: BankSearchInfo
+}
+
 interface NcCandidate {
   id: string
   reference: string
@@ -170,6 +185,7 @@ export default function ScadenzarioPage() {
     paymentDate: string
     amount: string
     bankCandidates: BankCandidate[]
+    bankSearchInfo: BankSearchInfo | null
     ncCandidates: NcCandidate[]
     loadingCandidates: boolean
     selectedBankTxId: string | null
@@ -182,6 +198,7 @@ export default function ScadenzarioPage() {
     paymentDate: new Date().toISOString().slice(0, 10),
     amount: '0',
     bankCandidates: [],
+    bankSearchInfo: null,
     ncCandidates: [],
     loadingCandidates: false,
     selectedBankTxId: null,
@@ -266,28 +283,89 @@ export default function ScadenzarioPage() {
     setCounterparties((data || []) as Array<{ id: string; name: string; email: string | null }>)
   }, [company?.id])
 
-  const loadBankCandidates = useCallback(async (row: ScadenzarioRow, targetAmount: number): Promise<BankCandidate[]> => {
-    if (!company?.id || row.kind !== 'installment') return []
+  const loadBankCandidates = useCallback(async (row: ScadenzarioRow, targetAmount: number): Promise<BankCandidatesResult> => {
+    if (!company?.id || row.kind !== 'installment') {
+      return {
+        candidates: [],
+        searchInfo: {
+          total_company: 0,
+          same_direction: 0,
+          in_date_window: 0,
+          in_amount_tolerance: 0,
+          target_amount: 0,
+          tolerance_pct: 0.1,
+          window_days: 60,
+        },
+      }
+    }
+
     const amountTarget = Math.max(round2(targetAmount), 0)
-    if (amountTarget <= 0.01) return []
+    const tolerancePct = 0.1
+    const windowDays = 60
+    const dateFrom = addDays(row.due_date, -windowDays)
+    const dateTo = addDays(row.due_date, windowDays)
+    const isIncasso = row.type === 'incasso'
 
-    const txDirection = row.type === 'incasso' ? 'in' : 'out'
-    const dateFrom = addDays(row.due_date, -30)
-    const dateTo = addDays(row.due_date, 30)
+    const sameDirectionCountQuery = isIncasso
+      ? supabase
+        .from('bank_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('company_id', company.id)
+        .gt('amount', 0)
+      : supabase
+        .from('bank_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('company_id', company.id)
+        .lt('amount', 0)
 
-    const { data, error: txErr } = await supabase
-      .from('bank_transactions')
-      .select('id, date, amount, description, counterparty_name, transaction_type, reconciliation_status, raw_text')
-      .eq('company_id', company.id)
-      .eq('direction', txDirection)
-      .gte('date', dateFrom)
-      .lte('date', dateTo)
-      .limit(300)
+    const windowQuery = isIncasso
+      ? supabase
+        .from('bank_transactions')
+        .select('id, date, amount, description, counterparty_name, transaction_type, reconciliation_status, raw_text', { count: 'exact' })
+        .eq('company_id', company.id)
+        .gt('amount', 0)
+        .gte('date', dateFrom)
+        .lte('date', dateTo)
+        .order('date', { ascending: false })
+        .limit(1000)
+      : supabase
+        .from('bank_transactions')
+        .select('id, date, amount, description, counterparty_name, transaction_type, reconciliation_status, raw_text', { count: 'exact' })
+        .eq('company_id', company.id)
+        .lt('amount', 0)
+        .gte('date', dateFrom)
+        .lte('date', dateTo)
+        .order('date', { ascending: false })
+        .limit(1000)
 
-    if (txErr) throw new Error(txErr.message)
+    console.info('[Scadenzario][BankMatch] query', {
+      company_id: company.id,
+      installment_id: row.id,
+      row_type: row.type,
+      due_date: row.due_date,
+      target_amount: amountTarget,
+      tolerance_pct: tolerancePct,
+      window_days: windowDays,
+      date_from: dateFrom,
+      date_to: dateTo,
+      amount_sign: isIncasso ? '> 0' : '< 0',
+      note: 'No counterparty-text filter and no reconciliation_status filter',
+    })
 
-    const cpNeedle = (row.counterparty_name || '').toLowerCase()
-    const scored = ((data || []) as Array<{
+    const [totalCountRes, sameDirectionRes, windowRes] = await Promise.all([
+      supabase
+        .from('bank_transactions')
+        .select('id', { count: 'exact', head: true })
+        .eq('company_id', company.id),
+      sameDirectionCountQuery,
+      windowQuery,
+    ])
+
+    if (totalCountRes.error) throw new Error(totalCountRes.error.message)
+    if (sameDirectionRes.error) throw new Error(sameDirectionRes.error.message)
+    if (windowRes.error) throw new Error(windowRes.error.message)
+
+    const rawRows = (windowRes.data || []) as Array<{
       id: string
       date: string
       amount: number
@@ -296,19 +374,22 @@ export default function ScadenzarioPage() {
       transaction_type: string | null
       reconciliation_status: string | null
       raw_text: string | null
-    }>)
+    }>
+
+    const scored = rawRows
       .map((tx) => {
         const txAbs = Math.abs(Number(tx.amount || 0))
         if (txAbs <= 0) return null
+
         const amountDeltaPct = amountTarget > 0 ? Math.abs(txAbs - amountTarget) / amountTarget : 1
-        if (amountDeltaPct > 0.05) return null
+        if (amountTarget > 0.01 && amountDeltaPct > tolerancePct) return null
 
         const dateDistance = daysDiffAbs(tx.date, row.due_date)
-        if (dateDistance > 30) return null
+        if (dateDistance > windowDays) return null
 
-        const hay = `${tx.counterparty_name || ''} ${tx.description || ''} ${tx.raw_text || ''}`.toLowerCase()
-        const cpScore = cpNeedle && hay.includes(cpNeedle) ? 10 : 0
-        const score = round2((100 - amountDeltaPct * 70 - (dateDistance / 30) * 25 + cpScore))
+        const amountScore = amountTarget > 0.01 ? Math.max(0, 1 - amountDeltaPct) : 0
+        const dateScore = Math.max(0, 1 - dateDistance / windowDays)
+        const score = round2(amountScore * 70 + dateScore * 30)
 
         return {
           id: tx.id,
@@ -323,10 +404,114 @@ export default function ScadenzarioPage() {
       })
       .filter(Boolean) as BankCandidate[]
 
-    return scored
+    const candidates = scored
       .sort((a, b) => b.score - a.score || a.date.localeCompare(b.date))
       .slice(0, 25)
+
+    const searchInfo: BankSearchInfo = {
+      total_company: Number(totalCountRes.count || 0),
+      same_direction: Number(sameDirectionRes.count || 0),
+      in_date_window: Number(windowRes.count || 0),
+      in_amount_tolerance: scored.length,
+      target_amount: amountTarget,
+      tolerance_pct: tolerancePct,
+      window_days: windowDays,
+    }
+
+    console.info('[Scadenzario][BankMatch] result', {
+      ...searchInfo,
+      candidates_count: candidates.length,
+      candidate_sample: candidates.slice(0, 5),
+    })
+
+    return { candidates, searchInfo }
   }, [company?.id])
+
+  const refreshBankCandidates = useCallback(async (row: ScadenzarioRow, targetAmount: number) => {
+    const amountTarget = Math.max(round2(targetAmount), 0)
+    setPaymentModal((prev) => ({
+      ...prev,
+      loadingCandidates: true,
+      error: null,
+      bankSearchInfo: null,
+    }))
+
+    if (!company?.id) {
+      setPaymentModal((prev) => ({ ...prev, loadingCandidates: false }))
+      return
+    }
+
+    if (amountTarget <= 0.01) {
+      const sameDirectionQuery = row.type === 'incasso'
+        ? supabase
+          .from('bank_transactions')
+          .select('id', { count: 'exact', head: true })
+          .eq('company_id', company.id)
+          .gt('amount', 0)
+        : supabase
+          .from('bank_transactions')
+          .select('id', { count: 'exact', head: true })
+          .eq('company_id', company.id)
+          .lt('amount', 0)
+
+      const [totalRes, sameDirectionRes] = await Promise.all([
+        supabase
+          .from('bank_transactions')
+          .select('id', { count: 'exact', head: true })
+          .eq('company_id', company.id),
+        sameDirectionQuery,
+      ])
+
+      if (totalRes.error || sameDirectionRes.error) {
+        setPaymentModal((prev) => ({
+          ...prev,
+          loadingCandidates: false,
+          error: totalRes.error?.message || sameDirectionRes.error?.message || 'Errore caricamento movimenti banca',
+        }))
+        return
+      }
+
+      setPaymentModal((prev) => ({
+        ...prev,
+        loadingCandidates: false,
+        bankCandidates: [],
+        selectedBankTxId: null,
+        bankSearchInfo: {
+          total_company: Number(totalRes.count || 0),
+          same_direction: Number(sameDirectionRes.count || 0),
+          in_date_window: 0,
+          in_amount_tolerance: 0,
+          target_amount: amountTarget,
+          tolerance_pct: 0.1,
+          window_days: 60,
+        },
+      }))
+      return
+    }
+
+    try {
+      const result = await loadBankCandidates(row, amountTarget)
+      const first = result.candidates[0] || null
+      setPaymentModal((prev) => {
+        if (!prev.open || prev.row?.id !== row.id) return prev
+        return {
+          ...prev,
+          loadingCandidates: false,
+          bankCandidates: result.candidates,
+          bankSearchInfo: result.searchInfo,
+          selectedBankTxId: first?.id || null,
+          paymentDate: first?.date || prev.paymentDate,
+          amount: first ? String(round2(Math.abs(first.amount))) : prev.amount,
+        }
+      })
+    } catch (e: any) {
+      setPaymentModal((prev) => ({
+        ...prev,
+        loadingCandidates: false,
+        error: e.message || 'Errore caricamento movimenti banca',
+      }))
+    }
+  }, [company?.id, loadBankCandidates])
 
   const loadNcCandidates = useCallback(async (counterpartyKey: string | null): Promise<NcCandidate[]> => {
     if (!company?.id || !counterpartyKey) return []
@@ -481,6 +666,7 @@ export default function ScadenzarioPage() {
       paymentDate: today,
       amount: String(isZeroNetCase ? 0 : (row.remaining_amount || row.amount || 0)),
       bankCandidates: [],
+      bankSearchInfo: null,
       ncCandidates: [],
       loadingCandidates: defaultMode === 'bank',
       selectedBankTxId: null,
@@ -504,27 +690,7 @@ export default function ScadenzarioPage() {
     }
 
     if (defaultMode === 'bank') {
-      try {
-        const candidates = await loadBankCandidates(row, Math.max(row.nc_net_amount || row.remaining_amount, 0))
-        const first = candidates[0] || null
-        setPaymentModal((prev) => {
-          if (!prev.open || prev.row?.id !== row.id) return prev
-          return {
-            ...prev,
-            bankCandidates: candidates,
-            selectedBankTxId: first?.id || null,
-            loadingCandidates: false,
-            paymentDate: first?.date || prev.paymentDate,
-            amount: first ? String(round2(Math.abs(first.amount))) : prev.amount,
-          }
-        })
-      } catch (e: any) {
-        setPaymentModal((prev) => ({
-          ...prev,
-          loadingCandidates: false,
-          error: e.message || 'Errore caricamento movimenti banca',
-        }))
-      }
+      await refreshBankCandidates(row, Math.max(row.nc_net_amount || row.remaining_amount, 0))
     }
   }
 
@@ -638,6 +804,7 @@ export default function ScadenzarioPage() {
         paymentDate: today,
         amount: '0',
         bankCandidates: [],
+        bankSearchInfo: null,
         ncCandidates: [],
         loadingCandidates: false,
         selectedBankTxId: null,
@@ -665,27 +832,7 @@ export default function ScadenzarioPage() {
     }))
 
     if (nextMode !== 'bank') return
-    if (paymentModal.bankCandidates.length > 0) return
-
-    setPaymentModal((prev) => ({ ...prev, loadingCandidates: true }))
-    try {
-      const candidates = await loadBankCandidates(row, Math.max(netSuggested, 0))
-      const first = candidates[0] || null
-      setPaymentModal((prev) => ({
-        ...prev,
-        bankCandidates: candidates,
-        selectedBankTxId: first?.id || null,
-        loadingCandidates: false,
-        paymentDate: first?.date || prev.paymentDate,
-        amount: first ? String(round2(Math.abs(first.amount))) : prev.amount,
-      }))
-    } catch (e: any) {
-      setPaymentModal((prev) => ({
-        ...prev,
-        loadingCandidates: false,
-        error: e.message || 'Errore caricamento movimenti banca',
-      }))
-    }
+    await refreshBankCandidates(row, Math.max(netSuggested, 0))
   }
 
   const openReminder = (row: ScadenzarioRow) => {
@@ -1273,36 +1420,42 @@ export default function ScadenzarioPage() {
               {paymentModal.settleMode === 'bank' && (
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
-                    <Label className="text-xs">Movimenti banca candidati (±5% importo, ±30 giorni)</Label>
+                    <Label className="text-xs">Movimenti banca candidati (±10% importo, ±60 giorni)</Label>
                     <Button
                       size="sm"
                       variant="outline"
                       onClick={async () => {
                         if (!paymentModal.row) return
-                        setPaymentModal((prev) => ({ ...prev, loadingCandidates: true, error: null }))
-                        try {
-                          const candidates = await loadBankCandidates(paymentModal.row, Math.max(paymentModal.row.nc_net_amount || paymentModal.row.remaining_amount, 0))
-                          const first = candidates[0] || null
-                          setPaymentModal((prev) => ({
-                            ...prev,
-                            loadingCandidates: false,
-                            bankCandidates: candidates,
-                            selectedBankTxId: first?.id || null,
-                            paymentDate: first?.date || prev.paymentDate,
-                            amount: first ? String(round2(Math.abs(first.amount))) : prev.amount,
-                          }))
-                        } catch (e: any) {
-                          setPaymentModal((prev) => ({ ...prev, loadingCandidates: false, error: e.message || 'Errore aggiornamento candidati' }))
-                        }
+                        await refreshBankCandidates(
+                          paymentModal.row,
+                          Math.max(paymentModal.row.nc_net_amount || paymentModal.row.remaining_amount, 0),
+                        )
                       }}
                     >
                       Aggiorna candidati
                     </Button>
                   </div>
+                  <div className="text-[11px] text-gray-500">
+                    {paymentModal.loadingCandidates
+                      ? 'Ricerca movimenti bancari in corso...'
+                      : paymentModal.bankSearchInfo
+                        ? `Cercando tra ${paymentModal.bankSearchInfo.total_company.toLocaleString('it-IT')} movimenti banca aziendali`
+                        : 'Nessuna diagnostica disponibile'}
+                  </div>
                   {paymentModal.loadingCandidates ? (
                     <div className="text-xs text-gray-500 border rounded-md px-3 py-2">Caricamento candidati...</div>
                   ) : paymentModal.bankCandidates.length === 0 ? (
-                    <div className="text-xs text-gray-500 border rounded-md px-3 py-2">Nessun movimento candidato trovato. Usa modalità Manuale o Compensa NC.</div>
+                    <div className="text-xs text-gray-500 border rounded-md px-3 py-2 space-y-1">
+                      <div>Nessun movimento candidato trovato. Usa modalità Manuale o Compensa NC.</div>
+                      {paymentModal.bankSearchInfo && (
+                        <div>
+                          Disponibili: {paymentModal.bankSearchInfo.total_company.toLocaleString('it-IT')} totali ·{' '}
+                          {paymentModal.bankSearchInfo.same_direction.toLocaleString('it-IT')} stessa direzione ·{' '}
+                          {paymentModal.bankSearchInfo.in_date_window.toLocaleString('it-IT')} in finestra ±{paymentModal.bankSearchInfo.window_days}gg ·{' '}
+                          {paymentModal.bankSearchInfo.in_amount_tolerance.toLocaleString('it-IT')} entro ±{Math.round(paymentModal.bankSearchInfo.tolerance_pct * 100)}%.
+                        </div>
+                      )}
+                    </div>
                   ) : (
                     <div className="max-h-56 overflow-y-auto border rounded-md divide-y">
                       {paymentModal.bankCandidates.map((tx) => {
