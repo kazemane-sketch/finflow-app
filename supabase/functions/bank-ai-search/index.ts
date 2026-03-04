@@ -12,7 +12,7 @@ const REQUEST_TIMEOUT_MS = Number(Deno.env.get("BANK_AI_SEARCH_TIMEOUT_MS") ?? "
 const ANTHROPIC_MODEL = Deno.env.get("ANTHROPIC_MODEL") ?? "claude-haiku-4-5-20251001";
 const GEMINI_EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_EMBEDDING_DIMS = Math.max(1, Number(Deno.env.get("BANK_AI_EMBEDDING_DIMS") ?? "3072") || 3072);
-const MAX_CANDIDATES = 50;
+const MAX_CANDIDATES = 200;
 
 type DirectionFilter = "all" | "in" | "out";
 type AppErrorPayload = {

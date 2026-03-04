@@ -1406,7 +1406,7 @@ export default function BancaPage() {
         direction: 'all',
         date_from: null,
         date_to: null,
-        limit: 50,
+        limit: 200,
       }
 
       const result = await askBankAiSearch(payload)
