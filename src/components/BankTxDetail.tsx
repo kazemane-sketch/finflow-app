@@ -1,7 +1,8 @@
 // Shared bank transaction detail component — extracted from BancaPage.tsx
-// Used in: BancaPage (sidebar), ScadenzarioPage (popup dialog)
+// Used in: BancaPage (sidebar), ScadenzarioPage (popup dialog), RiconciliazionePage (popup)
 
-import { X } from 'lucide-react'
+import { X, ChevronDown, Plus } from 'lucide-react'
+import { useState, useRef, useEffect } from 'react'
 import { fmtDate, fmtEur } from '@/lib/utils'
 
 // ---- helpers ----
@@ -43,31 +44,116 @@ export function txDirectionConfidenceLabel(conf?: number) {
   return `${Math.round(Number(conf) * 100)}%`
 }
 
+// ---- Type dropdown with create-new ----
+
+const TYPE_OPTIONS = [
+  { value: 'bonifico_in', label: 'Bonifico entrata' },
+  { value: 'bonifico_out', label: 'Bonifico uscita' },
+  { value: 'riba', label: 'RIBA' },
+  { value: 'sdd', label: 'SDD/RID' },
+  { value: 'pos', label: 'POS' },
+  { value: 'prelievo', label: 'Prelievo ATM' },
+  { value: 'commissione', label: 'Commissione/Spese' },
+  { value: 'stipendio', label: 'Stipendio' },
+  { value: 'f24', label: 'F24' },
+  { value: 'altro', label: 'Altro' },
+]
+
+function TypeDropdown({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const [customText, setCustomText] = useState('')
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  const handleCustomAdd = () => {
+    const trimmed = customText.trim()
+    if (!trimmed) return
+    onChange(trimmed)
+    setCustomText('')
+    setOpen(false)
+  }
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="w-full text-left text-xs px-2 py-1.5 border rounded-md bg-white hover:bg-gray-50 flex items-center justify-between"
+      >
+        <span>{txTypeLabel(value) || 'Seleziona tipo'}</span>
+        <ChevronDown className="h-3 w-3 text-gray-400" />
+      </button>
+      {open && (
+        <div className="absolute z-20 mt-1 w-full bg-white border rounded-md shadow-lg max-h-52 overflow-y-auto">
+          {TYPE_OPTIONS.map(t => (
+            <button
+              key={t.value}
+              type="button"
+              onClick={() => { onChange(t.value); setOpen(false) }}
+              className={`w-full text-left px-3 py-1.5 text-xs hover:bg-gray-50 transition-colors ${
+                value === t.value ? 'bg-sky-50 text-sky-700 font-medium' : 'text-gray-700'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+          <div className="border-t px-2 py-1.5 flex items-center gap-1">
+            <input
+              value={customText}
+              onChange={e => setCustomText(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); handleCustomAdd() } }}
+              placeholder="Nuovo tipo..."
+              className="flex-1 text-xs px-2 py-1 border rounded focus:outline-none focus:ring-1 focus:ring-sky-400"
+            />
+            <button
+              type="button"
+              onClick={handleCustomAdd}
+              className="shrink-0 p-1 rounded bg-sky-600 text-white hover:bg-sky-700"
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ---- component ----
 
 export interface BankTxDetailProps {
   tx: any
   onClose: () => void
-  /** If true, show direction edit controls */
+  /** If true, show edit controls */
   editable?: boolean
-  directionEditMode?: boolean
-  directionDraft?: 'in' | 'out'
-  directionSaving?: boolean
-  onDirectionDraftChange?: (d: 'in' | 'out') => void
-  onDirectionSave?: () => void
-  onEnableDirectionEdit?: () => void
+  /** Full edit mode */
+  editMode?: boolean
+  editDraft?: Record<string, any>
+  editSaving?: boolean
+  onEditDraftChange?: (field: string, value: any) => void
+  onEditSave?: () => void
+  onEnableEdit?: () => void
+  onCancelEdit?: () => void
 }
 
 export default function BankTxDetail({
   tx,
   onClose,
   editable = false,
-  directionEditMode = false,
-  directionDraft = 'in',
-  directionSaving = false,
-  onDirectionDraftChange,
-  onDirectionSave,
-  onEnableDirectionEdit,
+  editMode = false,
+  editDraft,
+  editSaving = false,
+  onEditDraftChange,
+  onEditSave,
+  onEnableEdit,
+  onCancelEdit,
 }: BankTxDetailProps) {
   if (!tx) return null
   const currentDirection = txDirection(tx)
@@ -86,6 +172,15 @@ export default function BankTxDetail({
       </div>
     )
   }
+
+  const EditField = ({ label, children }: { label: string; children: React.ReactNode }) => (
+    <div>
+      <p className="text-[10px] text-gray-400 uppercase tracking-wide mb-0.5">{label}</p>
+      {children}
+    </div>
+  )
+
+  const inputCls = 'w-full text-xs px-2 py-1.5 border rounded-md focus:outline-none focus:ring-1 focus:ring-sky-400'
 
   return (
     <div className="h-full flex flex-col bg-white">
@@ -148,46 +243,128 @@ export default function BankTxDetail({
         <Row l="Stato riconciliazione" v={tx.reconciliation_status} />
       </div>
       {editable && (
-        <div className="border-t px-4 py-3 bg-gray-50">
-          {!directionEditMode ? (
+        <div className="border-t px-4 py-3 bg-gray-50 max-h-[50vh] overflow-y-auto">
+          {!editMode ? (
             <button
-              onClick={onEnableDirectionEdit}
+              onClick={onEnableEdit}
               className="w-full text-xs px-3 py-1.5 rounded border border-gray-200 bg-white text-gray-700 hover:bg-gray-50"
             >
-              Correggi direzione
+              Modifica
             </button>
           ) : (
-            <div className="space-y-2">
-              <p className="text-xs font-medium text-gray-700">Correzione manuale direzione</p>
+            <div className="space-y-3">
+              <p className="text-xs font-semibold text-gray-700">Modifica movimento</p>
+
+              {/* Direction */}
+              <EditField label="Direzione">
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => onEditDraftChange?.('direction', 'in')}
+                    className={`text-xs px-2 py-1.5 rounded border font-medium ${
+                      editDraft?.direction === 'in'
+                        ? 'bg-emerald-600 border-emerald-600 text-white'
+                        : 'bg-white border-gray-200 text-gray-700'
+                    }`}
+                  >
+                    Entrata
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onEditDraftChange?.('direction', 'out')}
+                    className={`text-xs px-2 py-1.5 rounded border font-medium ${
+                      editDraft?.direction === 'out'
+                        ? 'bg-red-600 border-red-600 text-white'
+                        : 'bg-white border-gray-200 text-gray-700'
+                    }`}
+                  >
+                    Uscita
+                  </button>
+                </div>
+              </EditField>
+
+              {/* Counterparty */}
+              <EditField label="Controparte">
+                <input
+                  className={inputCls}
+                  value={editDraft?.counterparty_name || ''}
+                  onChange={e => onEditDraftChange?.('counterparty_name', e.target.value)}
+                />
+              </EditField>
+
+              {/* Description */}
+              <EditField label="Descrizione">
+                <input
+                  className={inputCls}
+                  value={editDraft?.description || ''}
+                  onChange={e => onEditDraftChange?.('description', e.target.value)}
+                />
+              </EditField>
+
+              {/* Dates */}
               <div className="grid grid-cols-2 gap-2">
+                <EditField label="Data">
+                  <input
+                    type="date"
+                    className={inputCls}
+                    value={editDraft?.date || ''}
+                    onChange={e => onEditDraftChange?.('date', e.target.value)}
+                  />
+                </EditField>
+                <EditField label="Data valuta">
+                  <input
+                    type="date"
+                    className={inputCls}
+                    value={editDraft?.value_date || ''}
+                    onChange={e => onEditDraftChange?.('value_date', e.target.value)}
+                  />
+                </EditField>
+              </div>
+
+              {/* Transaction type */}
+              <EditField label="Tipo operazione">
+                <TypeDropdown
+                  value={editDraft?.transaction_type || ''}
+                  onChange={v => onEditDraftChange?.('transaction_type', v)}
+                />
+              </EditField>
+
+              {/* Invoice ref */}
+              <EditField label="Rif. fattura">
+                <input
+                  className={inputCls}
+                  value={editDraft?.invoice_ref || ''}
+                  onChange={e => onEditDraftChange?.('invoice_ref', e.target.value)}
+                />
+              </EditField>
+
+              {/* Reference */}
+              <EditField label="Riferimento">
+                <input
+                  className={inputCls}
+                  value={editDraft?.reference || ''}
+                  onChange={e => onEditDraftChange?.('reference', e.target.value)}
+                />
+              </EditField>
+
+              {/* Actions */}
+              <div className="flex gap-2 pt-1">
                 <button
-                  onClick={() => onDirectionDraftChange?.('in')}
-                  className={`text-xs px-2 py-1.5 rounded border font-medium ${
-                    directionDraft === 'in'
-                      ? 'bg-emerald-600 border-emerald-600 text-white'
-                      : 'bg-white border-gray-200 text-gray-700'
-                  }`}
+                  type="button"
+                  onClick={onEditSave}
+                  disabled={editSaving}
+                  className="flex-1 text-xs px-3 py-1.5 rounded bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
                 >
-                  Segna Entrata
+                  {editSaving ? 'Salvataggio...' : 'Salva'}
                 </button>
                 <button
-                  onClick={() => onDirectionDraftChange?.('out')}
-                  className={`text-xs px-2 py-1.5 rounded border font-medium ${
-                    directionDraft === 'out'
-                      ? 'bg-red-600 border-red-600 text-white'
-                      : 'bg-white border-gray-200 text-gray-700'
-                  }`}
+                  type="button"
+                  onClick={onCancelEdit}
+                  className="flex-1 text-xs px-3 py-1.5 rounded border border-gray-200 text-gray-700 hover:bg-gray-50"
                 >
-                  Segna Uscita
+                  Annulla
                 </button>
               </div>
-              <button
-                onClick={onDirectionSave}
-                disabled={directionSaving}
-                className="w-full text-xs px-3 py-1.5 rounded bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
-              >
-                {directionSaving ? 'Salvataggio...' : 'Conferma'}
-              </button>
             </div>
           )}
         </div>

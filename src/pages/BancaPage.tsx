@@ -13,6 +13,7 @@ import {
   updateImportBatch, loadBankTransactions, loadBankAccounts, getClaudeApiKey,
   updateBankAccountBalance,
   deleteBankTransactions, deleteAllBankTransactions, updateBankTransactionDirection,
+  updateBankTransaction, verifyBankTransactions,
   getBankEmbeddingHealth,
   type BankEmbeddingHealth,
   type BankImportStats, type BankParseProgress, type BankParseResult, type BankTransaction,
@@ -619,6 +620,11 @@ export default function BancaPage() {
   const [directionDraft, setDirectionDraft] = useState<'in' | 'out'>('in')
   const [directionSaving, setDirectionSaving] = useState(false)
 
+  // Full edit mode
+  const [editMode, setEditMode] = useState(false)
+  const [editDraft, setEditDraft] = useState<Record<string, any>>({})
+  const [editSaving, setEditSaving] = useState(false)
+
   // AI search
   const [aiResult, setAiResult] = useState<{ text: string; mode: BankAiMode; isError: boolean; requestId?: string; candidateIds?: string[] } | null>(null)
   const [aiLoading, setAiLoading] = useState(false)
@@ -737,6 +743,7 @@ export default function BancaPage() {
     if (e.metaKey || e.ctrlKey || e.shiftKey) {
       setSelectedTx(null)
       setDirectionEditMode(false)
+      setEditMode(false)
       setSelectedIds(prev => {
         const n = new Set(prev)
         n.has(tx.id) ? n.delete(tx.id) : n.add(tx.id)
@@ -748,6 +755,7 @@ export default function BancaPage() {
     if (selectedTx?.id === tx.id && selectedIds.size === 0) {
       setSelectedTx(null)
       setDirectionEditMode(false)
+      setEditMode(false)
       return
     }
     if (selectedIds.size > 0) {
@@ -761,16 +769,29 @@ export default function BancaPage() {
     setSelectedTx(tx)
     setDirectionDraft(txDirection(tx))
     setDirectionEditMode(false)
+    setEditMode(false)
   }
+
+  const initEditDraft = (tx: any) => ({
+    direction: txDirection(tx),
+    counterparty_name: tx.counterparty_name || '',
+    description: tx.description || '',
+    date: tx.date || '',
+    value_date: tx.value_date || '',
+    transaction_type: tx.transaction_type || '',
+    invoice_ref: tx.invoice_ref || '',
+    reference: tx.reference || '',
+  })
 
   const handleRowDoubleClick = (tx: any) => {
     setSelectedIds(new Set())
     setSelectedTx(tx)
-    setDirectionDraft(txDirection(tx))
-    setDirectionEditMode(true)
+    setDirectionEditMode(false)
+    setEditDraft(initEditDraft(tx))
+    setEditMode(true)
   }
 
-  const clearSelection = () => { setSelectedIds(new Set()); setSelectedTx(null); setDirectionEditMode(false) }
+  const clearSelection = () => { setSelectedIds(new Set()); setSelectedTx(null); setDirectionEditMode(false); setEditMode(false) }
 
   const handleDelete = async () => {
     if (!deleteModal || !companyId) return
@@ -828,6 +849,47 @@ export default function BancaPage() {
       alert('Errore aggiornamento direzione: ' + e.message)
     }
     setDirectionSaving(false)
+  }
+
+  const handleEditSave = async () => {
+    if (!selectedTx?.id || !companyId) return
+    setEditSaving(true)
+    try {
+      await updateBankTransaction(companyId, selectedTx.id, editDraft)
+      const updatedAt = new Date().toISOString()
+      setTransactions(prev => prev.map(tx => {
+        if (tx.id !== selectedTx.id) return tx
+        const updated = { ...tx, ...editDraft }
+        if (editDraft.direction) {
+          const amountAbs = Math.abs(Number(editDraft.amount ?? tx.amount ?? 0))
+          updated.amount = editDraft.direction === 'in' ? amountAbs : -amountAbs
+          updated.direction_source = 'manual'
+          updated.direction_confidence = 1
+          updated.direction_needs_review = false
+          updated.direction_reason = 'Correzione manuale utente'
+          updated.direction_updated_at = updatedAt
+        }
+        return updated
+      }))
+      setSelectedTx((prev: any) => prev ? { ...prev, ...editDraft } : prev)
+      setEditMode(false)
+    } catch (e: any) {
+      alert('Errore aggiornamento: ' + e.message)
+    }
+    setEditSaving(false)
+  }
+
+  const handleBulkVerify = async () => {
+    if (selectedIds.size === 0) return
+    try {
+      await verifyBankTransactions(Array.from(selectedIds))
+      setTransactions(prev => prev.map(tx =>
+        selectedIds.has(tx.id) ? { ...tx, direction_needs_review: false } : tx
+      ))
+      clearSelection()
+    } catch (e: any) {
+      alert('Errore verifica: ' + e.message)
+    }
   }
 
   const finalizeImport = useCallback(async (
@@ -1192,13 +1254,16 @@ export default function BancaPage() {
               <Button variant="destructive" size="sm" onClick={() => setDeleteModal({ mode: 'selected' })}>
                 <Trash2 className="h-3.5 w-3.5 mr-1.5" />Elimina selezionati
               </Button>
+              <Button variant="outline" size="sm" onClick={handleBulkVerify}>
+                <CheckCircle className="h-3.5 w-3.5 mr-1.5" />Verifica selezionati
+              </Button>
               <Button variant="outline" size="sm" onClick={clearSelection}>Deseleziona tutto</Button>
             </div>
           )}
 
           {transactions.length > 0 && !isMultiSelect && (
             <p className="text-[11px] text-gray-400">
-              💡 Clicca su un movimento per i dettagli · Doppio click per correzione direzione · Ctrl/Cmd+click per selezione multipla
+              💡 Clicca su un movimento per i dettagli · Doppio click per modifica · Ctrl/Cmd+click per selezione multipla
             </p>
           )}
 
@@ -1487,17 +1552,15 @@ export default function BancaPage() {
         <div className="hidden lg:block w-72 xl:w-80 flex-shrink-0 overflow-hidden border-l h-full">
           <BankTxDetail
             tx={selectedTx}
-            onClose={() => { setSelectedTx(null); setDirectionEditMode(false) }}
+            onClose={() => { setSelectedTx(null); setDirectionEditMode(false); setEditMode(false) }}
             editable
-            directionEditMode={directionEditMode}
-            directionDraft={directionDraft}
-            directionSaving={directionSaving}
-            onDirectionDraftChange={setDirectionDraft}
-            onDirectionSave={handleSaveDirection}
-            onEnableDirectionEdit={() => {
-              setDirectionDraft(txDirection(selectedTx))
-              setDirectionEditMode(true)
-            }}
+            editMode={editMode}
+            editDraft={editDraft}
+            editSaving={editSaving}
+            onEditDraftChange={(field, value) => setEditDraft(prev => ({ ...prev, [field]: value }))}
+            onEditSave={handleEditSave}
+            onEnableEdit={() => { setEditDraft(initEditDraft(selectedTx)); setEditMode(true) }}
+            onCancelEdit={() => setEditMode(false)}
           />
         </div>
       )}

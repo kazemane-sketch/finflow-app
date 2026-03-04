@@ -843,3 +843,66 @@ export async function updateBankTransactionDirection(
     .eq('company_id', companyId);
   if (error) throw new Error(error.message);
 }
+
+// ─── Generic field update (full edit mode) ───────────────────────
+
+const EDITABLE_FIELDS = new Set([
+  'date', 'value_date', 'amount', 'counterparty_name',
+  'description', 'transaction_type', 'reference', 'invoice_ref',
+  'commission_amount', 'direction',
+]);
+
+export async function updateBankTransaction(
+  companyId: string,
+  txId: string,
+  updates: Record<string, unknown>
+): Promise<void> {
+  const filtered: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(updates)) {
+    if (EDITABLE_FIELDS.has(key)) filtered[key] = val;
+  }
+  if (Object.keys(filtered).length === 0) return;
+
+  // If direction changed, also update direction metadata + recalculate signed amount
+  if ('direction' in filtered) {
+    const dir = filtered.direction as 'in' | 'out';
+    const { data: authData } = await supabase.auth.getUser();
+    const userId = authData?.user?.id || null;
+
+    const { data: current, error: loadError } = await supabase
+      .from('bank_transactions')
+      .select('amount')
+      .eq('id', txId)
+      .eq('company_id', companyId)
+      .single();
+    if (loadError) throw new Error(loadError.message);
+
+    const amountAbs = Math.abs(Number(filtered.amount ?? current?.amount ?? 0));
+    filtered.amount = dir === 'in' ? amountAbs : -amountAbs;
+    filtered.direction_source = 'manual';
+    filtered.direction_confidence = 1;
+    filtered.direction_needs_review = false;
+    filtered.direction_reason = 'Correzione manuale utente';
+    filtered.direction_updated_at = new Date().toISOString();
+    filtered.direction_updated_by = userId;
+  }
+
+  const { error } = await supabase
+    .from('bank_transactions')
+    .update(filtered)
+    .eq('id', txId)
+    .eq('company_id', companyId);
+  if (error) throw new Error(error.message);
+}
+
+// ─── Bulk verify (clear direction_needs_review) ──────────────────
+
+export async function verifyBankTransactions(ids: string[]): Promise<void> {
+  for (let i = 0; i < ids.length; i += 100) {
+    const { error } = await supabase
+      .from('bank_transactions')
+      .update({ direction_needs_review: false })
+      .in('id', ids.slice(i, i + 100));
+    if (error) throw new Error(error.message);
+  }
+}

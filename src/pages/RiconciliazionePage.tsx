@@ -11,7 +11,7 @@ import { useCompany } from '@/hooks/useCompany'
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 import { getValidAccessToken } from '@/lib/getValidAccessToken'
 import { fmtDate, fmtEur } from '@/lib/utils'
-import { txTypeLabel, txTypeBadge, txDirection } from '@/components/BankTxDetail'
+import BankTxDetail, { txTypeLabel, txTypeBadge, txDirection } from '@/components/BankTxDetail'
 
 /* ─── types ──────────────────────────────────── */
 
@@ -35,6 +35,7 @@ interface SuggestionRow {
     transaction_type: string | null
     direction: string | null
     reconciliation_status: string | null
+    commission_amount: number | null
   } | null
   invoice: {
     id: string
@@ -64,6 +65,7 @@ interface UnmatchedTx {
   direction: string | null
   raw_text: string | null
   extraction_status: string | null
+  commission_amount: number | null
 }
 
 interface OpenInstallment {
@@ -147,6 +149,11 @@ export default function RiconciliazionePage() {
   const [assistedSearch, setAssistedSearch] = useState('')
   const [candidateSearch, setCandidateSearch] = useState('')
 
+  // Detail popup (double-click)
+  const [detailPopup, setDetailPopup] = useState<{ type: 'bank_tx' | 'invoice'; id: string } | null>(null)
+  const [detailPopupData, setDetailPopupData] = useState<any>(null)
+  const [detailPopupLoading, setDetailPopupLoading] = useState(false)
+
   // ─── load KPIs ──────────────────────────────
   const loadKpis = useCallback(async () => {
     if (!companyId) return
@@ -181,7 +188,7 @@ export default function RiconciliazionePage() {
       .select(`
         id, bank_transaction_id, installment_id, invoice_id,
         match_score, match_reason, proposed_by, suggestion_data, status, created_at,
-        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status),
+        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount),
         invoice:invoices(id, number, counterparty, total_amount, date),
         installment:invoice_installments(id, installment_no, due_date, amount_due, paid_amount, status, direction)
       `)
@@ -202,7 +209,7 @@ export default function RiconciliazionePage() {
     if (!companyId) return
     const { data } = await supabase
       .from('bank_transactions')
-      .select('id, date, amount, counterparty_name, description, transaction_type, direction, raw_text, extraction_status')
+      .select('id, date, amount, counterparty_name, description, transaction_type, direction, raw_text, extraction_status, commission_amount')
       .eq('company_id', companyId)
       .eq('reconciliation_status', 'unmatched')
       .order('date', { ascending: false })
@@ -247,6 +254,35 @@ export default function RiconciliazionePage() {
     Promise.all([loadKpis(), loadSuggestions(), loadUnmatched(), loadOpenInstallments()])
       .finally(() => setLoading(false))
   }, [companyId, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments])
+
+  // ─── detail popup loader ───────────────────
+  useEffect(() => {
+    if (!detailPopup) { setDetailPopupData(null); return }
+    let cancelled = false
+    setDetailPopupLoading(true)
+
+    if (detailPopup.type === 'bank_tx') {
+      supabase.from('bank_transactions').select('*').eq('id', detailPopup.id).single()
+        .then(({ data, error }) => {
+          if (cancelled) return
+          if (error) console.error('Detail load error:', error.message)
+          else setDetailPopupData(data)
+          setDetailPopupLoading(false)
+        })
+    } else {
+      supabase.from('invoices')
+        .select('*, counterparty:counterparties(*), installments:invoice_installments(*)')
+        .eq('id', detailPopup.id).single()
+        .then(({ data, error }) => {
+          if (cancelled) return
+          if (error) console.error('Detail load error:', error.message)
+          else setDetailPopupData(data)
+          setDetailPopupLoading(false)
+        })
+    }
+
+    return () => { cancelled = true }
+  }, [detailPopup])
 
   // ─── generate suggestions ──────────────────
   const generateSuggestions = useCallback(async () => {
@@ -675,6 +711,8 @@ export default function RiconciliazionePage() {
                   onReject={() => rejectSuggestion(s)}
                   confirming={confirmingId === s.id}
                   rejecting={rejectingId === s.id}
+                  onBankTxDoubleClick={(txId) => setDetailPopup({ type: 'bank_tx', id: txId })}
+                  onInvoiceDoubleClick={(invId) => setDetailPopup({ type: 'invoice', id: invId })}
                 />
               ))}
             </>
@@ -707,12 +745,17 @@ export default function RiconciliazionePage() {
                 {filteredUnmatched.length === 0 ? (
                   <div className="text-xs text-gray-400 text-center py-8">Nessun movimento non riconciliato</div>
                 ) : filteredUnmatched.map(tx => {
-                  const dir = directionIcon(tx.direction)
                   const isSelected = selectedTxId === tx.id
+                  const txAbs = Math.abs(Number(tx.amount))
+                  const hasComm = tx.commission_amount != null && Number(tx.commission_amount) !== 0
+                  const sign = tx.direction === 'in' ? '+' : '-'
+                  const netAmt = hasComm ? txAbs - Math.abs(Number(tx.commission_amount)) : txAbs
                   return (
                     <button
                       key={tx.id}
                       onClick={() => setSelectedTxId(isSelected ? null : tx.id)}
+                      onDoubleClick={() => setDetailPopup({ type: 'bank_tx', id: tx.id })}
+                      title="Doppio click per dettaglio"
                       className={`w-full text-left px-3 py-2 border-b last:border-b-0 transition-colors ${
                         isSelected ? 'bg-purple-50 border-l-2 border-l-purple-500' : 'hover:bg-gray-50'
                       }`}
@@ -724,9 +767,14 @@ export default function RiconciliazionePage() {
                             {tx.counterparty_name || 'N.D.'}
                           </span>
                         </div>
-                        <span className={`text-xs font-semibold shrink-0 ml-2 ${tx.direction === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
-                          {tx.direction === 'in' ? '+' : '-'}{fmtEur(Math.abs(Number(tx.amount)))}
-                        </span>
+                        <div className="text-right shrink-0 ml-2">
+                          <span className={`text-xs font-semibold ${tx.direction === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
+                            {sign}{fmtEur(netAmt)}{hasComm && <span className="text-[9px] font-normal text-gray-400 ml-0.5">netto</span>}
+                          </span>
+                          {hasComm && (
+                            <p className="text-[9px] text-gray-400">lordo {sign}{fmtEur(txAbs)}</p>
+                          )}
+                        </div>
                       </div>
                       <div className="flex items-center gap-2 mt-0.5 pl-3.5">
                         <span className="text-[10px] text-gray-400">{fmtDate(tx.date)}</span>
@@ -834,6 +882,146 @@ export default function RiconciliazionePage() {
           </div>
         </TabsContent>
       </Tabs>
+
+      {/* ──── Detail popup overlay ──── */}
+      {detailPopup && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[2px]"
+          onClick={() => setDetailPopup(null)}
+        >
+          <div
+            className="bg-white rounded-xl shadow-2xl w-full max-w-[420px] max-h-[85vh] overflow-hidden flex flex-col"
+            onClick={e => e.stopPropagation()}
+          >
+            {detailPopupLoading ? (
+              <div className="flex items-center justify-center py-16">
+                <Loader2 className="h-5 w-5 animate-spin text-purple-500" />
+                <span className="ml-2 text-sm text-gray-500">Caricamento...</span>
+              </div>
+            ) : detailPopup.type === 'bank_tx' && detailPopupData ? (
+              <BankTxDetail
+                tx={detailPopupData}
+                onClose={() => setDetailPopup(null)}
+              />
+            ) : detailPopup.type === 'invoice' && detailPopupData ? (
+              <InvoiceDetailPopup
+                invoice={detailPopupData}
+                onClose={() => setDetailPopup(null)}
+              />
+            ) : (
+              <div className="p-6 text-center text-sm text-gray-400">Dati non trovati</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/* ─── Invoice Detail Popup ────────────────────── */
+
+function InvoiceDetailPopup({ invoice, onClose }: { invoice: any; onClose: () => void }) {
+  const cp = invoice.counterparty
+  const installments: any[] = invoice.installments || []
+  const isAttivo = invoice.direction === 'attivo'
+
+  return (
+    <div className="h-full flex flex-col bg-white">
+      <div className="flex items-center justify-between px-4 py-3 border-b flex-shrink-0">
+        <span className="text-sm font-semibold">Dettaglio fattura</span>
+        <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1">
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+
+      <div className={`px-4 py-4 flex-shrink-0 ${isAttivo ? 'bg-emerald-50' : 'bg-red-50'}`}>
+        <p className={`text-2xl font-bold ${isAttivo ? 'text-emerald-700' : 'text-red-700'}`}>
+          {isAttivo ? '+' : '-'}{fmtEur(Math.abs(Number(invoice.total_amount || 0)))}
+        </p>
+        <div className="flex items-center gap-2 mt-2">
+          <span className="text-xs text-gray-500">{fmtDate(invoice.date)}</span>
+          <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${isAttivo ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
+            {isAttivo ? 'Vendita' : 'Acquisto'}
+          </span>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+        {invoice.number && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Numero fattura</p>
+            <p className="text-xs text-gray-800 mt-0.5">{invoice.number}</p>
+          </div>
+        )}
+        {cp?.denom && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Controparte</p>
+            <p className="text-xs text-gray-800 mt-0.5 font-medium">{cp.denom}</p>
+          </div>
+        )}
+        {cp?.piva && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">P.IVA</p>
+            <p className="text-xs text-gray-800 mt-0.5 font-mono">{cp.piva}</p>
+          </div>
+        )}
+        {cp?.cf && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Codice fiscale</p>
+            <p className="text-xs text-gray-800 mt-0.5 font-mono">{cp.cf}</p>
+          </div>
+        )}
+        {invoice.payment_method && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Metodo pagamento</p>
+            <p className="text-xs text-gray-800 mt-0.5">{invoice.payment_method}</p>
+          </div>
+        )}
+        {invoice.payment_terms && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Condizioni pagamento</p>
+            <p className="text-xs text-gray-800 mt-0.5">{invoice.payment_terms}</p>
+          </div>
+        )}
+
+        {/* Installments */}
+        {installments.length > 0 && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide mb-1.5">Rate ({installments.length})</p>
+            <div className="space-y-1.5">
+              {installments
+                .sort((a: any, b: any) => a.installment_no - b.installment_no)
+                .map((inst: any) => {
+                  const remaining = Number(inst.amount_due) - Number(inst.paid_amount || 0)
+                  return (
+                    <div key={inst.id} className="flex items-center justify-between text-xs px-2 py-1.5 rounded bg-gray-50">
+                      <div className="flex items-center gap-2">
+                        <span className="text-gray-600 font-medium">Rata {inst.installment_no}</span>
+                        <span className="text-[10px] text-gray-400">{fmtDate(inst.due_date)}</span>
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${
+                          inst.status === 'paid' ? 'bg-emerald-100 text-emerald-700' :
+                          inst.status === 'overdue' ? 'bg-red-100 text-red-700' :
+                          inst.status === 'partial' ? 'bg-amber-100 text-amber-700' :
+                          'bg-gray-100 text-gray-600'
+                        }`}>
+                          {inst.status === 'paid' ? 'Pagata' :
+                           inst.status === 'overdue' ? 'Scaduta' :
+                           inst.status === 'partial' ? 'Parziale' : 'In attesa'}
+                        </span>
+                      </div>
+                      <div className="text-right">
+                        <span className="font-semibold text-gray-800">{fmtEur(inst.amount_due)}</span>
+                        {inst.status !== 'paid' && remaining !== Number(inst.amount_due) && (
+                          <p className="text-[9px] text-gray-400">residuo {fmtEur(remaining)}</p>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -863,12 +1051,14 @@ function KpiCard({ label, value, icon: Icon, color, bg, iconColor, sub }: {
 
 /* ─── Suggestion Card ────────────────────────── */
 
-function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting }: {
+function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting, onBankTxDoubleClick, onInvoiceDoubleClick }: {
   suggestion: SuggestionRow
   onConfirm: () => void
   onReject: () => void
   confirming: boolean
   rejecting: boolean
+  onBankTxDoubleClick?: (txId: string) => void
+  onInvoiceDoubleClick?: (invoiceId: string) => void
 }) {
   const [expanded, setExpanded] = useState(false)
   const tx = suggestion.bank_transaction
@@ -929,14 +1119,35 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
           {/* Two-column: Bank tx ↔ Invoice/Installment */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             {/* Bank transaction side */}
-            <div className={`rounded-md p-2.5 ${txDir === 'in' ? 'bg-emerald-50/70' : 'bg-red-50/70'}`}>
+            <div
+              className={`rounded-md p-2.5 cursor-pointer hover:ring-1 hover:ring-gray-300 transition-shadow ${txDir === 'in' ? 'bg-emerald-50/70' : 'bg-red-50/70'}`}
+              onDoubleClick={() => onBankTxDoubleClick?.(tx.id)}
+              title="Doppio click per dettaglio"
+            >
               <div className="flex items-center gap-1.5 mb-1">
                 <Landmark className="h-3 w-3 text-gray-500" />
                 <span className="text-[10px] font-semibold uppercase text-gray-500">Movimento bancario</span>
               </div>
-              <p className={`text-sm font-bold ${txDir === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
-                {txDir === 'in' ? '+' : '-'}{fmtEur(absAmount)}
-              </p>
+              {(() => {
+                const hasComm = tx.commission_amount != null && Number(tx.commission_amount) !== 0
+                const sign = txDir === 'in' ? '+' : '-'
+                if (hasComm) {
+                  const netAmt = absAmount - Math.abs(Number(tx.commission_amount))
+                  return (
+                    <>
+                      <p className={`text-sm font-bold ${txDir === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
+                        {sign}{fmtEur(netAmt)} <span className="text-[10px] font-normal text-gray-500">netto</span>
+                      </p>
+                      <p className="text-[10px] text-gray-400">lordo {sign}{fmtEur(absAmount)}</p>
+                    </>
+                  )
+                }
+                return (
+                  <p className={`text-sm font-bold ${txDir === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
+                    {sign}{fmtEur(absAmount)}
+                  </p>
+                )
+              })()}
               <p className="text-xs text-gray-700 mt-0.5">{tx.counterparty_name || 'N.D.'}</p>
               <div className="flex items-center gap-2 mt-0.5">
                 <span className="text-[10px] text-gray-400">{fmtDate(tx.date)}</span>
@@ -947,7 +1158,11 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
             </div>
 
             {/* Invoice/Installment side */}
-            <div className="rounded-md p-2.5 bg-blue-50/70">
+            <div
+              className="rounded-md p-2.5 bg-blue-50/70 cursor-pointer hover:ring-1 hover:ring-blue-300 transition-shadow"
+              onDoubleClick={() => inv && onInvoiceDoubleClick?.(inv.id)}
+              title="Doppio click per dettaglio"
+            >
               <div className="flex items-center gap-1.5 mb-1">
                 <FileText className="h-3 w-3 text-gray-500" />
                 <span className="text-[10px] font-semibold uppercase text-gray-500">
