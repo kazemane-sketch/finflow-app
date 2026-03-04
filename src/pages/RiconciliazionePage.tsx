@@ -4,7 +4,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   Link2, CheckCircle2, XCircle, Sparkles, RefreshCw, ChevronRight,
   ArrowRightLeft, Loader2, AlertTriangle, Search, FileText, Landmark,
-  ChevronDown, X, Check, Zap,
+  ChevronDown, X, Check, Zap, Trash2, Unlink,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { useCompany } from '@/hooks/useCompany'
@@ -81,6 +81,35 @@ interface OpenInstallment {
   counterparty_name: string | null
 }
 
+interface ReconciledRow {
+  id: string
+  invoice_id: string
+  bank_transaction_id: string
+  match_type: string
+  confidence: number
+  match_reason: string | null
+  confirmed_at: string | null
+  created_at: string
+  bank_transaction: {
+    id: string
+    date: string | null
+    amount: number
+    counterparty_name: string | null
+    description: string | null
+    transaction_type: string | null
+    direction: string | null
+    commission_amount: number | null
+  } | null
+  invoice: {
+    id: string
+    number: string | null
+    counterparty: Record<string, unknown> | null
+    total_amount: number | null
+    date: string | null
+    direction: string | null
+  } | null
+}
+
 interface KpiData {
   unmatched: number
   pendingSuggestions: number
@@ -138,14 +167,15 @@ export default function RiconciliazionePage() {
   const [searchParams, setSearchParams] = useSearchParams()
 
   // Tab state
-  const [activeTab, setActiveTab] = useState<'suggestions' | 'assisted'>(
-    (searchParams.get('tab') as 'suggestions' | 'assisted') || 'suggestions'
+  const [activeTab, setActiveTab] = useState<'suggestions' | 'assisted' | 'reconciled'>(
+    (searchParams.get('tab') as 'suggestions' | 'assisted' | 'reconciled') || 'suggestions'
   )
 
   // Data
   const [suggestions, setSuggestions] = useState<SuggestionRow[]>([])
   const [unmatchedTxs, setUnmatchedTxs] = useState<UnmatchedTx[]>([])
   const [openInstallments, setOpenInstallments] = useState<OpenInstallment[]>([])
+  const [reconciledRows, setReconciledRows] = useState<ReconciledRow[]>([])
   const [kpi, setKpi] = useState<KpiData>({ unmatched: 0, pendingSuggestions: 0, matched: 0, total: 0 })
 
   // UI state
@@ -161,6 +191,11 @@ export default function RiconciliazionePage() {
   )
   const [assistedSearch, setAssistedSearch] = useState('')
   const [candidateSearch, setCandidateSearch] = useState('')
+
+  // Reconciled tab state
+  const [reconciledSearch, setReconciledSearch] = useState('')
+  const [deletingReconId, setDeletingReconId] = useState<string | null>(null)
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
 
   // Detail popup (double-click)
   const [detailPopup, setDetailPopup] = useState<{ type: 'bank_tx' | 'invoice'; id: string } | null>(null)
@@ -260,13 +295,35 @@ export default function RiconciliazionePage() {
     }
   }, [companyId])
 
+  // ─── load reconciled ───────────────────────
+  const loadReconciled = useCallback(async () => {
+    if (!companyId) return
+    const { data, error } = await supabase
+      .from('reconciliations')
+      .select(`
+        id, invoice_id, bank_transaction_id, match_type, confidence,
+        match_reason, confirmed_at, created_at,
+        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, commission_amount),
+        invoice:invoices(id, number, counterparty, total_amount, date, direction)
+      `)
+      .eq('company_id', companyId)
+      .order('confirmed_at', { ascending: false, nullsFirst: false })
+      .limit(500)
+
+    if (error) {
+      console.error('Error loading reconciled:', error)
+      return
+    }
+    setReconciledRows((data || []) as unknown as ReconciledRow[])
+  }, [companyId])
+
   // ─── initial load ───────────────────────────
   useEffect(() => {
     if (!companyId) return
     setLoading(true)
-    Promise.all([loadKpis(), loadSuggestions(), loadUnmatched(), loadOpenInstallments()])
+    Promise.all([loadKpis(), loadSuggestions(), loadUnmatched(), loadOpenInstallments(), loadReconciled()])
       .finally(() => setLoading(false))
-  }, [companyId, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments])
+  }, [companyId, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments, loadReconciled])
 
   // ─── detail popup loader ───────────────────
   useEffect(() => {
@@ -535,9 +592,82 @@ export default function RiconciliazionePage() {
     setConfirmingId(null)
   }, [companyId, unmatchedTxs, loadKpis])
 
+  // ─── delete reconciliation (undo) ─────────
+  const deleteReconciliation = useCallback(async (recon: ReconciledRow) => {
+    if (!companyId) return
+    setDeletingReconId(recon.id)
+    try {
+      // 1. Find the installment linked via reconciliation_log so we can reverse paid_amount
+      const { data: logRows } = await supabase
+        .from('reconciliation_log')
+        .select('installment_id')
+        .eq('bank_transaction_id', recon.bank_transaction_id)
+        .eq('invoice_id', recon.invoice_id)
+        .eq('accepted', true)
+        .limit(1)
+
+      const installmentId = logRows?.[0]?.installment_id
+
+      // 2. Delete reconciliation row
+      const { error: e1 } = await supabase
+        .from('reconciliations')
+        .delete()
+        .eq('id', recon.id)
+      if (e1) throw e1
+
+      // 3. Reset bank transaction status back to unmatched
+      const { error: e2 } = await supabase
+        .from('bank_transactions')
+        .update({ reconciliation_status: 'unmatched' })
+        .eq('id', recon.bank_transaction_id)
+      if (e2) throw e2
+
+      // 4. Reverse installment paid_amount if we can identify the installment
+      if (installmentId && recon.bank_transaction) {
+        const txAmount = Math.abs(Number(recon.bank_transaction.amount))
+        const { data: instData } = await supabase
+          .from('invoice_installments')
+          .select('paid_amount, amount_due')
+          .eq('id', installmentId)
+          .single()
+        if (instData) {
+          const newPaid = Math.max(0, Number(instData.paid_amount) - txAmount)
+          const newStatus = newPaid <= 0 ? 'pending' : newPaid >= Number(instData.amount_due) ? 'paid' : 'partial'
+          await supabase
+            .from('invoice_installments')
+            .update({ paid_amount: newPaid, status: newStatus })
+            .eq('id', installmentId)
+        }
+      }
+
+      // 5. Log the undo
+      const { data: { user } } = await supabase.auth.getUser()
+      await supabase.from('reconciliation_log').insert({
+        company_id: companyId,
+        bank_transaction_id: recon.bank_transaction_id,
+        installment_id: installmentId || null,
+        invoice_id: recon.invoice_id,
+        proposed_by: 'manual',
+        accepted: false,
+        user_id: user?.id,
+        match_score: (recon.confidence ?? 0) * 100,
+        match_reason: 'Riconciliazione annullata manualmente',
+      })
+
+      toast.success('Riconciliazione eliminata')
+      setReconciledRows(prev => prev.filter(r => r.id !== recon.id))
+      setConfirmDeleteId(null)
+      await Promise.all([loadKpis(), loadUnmatched(), loadOpenInstallments()])
+    } catch (err: unknown) {
+      const msg = errMsg(err)
+      toast.error(`Errore eliminazione: ${msg}`)
+    }
+    setDeletingReconId(null)
+  }, [companyId, loadKpis, loadUnmatched, loadOpenInstallments])
+
   // ─── tab change handler ────────────────────
   const handleTabChange = (tab: string) => {
-    const t = tab as 'suggestions' | 'assisted'
+    const t = tab as 'suggestions' | 'assisted' | 'reconciled'
     setActiveTab(t)
     setSearchParams(prev => {
       const p = new URLSearchParams(prev)
@@ -594,6 +724,25 @@ export default function RiconciliazionePage() {
 
     return filtered.slice(0, 50)
   }, [selectedTxId, unmatchedTxs, openInstallments, candidateSearch])
+
+  // Filtered reconciled rows
+  const filteredReconciled = useMemo(() => {
+    if (!reconciledSearch.trim()) return reconciledRows
+    const q = reconciledSearch.toLowerCase()
+    return reconciledRows.filter(r => {
+      const tx = r.bank_transaction
+      const inv = r.invoice
+      const cpName = inv?.counterparty && typeof inv.counterparty === 'object'
+        ? ((inv.counterparty as any).denom || '').toLowerCase() : ''
+      return (
+        (tx?.counterparty_name || '').toLowerCase().includes(q) ||
+        (tx?.description || '').toLowerCase().includes(q) ||
+        (inv?.number || '').toLowerCase().includes(q) ||
+        cpName.includes(q) ||
+        String(tx?.amount || '').includes(q)
+      )
+    })
+  }, [reconciledRows, reconciledSearch])
 
   // Percentage KPI
   const matchPct = kpi.total > 0 ? Math.round((kpi.matched / kpi.total) * 100) : 0
@@ -679,6 +828,15 @@ export default function RiconciliazionePage() {
           <TabsTrigger value="assisted" className="gap-1.5">
             <ArrowRightLeft className="h-3.5 w-3.5" />
             Riconciliazione assistita
+          </TabsTrigger>
+          <TabsTrigger value="reconciled" className="gap-1.5">
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            Riconciliati
+            {kpi.matched > 0 && (
+              <span className="ml-1 text-[10px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-semibold">
+                {kpi.matched}
+              </span>
+            )}
           </TabsTrigger>
         </TabsList>
 
@@ -893,6 +1051,173 @@ export default function RiconciliazionePage() {
               </div>
             </div>
           </div>
+        </TabsContent>
+
+        {/* ──── Tab 3: Reconciled ──── */}
+        <TabsContent value="reconciled" className="mt-4">
+          {reconciledRows.length === 0 ? (
+            <EmptyState
+              icon={CheckCircle2}
+              title="Nessuna riconciliazione"
+              description="Non ci sono ancora movimenti riconciliati. Accetta i suggerimenti AI o usa la riconciliazione assistita."
+            />
+          ) : (
+            <div className="space-y-3">
+              {/* Search bar */}
+              <div className="relative max-w-md">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
+                <input
+                  type="text"
+                  value={reconciledSearch}
+                  onChange={e => setReconciledSearch(e.target.value)}
+                  placeholder="Cerca per controparte, fattura, importo..."
+                  className="w-full pl-9 pr-3 py-2 text-sm border rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-400"
+                />
+              </div>
+
+              {/* Results count */}
+              <p className="text-xs text-gray-400">
+                {filteredReconciled.length} riconciliazion{filteredReconciled.length === 1 ? 'e' : 'i'}
+                {reconciledSearch && ` su ${reconciledRows.length} totali`}
+              </p>
+
+              {/* Table */}
+              <div className="border rounded-lg bg-white overflow-hidden">
+                {/* Header */}
+                <div className="grid grid-cols-[1fr_auto_1fr_auto] gap-0 bg-gray-50 border-b px-4 py-2.5 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                  <div className="flex items-center gap-1.5">
+                    <Landmark className="h-3 w-3" />
+                    Movimento bancario
+                  </div>
+                  <div className="px-4" />
+                  <div className="flex items-center gap-1.5">
+                    <FileText className="h-3 w-3" />
+                    Fattura
+                  </div>
+                  <div className="text-right">Azioni</div>
+                </div>
+
+                {/* Rows */}
+                <div className="divide-y max-h-[60vh] overflow-y-auto">
+                  {filteredReconciled.map(r => {
+                    const tx = r.bank_transaction
+                    const inv = r.invoice
+                    if (!tx) return null
+
+                    const txDir = txDirection(tx)
+                    const absAmount = Math.abs(Number(tx.amount))
+                    const hasComm = tx.commission_amount != null && Number(tx.commission_amount) !== 0
+                    const sign = txDir === 'in' ? '+' : '-'
+                    const netAmt = hasComm ? absAmount - Math.abs(Number(tx.commission_amount)) : absAmount
+                    const invoiceDenom = inv?.counterparty && typeof inv.counterparty === 'object'
+                      ? (inv.counterparty as any).denom || 'N.D.' : 'N.D.'
+                    const isConfirmingDelete = confirmDeleteId === r.id
+                    const isDeleting = deletingReconId === r.id
+
+                    return (
+                      <div key={r.id} className="grid grid-cols-[1fr_auto_1fr_auto] gap-0 px-4 py-3 hover:bg-gray-50/50 items-center transition-colors">
+                        {/* Bank transaction */}
+                        <div
+                          className="cursor-pointer hover:opacity-80 min-w-0"
+                          onDoubleClick={() => setDetailPopup({ type: 'bank_tx', id: tx.id })}
+                          title="Doppio click per dettaglio"
+                        >
+                          <div className="flex items-center gap-2">
+                            <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${txDir === 'in' ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                            <span className="text-xs font-medium text-gray-800 truncate">
+                              {tx.counterparty_name || 'N.D.'}
+                            </span>
+                            <span className={`text-xs font-bold shrink-0 ${txDir === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
+                              {sign}{fmtEur(netAmt)}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2 mt-0.5 pl-3.5">
+                            <span className="text-[10px] text-gray-400">{fmtDate(tx.date)}</span>
+                            {tx.description && (
+                              <span className="text-[10px] text-gray-400 truncate">{tx.description.slice(0, 60)}</span>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Arrow */}
+                        <div className="px-3 flex flex-col items-center">
+                          <Link2 className="h-4 w-4 text-emerald-500" />
+                          <span className={`text-[9px] mt-0.5 px-1.5 py-0.5 rounded-full font-medium ${
+                            r.match_type === 'auto' ? 'bg-blue-50 text-blue-600'
+                            : r.match_type === 'manual' ? 'bg-gray-100 text-gray-600'
+                            : 'bg-purple-50 text-purple-600'
+                          }`}>
+                            {r.match_type === 'auto' ? 'Auto' : r.match_type === 'manual' ? 'Manuale' : 'AI'}
+                          </span>
+                        </div>
+
+                        {/* Invoice */}
+                        <div
+                          className="cursor-pointer hover:opacity-80 min-w-0"
+                          onDoubleClick={() => inv && setDetailPopup({ type: 'invoice', id: inv.id })}
+                          title="Doppio click per dettaglio"
+                        >
+                          {inv ? (
+                            <>
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-medium text-gray-800 truncate">{invoiceDenom}</span>
+                                {inv.number && (
+                                  <span className="text-[10px] text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded shrink-0">
+                                    {inv.number}
+                                  </span>
+                                )}
+                                <span className="text-xs font-bold text-blue-700 shrink-0">
+                                  {fmtEur(inv.total_amount)}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <span className="text-[10px] text-gray-400">{fmtDate(inv.date)}</span>
+                              </div>
+                            </>
+                          ) : (
+                            <span className="text-xs text-gray-400">Fattura non trovata</span>
+                          )}
+                        </div>
+
+                        {/* Actions */}
+                        <div className="flex items-center gap-1 shrink-0 ml-2">
+                          {isConfirmingDelete ? (
+                            <div className="flex items-center gap-1">
+                              <button
+                                onClick={() => deleteReconciliation(r)}
+                                disabled={isDeleting}
+                                className="flex items-center gap-1 px-2 py-1 text-[10px] font-medium rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
+                              >
+                                {isDeleting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+                                Conferma
+                              </button>
+                              <button
+                                onClick={() => setConfirmDeleteId(null)}
+                                disabled={isDeleting}
+                                className="p-1 text-gray-400 hover:text-gray-600 transition-colors"
+                              >
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          ) : (
+                            <>
+                              <button
+                                onClick={() => setConfirmDeleteId(r.id)}
+                                className="p-1.5 rounded-md text-red-400 hover:bg-red-50 hover:text-red-600 transition-colors"
+                                title="Elimina riconciliazione"
+                              >
+                                <Unlink className="h-4 w-4" />
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
         </TabsContent>
       </Tabs>
 

@@ -1394,18 +1394,16 @@ export default function BancaPage() {
       setAiResult({ text: 'Azienda non selezionata.', mode: 'analysis', isError: true })
       return
     }
-    if (transactions.length === 0) {
-      setAiResult({ text: "Nessun movimento disponibile per l'analisi AI.", mode: 'analysis', isError: true })
-      return
-    }
     setAiLoading(true); setAiResult(null)
     try {
+      // AI search always searches across ALL data — don't restrict by current date/direction filters.
+      // If the query is time-related (e.g. "ottobre"), the AI will return filter mode with appropriate dates.
       const payload: BankAiSearchRequest = {
         query,
         company_id: companyId,
-        direction: dirFilter === 'in' || dirFilter === 'out' ? dirFilter : 'all',
-        date_from: dateFrom || null,
-        date_to: dateTo || null,
+        direction: 'all',
+        date_from: null,
+        date_to: null,
         limit: 50,
       }
 
@@ -1419,12 +1417,19 @@ export default function BancaPage() {
       if (isFilterMode) {
         console.log('[Banca AI] filter mode:', result.filter)
         const f = result.filter!
-        if (f.date_from) setDateFrom(f.date_from)
-        if (f.date_to) setDateTo(f.date_to)
-        if (f.direction === 'in' || f.direction === 'out') setDirFilter(f.direction)
+        // Reset all filters first, then apply AI-determined ones
+        setDateFrom(f.date_from || '')
+        setDateTo(f.date_to || '')
+        setDirFilter(f.direction === 'in' || f.direction === 'out' ? f.direction : 'all')
+        setTypeFilter('all')
         // Clear text query — AI has converted it to structured filters;
-        // leaving it would cause the text filter to exclude all transactions
+        // leaving it would cause the text filter to exclude all transactions.
+        // Also clear debounced query immediately + cancel pending debounce timer
+        // to prevent a race condition where the 300ms debounce fires AFTER aiResult
+        // triggers loadData, causing a second loadData with empty query.
         setQuery('')
+        clearTimeout(queryDebounceRef.current)
+        setDebouncedQuery('')
         // Show AI answer without candidateIds (let regular filters work)
         setAiResult({
           text: result.answer || 'Filtri applicati.',
