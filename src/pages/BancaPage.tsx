@@ -22,6 +22,7 @@ import {
   type BankSaldoRow, type SaldoMetadata,
 } from '@/lib/bankParser'
 import { verifyPassword } from '@/lib/invoiceSaver'
+import { triggerAutoReconciliation } from '@/lib/reconciliationTrigger'
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
 import { getValidAccessToken, type AccessTokenError } from '@/lib/getValidAccessToken'
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges'
@@ -719,7 +720,7 @@ async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchR
 export default function BancaPage() {
   const { company } = useCompany()
   const companyId = company?.id || null
-  const { txScores } = useReconciliationBadges()
+  const { txScores, refresh: refreshBadges } = useReconciliationBadges()
 
   const [transactions, setTransactions] = useState<any[]>([])
   const [bankAccounts, setBankAccounts] = useState<any[]>([])
@@ -1204,7 +1205,15 @@ export default function BancaPage() {
       stats: finalStats,
     })
     await loadData()
-  }, [companyId, loadData])
+
+    // Auto-trigger reconciliation pipeline in background (fire-and-forget)
+    if (saveResult.saved > 0 && companyId) {
+      triggerAutoReconciliation(companyId, {
+        extractFirst: true,
+        onComplete: () => { void refreshBadges() },
+      })
+    }
+  }, [companyId, loadData, refreshBadges])
 
   const handleSummaryConfirm = useCallback(async () => {
     if (!summaryReview) return
@@ -1472,6 +1481,7 @@ export default function BancaPage() {
   const latestBalance = balanceInfo?.opening_balance_confirmed ? balanceInfo.computed_balance : null
   const uniqueTypes = [...new Set(transactions.map(t => t.transaction_type).filter(Boolean))]
   const hasDateFilter = !!(dateFrom || dateTo)
+  const hasActiveFilters = !!(debouncedQuery || dirFilter !== 'all' || typeFilter !== 'all' || hasDateFilter || aiResult)
 
   // Multi-select helpers
   const selectAll = () => {
@@ -1530,7 +1540,7 @@ export default function BancaPage() {
             </div>
           )}
 
-          {transactions.length > 0 && !selectMode && (
+          {transactions.length > 0 && !selectMode && !hasActiveFilters && (
             <p className="text-[11px] text-gray-400">
               💡 Clicca su un movimento per i dettagli · Doppio click per modifica · Ctrl/Cmd+click per selezione multipla
             </p>
@@ -1743,7 +1753,7 @@ export default function BancaPage() {
           )}
 
           {/* FILTERS */}
-          {transactions.length > 0 && (
+          {(totalCount > 0 || hasActiveFilters) && (
             <div className="space-y-2">
               {/* Barra unificata: digita = filtro, Invio = AI */}
               <div className="flex flex-wrap items-center gap-2">
@@ -1831,20 +1841,40 @@ export default function BancaPage() {
 
           {/* Transactions list */}
           {transactions.length === 0 && !loading && !importing ? (
-            <Card>
-              <CardContent className="p-10 text-center">
-                <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-primary/10 mb-4">
-                  <Landmark className="h-8 w-8 text-primary" />
-                </div>
-                <h3 className="text-lg font-semibold mb-2">Nessun movimento bancario</h3>
-                <p className="text-sm text-muted-foreground mb-4 max-w-md mx-auto">
-                  Carica il PDF dell'estratto conto MPS per importare automaticamente i movimenti.
-                </p>
-                <Button onClick={() => fileRef.current?.click()}>
-                  <Upload className="h-4 w-4 mr-2" />Carica estratto conto PDF
-                </Button>
-              </CardContent>
-            </Card>
+            hasActiveFilters ? (
+              <Card>
+                <CardContent className="p-10 text-center">
+                  <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-gray-100 mb-4">
+                    <Search className="h-8 w-8 text-gray-400" />
+                  </div>
+                  <h3 className="text-lg font-semibold mb-2">Nessun risultato</h3>
+                  <p className="text-sm text-muted-foreground mb-4 max-w-md mx-auto">
+                    Nessun movimento trovato con i filtri attuali.
+                  </p>
+                  <Button variant="outline" onClick={() => {
+                    setQuery(''); setAiResult(null); setDirFilter('all'); setTypeFilter('all')
+                    setDateFrom(''); setDateTo('')
+                  }}>
+                    <X className="h-4 w-4 mr-2" />Resetta filtri
+                  </Button>
+                </CardContent>
+              </Card>
+            ) : (
+              <Card>
+                <CardContent className="p-10 text-center">
+                  <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-primary/10 mb-4">
+                    <Landmark className="h-8 w-8 text-primary" />
+                  </div>
+                  <h3 className="text-lg font-semibold mb-2">Nessun movimento bancario</h3>
+                  <p className="text-sm text-muted-foreground mb-4 max-w-md mx-auto">
+                    Carica il PDF dell'estratto conto MPS per importare automaticamente i movimenti.
+                  </p>
+                  <Button onClick={() => fileRef.current?.click()}>
+                    <Upload className="h-4 w-4 mr-2" />Carica estratto conto PDF
+                  </Button>
+                </CardContent>
+              </Card>
+            )
           ) : (
             <Card>
               <CardHeader className="py-2.5 px-4 border-b">

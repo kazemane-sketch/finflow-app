@@ -14,6 +14,7 @@ import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges';
 import { ReconciledIcon, ReconciliationDot } from '@/components/ReconciliationIndicators';
+import { triggerAutoReconciliation } from '@/lib/reconciliationTrigger';
 import {
   subscribeExtraction, getExtractionState,
   startExtraction, loadExtractionStats as loadExtStats,
@@ -652,7 +653,7 @@ export default function FatturePage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const companyId = company?.id || null;
-  const { matchedInvoiceIds, invoiceScores } = useReconciliationBadges();
+  const { matchedInvoiceIds, invoiceScores, refresh: refreshBadges } = useReconciliationBadges();
   const [invoices, setInvoices] = useState<DBInvoice[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<DBInvoiceDetail | null>(null);
@@ -875,7 +876,16 @@ export default function FatturePage() {
       setImportLogs(prev => [...prev, { fn, status: status === 'ok' ? 'ok' : status === 'duplicate' ? 'duplicate' : 'error_save', message: status === 'error' ? 'Errore salvataggio' : undefined }]);
     });
     setImportPhase('done'); await reload(true); setTimeout(() => setImporting(false), 3000);
-  }, [companyId, ensureCompany, refetchCompany, reload]);
+
+    // Auto-trigger reconciliation in background (fire-and-forget)
+    const reconCid = companyId || company?.id
+    if (okParsed.length > 0 && reconCid) {
+      triggerAutoReconciliation(reconCid, {
+        extractFirst: false,
+        onComplete: () => { void refreshBadges() },
+      })
+    }
+  }, [companyId, company?.id, ensureCompany, refetchCompany, reload, refreshBadges]);
 
   const handleDeleteConfirm = useCallback(async (_pw: string) => {
     const ids = deleteModal.ids; setDeleteModal({ open: false, ids: [] });
