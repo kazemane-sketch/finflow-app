@@ -71,7 +71,7 @@ const tools = [
       type: "object" as const,
       properties: {
         query: { type: "string", description: "Testo da cercare (prodotti, codici, CIG, CUP, riferimenti)" },
-        direction: { type: "string", enum: ["in", "out"], description: "in = attive, out = passive" },
+        direction: { type: "string", enum: ["in", "out"], description: "in = attive (vendita/emesse), out = passive (acquisto/ricevute)" },
         date_from: { type: "string", description: "Data inizio YYYY-MM-DD" },
         date_to: { type: "string", description: "Data fine YYYY-MM-DD" },
         limit: { type: "number", description: "Max risultati (default 20, max 100)" },
@@ -312,8 +312,7 @@ async function handleSearchInvoices(sql: SqlClient, companyId: string, args: Rec
   const limit = Math.min(Number(args.limit) || 20, 100);
   params.push(limit);
 
-  return await sql.unsafe(
-    `SELECT i.id, i.number, i.date, i.total_amount, i.direction, i.doc_type,
+  const query = `SELECT i.id, i.number, i.date, i.total_amount, i.direction, i.doc_type,
             i.counterparty->>'denom' as counterparty_name,
             i.payment_status, i.extraction_status,
             (SELECT string_agg(il.description, ' | ' ORDER BY il.line_number)
@@ -321,9 +320,18 @@ async function handleSearchInvoices(sql: SqlClient, companyId: string, args: Rec
      FROM invoices i
      WHERE ${conditions.join(" AND ")}
      ORDER BY i.date DESC
-     LIMIT $${idx}`,
-    params,
-  );
+     LIMIT $${idx}`;
+
+  console.log(`[search_invoices] query="${queryText}" words=${JSON.stringify(words)} direction=${args.direction || "any"}`);
+  console.log(`[search_invoices] SQL conditions: ${conditions.join(" AND ")}`);
+
+  const results = await sql.unsafe(query, params);
+  console.log(`[search_invoices] found ${results.length} results`);
+  if (results.length > 0) {
+    console.log(`[search_invoices] first result: ${results[0].number} - ${results[0].counterparty_name} - lines: ${clip(results[0].line_descriptions, 200)}`);
+  }
+
+  return results;
 }
 
 async function handleGetInvoiceDetail(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
@@ -779,8 +787,10 @@ async function executeToolHandler(
   sql: SqlClient,
   companyId: string,
   toolName: string,
+  // Log every tool call for debugging
   toolInput: Record<string, unknown>,
 ): Promise<unknown> {
+  console.log(`[tool_call] ${toolName} args=${JSON.stringify(toolInput)}`);
   switch (toolName) {
     case "get_invoices":
       return handleGetInvoices(sql, companyId, toolInput);
@@ -815,10 +825,12 @@ const SYSTEM_PROMPT = `Sei l'assistente AI di FinFlow, un gestionale finanziario
 
 Hai accesso ai dati dell'azienda tramite le seguenti funzioni. Quando l'utente chiede informazioni, usa le funzioni per recuperare dati reali. Non inventare mai dati. Per importi usa il formato italiano (1.234,56 €). Quando analizzi movimenti bancari, presta particolare attenzione al campo raw_text e extracted_refs per trovare riferimenti a fatture, mandati, contratti, rate.
 
-STRATEGIA DI RICERCA FATTURE:
+STRATEGIA DI RICERCA FATTURE — IMPORTANTE:
 - Per filtri strutturati (controparte, data, importo, tipo doc): usa get_invoices
-- Per ricerca testuale (prodotti, CIG, CUP, codici, keywords): usa search_invoices — cerca nelle righe fattura, extracted_summary, numero e controparte
+- IMPORTANTE: Quando l'utente cerca fatture per CONTENUTO (prodotti, materiali, articoli, descrizioni, servizi, codici, CIG, CUP, keywords), usa SEMPRE il tool search_invoices. Questo tool cerca anche nelle RIGHE FATTURA (invoice_lines.description) e nel riassunto AI (extracted_summary). Il tool get_invoices NON cerca nelle descrizioni delle righe fattura.
+- Esempi di quando usare search_invoices: "fatture con calcare", "fatture pietrisco", "forniture cemento", "fattura con CIG...", "chi ha fatturato per trasporti", "fatture relative a manutenzione"
 - Per dettaglio singola fattura con extracted_summary AI: usa get_invoice_detail
+- Se search_invoices ritorna 0 risultati, prova con parole chiave diverse o più corte (es. "calcar" invece di "calcare", "pietr" invece di "pietrisco")
 
 CONTROPARTI: get_counterparties supporta ordinamento per fatturato, credito o debito (order_by). Usa role per filtrare clienti/fornitori. Supporta date_from/date_to per statistiche nel periodo.
 
