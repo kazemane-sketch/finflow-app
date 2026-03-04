@@ -704,7 +704,7 @@ export default function BancaPage() {
   const runExtraction = useCallback(async () => {
     if (!companyId || extractionRunning) return
     setExtractionRunning(true)
-    setExtractionProgress({ processed: 0, total: transactions.length })
+    setExtractionProgress({ processed: 0, total: 0 })
     let totalProcessed = 0
     try {
       while (true) {
@@ -715,15 +715,21 @@ export default function BancaPage() {
         })
         const data = await res.json()
         if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+        // First response with nothing pending — already fully extracted
+        if (totalProcessed === 0 && (data.processed || 0) === 0 && (data.total_pending || 0) <= 0) {
+          alert('Tutti i riferimenti sono già stati estratti.')
+          break
+        }
         totalProcessed += (data.processed || 0)
         setExtractionProgress({ processed: totalProcessed, total: totalProcessed + (data.total_pending || 0) })
         if ((data.total_pending || 0) <= 0) break
       }
     } catch (e: any) {
       console.error('[Extraction]', e)
+      alert('Errore estrazione: ' + e.message)
     }
     setExtractionRunning(false)
-  }, [companyId, extractionRunning, transactions.length])
+  }, [companyId, extractionRunning])
 
   // Debounce text query
   useEffect(() => {
