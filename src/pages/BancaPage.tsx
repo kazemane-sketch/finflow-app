@@ -10,14 +10,15 @@ import {
 } from 'lucide-react'
 import {
   parseBankPdf, saveBankTransactions, ensureBankAccount, createImportBatch,
-  updateImportBatch, loadBankTransactions, loadBankAccounts, getClaudeApiKey,
+  updateImportBatch, loadBankTransactions, loadBankTransactionDetail, loadBankAccounts, getClaudeApiKey,
   updateBankAccountBalance,
   deleteBankTransactions, deleteAllBankTransactions, updateBankTransactionDirection,
   updateBankTransaction, verifyBankTransactions,
   getBankEmbeddingHealth,
-  type BankEmbeddingHealth,
+  type BankEmbeddingHealth, type BankTxFilters,
   type BankImportStats, type BankParseProgress, type BankParseResult, type BankTransaction,
 } from '@/lib/bankParser'
+import { verifyPassword } from '@/lib/invoiceSaver'
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
 import { getValidAccessToken, type AccessTokenError } from '@/lib/getValidAccessToken'
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges'
@@ -226,31 +227,41 @@ function ImportProgress({ progress, txCount }: { progress: BankParseProgress; tx
 }
 
 // ============================================================
-// DELETE CONFIRM MODAL
+// DELETE CONFIRM MODAL — with password verification
 // ============================================================
-function DeleteModal({ mode, count, onConfirm, onCancel }: {
-  mode: 'selected' | 'all'; count: number; onConfirm: () => void; onCancel: () => void;
+function ConfirmDeleteModal({ open, count, onConfirm, onCancel }: {
+  open: boolean; count: number; onConfirm: (pw: string) => void; onCancel: () => void;
 }) {
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+  const inputRef = useRef<HTMLInputElement>(null)
+  useEffect(() => { if (open) { setPassword(''); setError(''); setTimeout(() => inputRef.current?.focus(), 100) } }, [open])
+  if (!open) return null
+  const handleConfirm = async () => {
+    if (!password.trim()) { setError('Inserisci la password'); return }
+    setLoading(true); setError('')
+    const ok = await verifyPassword(password)
+    setLoading(false)
+    if (ok) onConfirm(password); else setError('Password errata')
+  }
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-white rounded-xl shadow-xl p-6 max-w-sm w-full mx-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={onCancel}>
+      <div className="bg-white rounded-xl shadow-2xl p-6 max-w-md w-full mx-4" onClick={e => e.stopPropagation()}>
         <div className="flex items-center gap-3 mb-4">
-          <div className="flex h-10 w-10 items-center justify-center rounded-full bg-red-100">
-            <AlertTriangle className="h-5 w-5 text-red-600" />
-          </div>
-          <div>
-            <p className="font-semibold text-gray-900">Conferma eliminazione</p>
-            <p className="text-sm text-gray-500">
-              {mode === 'all' ? 'Eliminare TUTTI i movimenti del conto?' : `Eliminare ${count} movimento/i selezionato/i?`}
-            </p>
-          </div>
+          <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center"><span className="text-red-600 text-lg">🗑</span></div>
+          <div><h3 className="text-lg font-bold text-gray-900">Conferma Eliminazione</h3><p className="text-sm text-gray-500">{count === 1 ? 'Stai per eliminare 1 movimento' : `Stai per eliminare ${count} movimenti`}</p></div>
         </div>
-        <p className="text-sm text-red-600 mb-5">⚠️ Questa azione è irreversibile.</p>
-        <div className="flex gap-3 justify-end">
-          <Button variant="outline" onClick={onCancel}>Annulla</Button>
-          <Button variant="destructive" onClick={onConfirm}>
-            <Trash2 className="h-3.5 w-3.5 mr-1.5" />Elimina
-          </Button>
+        <p className="text-sm text-gray-600 mb-4">Questa azione è <span className="font-semibold text-red-600">irreversibile</span>. Inserisci la tua password per confermare.</p>
+        <div className="mb-4">
+          <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
+          <input ref={inputRef} type="password" value={password} onChange={e => { setPassword(e.target.value); setError('') }} onKeyDown={e => e.key === 'Enter' && handleConfirm()}
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 outline-none" placeholder="Inserisci la tua password" />
+          {error && <p className="text-sm text-red-600 mt-1">{error}</p>}
+        </div>
+        <div className="flex justify-end gap-3">
+          <button onClick={onCancel} className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">Annulla</button>
+          <button onClick={handleConfirm} disabled={loading} className="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-50">{loading ? 'Verifica...' : `Elimina ${count} moviment${count === 1 ? 'o' : 'i'}`}</button>
         </div>
       </div>
     </div>
@@ -338,8 +349,10 @@ function SummaryReviewModal({
 // ============================================================
 // TRANSACTION ROW
 // ============================================================
-function TxRow({ tx, selected, onClick, onDoubleClick, suggestionScore }: {
-  tx: any; selected: boolean; onClick: (e: MouseEvent<HTMLDivElement>) => void; onDoubleClick?: (e: MouseEvent<HTMLDivElement>) => void; suggestionScore?: number
+function TxRow({ tx, selected, checked, selectMode, onClick, onCheck, onDoubleClick, suggestionScore }: {
+  tx: any; selected: boolean; checked?: boolean; selectMode?: boolean;
+  onClick: (e: MouseEvent<HTMLDivElement>) => void; onCheck?: () => void;
+  onDoubleClick?: (e: MouseEvent<HTMLDivElement>) => void; suggestionScore?: number
 }) {
   const direction = txDirection(tx)
   const isIn = direction === 'in'
@@ -357,6 +370,10 @@ function TxRow({ tx, selected, onClick, onDoubleClick, suggestionScore }: {
       className={`flex items-center gap-3 px-4 py-3 cursor-pointer border-b border-gray-100 transition-all select-none
         ${selected ? 'bg-sky-50 border-l-[3px] border-l-sky-500' : 'hover:bg-gray-50 border-l-[3px] border-l-transparent'}`}
     >
+      {selectMode && (
+        <input type="checkbox" checked={!!checked} onChange={onCheck}
+          className="accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />
+      )}
       <div className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${isIn ? 'bg-emerald-100' : 'bg-red-100'}`}>
         {isIn ? <TrendingUp className="h-4 w-4 text-emerald-600" /> : <TrendingDown className="h-4 w-4 text-red-600" />}
       </div>
@@ -615,13 +632,24 @@ export default function BancaPage() {
   const [loading, setLoading] = useState(false)
   const [selectedTx, setSelectedTx] = useState<any>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [selectMode, setSelectMode] = useState(false)
   const [query, setQuery] = useState('')
+  const [debouncedQuery, setDebouncedQuery] = useState('')
   const [dirFilter, setDirFilter] = useState<'all' | 'in' | 'out' | 'review'>('all')
   const [typeFilter, setTypeFilter] = useState<string>('all')
   const [dateFrom, setDateFrom] = useState<string>('')
   const [dateTo, setDateTo] = useState<string>('')
-  const [deleteModal, setDeleteModal] = useState<{ mode: 'selected' | 'all' } | null>(null)
+  const [deleteModal, setDeleteModal] = useState<{ open: boolean; ids: string[] }>({ open: false, ids: [] })
   const [deleting, setDeleting] = useState(false)
+
+  // Pagination
+  const PAGE_SIZE = 50
+  const [totalCount, setTotalCount] = useState(0)
+  const [page, setPage] = useState(0)
+  const [allLoaded, setAllLoaded] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const queryDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined)
   const [directionEditMode, setDirectionEditMode] = useState(false)
   const [directionDraft, setDirectionDraft] = useState<'in' | 'out'>('in')
   const [directionSaving, setDirectionSaving] = useState(false)
@@ -697,19 +725,79 @@ export default function BancaPage() {
     setExtractionRunning(false)
   }, [companyId, extractionRunning, transactions.length])
 
-  const loadData = useCallback(async () => {
+  // Debounce text query
+  useEffect(() => {
+    clearTimeout(queryDebounceRef.current)
+    queryDebounceRef.current = setTimeout(() => setDebouncedQuery(query), 300)
+    return () => clearTimeout(queryDebounceRef.current)
+  }, [query])
+
+  const buildFilters = useCallback((): BankTxFilters => ({
+    query: debouncedQuery || undefined,
+    direction: dirFilter,
+    transactionType: typeFilter,
+    dateFrom: dateFrom || undefined,
+    dateTo: dateTo || undefined,
+    candidateIds: aiResult?.candidateIds?.length ? aiResult.candidateIds : undefined,
+  }), [debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds])
+
+  const loadData = useCallback(async (reset = true) => {
     if (!companyId) return
-    setLoading(true)
+    if (reset) {
+      setLoading(true)
+      setPage(0)
+      setAllLoaded(false)
+    } else {
+      setLoadingMore(true)
+    }
+    const currentPage = reset ? 0 : page
+    const filters = buildFilters()
     try {
-      const [txs, accs] = await Promise.all([loadBankTransactions(companyId), loadBankAccounts(companyId)])
-      setTransactions(txs)
+      const [result, accs] = await Promise.all([
+        loadBankTransactions(companyId, filters, { page: currentPage, pageSize: PAGE_SIZE }),
+        reset ? loadBankAccounts(companyId) : Promise.resolve(bankAccounts),
+      ])
+      if (reset) {
+        setTransactions(result.data)
+      } else {
+        setTransactions(prev => [...prev, ...result.data])
+      }
+      setTotalCount(result.count)
       setBankAccounts(accs)
+      if (result.data.length < PAGE_SIZE) setAllLoaded(true)
     } catch (e: any) { console.error(e) }
     setLoading(false)
-    void refreshEmbeddingHealth()
-  }, [companyId, refreshEmbeddingHealth])
+    setLoadingMore(false)
+    if (reset) void refreshEmbeddingHealth()
+  }, [companyId, refreshEmbeddingHealth, buildFilters, page, bankAccounts])
 
-  useEffect(() => { loadData() }, [loadData])
+  // Initial load + reload when filters change
+  useEffect(() => {
+    if (!companyId) return
+    setPage(0)
+    setAllLoaded(false)
+    setTransactions([])
+    setTotalCount(0)
+    loadData(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyId, debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds?.join(',')])
+
+  // Load next page when page increments
+  useEffect(() => {
+    if (page > 0) loadData(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page])
+
+  // IntersectionObserver for infinite scroll
+  useEffect(() => {
+    if (!bottomRef.current || allLoaded || loadingMore || loading) return
+    const observer = new IntersectionObserver(
+      entries => { if (entries[0].isIntersecting) setPage(prev => prev + 1) },
+      { threshold: 0.1 },
+    )
+    observer.observe(bottomRef.current)
+    return () => observer.disconnect()
+  }, [allLoaded, loadingMore, loading])
 
   // Quick date filters
   const setQuickDate = (type: string) => {
@@ -746,10 +834,7 @@ export default function BancaPage() {
   }
 
   const handleRowClick = (tx: any, e: MouseEvent<HTMLDivElement>) => {
-    if (e.metaKey || e.ctrlKey || e.shiftKey) {
-      setSelectedTx(null)
-      setDirectionEditMode(false)
-      setEditMode(false)
+    if (selectMode) {
       setSelectedIds(prev => {
         const n = new Set(prev)
         n.has(tx.id) ? n.delete(tx.id) : n.add(tx.id)
@@ -757,25 +842,18 @@ export default function BancaPage() {
       })
       return
     }
-
-    if (selectedTx?.id === tx.id && selectedIds.size === 0) {
+    if (selectedTx?.id === tx.id) {
       setSelectedTx(null)
       setDirectionEditMode(false)
       setEditMode(false)
       return
     }
-    if (selectedIds.size > 0) {
-      setSelectedIds(prev => {
-        const n = new Set(prev)
-        n.has(tx.id) ? n.delete(tx.id) : n.add(tx.id)
-        return n
-      })
-      return
-    }
+    // Show lightweight data immediately, then lazy-load full detail
     setSelectedTx(tx)
     setDirectionDraft(txDirection(tx))
     setDirectionEditMode(false)
     setEditMode(false)
+    loadBankTransactionDetail(tx.id).then(full => { if (full) setSelectedTx(full) })
   }
 
   const initEditDraft = (tx: any) => ({
@@ -790,28 +868,30 @@ export default function BancaPage() {
   })
 
   const handleRowDoubleClick = (tx: any) => {
+    if (selectMode) return
     setSelectedIds(new Set())
     setSelectedTx(tx)
     setDirectionEditMode(false)
     setEditDraft(initEditDraft(tx))
     setEditMode(true)
+    loadBankTransactionDetail(tx.id).then(full => { if (full) setSelectedTx(full) })
   }
 
   const clearSelection = () => { setSelectedIds(new Set()); setSelectedTx(null); setDirectionEditMode(false); setEditMode(false) }
 
-  const handleDelete = async () => {
-    if (!deleteModal || !companyId) return
+  const handleDelete = async (_pw: string) => {
+    const ids = deleteModal.ids
+    setDeleteModal({ open: false, ids: [] })
     setDeleting(true)
     try {
-      if (deleteModal.mode === 'selected') {
-        await deleteBankTransactions(Array.from(selectedIds))
-        setSelectedIds(new Set()); setSelectedTx(null)
-      } else {
-        await deleteAllBankTransactions(companyId); setSelectedTx(null)
-      }
-      await loadData()
+      await deleteBankTransactions(ids)
+      setSelectedIds(new Set())
+      setSelectMode(false)
+      setSelectedTx(null)
+      setPage(0); setAllLoaded(false); setTransactions([])
+      await loadData(true)
     } catch (e: any) { alert('Errore eliminazione: ' + e.message) }
-    setDeleting(false); setDeleteModal(null)
+    setDeleting(false)
   }
 
   const handleSaveDirection = async () => {
@@ -1102,29 +1182,7 @@ export default function BancaPage() {
     if (fileRef.current) fileRef.current.value = ''
   }, [companyId, finalizeImport])
 
-  // Filters — AI candidateIds have absolute priority
-  const filtered = transactions.filter(tx => {
-    if (aiResult?.candidateIds?.length) {
-      return aiResult.candidateIds.includes(tx.id)
-    }
-
-    const direction = txDirection(tx)
-    if (dirFilter === 'in' && direction !== 'in') return false
-    if (dirFilter === 'out' && direction !== 'out') return false
-    if (dirFilter === 'review' && !tx.direction_needs_review && !tx.counterparty_needs_review) return false
-    if (typeFilter !== 'all' && tx.transaction_type !== typeFilter) return false
-    if (dateFrom && tx.date < dateFrom) return false
-    if (dateTo && tx.date > dateTo) return false
-
-    if (query) {
-      const q = query.toLowerCase()
-      return (tx.description?.toLowerCase().includes(q)) ||
-        (tx.counterparty_name?.toLowerCase().includes(q)) ||
-        (tx.invoice_ref?.toLowerCase().includes(q)) ||
-        (tx.reference?.toLowerCase().includes(q))
-    }
-    return true
-  })
+  // Filters are now server-side — `transactions` already contains filtered results
 
   const handleAiSearch = async () => {
     if (!query.trim()) return
@@ -1212,17 +1270,24 @@ export default function BancaPage() {
     setAiLoading(false)
   }
 
-  // KPI su dati filtrati
-  const totalIn = filtered
+  // KPI su dati caricati
+  const totalIn = transactions
     .filter(t => txDirection(t) === 'in')
     .reduce((s, t) => s + Math.abs(Number(t.amount || 0)), 0)
-  const totalOut = filtered
+  const totalOut = transactions
     .filter(t => txDirection(t) === 'out')
     .reduce((s, t) => s + Math.abs(Number(t.amount || 0)), 0)
   const latestBalance = transactions[0]?.balance
   const uniqueTypes = [...new Set(transactions.map(t => t.transaction_type).filter(Boolean))]
-  const isMultiSelect = selectedIds.size > 0
   const hasDateFilter = !!(dateFrom || dateTo)
+
+  // Multi-select helpers
+  const selectAll = () => {
+    const allChecked = transactions.length > 0 && transactions.every(t => selectedIds.has(t.id))
+    if (allChecked) setSelectedIds(new Set())
+    else setSelectedIds(new Set(transactions.map(t => t.id)))
+  }
+  const allChecked = transactions.length > 0 && transactions.every(t => selectedIds.has(t.id))
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -1237,12 +1302,12 @@ export default function BancaPage() {
             </div>
             <div className="flex items-center gap-2 flex-wrap">
               {transactions.length > 0 && (
-                <Button variant="outline" size="sm" className="text-red-600 border-red-200 hover:bg-red-50"
-                  onClick={() => setDeleteModal({ mode: 'all' })}>
-                  <Trash2 className="h-3.5 w-3.5 mr-1.5" />Svuota tutto
+                <Button variant="outline" size="sm"
+                  onClick={() => { setSelectMode(!selectMode); if (selectMode) { setSelectedIds(new Set()) } }}>
+                  {selectMode ? <><X className="h-3.5 w-3.5 mr-1.5" />Esci selezione</> : <>☐ Seleziona</>}
                 </Button>
               )}
-              <Button variant="outline" size="sm" onClick={loadData} disabled={loading}>
+              <Button variant="outline" size="sm" onClick={() => loadData(true)} disabled={loading}>
                 <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`} />Aggiorna
               </Button>
               <Button size="sm" onClick={() => fileRef.current?.click()} disabled={importing || !companyId}>
@@ -1254,20 +1319,26 @@ export default function BancaPage() {
 
 
 
-          {isMultiSelect && (
+          {selectMode && (
             <div className="flex items-center gap-3 p-3 bg-sky-50 border border-sky-200 rounded-lg">
-              <span className="text-sm font-medium text-sky-800">{selectedIds.size} movimento/i selezionati</span>
-              <Button variant="destructive" size="sm" onClick={() => setDeleteModal({ mode: 'selected' })}>
-                <Trash2 className="h-3.5 w-3.5 mr-1.5" />Elimina selezionati
-              </Button>
-              <Button variant="outline" size="sm" onClick={handleBulkVerify}>
-                <CheckCircle className="h-3.5 w-3.5 mr-1.5" />Verifica selezionati
-              </Button>
-              <Button variant="outline" size="sm" onClick={clearSelection}>Deseleziona tutto</Button>
+              <button onClick={selectAll} className="px-2 py-1 text-[10px] font-semibold bg-gray-100 text-gray-600 rounded hover:bg-gray-200">
+                {allChecked ? 'Deseleziona tutti' : 'Seleziona tutti'}
+              </button>
+              <span className="text-sm font-medium text-sky-800">{selectedIds.size} selezionati</span>
+              {selectedIds.size > 0 && (
+                <>
+                  <Button variant="destructive" size="sm" onClick={() => setDeleteModal({ open: true, ids: Array.from(selectedIds) })}>
+                    <Trash2 className="h-3.5 w-3.5 mr-1.5" />Elimina {selectedIds.size}
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={handleBulkVerify}>
+                    <CheckCircle className="h-3.5 w-3.5 mr-1.5" />Verifica selezionati
+                  </Button>
+                </>
+              )}
             </div>
           )}
 
-          {transactions.length > 0 && !isMultiSelect && (
+          {transactions.length > 0 && !selectMode && (
             <p className="text-[11px] text-gray-400">
               💡 Clicca su un movimento per i dettagli · Doppio click per modifica · Ctrl/Cmd+click per selezione multipla
             </p>
@@ -1533,21 +1604,31 @@ export default function BancaPage() {
             <Card>
               <CardHeader className="py-2.5 px-4 border-b">
                 <CardTitle className="text-sm font-semibold">
-                  Movimenti ({filtered.length}{filtered.length !== transactions.length ? ` di ${transactions.length}` : ''})
+                  Movimenti ({totalCount}{transactions.length < totalCount ? `, caricati ${transactions.length}` : ''})
                 </CardTitle>
               </CardHeader>
               <div className="divide-y divide-gray-50 max-h-[calc(100vh-420px)] overflow-y-auto">
-                {filtered.length === 0
+                {transactions.length === 0 && !loading
                   ? <p className="text-sm text-gray-400 text-center py-10">Nessun risultato</p>
-                  : filtered.map(tx => (
+                  : transactions.map(tx => (
                     <TxRow
                       key={tx.id} tx={tx}
-                      selected={selectedIds.has(tx.id) || (!isMultiSelect && selectedTx?.id === tx.id)}
+                      selected={selectedIds.has(tx.id) || (!selectMode && selectedTx?.id === tx.id)}
+                      checked={selectedIds.has(tx.id)}
+                      selectMode={selectMode}
                       onClick={(e) => handleRowClick(tx, e)}
+                      onCheck={() => setSelectedIds(prev => {
+                        const n = new Set(prev); n.has(tx.id) ? n.delete(tx.id) : n.add(tx.id); return n
+                      })}
                       onDoubleClick={() => handleRowDoubleClick(tx)}
                       suggestionScore={txScores.get(tx.id)}
                     />
                   ))}
+                {!allLoaded && (
+                  <div ref={bottomRef} className="py-4 text-center text-xs text-gray-400">
+                    {loadingMore ? 'Caricamento...' : ''}
+                  </div>
+                )}
               </div>
             </Card>
           )}
@@ -1555,7 +1636,7 @@ export default function BancaPage() {
       </div>
 
       {/* RIGHT DETAIL PANEL */}
-      {selectedTx && !isMultiSelect && (
+      {selectedTx && !selectMode && (
         <div className="hidden lg:block w-72 xl:w-80 flex-shrink-0 overflow-hidden border-l h-full">
           <BankTxDetail
             tx={selectedTx}
@@ -1603,10 +1684,8 @@ export default function BancaPage() {
         />
       )}
 
-      {deleteModal && (
-        <DeleteModal mode={deleteModal.mode} count={selectedIds.size}
-          onConfirm={handleDelete} onCancel={() => !deleting && setDeleteModal(null)} />
-      )}
+      <ConfirmDeleteModal open={deleteModal.open} count={deleteModal.ids.length}
+        onConfirm={handleDelete} onCancel={() => !deleting && setDeleteModal({ open: false, ids: [] })} />
     </div>
   )
 }

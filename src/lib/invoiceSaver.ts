@@ -293,27 +293,65 @@ export async function saveInvoicesToDB(
 }
 
 // ============================================================
-// LOAD — carica lista fatture
+// LOAD — carica lista fatture con filtri e paginazione
 // ============================================================
-export async function loadInvoices(companyId: string): Promise<DBInvoice[]> {
-  const { data, error } = await supabase
-    .from('invoices')
-    .select('id, company_id, counterparty_id, counterparty_status_snapshot, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, paid_date, payment_status, reconciliation_status, sdi_id, notes, source_filename, parse_method, xml_hash, created_at')
-    .eq('company_id', companyId)
-    .order('date', { ascending: false })
-    .range(0, 4999);
+const INVOICE_LIST_COLS = 'id, company_id, counterparty_id, counterparty_status_snapshot, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, paid_date, payment_status, reconciliation_status, sdi_id, notes, source_filename, parse_method, xml_hash, extraction_status, created_at';
 
+export interface InvoiceFilters {
+  direction?: 'all' | 'in' | 'out';
+  status?: 'all' | 'pending' | 'overdue' | 'paid';
+  dateFrom?: string;
+  dateTo?: string;
+  query?: string;
+  candidateIds?: string[];
+}
+
+export async function loadInvoices(
+  companyId: string,
+  filters?: InvoiceFilters,
+  pagination?: { page: number; pageSize: number },
+): Promise<{ data: DBInvoice[]; count: number }> {
+  const page = pagination?.page ?? 0;
+  const pageSize = pagination?.pageSize ?? 50;
+  const from = page * pageSize;
+  const to = from + pageSize - 1;
+
+  let q = supabase.from('invoices')
+    .select(INVOICE_LIST_COLS, { count: 'exact' })
+    .eq('company_id', companyId);
+
+  if (filters?.candidateIds?.length) {
+    q = q.in('id', filters.candidateIds);
+  } else {
+    if (filters?.direction && filters.direction !== 'all') {
+      q = q.eq('direction', filters.direction);
+    }
+    if (filters?.status && filters.status !== 'all') {
+      q = q.eq('payment_status', filters.status);
+    }
+    if (filters?.dateFrom) q = q.gte('date', filters.dateFrom);
+    if (filters?.dateTo) q = q.lte('date', filters.dateTo);
+    if (filters?.query) {
+      const p = `%${filters.query}%`;
+      q = q.or(`number.ilike.${p},source_filename.ilike.${p}`);
+    }
+  }
+
+  q = q.order('date', { ascending: false }).range(from, to);
+  const { data, error, count } = await q;
   if (error) throw new Error(error.message);
   const rows = (data || []) as DBInvoice[];
+
+  // Enrich counterparty status
   const hasLinkedCounterparty = rows.some((r) => Boolean(r.counterparty_id));
-  if (!hasLinkedCounterparty) return rows;
+  if (!hasLinkedCounterparty) return { data: rows, count: count ?? 0 };
 
   const { data: statuses, error: statusErr } = await supabase
     .from('counterparties')
     .select('id, status')
     .eq('company_id', companyId);
 
-  if (statusErr || !statuses) return rows;
+  if (statusErr || !statuses) return { data: rows, count: count ?? 0 };
 
   const statusMap = new Map<string, string>(
     statuses
@@ -321,12 +359,39 @@ export async function loadInvoices(companyId: string): Promise<DBInvoice[]> {
       .map((s: any) => [String(s.id), String(s.status)]),
   );
 
-  return rows.map((row) => ({
+  const enriched = rows.map((row) => ({
     ...row,
     counterparty_status_snapshot: row.counterparty_id
       ? (statusMap.get(row.counterparty_id) || row.counterparty_status_snapshot)
       : row.counterparty_status_snapshot,
   }));
+
+  return { data: enriched, count: count ?? 0 };
+}
+
+/** Load invoice stats (counts by status) — lightweight HEAD queries */
+export async function loadInvoiceStats(
+  companyId: string,
+  filters?: Omit<InvoiceFilters, 'candidateIds'>,
+): Promise<{ total: number; daPagare: number; scadute: number; pagate: number }> {
+  const buildQ = (status?: string) => {
+    let q = supabase.from('invoices').select('id', { count: 'exact', head: true }).eq('company_id', companyId);
+    if (filters?.direction && filters.direction !== 'all') q = q.eq('direction', filters.direction);
+    if (filters?.dateFrom) q = q.gte('date', filters.dateFrom);
+    if (filters?.dateTo) q = q.lte('date', filters.dateTo);
+    if (filters?.query) { const p = `%${filters.query}%`; q = q.or(`number.ilike.${p},source_filename.ilike.${p}`); }
+    if (status) q = q.eq('payment_status', status);
+    return q;
+  };
+  const [total, pending, overdue, paid] = await Promise.all([
+    buildQ(), buildQ('pending'), buildQ('overdue'), buildQ('paid'),
+  ]);
+  return {
+    total: total.count ?? 0,
+    daPagare: pending.count ?? 0,
+    scadute: overdue.count ?? 0,
+    pagate: paid.count ?? 0,
+  };
 }
 
 // ============================================================

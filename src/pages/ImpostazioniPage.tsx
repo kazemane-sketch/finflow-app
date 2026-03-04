@@ -190,16 +190,22 @@ export default function ImpostazioniPage() {
 
     setSavingDefaults(true)
     try {
-      const { error } = await supabase
+      const { error, count } = await supabase
         .from('companies')
         .update({
           default_dso_days: Math.round(dso),
           default_pso_days: Math.round(pso),
           updated_at: new Date().toISOString(),
-        })
+        }, { count: 'exact' })
         .eq('id', companyId)
       if (error) throw error
+      if (count === 0) {
+        alert('Impossibile aggiornare: verifica di avere il ruolo owner/admin.')
+        setSavingDefaults(false)
+        return
+      }
       await refetchCompany()
+      alert('Default scadenze salvati.')
     } catch (e: any) {
       alert('Errore salvataggio default scadenze: ' + e.message)
     }

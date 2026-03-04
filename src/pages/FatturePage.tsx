@@ -4,9 +4,9 @@ import { useState, useCallback, useRef, useEffect, useSyncExternalStore } from '
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { processInvoiceFile, TIPO, MP, REG } from '@/lib/invoiceParser';
 import {
-  saveInvoicesToDB, loadInvoices, loadInvoiceDetail,
+  saveInvoicesToDB, loadInvoices, loadInvoiceDetail, loadInvoiceStats,
   deleteInvoices, updateInvoice, verifyPassword,
-  type DBInvoice, type DBInvoiceDetail, type InvoiceUpdate,
+  type DBInvoice, type DBInvoiceDetail, type InvoiceUpdate, type InvoiceFilters,
 } from '@/lib/invoiceSaver';
 import { listInstallmentsForInvoice, type InvoiceInstallment } from '@/lib/scadenzario';
 import { aiSearchInvoices, type AISearchResult } from '@/lib/aiSearch';
@@ -659,6 +659,17 @@ export default function FatturePage() {
   const [installments, setInstallments] = useState<InvoiceInstallment[]>([]);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [loadingList, setLoadingList] = useState(false);
+
+  // Pagination
+  const PAGE_SIZE = 50;
+  const [totalCount, setTotalCount] = useState(0);
+  const [page, setPage] = useState(0);
+  const [allLoaded, setAllLoaded] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const queryDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const [serverStats, setServerStats] = useState<{ total: number; daPagare: number; scadute: number; pagate: number } | null>(null);
   const [importing, setImporting] = useState(false);
   const [importPhase, setImportPhase] = useState<'reading' | 'saving' | 'done'>('reading');
   const [importCurrent, setImportCurrent] = useState(0);
@@ -707,13 +718,72 @@ export default function FatturePage() {
     loadExtStats(companyId, invoices.length);
   }, [companyId, invoices.length]);
 
-  const reload = useCallback(async () => {
+  // Debounce text query
+  useEffect(() => {
+    clearTimeout(queryDebounceRef.current);
+    queryDebounceRef.current = setTimeout(() => setDebouncedQuery(query), 300);
+    return () => clearTimeout(queryDebounceRef.current);
+  }, [query]);
+
+  const buildFilters = useCallback((): InvoiceFilters => ({
+    direction: directionFilter,
+    status: statusFilter,
+    dateFrom: dateFrom || undefined,
+    dateTo: dateTo || undefined,
+    query: debouncedQuery || undefined,
+    candidateIds: aiResult?.ids?.length ? aiResult.ids : undefined,
+  }), [directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.ids]);
+
+  const reload = useCallback(async (reset = true) => {
     if (!companyId) return;
-    setLoadingList(true);
-    try { setInvoices(await loadInvoices(companyId)); } catch (e) { console.error('Errore:', e); }
+    if (reset) {
+      setLoadingList(true);
+      setPage(0);
+      setAllLoaded(false);
+    } else {
+      setLoadingMore(true);
+    }
+    const currentPage = reset ? 0 : page;
+    const filters = buildFilters();
+    try {
+      const result = await loadInvoices(companyId, filters, { page: currentPage, pageSize: PAGE_SIZE });
+      if (reset) {
+        setInvoices(result.data);
+        // Load stats in parallel for header
+        const stats = await loadInvoiceStats(companyId, { direction: filters.direction, dateFrom: filters.dateFrom, dateTo: filters.dateTo, query: filters.query });
+        setServerStats(stats);
+      } else {
+        setInvoices(prev => [...prev, ...result.data]);
+      }
+      setTotalCount(result.count);
+      if (result.data.length < PAGE_SIZE) setAllLoaded(true);
+    } catch (e) { console.error('Errore:', e); }
     setLoadingList(false);
-  }, [companyId]);
-  useEffect(() => { reload(); }, [reload]);
+    setLoadingMore(false);
+  }, [companyId, buildFilters, page]);
+
+  // Initial load + reload when filters change
+  useEffect(() => {
+    if (!companyId) return;
+    setPage(0); setAllLoaded(false); setInvoices([]); setTotalCount(0);
+    reload(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyId, directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.ids?.join(',')]);
+
+  // Load next page
+  useEffect(() => { if (page > 0) reload(false); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [page]);
+
+  // IntersectionObserver for infinite scroll
+  useEffect(() => {
+    if (!bottomRef.current || allLoaded || loadingMore || loadingList) return;
+    const observer = new IntersectionObserver(
+      entries => { if (entries[0].isIntersecting) setPage(prev => prev + 1); },
+      { threshold: 0.1 },
+    );
+    observer.observe(bottomRef.current);
+    return () => observer.disconnect();
+  }, [allLoaded, loadingMore, loadingList]);
+
   useEffect(() => { if (invoices.length > 0) loadExtractionStats(); }, [invoices.length, loadExtractionStats]);
 
   useEffect(() => {
@@ -798,7 +868,7 @@ export default function FatturePage() {
       setImportCurrent(cur); setImportTotal(tot);
       setImportLogs(prev => [...prev, { fn, status: status === 'ok' ? 'ok' : status === 'duplicate' ? 'duplicate' : 'error_save', message: status === 'error' ? 'Errore salvataggio' : undefined }]);
     });
-    setImportPhase('done'); await reload(); setTimeout(() => setImporting(false), 3000);
+    setImportPhase('done'); await reload(true); setTimeout(() => setImporting(false), 3000);
   }, [companyId, ensureCompany, refetchCompany, reload]);
 
   const handleDeleteConfirm = useCallback(async (_pw: string) => {
@@ -806,49 +876,32 @@ export default function FatturePage() {
     try { await deleteInvoices(ids); } catch {}
     setChecked(new Set()); setSelectMode(false);
     if (ids.includes(selectedId || '')) setSelectedId(null);
-    await reload();
+    setPage(0); setAllLoaded(false); setInvoices([]);
+    await reload(true);
   }, [deleteModal.ids, selectedId, reload]);
 
-  const handleEdit = useCallback(async (u: InvoiceUpdate) => { if (!selectedId) return; await updateInvoice(selectedId, u); await reload(); }, [selectedId, reload]);
+  const handleEdit = useCallback(async (u: InvoiceUpdate) => { if (!selectedId) return; await updateInvoice(selectedId, u); await reload(true); }, [selectedId, reload]);
 
-  // ── Filtering logic ──
-  const filtered = invoices.filter(inv => {
-    // Direction filter
-    if (directionFilter !== 'all' && inv.direction !== directionFilter) return false;
-    // Status filter
-    if (statusFilter !== 'all' && inv.payment_status !== statusFilter) return false;
-    // Date filter
-    if (dateFrom && inv.date < dateFrom) return false;
-    if (dateTo && inv.date > dateTo) return false;
-    // AI search mode: filter by AI result IDs
-    if (aiResult) return aiResult.ids.includes(inv.id);
-    // Text search (instant, no AI)
-    if (!query) return true;
-    const s = query.toLowerCase(); const cp = (inv.counterparty || {}) as any;
-    return (cp?.denom || '').toLowerCase().includes(s) || inv.number.toLowerCase().includes(s) || inv.source_filename.toLowerCase().includes(s);
-  });
+  // Filters are now server-side — `invoices` already contains filtered results
 
   const toggleCheck = (id: string) => setChecked(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
   const selectAll = () => {
-    const fids = new Set(filtered.map(i => i.id));
-    const allC = filtered.every(i => checked.has(i.id));
-    setChecked(prev => { const n = new Set(prev); fids.forEach(id => allC ? n.delete(id) : n.add(id)); return n; });
+    const allC = invoices.length > 0 && invoices.every(i => checked.has(i.id));
+    if (allC) setChecked(new Set());
+    else setChecked(new Set(invoices.map(i => i.id)));
   };
 
-  // ── Stats: based on filtered results ──
+  // ── Stats: from server-side counts + loaded data for amounts ──
   const stats = {
-    total: filtered.length,
-    totalAmount: filtered.reduce((s, i) => s + (i.doc_type === 'TD04' ? -1 : 1) * i.total_amount, 0),
-    daPagare: filtered.filter(i => i.payment_status === 'pending').length,
-    scadute: filtered.filter(i => i.payment_status === 'overdue').length,
-    pagate: filtered.filter(i => i.payment_status === 'paid').length,
-    counterparties: new Set(filtered.map(i => (i.counterparty as any)?.denom || i.source_filename)).size,
+    total: serverStats?.total ?? totalCount,
+    totalAmount: invoices.reduce((s, i) => s + (i.doc_type === 'TD04' ? -1 : 1) * i.total_amount, 0),
+    daPagare: serverStats?.daPagare ?? invoices.filter(i => i.payment_status === 'pending').length,
+    scadute: serverStats?.scadute ?? invoices.filter(i => i.payment_status === 'overdue').length,
+    pagate: serverStats?.pagate ?? invoices.filter(i => i.payment_status === 'paid').length,
+    counterparties: new Set(invoices.map(i => (i.counterparty as any)?.denom || i.source_filename)).size,
   };
   const selectedInvoice = invoices.find(i => i.id === selectedId);
-  const allFilteredChecked = filtered.length > 0 && filtered.every(i => checked.has(i.id));
-
-  // Total for current direction (before other filters) for reference
-  const dirTotal = invoices.filter(i => directionFilter === 'all' || i.direction === directionFilter).length;
+  const allFilteredChecked = invoices.length > 0 && invoices.every(i => checked.has(i.id));
 
   return (
     <div className="h-full flex flex-col bg-gray-50">
@@ -856,7 +909,7 @@ export default function FatturePage() {
       {/* Top bar */}
       <div className="flex items-center gap-3 px-4 py-2.5 bg-white border-b shadow-sm flex-shrink-0 flex-wrap print:hidden">
         <h1 className="text-lg font-bold text-gray-800">📄 Fatture {directionFilter === 'out' ? 'Attive' : directionFilter === 'in' ? 'Passive' : ''}</h1><div className="flex-1" />
-        <span className="text-xs px-2 py-1 bg-gray-100 rounded font-medium">{stats.total}{stats.total !== dirTotal ? `/${dirTotal}` : ''} fatture</span>
+        <span className="text-xs px-2 py-1 bg-gray-100 rounded font-medium">{stats.total} fatture</span>
         <span className="text-xs px-2 py-1 bg-yellow-100 text-yellow-800 rounded font-medium">{stats.daPagare} {directionFilter === 'out' ? 'da incassare' : 'da pagare'}</span>
         {stats.scadute > 0 && <span className="text-xs px-2 py-1 bg-red-100 text-red-800 rounded font-medium">{stats.scadute} scadute</span>}
         <span className="text-xs px-2 py-1 bg-green-100 text-green-800 rounded font-medium">{stats.pagate} {directionFilter === 'out' ? 'incassate' : 'pagate'}</span>
@@ -960,8 +1013,11 @@ export default function FatturePage() {
           </div>
           <div className="flex-1 overflow-y-auto">
             {loadingList || companyLoading ? <div className="text-center py-8 text-gray-400 text-sm">Caricamento...</div>
-              : filtered.length === 0 ? <div className="text-center py-8 text-gray-400 text-sm">{invoices.length === 0 ? 'Nessuna fattura importata' : 'Nessun risultato'}</div>
-              : filtered.map(inv => <InvoiceCard key={inv.id} inv={inv} selected={selectedId === inv.id} checked={checked.has(inv.id)} selectMode={selectMode} onSelect={() => setSelectedId(inv.id)} onCheck={() => toggleCheck(inv.id)} isMatched={matchedInvoiceIds.has(inv.id)} suggestionScore={invoiceScores.get(inv.id)} />)}
+              : invoices.length === 0 ? <div className="text-center py-8 text-gray-400 text-sm">Nessun risultato</div>
+              : <>
+                {invoices.map(inv => <InvoiceCard key={inv.id} inv={inv} selected={selectedId === inv.id} checked={checked.has(inv.id)} selectMode={selectMode} onSelect={() => setSelectedId(inv.id)} onCheck={() => toggleCheck(inv.id)} isMatched={matchedInvoiceIds.has(inv.id)} suggestionScore={invoiceScores.get(inv.id)} />)}
+                {!allLoaded && <div ref={bottomRef} className="py-4 text-center text-xs text-gray-400">{loadingMore ? 'Caricamento...' : ''}</div>}
+              </>}
           </div>
         </div>
         {/* Detail */}

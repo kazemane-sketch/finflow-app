@@ -764,11 +764,72 @@ export async function updateImportBatch(
   }).eq('id', batchId);
 }
 
-export async function loadBankTransactions(companyId: string): Promise<any[]> {
-  const { data, error } = await supabase.from('bank_transactions').select('*')
-    .eq('company_id', companyId).order('date', { ascending: false });
+// Columns for list view — excludes heavy fields (raw_text, extracted_refs, embedding, embedding_error)
+const BANK_TX_LIST_COLS = `id, company_id, bank_account_id, date, value_date, amount, balance,
+  description, description_source, description_confidence,
+  counterparty_name, counterparty_source, counterparty_confidence,
+  counterparty_needs_review, counterparty_account,
+  transaction_type, direction, direction_source, direction_confidence,
+  direction_needs_review, direction_reason, direction_updated_at,
+  reference, invoice_ref, cbi_flow_id, branch, commission_amount,
+  reconciliation_status, extraction_status, embedding_status,
+  summary_reason, created_at, updated_at`;
+
+export interface BankTxFilters {
+  query?: string;
+  direction?: 'all' | 'in' | 'out' | 'review';
+  transactionType?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  candidateIds?: string[];
+}
+
+export async function loadBankTransactions(
+  companyId: string,
+  filters?: BankTxFilters,
+  pagination?: { page: number; pageSize: number },
+): Promise<{ data: any[]; count: number }> {
+  const page = pagination?.page ?? 0;
+  const pageSize = pagination?.pageSize ?? 50;
+  const from = page * pageSize;
+  const to = from + pageSize - 1;
+
+  let q = supabase.from('bank_transactions')
+    .select(BANK_TX_LIST_COLS, { count: 'exact' })
+    .eq('company_id', companyId);
+
+  if (filters?.candidateIds?.length) {
+    q = q.in('id', filters.candidateIds);
+  } else {
+    if (filters?.direction === 'in') {
+      q = q.eq('direction', 'in');
+    } else if (filters?.direction === 'out') {
+      q = q.eq('direction', 'out');
+    } else if (filters?.direction === 'review') {
+      q = q.or('direction_needs_review.eq.true,counterparty_needs_review.eq.true');
+    }
+    if (filters?.transactionType && filters.transactionType !== 'all') {
+      q = q.eq('transaction_type', filters.transactionType);
+    }
+    if (filters?.dateFrom) q = q.gte('date', filters.dateFrom);
+    if (filters?.dateTo) q = q.lte('date', filters.dateTo);
+    if (filters?.query) {
+      const p = `%${filters.query}%`;
+      q = q.or(`description.ilike.${p},counterparty_name.ilike.${p},invoice_ref.ilike.${p},reference.ilike.${p}`);
+    }
+  }
+
+  q = q.order('date', { ascending: false }).range(from, to);
+  const { data, error, count } = await q;
   if (error) throw new Error(error.message);
-  return data || [];
+  return { data: data || [], count: count ?? 0 };
+}
+
+export async function loadBankTransactionDetail(txId: string): Promise<any | null> {
+  const { data, error } = await supabase.from('bank_transactions')
+    .select('*').eq('id', txId).single();
+  if (error) return null;
+  return data;
 }
 
 export async function getBankEmbeddingHealth(companyId: string): Promise<BankEmbeddingHealth | null> {
