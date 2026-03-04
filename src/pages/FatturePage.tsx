@@ -13,6 +13,7 @@ import { aiSearchInvoices, type AISearchResult } from '@/lib/aiSearch';
 import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client';
+import { getValidAccessToken } from '@/lib/getValidAccessToken';
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges';
 import { ReconciledIcon, ReconciliationDot } from '@/components/ReconciliationIndicators';
 
@@ -688,10 +689,11 @@ export default function FatturePage() {
     setExtractionProgress({ processed: 0, total: invoices.length });
     let totalProcessed = 0;
     try {
+      const token = await getValidAccessToken();
       while (true) {
         const res = await fetch(`${SUPABASE_URL}/functions/v1/invoice-extract-summary`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
+          headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY, 'Authorization': `Bearer ${token}` },
           body: JSON.stringify({ company_id: companyId, batch_size: 50 }),
         });
         const data = await res.json();
@@ -704,6 +706,7 @@ export default function FatturePage() {
       loadExtractionStats();
     } catch (e: any) {
       console.error('[Invoice Extraction]', e);
+      alert(`Errore estrazione: ${e.message || e}`);
     }
     setExtractionRunning(false);
   }, [companyId, extractionRunning, invoices.length]);
@@ -711,9 +714,10 @@ export default function FatturePage() {
   const loadExtractionStats = useCallback(async () => {
     if (!companyId) return;
     try {
+      const token = await getValidAccessToken();
       const res = await fetch(`${SUPABASE_URL}/functions/v1/invoice-extract-summary`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
+        headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY, 'Authorization': `Bearer ${token}` },
         body: JSON.stringify({ company_id: companyId, batch_size: 0 }),
       });
       const data = await res.json();
