@@ -734,6 +734,9 @@ export default function BancaPage() {
   const [typeFilter, setTypeFilter] = useState<string>('all')
   const [dateFrom, setDateFrom] = useState<string>('')
   const [dateTo, setDateTo] = useState<string>('')
+  const [amountMin, setAmountMin] = useState<number | undefined>(undefined)
+  const [amountMax, setAmountMax] = useState<number | undefined>(undefined)
+  const [counterpartyPattern, setCounterpartyPattern] = useState<string | undefined>(undefined)
   const [deleteModal, setDeleteModal] = useState<{ open: boolean; ids: string[] }>({ open: false, ids: [] })
   const [deleting, setDeleting] = useState(false)
 
@@ -852,6 +855,12 @@ export default function BancaPage() {
     return () => clearTimeout(queryDebounceRef.current)
   }, [query])
 
+  // Helper: reset all filters to defaults (used on AI search start, query clear, etc.)
+  const resetAllFilters = useCallback(() => {
+    setDateFrom(''); setDateTo(''); setDirFilter('all'); setTypeFilter('all')
+    setAmountMin(undefined); setAmountMax(undefined); setCounterpartyPattern(undefined)
+  }, [])
+
   const buildFilters = useCallback((): BankTxFilters => ({
     query: debouncedQuery || undefined,
     direction: dirFilter,
@@ -859,7 +868,10 @@ export default function BancaPage() {
     dateFrom: dateFrom || undefined,
     dateTo: dateTo || undefined,
     candidateIds: aiResult?.candidateIds?.length ? aiResult.candidateIds : undefined,
-  }), [debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds])
+    amountMin,
+    amountMax,
+    counterpartyPattern,
+  }), [debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds, amountMin, amountMax, counterpartyPattern])
 
   const loadData = useCallback(async (reset = true) => {
     if (!companyId) return
@@ -909,7 +921,7 @@ export default function BancaPage() {
     setTotalCount(0)
     loadData(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [companyId, debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds?.join(',')])
+  }, [companyId, debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds?.join(','), amountMin, amountMax, counterpartyPattern])
 
   // One-time saldo cleanup check on mount
   useEffect(() => {
@@ -1396,7 +1408,7 @@ export default function BancaPage() {
     }
     setAiLoading(true); setAiResult(null)
     // Reset ALL filters before AI search — each search starts completely fresh
-    setDateFrom(''); setDateTo(''); setDirFilter('all'); setTypeFilter('all')
+    resetAllFilters()
     try {
       // AI search always searches across ALL data — don't restrict by current date/direction filters.
       // If the query is time-related (e.g. "ottobre"), the AI will return filter mode with appropriate dates.
@@ -1406,7 +1418,7 @@ export default function BancaPage() {
         direction: 'all',
         date_from: null,
         date_to: null,
-        limit: 200,
+        limit: 500,
       }
 
       const result = await askBankAiSearch(payload)
@@ -1423,7 +1435,11 @@ export default function BancaPage() {
         setDateFrom(f.date_from || '')
         setDateTo(f.date_to || '')
         setDirFilter(f.direction === 'in' || f.direction === 'out' ? f.direction : 'all')
-        setTypeFilter('all')
+        setTypeFilter(Array.isArray(f.transaction_types) && f.transaction_types.length === 1 ? f.transaction_types[0] : 'all')
+        // Apply amount range and counterparty filters
+        setAmountMin(typeof f.amount_min === 'number' ? f.amount_min : undefined)
+        setAmountMax(typeof f.amount_max === 'number' ? f.amount_max : undefined)
+        setCounterpartyPattern(f.counterparty_pattern || undefined)
         // Clear text query — AI has converted it to structured filters;
         // leaving it would cause the text filter to exclude all transactions.
         // Also clear debounced query immediately + cancel pending debounce timer
@@ -1484,7 +1500,7 @@ export default function BancaPage() {
   const latestBalance = balanceInfo?.opening_balance_confirmed ? balanceInfo.computed_balance : null
   const uniqueTypes = [...new Set(transactions.map(t => t.transaction_type).filter(Boolean))]
   const hasDateFilter = !!(dateFrom || dateTo)
-  const hasActiveFilters = !!(debouncedQuery || dirFilter !== 'all' || typeFilter !== 'all' || hasDateFilter || aiResult)
+  const hasActiveFilters = !!(debouncedQuery || dirFilter !== 'all' || typeFilter !== 'all' || hasDateFilter || aiResult || amountMin != null || amountMax != null || counterpartyPattern)
 
   // Multi-select helpers
   const selectAll = () => {
@@ -1771,7 +1787,7 @@ export default function BancaPage() {
                       if (aiResult) {
                         // Clear previous AI search + any AI-applied filters
                         setAiResult(null)
-                        setDateFrom(''); setDateTo(''); setDirFilter('all'); setTypeFilter('all')
+                        resetAllFilters()
                       }
                     }}
                     onKeyDown={e => e.key === 'Enter' && handleAiSearch()}
@@ -1781,8 +1797,7 @@ export default function BancaPage() {
                     }`}
                   />
                   {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => {
-                    setQuery(''); setAiResult(null)
-                    setDateFrom(''); setDateTo(''); setDirFilter('all'); setTypeFilter('all')
+                    setQuery(''); setAiResult(null); resetAllFilters()
                   }}><X className="h-3.5 w-3.5" /></button>}
                 </div>
                 {(['all', 'in', 'out', 'review'] as const).map(d => (
@@ -1865,8 +1880,7 @@ export default function BancaPage() {
                     Nessun movimento trovato con i filtri attuali.
                   </p>
                   <Button variant="outline" onClick={() => {
-                    setQuery(''); setAiResult(null); setDirFilter('all'); setTypeFilter('all')
-                    setDateFrom(''); setDateTo('')
+                    setQuery(''); setAiResult(null); resetAllFilters()
                   }}>
                     <X className="h-4 w-4 mr-2" />Resetta filtri
                   </Button>

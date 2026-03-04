@@ -842,6 +842,9 @@ export interface BankTxFilters {
   dateFrom?: string;
   dateTo?: string;
   candidateIds?: string[];
+  amountMin?: number;
+  amountMax?: number;
+  counterpartyPattern?: string;
 }
 
 export async function loadBankTransactions(
@@ -876,6 +879,17 @@ export async function loadBankTransactions(
     if (filters?.query) {
       const p = `%${filters.query}%`;
       q = q.or(`description.ilike.${p},counterparty_name.ilike.${p},invoice_ref.ilike.${p},reference.ilike.${p}`);
+    }
+    // Amount range filters (applied on absolute value: |amount| >= min, |amount| <= max)
+    if (filters?.amountMin != null) {
+      q = q.or(`amount.gte.${filters.amountMin},amount.lte.${-filters.amountMin}`);
+    }
+    if (filters?.amountMax != null) {
+      q = q.gte('amount', -filters.amountMax).lte('amount', filters.amountMax);
+    }
+    // Counterparty name pattern (ILIKE)
+    if (filters?.counterpartyPattern) {
+      q = q.ilike('counterparty_name', `%${filters.counterpartyPattern}%`);
     }
   }
 
@@ -1053,6 +1067,11 @@ export async function fetchBankTxAggregates(
     if (filters?.dateTo) params.p_date_to = filters.dateTo;
     if (filters?.query) params.p_query = filters.query;
   }
+
+  // Amount / counterparty filters (applied regardless of candidateIds or normal mode)
+  if (filters?.amountMin != null) params.p_amount_min = filters.amountMin;
+  if (filters?.amountMax != null) params.p_amount_max = filters.amountMax;
+  if (filters?.counterpartyPattern) params.p_counterparty_pattern = filters.counterpartyPattern;
 
   const { data, error } = await supabase.rpc('bank_tx_aggregates', params);
   if (error) throw new Error(error.message);

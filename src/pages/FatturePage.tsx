@@ -982,7 +982,6 @@ export default function FatturePage() {
               <input
                 value={query}
                 onChange={e => handleQueryChange(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter' && query.trim()) handleAISearch(); }}
                 placeholder={directionFilter === 'out' ? '🔍 Cerca cliente, articolo...' : '🔍 Cerca fornitore, articolo...'}
                 className="flex-1 px-2.5 py-1.5 text-xs border rounded-lg bg-gray-50 outline-none focus:ring-1 focus:ring-sky-400"
               />
