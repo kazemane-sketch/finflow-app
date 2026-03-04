@@ -14,20 +14,41 @@ function createAccessTokenError(message: string, extra?: Partial<AccessTokenErro
   return err
 }
 
+/**
+ * Check if a JWT is expired or about to expire (within bufferSeconds).
+ * Returns true if the token should be refreshed proactively.
+ */
+function isTokenExpiringSoon(token: string, bufferSeconds = 60): boolean {
+  try {
+    const parts = token.split('.')
+    if (parts.length < 2) return true
+    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = `${base64}${'='.repeat((4 - (base64.length % 4)) % 4)}`
+    const payload = JSON.parse(atob(padded))
+    const exp = payload?.exp
+    if (typeof exp !== 'number') return true
+    return Date.now() / 1000 > exp - bufferSeconds
+  } catch {
+    return true // if we can't decode, assume expired
+  }
+}
+
 export async function getValidAccessToken(opts?: { forceRefresh?: boolean }): Promise<string> {
   const forceRefresh = opts?.forceRefresh === true
 
   if (!forceRefresh) {
     const { data: sessionData } = await supabase.auth.getSession()
     const token = sessionData?.session?.access_token
-    if (token) return token
+    // Only use cached token if it's still valid for at least 60 more seconds
+    if (token && !isTokenExpiringSoon(token)) return token
   }
 
+  // Token is expired/expiring/missing — force refresh
   const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession()
     .catch(() => ({ data: null as any, error: new Error('refresh_failed') as Error }))
 
   const refreshedToken = refreshed?.session?.access_token
-  if (refreshedToken) return refreshedToken
+  if (refreshedToken && !isTokenExpiringSoon(refreshedToken, 5)) return refreshedToken
 
   if (refreshError) {
     throw createAccessTokenError('Sessione non valida o scaduta.', {
