@@ -765,15 +765,13 @@ export async function updateImportBatch(
 }
 
 // Columns for list view — excludes heavy fields (raw_text, extracted_refs, embedding, embedding_error)
-const BANK_TX_LIST_COLS = `id, company_id, bank_account_id, date, value_date, amount, balance,
-  description, description_source, description_confidence,
-  counterparty_name, counterparty_source, counterparty_confidence,
-  counterparty_needs_review, counterparty_account,
+const BANK_TX_LIST_COLS = `id, company_id, bank_account_id, import_batch_id, date, value_date, amount, balance,
+  description, counterparty_name, counterparty_account, category_code,
   transaction_type, direction, direction_source, direction_confidence,
-  direction_needs_review, direction_reason, direction_updated_at,
-  reference, invoice_ref, cbi_flow_id, branch, commission_amount,
-  reconciliation_status, extraction_status, embedding_status,
-  summary_reason, created_at, updated_at`;
+  direction_needs_review, direction_reason, direction_updated_at, direction_updated_by,
+  reference, invoice_ref, cbi_flow_id, branch, commission_amount, posting_side, hash,
+  reconciliation_status, extraction_status, extraction_model, extracted_at,
+  embedding_status, embedding_model, embedding_updated_at, created_at`;
 
 export interface BankTxFilters {
   query?: string;
@@ -806,7 +804,7 @@ export async function loadBankTransactions(
     } else if (filters?.direction === 'out') {
       q = q.eq('direction', 'out');
     } else if (filters?.direction === 'review') {
-      q = q.or('direction_needs_review.eq.true,counterparty_needs_review.eq.true');
+      q = q.eq('direction_needs_review', true);
     }
     if (filters?.transactionType && filters.transactionType !== 'all') {
       q = q.eq('transaction_type', filters.transactionType);

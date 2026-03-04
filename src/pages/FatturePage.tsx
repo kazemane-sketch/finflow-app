@@ -670,6 +670,7 @@ export default function FatturePage() {
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const queryDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [serverStats, setServerStats] = useState<{ total: number; daPagare: number; scadute: number; pagate: number } | null>(null);
+  const [tabCounts, setTabCounts] = useState<{ in: number; out: number }>({ in: 0, out: 0 });
   const [importing, setImporting] = useState(false);
   const [importPhase, setImportPhase] = useState<'reading' | 'saving' | 'done'>('reading');
   const [importCurrent, setImportCurrent] = useState(0);
@@ -749,9 +750,14 @@ export default function FatturePage() {
       const result = await loadInvoices(companyId, filters, { page: currentPage, pageSize: PAGE_SIZE });
       if (reset) {
         setInvoices(result.data);
-        // Load stats in parallel for header
-        const stats = await loadInvoiceStats(companyId, { direction: filters.direction, dateFrom: filters.dateFrom, dateTo: filters.dateTo, query: filters.query });
+        // Load stats + tab counts in parallel
+        const [stats, inStats, outStats] = await Promise.all([
+          loadInvoiceStats(companyId, { direction: filters.direction, dateFrom: filters.dateFrom, dateTo: filters.dateTo, query: filters.query }),
+          loadInvoiceStats(companyId, { direction: 'in', dateFrom: filters.dateFrom, dateTo: filters.dateTo, query: filters.query }),
+          loadInvoiceStats(companyId, { direction: 'out', dateFrom: filters.dateFrom, dateTo: filters.dateTo, query: filters.query }),
+        ]);
         setServerStats(stats);
+        setTabCounts({ in: inStats.total, out: outStats.total });
       } else {
         setInvoices(prev => [...prev, ...result.data]);
       }
@@ -945,7 +951,7 @@ export default function FatturePage() {
               <button key={k} onClick={() => setDirectionFilter(k)} className={`flex-1 py-2.5 text-xs font-bold transition-all ${directionFilter === k ? (k === 'in' ? 'text-orange-700 border-b-2 border-orange-500 bg-orange-50' : 'text-emerald-700 border-b-2 border-emerald-500 bg-emerald-50') : 'text-gray-400 hover:text-gray-600 hover:bg-gray-50'}`}>
                 {label}
                 <span className={`ml-1.5 text-[10px] px-1.5 py-0.5 rounded-full ${directionFilter === k ? (k === 'in' ? 'bg-orange-200 text-orange-800' : 'bg-emerald-200 text-emerald-800') : 'bg-gray-100 text-gray-500'}`}>
-                  {invoices.filter(i => i.direction === k).length}
+                  {tabCounts[k]}
                 </span>
               </button>
             ))}
