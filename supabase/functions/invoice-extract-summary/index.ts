@@ -159,7 +159,7 @@ Deno.serve(async (req) => {
     // 1. Select pending invoices with lines and installments
     const rows: InvoiceRow[] = await sql.unsafe(
       `SELECT i.id, i.number, i.date, i.total_amount, i.taxable_amount,
-              COALESCE(i.tax_amount, i.vat_amount, 0) as vat_amount,
+              COALESCE(i.tax_amount, 0) as vat_amount,
               i.doc_type, i.direction, i.counterparty, i.raw_xml,
               (SELECT json_agg(json_build_object(
                 'line_number', il.line_number, 'description', il.description,
