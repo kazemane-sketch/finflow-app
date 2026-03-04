@@ -226,6 +226,11 @@ export default function ScadenzarioPage() {
   const [detailTxData, setDetailTxData] = useState<any>(null)
   const [detailTxLoading, setDetailTxLoading] = useState(false)
 
+  // Invoice detail popup (double-click on scadenzario row)
+  const [detailInvoiceId, setDetailInvoiceId] = useState<string | null>(null)
+  const [detailInvoiceData, setDetailInvoiceData] = useState<any>(null)
+  const [detailInvoiceLoading, setDetailInvoiceLoading] = useState(false)
+
   const counterpartyMap = useMemo(
     () => new Map(counterparties.map((cp) => [cp.id, cp])),
     [counterparties],
@@ -742,6 +747,30 @@ export default function ScadenzarioPage() {
       })
     return () => { cancelled = true }
   }, [detailTxId])
+
+  // ─── invoice detail popup loader ──────────
+  useEffect(() => {
+    if (!detailInvoiceId) { setDetailInvoiceData(null); return }
+    let cancelled = false
+    setDetailInvoiceLoading(true)
+    supabase
+      .from('invoices')
+      .select('*, counterparty:counterparties(*), installments:invoice_installments(*)')
+      .eq('id', detailInvoiceId)
+      .single()
+      .then(({ data, error: err }) => {
+        if (cancelled) return
+        if (err) {
+          console.error('[Scadenzario] Failed to load invoice detail:', err.message)
+          toast.error('Errore caricamento dettaglio fattura')
+          setDetailInvoiceId(null)
+        } else {
+          setDetailInvoiceData(data)
+        }
+        setDetailInvoiceLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [detailInvoiceId])
 
   const runInstallmentBackfill = useCallback(async () => {
     if (!company?.id) return
@@ -1312,7 +1341,7 @@ export default function ScadenzarioPage() {
                               </tr>
                             )}
                             <tr
-                              onDoubleClick={() => navigate(row.reference_link)}
+                              onDoubleClick={() => row.invoice_id ? setDetailInvoiceId(row.invoice_id) : navigate(row.reference_link)}
                               className={`border-t cursor-pointer ${isOverdue ? 'bg-red-50/60' : isToday ? 'bg-amber-50/70' : ''}`}
                             >
                               <td className="px-3 py-2">
@@ -1750,6 +1779,132 @@ export default function ScadenzarioPage() {
           </div>
         </div>
       )}
+
+      {/* Invoice detail popup (double-click on scadenzario row) */}
+      {detailInvoiceId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[2px]" onClick={() => setDetailInvoiceId(null)}>
+          <div
+            className="bg-white rounded-xl shadow-2xl w-full max-w-[420px] max-h-[85vh] overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {detailInvoiceLoading ? (
+              <div className="p-8 text-center text-sm text-gray-500">Caricamento dettaglio fattura...</div>
+            ) : detailInvoiceData ? (
+              <ScadenzarioInvoicePopup invoice={detailInvoiceData} onClose={() => setDetailInvoiceId(null)} />
+            ) : (
+              <div className="p-8 text-center text-sm text-gray-500">Fattura non trovata</div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/* ─── Invoice Detail Popup (Scadenzario) ──────── */
+
+function ScadenzarioInvoicePopup({ invoice, onClose }: { invoice: any; onClose: () => void }) {
+  const cp = invoice.counterparty
+  const installments: any[] = invoice.installments || []
+  const isAttivo = invoice.direction === 'attivo'
+
+  return (
+    <div className="h-full flex flex-col bg-white">
+      <div className="flex items-center justify-between px-4 py-3 border-b flex-shrink-0">
+        <span className="text-sm font-semibold">Dettaglio fattura</span>
+        <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1">
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+
+      <div className={`px-4 py-4 flex-shrink-0 ${isAttivo ? 'bg-emerald-50' : 'bg-red-50'}`}>
+        <p className={`text-2xl font-bold ${isAttivo ? 'text-emerald-700' : 'text-red-700'}`}>
+          {isAttivo ? '+' : '-'}{fmtEur(Math.abs(Number(invoice.total_amount || 0)))}
+        </p>
+        <div className="flex items-center gap-2 mt-2">
+          <span className="text-xs text-gray-500">{fmtDate(invoice.date)}</span>
+          <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${isAttivo ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
+            {isAttivo ? 'Vendita' : 'Acquisto'}
+          </span>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+        {invoice.number && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Numero fattura</p>
+            <p className="text-xs text-gray-800 mt-0.5">{invoice.number}</p>
+          </div>
+        )}
+        {(cp?.denom || cp?.name) && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Controparte</p>
+            <p className="text-xs text-gray-800 mt-0.5 font-medium">{cp.denom || cp.name}</p>
+          </div>
+        )}
+        {(cp?.piva || cp?.vat_number) && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">P.IVA</p>
+            <p className="text-xs text-gray-800 mt-0.5 font-mono">{cp.piva || cp.vat_number}</p>
+          </div>
+        )}
+        {(cp?.cf || cp?.fiscal_code) && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Codice fiscale</p>
+            <p className="text-xs text-gray-800 mt-0.5 font-mono">{cp.cf || cp.fiscal_code}</p>
+          </div>
+        )}
+        {invoice.payment_method && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Metodo pagamento</p>
+            <p className="text-xs text-gray-800 mt-0.5">{invoice.payment_method}</p>
+          </div>
+        )}
+        {invoice.payment_terms && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide">Condizioni pagamento</p>
+            <p className="text-xs text-gray-800 mt-0.5">{invoice.payment_terms}</p>
+          </div>
+        )}
+
+        {/* Installments */}
+        {installments.length > 0 && (
+          <div>
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide mb-1.5">Rate ({installments.length})</p>
+            <div className="space-y-1.5">
+              {installments
+                .sort((a: any, b: any) => a.installment_no - b.installment_no)
+                .map((inst: any) => {
+                  const remaining = Number(inst.amount_due) - Number(inst.paid_amount || 0)
+                  return (
+                    <div key={inst.id} className="flex items-center justify-between text-xs px-2 py-1.5 rounded bg-gray-50">
+                      <div className="flex items-center gap-2">
+                        <span className="text-gray-600 font-medium">Rata {inst.installment_no}</span>
+                        <span className="text-[10px] text-gray-400">{fmtDate(inst.due_date)}</span>
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${
+                          inst.status === 'paid' ? 'bg-emerald-100 text-emerald-700' :
+                          inst.status === 'overdue' ? 'bg-red-100 text-red-700' :
+                          inst.status === 'partial' ? 'bg-amber-100 text-amber-700' :
+                          'bg-gray-100 text-gray-600'
+                        }`}>
+                          {inst.status === 'paid' ? 'Pagata' :
+                           inst.status === 'overdue' ? 'Scaduta' :
+                           inst.status === 'partial' ? 'Parziale' : 'In attesa'}
+                        </span>
+                      </div>
+                      <div className="text-right">
+                        <span className="font-semibold text-gray-800">{fmtEur(inst.amount_due)}</span>
+                        {inst.status !== 'paid' && remaining !== Number(inst.amount_due) && (
+                          <p className="text-[9px] text-gray-400">residuo {fmtEur(remaining)}</p>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   )
 }

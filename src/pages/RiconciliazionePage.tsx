@@ -90,6 +90,19 @@ interface KpiData {
 
 /* ─── helpers ────────────────────────────────── */
 
+function errMsg(err: unknown): string {
+  if (err instanceof Error) return err.message
+  if (err && typeof err === 'object' && 'message' in err) return String((err as any).message)
+  return String(err)
+}
+
+/** Map suggestion proposed_by → reconciliations.match_type (CHECK constraint) */
+function toMatchType(proposed: string): 'auto' | 'suggested' | 'manual' {
+  if (proposed === 'deterministic') return 'auto'
+  if (proposed === 'manual') return 'manual'
+  return 'suggested' // rule, ai, etc.
+}
+
 function scoreBadge(score: number): string {
   if (score >= 90) return 'bg-emerald-100 text-emerald-700'
   if (score >= 75) return 'bg-blue-100 text-blue-700'
@@ -305,7 +318,7 @@ export default function RiconciliazionePage() {
       toast.success(`${data.new_suggestions} nuovi suggerimenti generati (${data.processed} movimenti analizzati)`)
       await Promise.all([loadKpis(), loadSuggestions()])
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err)
+      const msg = errMsg(err)
       toast.error(`Errore generazione: ${msg}`)
     }
     setGenerating(false)
@@ -333,7 +346,7 @@ export default function RiconciliazionePage() {
           company_id: companyId,
           invoice_id: suggestion.invoice_id!,
           bank_transaction_id: suggestion.bank_transaction_id,
-          match_type: suggestion.proposed_by,
+          match_type: toMatchType(suggestion.proposed_by),
           confidence: suggestion.match_score / 100,
           match_reason: suggestion.match_reason,
           confirmed_by: userId,
@@ -390,7 +403,7 @@ export default function RiconciliazionePage() {
       setSuggestions(prev => prev.filter(s => s.bank_transaction_id !== suggestion.bank_transaction_id))
       await loadKpis()
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err)
+      const msg = errMsg(err)
       toast.error(`Errore conferma: ${msg}`)
     }
     setConfirmingId(null)
@@ -426,7 +439,7 @@ export default function RiconciliazionePage() {
       setSuggestions(prev => prev.filter(s => s.id !== suggestion.id))
       await loadKpis()
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err)
+      const msg = errMsg(err)
       toast.error(`Errore rifiuto: ${msg}`)
     }
     setRejectingId(null)
@@ -516,7 +529,7 @@ export default function RiconciliazionePage() {
       setSelectedTxId(null)
       await loadKpis()
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err)
+      const msg = errMsg(err)
       toast.error(`Errore: ${msg}`)
     }
     setConfirmingId(null)
@@ -953,22 +966,22 @@ function InvoiceDetailPopup({ invoice, onClose }: { invoice: any; onClose: () =>
             <p className="text-xs text-gray-800 mt-0.5">{invoice.number}</p>
           </div>
         )}
-        {cp?.denom && (
+        {(cp?.denom || cp?.name) && (
           <div>
             <p className="text-[10px] text-gray-400 uppercase tracking-wide">Controparte</p>
-            <p className="text-xs text-gray-800 mt-0.5 font-medium">{cp.denom}</p>
+            <p className="text-xs text-gray-800 mt-0.5 font-medium">{cp.denom || cp.name}</p>
           </div>
         )}
-        {cp?.piva && (
+        {(cp?.piva || cp?.vat_number) && (
           <div>
             <p className="text-[10px] text-gray-400 uppercase tracking-wide">P.IVA</p>
-            <p className="text-xs text-gray-800 mt-0.5 font-mono">{cp.piva}</p>
+            <p className="text-xs text-gray-800 mt-0.5 font-mono">{cp.piva || cp.vat_number}</p>
           </div>
         )}
-        {cp?.cf && (
+        {(cp?.cf || cp?.fiscal_code) && (
           <div>
             <p className="text-[10px] text-gray-400 uppercase tracking-wide">Codice fiscale</p>
-            <p className="text-xs text-gray-800 mt-0.5 font-mono">{cp.cf}</p>
+            <p className="text-xs text-gray-800 mt-0.5 font-mono">{cp.cf || cp.fiscal_code}</p>
           </div>
         )}
         {invoice.payment_method && (
