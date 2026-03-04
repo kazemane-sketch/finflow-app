@@ -52,7 +52,7 @@ const tools = [
         piva: { type: "string", description: "P.IVA o codice fiscale controparte (ricerca parziale)" },
         date_from: { type: "string", description: "Data inizio YYYY-MM-DD" },
         date_to: { type: "string", description: "Data fine YYYY-MM-DD" },
-        direction: { type: "string", enum: ["in", "out"], description: "in = attive (vendita), out = passive (acquisto)" },
+        direction: { type: "string", enum: ["in", "out"], description: "out = attive (emesse/vendita), in = passive (ricevute/acquisto)" },
         doc_type: { type: "string", description: "Tipo documento FatturaPA: TD01, TD04, TD24, etc." },
         number_contains: { type: "string", description: "Ricerca parziale nel numero fattura" },
         line_description: { type: "string", description: "Cerca nelle descrizioni righe fattura (ILIKE)" },
@@ -71,7 +71,7 @@ const tools = [
       type: "object" as const,
       properties: {
         query: { type: "string", description: "Testo da cercare (prodotti, codici, CIG, CUP, riferimenti)" },
-        direction: { type: "string", enum: ["in", "out"], description: "in = attive (vendita/emesse), out = passive (acquisto/ricevute)" },
+        direction: { type: "string", enum: ["in", "out"], description: "out = attive (emesse/vendita), in = passive (ricevute/acquisto)" },
         date_from: { type: "string", description: "Data inizio YYYY-MM-DD" },
         date_to: { type: "string", description: "Data fine YYYY-MM-DD" },
         limit: { type: "number", description: "Max risultati (default 20, max 100)" },
@@ -129,7 +129,7 @@ const tools = [
       type: "object" as const,
       properties: {
         counterparty: { type: "string", description: "Nome controparte (ILIKE)" },
-        direction: { type: "string", enum: ["in", "out"], description: "in = incassi attesi, out = pagamenti da fare" },
+        direction: { type: "string", enum: ["in", "out"], description: "out = incassi attesi (fatture attive/emesse), in = pagamenti da fare (fatture passive/ricevute)" },
         status: { type: "string", enum: ["pending", "overdue", "partial"], description: "Stato rata" },
         due_date_from: { type: "string" },
         due_date_to: { type: "string" },
@@ -549,11 +549,11 @@ async function handleGetCounterparties(sql: SqlClient, companyId: string, args: 
      FROM counterparties cp
      LEFT JOIN LATERAL (
        SELECT
-         count(*) FILTER (WHERE inv.direction = 'in') as fatture_attive,
-         count(*) FILTER (WHERE inv.direction = 'out') as fatture_passive,
+         count(*) FILTER (WHERE inv.direction = 'out') as fatture_attive,
+         count(*) FILTER (WHERE inv.direction = 'in') as fatture_passive,
          coalesce(sum(inv.total_amount), 0) as fatturato_totale,
-         coalesce(sum(CASE WHEN inv.direction = 'in' THEN ii_agg.residuo ELSE 0 END), 0) as credito_residuo,
-         coalesce(sum(CASE WHEN inv.direction = 'out' THEN ii_agg.residuo ELSE 0 END), 0) as debito_residuo
+         coalesce(sum(CASE WHEN inv.direction = 'out' THEN ii_agg.residuo ELSE 0 END), 0) as credito_residuo,
+         coalesce(sum(CASE WHEN inv.direction = 'in' THEN ii_agg.residuo ELSE 0 END), 0) as debito_residuo
        FROM invoices inv
        LEFT JOIN LATERAL (
          SELECT coalesce(sum(ii.amount_due - ii.paid_amount), 0) as residuo
@@ -588,11 +588,11 @@ async function handleGetCompanyStats(sql: SqlClient, companyId: string, args: Re
 
   const [stats] = await sql.unsafe(
     `SELECT
-      (SELECT count(*) FROM invoices WHERE company_id = $1 AND direction = 'in'${invDateFilter}) as fatture_attive,
-      (SELECT count(*) FROM invoices WHERE company_id = $1 AND direction = 'out'${invDateFilter}) as fatture_passive,
+      (SELECT count(*) FROM invoices WHERE company_id = $1 AND direction = 'out'${invDateFilter}) as fatture_attive,
+      (SELECT count(*) FROM invoices WHERE company_id = $1 AND direction = 'in'${invDateFilter}) as fatture_passive,
       (SELECT count(*) FROM bank_transactions WHERE company_id = $1${btDateFilter}) as movimenti_totali,
-      (SELECT coalesce(sum(amount_due - paid_amount), 0) FROM invoice_installments WHERE company_id = $1 AND direction = 'out' AND status IN ('pending', 'overdue', 'partial')) as totale_da_pagare,
-      (SELECT coalesce(sum(amount_due - paid_amount), 0) FROM invoice_installments WHERE company_id = $1 AND direction = 'in' AND status IN ('pending', 'overdue', 'partial')) as totale_da_incassare,
+      (SELECT coalesce(sum(amount_due - paid_amount), 0) FROM invoice_installments WHERE company_id = $1 AND direction = 'in' AND status IN ('pending', 'overdue', 'partial')) as totale_da_pagare,
+      (SELECT coalesce(sum(amount_due - paid_amount), 0) FROM invoice_installments WHERE company_id = $1 AND direction = 'out' AND status IN ('pending', 'overdue', 'partial')) as totale_da_incassare,
       (SELECT coalesce(sum(amount_due - paid_amount), 0) FROM invoice_installments WHERE company_id = $1 AND status = 'overdue') as totale_scaduto,
       (SELECT count(*) FROM bank_transactions WHERE company_id = $1 AND reconciliation_status = 'unmatched') as movimenti_non_riconciliati,
       (SELECT coalesce(sum(amount), 0) FROM bank_transactions WHERE company_id = $1) as saldo_banca`,
@@ -612,7 +612,7 @@ async function handleGetCompanyStats(sql: SqlClient, companyId: string, args: Re
   const topClienti = await sql.unsafe(
     `SELECT cp.name, coalesce(sum(i.total_amount), 0) as fatturato
      FROM counterparties cp
-     JOIN invoices i ON i.counterparty_id = cp.id AND i.direction = 'in'
+     JOIN invoices i ON i.counterparty_id = cp.id AND i.direction = 'out'
      WHERE cp.company_id = $1${top5DateFilter}
      GROUP BY cp.id, cp.name
      ORDER BY fatturato DESC
@@ -623,7 +623,7 @@ async function handleGetCompanyStats(sql: SqlClient, companyId: string, args: Re
   const topFornitori = await sql.unsafe(
     `SELECT cp.name, coalesce(sum(i.total_amount), 0) as fatturato
      FROM counterparties cp
-     JOIN invoices i ON i.counterparty_id = cp.id AND i.direction = 'out'
+     JOIN invoices i ON i.counterparty_id = cp.id AND i.direction = 'in'
      WHERE cp.company_id = $1${top5DateFilter}
      GROUP BY cp.id, cp.name
      ORDER BY fatturato DESC
@@ -824,6 +824,11 @@ async function executeToolHandler(
 const SYSTEM_PROMPT = `Sei l'assistente AI di FinFlow, un gestionale finanziario per PMI italiane. Rispondi in italiano, in modo pratico e preciso.
 
 Hai accesso ai dati dell'azienda tramite le seguenti funzioni. Quando l'utente chiede informazioni, usa le funzioni per recuperare dati reali. Non inventare mai dati. Per importi usa il formato italiano (1.234,56 €). Quando analizzi movimenti bancari, presta particolare attenzione al campo raw_text e extracted_refs per trovare riferimenti a fatture, mandati, contratti, rate.
+
+CONVENZIONE DIRECTION (MOLTO IMPORTANTE):
+- direction='out' = Fattura ATTIVA (emessa da noi, vendita) → denaro IN ENTRATA. Nel campo direction dei risultati, "out" significa fattura attiva/emessa.
+- direction='in' = Fattura PASSIVA (ricevuta, acquisto) → denaro IN USCITA. Nel campo direction dei risultati, "in" significa fattura passiva/ricevuta.
+- Quando presenti i risultati, traduci SEMPRE: direction='out' → "Attiva", direction='in' → "Passiva". MAI il contrario.
 
 STRATEGIA DI RICERCA FATTURE — IMPORTANTE:
 - Per filtri strutturati (controparte, data, importo, tipo doc): usa get_invoices
