@@ -161,6 +161,19 @@ const tools = [
       required: ["bank_transaction_id"],
     },
   },
+  {
+    name: "search_knowledge_base",
+    description:
+      "Cerca nella knowledge base aziendale (documenti caricati dall'utente: PDF, TXT, CSV). Usa ricerca semantica con embeddings. Utile per trovare informazioni in documenti interni, contratti, regolamenti, procedure.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        query: { type: "string", description: "Domanda o testo da cercare nei documenti" },
+        limit: { type: "number", description: "Numero max di risultati (default 5, max 20)" },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
 /* ─── tool handlers ───────────────────────── */
@@ -519,6 +532,64 @@ async function handleSuggestReconciliation(sql: SqlClient, companyId: string, ar
   };
 }
 
+async function embedQueryText(geminiKey: string, text: string): Promise<string> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${geminiKey}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "models/gemini-embedding-001",
+      content: { parts: [{ text }] },
+      taskType: "RETRIEVAL_QUERY",
+      outputDimensionality: 3072,
+    }),
+  });
+  const payload = await res.json();
+  if (!res.ok) throw new Error(`Gemini embedding error: ${payload?.error?.message || res.status}`);
+  const values = payload?.embedding?.values;
+  if (!Array.isArray(values) || values.length !== 3072) throw new Error("Embedding query invalido");
+  return `[${values.map((v: number) => Number.isFinite(v) ? v.toFixed(8) : "0").join(",")}]`;
+}
+
+async function handleSearchKnowledgeBase(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const query = String(args.query || "").trim();
+  if (!query) return { error: "Query vuota" };
+
+  const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
+  if (!geminiKey) return { error: "GEMINI_API_KEY non configurata per knowledge base search" };
+
+  const limit = Math.min(Number(args.limit) || 5, 20);
+
+  // Generate query embedding
+  const vectorLiteral = await embedQueryText(geminiKey, query);
+
+  // Search using pgvector cosine distance via the pre-built function
+  const results = await sql.unsafe(
+    `SELECT kc.id, kc.document_id, kc.chunk_index, kc.content,
+            kd.file_name,
+            (1 - (kc.embedding <=> $2::vector(3072)))::numeric AS similarity
+     FROM kb_chunks kc
+     JOIN kb_documents kd ON kd.id = kc.document_id
+     WHERE kc.company_id = $1
+       AND kc.embedding IS NOT NULL
+       AND kd.status = 'ready'
+     ORDER BY kc.embedding <=> $2::vector(3072)
+     LIMIT $3`,
+    [companyId, vectorLiteral, limit],
+  );
+
+  return {
+    query,
+    results: results.map((r: Record<string, unknown>) => ({
+      file_name: r.file_name,
+      chunk_index: r.chunk_index,
+      content: String(r.content || "").slice(0, 2000),
+      similarity: Number(r.similarity || 0).toFixed(4),
+    })),
+    total: results.length,
+  };
+}
+
 async function executeToolHandler(
   sql: SqlClient,
   companyId: string,
@@ -544,6 +615,8 @@ async function executeToolHandler(
       return handleGetCompanyStats(sql, companyId);
     case "suggest_reconciliation":
       return handleSuggestReconciliation(sql, companyId, toolInput);
+    case "search_knowledge_base":
+      return handleSearchKnowledgeBase(sql, companyId, toolInput);
     default:
       return { error: `Tool sconosciuto: ${toolName}` };
   }
@@ -554,6 +627,8 @@ async function executeToolHandler(
 const SYSTEM_PROMPT = `Sei l'assistente AI di FinFlow, un gestionale finanziario per PMI italiane. Rispondi in italiano, in modo pratico e preciso.
 
 Hai accesso ai dati dell'azienda tramite le seguenti funzioni. Quando l'utente chiede informazioni, usa le funzioni per recuperare dati reali. Non inventare mai dati. Per importi usa il formato italiano (1.234,56 €). Quando analizzi movimenti bancari, presta particolare attenzione al campo raw_text e extracted_refs per trovare riferimenti a fatture, mandati, contratti, rate.
+
+Hai anche accesso alla Knowledge Base aziendale tramite search_knowledge_base. Se l'utente chiede informazioni su documenti caricati (contratti, regolamenti, procedure, manuali), cerca prima nella knowledge base.
 
 Quando presenti tabelle o elenchi, usa il formato markdown. Quando menzioni importi, specifica sempre se è un'entrata o un'uscita. Per le date usa il formato italiano (gg/mm/aaaa).`;
 
