@@ -121,6 +121,7 @@ Formato richiesto:
 
 Regole importanti:
 - Includi TUTTI i movimenti presenti nel chunk.
+- NON includere righe "SALDO INIZIALE", "SALDO FINALE", "SALDO CONTABILE", "SALDO DISPONIBILE" come transazioni. Sono righe di riepilogo, non movimenti bancari reali.
 - Determina posting_side dalla colonna del movimento: DARE o AVERE, se visibile.
 - Matrice contabile con segno esplicito su amount_text:
   - DARE + (o senza segno) => out

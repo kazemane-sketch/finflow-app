@@ -6,8 +6,9 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useAuth } from '@/hooks/useAuth'
 import { useCompany } from '@/hooks/useCompany'
-import { Settings, Building2, Landmark, Pencil, Trash2, Plus, X, AlertTriangle } from 'lucide-react'
+import { Settings, Building2, Landmark, Pencil, Trash2, Plus, X, AlertTriangle, CheckCircle } from 'lucide-react'
 import { supabase } from '@/integrations/supabase/client'
+import { saveOpeningBalance } from '@/lib/bankParser'
 
 // ============================================================
 // BANK ACCOUNT FORM MODAL
@@ -148,6 +149,10 @@ export default function ImpostazioniPage() {
   const [paymentDefaults, setPaymentDefaults] = useState({ default_dso_days: '30', default_pso_days: '30' })
   const [savingDefaults, setSavingDefaults] = useState(false)
 
+  // Opening balance inline edit
+  const [obEdit, setObEdit] = useState<{ id: string; amount: string; date: string } | null>(null)
+  const [obSaving, setObSaving] = useState(false)
+
   const loadBankAccounts = useCallback(async () => {
     if (!companyId) return
     const { data } = await supabase
@@ -210,6 +215,35 @@ export default function ImpostazioniPage() {
       alert('Errore salvataggio default scadenze: ' + e.message)
     }
     setSavingDefaults(false)
+  }
+
+  const handleSaveOpeningBalance = async () => {
+    if (!obEdit) return
+    const numAmount = Number(obEdit.amount.replace(',', '.'))
+    if (isNaN(numAmount) || !obEdit.date) {
+      alert('Importo e data sono obbligatori')
+      return
+    }
+    setObSaving(true)
+    try {
+      await saveOpeningBalance(obEdit.id, numAmount, obEdit.date, true)
+      await loadBankAccounts()
+      setObEdit(null)
+    } catch (e: any) {
+      alert('Errore: ' + e.message)
+    }
+    setObSaving(false)
+  }
+
+  const fmtEur = (n: number | null | undefined) => {
+    if (n == null) return '—'
+    return new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(n)
+  }
+
+  const fmtDate = (d: string | null | undefined) => {
+    if (!d) return ''
+    const [y, m, dd] = d.split('-')
+    return `${dd}/${m}/${y}`
   }
 
   return (
@@ -330,28 +364,93 @@ export default function ImpostazioniPage() {
             ) : (
               <div className="space-y-2">
                 {bankAccounts.map(acc => (
-                  <div key={acc.id} className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg border border-gray-100">
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-gray-900">{acc.name}</p>
-                      <div className="flex items-center gap-3 mt-0.5 flex-wrap">
-                        {acc.bank_name && <span className="text-xs text-gray-500">{acc.bank_name}</span>}
-                        {acc.iban && <span className="text-[10px] font-mono text-gray-400">{acc.iban}</span>}
-                        
+                  <div key={acc.id} className="p-3 bg-gray-50 rounded-lg border border-gray-100 space-y-2">
+                    <div className="flex items-center gap-3">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-gray-900">{acc.name}</p>
+                        <div className="flex items-center gap-3 mt-0.5 flex-wrap">
+                          {acc.bank_name && <span className="text-xs text-gray-500">{acc.bank_name}</span>}
+                          {acc.iban && <span className="text-[10px] font-mono text-gray-400">{acc.iban}</span>}
+                        </div>
+                      </div>
+                      <div className="flex gap-1 flex-shrink-0">
+                        <button
+                          onClick={() => setBankModal({ account: acc })}
+                          className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-md transition-colors"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          onClick={() => setDeleteModal(acc)}
+                          className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
                       </div>
                     </div>
-                    <div className="flex gap-1 flex-shrink-0">
-                      <button
-                        onClick={() => setBankModal({ account: acc })}
-                        className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-md transition-colors"
-                      >
-                        <Pencil className="h-3.5 w-3.5" />
-                      </button>
-                      <button
-                        onClick={() => setDeleteModal(acc)}
-                        className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-md transition-colors"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
+
+                    {/* Opening balance section */}
+                    <div className="border-t border-gray-200 pt-2">
+                      {obEdit != null && obEdit.id === acc.id ? (
+                        <div className="flex items-end gap-2 flex-wrap">
+                          <div>
+                            <label className="block text-[10px] font-medium text-gray-500 mb-0.5">Saldo iniziale (€)</label>
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              value={obEdit.amount}
+                              onChange={e => setObEdit(prev => prev ? { ...prev, amount: e.target.value } : prev)}
+                              className="px-2 py-1 text-xs border border-gray-300 rounded-md w-32 focus:ring-2 focus:ring-sky-500 outline-none"
+                              placeholder="12345.67"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[10px] font-medium text-gray-500 mb-0.5">Data</label>
+                            <input
+                              type="date"
+                              value={obEdit.date}
+                              onChange={e => setObEdit(prev => prev ? { ...prev, date: e.target.value } : prev)}
+                              className="px-2 py-1 text-xs border border-gray-300 rounded-md focus:ring-2 focus:ring-sky-500 outline-none"
+                            />
+                          </div>
+                          <Button size="sm" onClick={handleSaveOpeningBalance} disabled={obSaving}>
+                            {obSaving ? '...' : 'Salva'}
+                          </Button>
+                          <Button variant="outline" size="sm" onClick={() => setObEdit(null)} disabled={obSaving}>
+                            Annulla
+                          </Button>
+                        </div>
+                      ) : acc.opening_balance_confirmed ? (
+                        <div className="flex items-center gap-2 text-xs">
+                          <CheckCircle className="h-3 w-3 text-emerald-500 flex-shrink-0" />
+                          <span className="text-gray-600">
+                            Saldo iniziale: <span className="font-semibold text-gray-800">{fmtEur(acc.opening_balance)}</span>
+                          </span>
+                          {acc.opening_balance_date && (
+                            <span className="text-gray-400">al {fmtDate(acc.opening_balance_date)}</span>
+                          )}
+                          <button
+                            onClick={() => setObEdit({
+                              id: acc.id,
+                              amount: acc.opening_balance != null ? String(acc.opening_balance) : '',
+                              date: acc.opening_balance_date || '',
+                            })}
+                            className="text-sky-600 hover:text-sky-800 hover:underline ml-1"
+                          >
+                            Modifica
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2 text-xs">
+                          <span className="text-gray-400">Saldo iniziale non configurato</span>
+                          <button
+                            onClick={() => setObEdit({ id: acc.id, amount: '', date: '' })}
+                            className="text-sky-600 hover:text-sky-800 hover:underline"
+                          >
+                            Imposta
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}

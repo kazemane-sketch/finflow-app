@@ -75,9 +75,17 @@ export interface BankImportStats {
   raw_overlap_failed_count: number;
 }
 
+export interface SaldoMetadata {
+  saldoInizialeAmount?: number;
+  saldoInizialeDate?: string;
+  saldoFinaleAmount?: number;
+  saldoFinaleDate?: string;
+}
+
 export interface BankParseResult {
   transactions: BankTransaction[];
   summaryCandidates: BankTransaction[];
+  saldoMetadata?: SaldoMetadata;
   accountHolder?: string;
   iban?: string;
   bankName?: string;
@@ -97,6 +105,17 @@ export interface BankParseProgress {
   current: number;
   total: number;
   message: string;
+}
+
+// ─── Saldo row detection ──────────────────────────────────────────
+const SALDO_PATTERNS = [
+  /saldo\s+(iniziale|finale|contabile|disponibile|liquido)/i,
+  /^saldo\s/i,
+];
+
+export function isSaldoRow(tx: { description?: string; raw_text?: string }): boolean {
+  const text = `${tx.description || ''} ${tx.raw_text || ''}`;
+  return SALDO_PATTERNS.some(pat => pat.test(text));
 }
 
 function normalizeDirection(v: unknown): 'in' | 'out' | null {
@@ -578,6 +597,11 @@ export async function parseBankPdf(
       droppedMissingRequiredCountClient++;
       continue;
     }
+    // Safety net: move saldo rows to summaryCandidates instead of transactions
+    if (isSaldoRow(mapped)) {
+      result.summaryCandidates.push(mapped);
+      continue;
+    }
     result.transactions.push(mapped);
   }
 
@@ -591,6 +615,27 @@ export async function parseBankPdf(
   result.summaryCandidates = result.summaryCandidates.sort((a, b) => b.date.localeCompare(a.date));
   result.stats.dropped_missing_required_count += droppedMissingRequiredCountClient;
   result.stats.summary_candidates_count = result.summaryCandidates.length || result.stats.summary_candidates_count;
+
+  // Extract saldo metadata from summary candidates for the dialog
+  const saldoMeta: SaldoMetadata = {};
+  for (const sc of result.summaryCandidates) {
+    const desc = `${sc.description || ''} ${sc.raw_text || ''}`;
+    if (/saldo\s+iniziale/i.test(desc) && sc.amount != null) {
+      if (!saldoMeta.saldoInizialeDate || sc.date < saldoMeta.saldoInizialeDate) {
+        saldoMeta.saldoInizialeAmount = Math.abs(sc.amount);
+        saldoMeta.saldoInizialeDate = sc.date;
+      }
+    }
+    if (/saldo\s+finale/i.test(desc) && sc.amount != null) {
+      if (!saldoMeta.saldoFinaleDate || sc.date > saldoMeta.saldoFinaleDate) {
+        saldoMeta.saldoFinaleAmount = Math.abs(sc.amount);
+        saldoMeta.saldoFinaleDate = sc.date;
+      }
+    }
+  }
+  if (saldoMeta.saldoInizialeAmount != null || saldoMeta.saldoFinaleAmount != null) {
+    result.saldoMetadata = saldoMeta;
+  }
 
   if (result.failedChunks && result.failedChunks.length > 0) {
     result.errors.push(`${result.failedChunks.length} blocchi di pagine non processati (chunk ${result.failedChunks.join(', ')})`);
@@ -741,6 +786,23 @@ export async function updateBankAccountBalance(
     .eq('id', bankAccountId);
 
   if (error) throw new Error('Errore aggiornamento saldo conto: ' + error.message);
+}
+
+export async function saveOpeningBalance(
+  bankAccountId: string,
+  amount: number,
+  date: string,
+  confirmed = true,
+): Promise<void> {
+  const { error } = await supabase
+    .from('bank_accounts')
+    .update({
+      opening_balance: amount,
+      opening_balance_date: date,
+      opening_balance_confirmed: confirmed,
+    })
+    .eq('id', bankAccountId);
+  if (error) throw new Error('Errore salvataggio saldo iniziale: ' + error.message);
 }
 
 export async function createImportBatch(companyId: string, filename: string): Promise<string> {
@@ -964,4 +1026,96 @@ export async function verifyBankTransactions(ids: string[]): Promise<void> {
       .in('id', ids.slice(i, i + 100));
     if (error) throw new Error(error.message);
   }
+}
+
+// ─── Server-side KPI aggregates ──────────────────────────────────
+
+export interface BankTxAggregates {
+  total_in: number;
+  total_out: number;
+  tx_count: number;
+}
+
+export async function fetchBankTxAggregates(
+  companyId: string,
+  filters?: BankTxFilters,
+): Promise<BankTxAggregates> {
+  const params: Record<string, unknown> = { p_company_id: companyId };
+
+  if (filters?.candidateIds?.length) {
+    params.p_candidate_ids = filters.candidateIds;
+  } else {
+    params.p_direction = filters?.direction || 'all';
+    if (filters?.transactionType && filters.transactionType !== 'all') {
+      params.p_transaction_type = filters.transactionType;
+    }
+    if (filters?.dateFrom) params.p_date_from = filters.dateFrom;
+    if (filters?.dateTo) params.p_date_to = filters.dateTo;
+    if (filters?.query) params.p_query = filters.query;
+  }
+
+  const { data, error } = await supabase.rpc('bank_tx_aggregates', params);
+  if (error) throw new Error(error.message);
+  const row = Array.isArray(data) ? data[0] : data;
+  return {
+    total_in: Number(row?.total_in || 0),
+    total_out: Number(row?.total_out || 0),
+    tx_count: Number(row?.tx_count || 0),
+  };
+}
+
+// ─── Computed balance (opening_balance + sum of tx) ──────────────
+
+export interface BankComputedBalance {
+  bank_account_id: string;
+  bank_account_name: string;
+  opening_balance: number;
+  opening_balance_date: string | null;
+  opening_balance_confirmed: boolean;
+  tx_sum: number;
+  computed_balance: number;
+  latest_tx_date: string | null;
+  tx_count: number;
+}
+
+export async function fetchBankComputedBalance(
+  companyId: string,
+  bankAccountId?: string,
+): Promise<BankComputedBalance[]> {
+  const params: Record<string, unknown> = { p_company_id: companyId };
+  if (bankAccountId) params.p_bank_account_id = bankAccountId;
+
+  const { data, error } = await supabase.rpc('bank_computed_balance', params);
+  if (error) throw new Error(error.message);
+  return (data || []).map((row: any) => ({
+    bank_account_id: row.bank_account_id,
+    bank_account_name: row.bank_account_name,
+    opening_balance: Number(row.opening_balance || 0),
+    opening_balance_date: row.opening_balance_date || null,
+    opening_balance_confirmed: !!row.opening_balance_confirmed,
+    tx_sum: Number(row.tx_sum || 0),
+    computed_balance: Number(row.computed_balance || 0),
+    latest_tx_date: row.latest_tx_date || null,
+    tx_count: Number(row.tx_count || 0),
+  }));
+}
+
+// ─── Find SALDO INIZIALE/FINALE rows for cleanup ─────────────────
+
+export interface BankSaldoRow {
+  id: string;
+  date: string;
+  amount: number;
+  description: string;
+}
+
+export async function fetchBankSaldoRows(companyId: string): Promise<BankSaldoRow[]> {
+  const { data, error } = await supabase.rpc('bank_saldo_rows', { p_company_id: companyId });
+  if (error) throw new Error(error.message);
+  return (data || []).map((row: any) => ({
+    id: row.row_id,
+    date: row.row_date,
+    amount: Number(row.row_amount || 0),
+    description: row.row_description || '',
+  }));
 }

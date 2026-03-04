@@ -11,12 +11,15 @@ import {
 import {
   parseBankPdf, saveBankTransactions, ensureBankAccount, createImportBatch,
   updateImportBatch, loadBankTransactions, loadBankTransactionDetail, loadBankAccounts, getClaudeApiKey,
-  updateBankAccountBalance,
+  updateBankAccountBalance, saveOpeningBalance,
   deleteBankTransactions, deleteAllBankTransactions, updateBankTransactionDirection,
   updateBankTransaction, verifyBankTransactions,
   getBankEmbeddingHealth,
-  type BankEmbeddingHealth, type BankTxFilters,
+  fetchBankTxAggregates, fetchBankComputedBalance, fetchBankSaldoRows,
+  isSaldoRow,
+  type BankEmbeddingHealth, type BankTxFilters, type BankTxAggregates, type BankComputedBalance,
   type BankImportStats, type BankParseProgress, type BankParseResult, type BankTransaction,
+  type BankSaldoRow, type SaldoMetadata,
 } from '@/lib/bankParser'
 import { verifyPassword } from '@/lib/invoiceSaver'
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
@@ -347,6 +350,102 @@ function SummaryReviewModal({
 }
 
 // ============================================================
+// SALDO INIZIALE DIALOG — shows during first import when saldo metadata found
+// ============================================================
+function SaldoInizialeDialog({
+  saldoMeta,
+  bankAccountId,
+  onConfirm,
+  onSkip,
+}: {
+  saldoMeta: SaldoMetadata;
+  bankAccountId: string;
+  onConfirm: (amount: number, date: string) => void;
+  onSkip: () => void;
+}) {
+  const [amount, setAmount] = useState(
+    saldoMeta.saldoInizialeAmount != null ? String(saldoMeta.saldoInizialeAmount) : ''
+  )
+  const [date, setDate] = useState(saldoMeta.saldoInizialeDate || '')
+  const [saving, setSaving] = useState(false)
+
+  const handleConfirm = async () => {
+    const numAmount = Number(amount.replace(',', '.'))
+    if (isNaN(numAmount)) return
+    if (!date) return
+    setSaving(true)
+    try {
+      await saveOpeningBalance(bankAccountId, numAmount, date, true)
+      onConfirm(numAmount, date)
+    } catch (e: any) {
+      alert('Errore salvataggio: ' + e.message)
+    }
+    setSaving(false)
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+      <div className="bg-white rounded-xl shadow-xl p-6 max-w-md w-full mx-4">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-10 h-10 rounded-full bg-sky-100 flex items-center justify-center">
+            <Landmark className="h-5 w-5 text-sky-600" />
+          </div>
+          <div>
+            <h3 className="font-semibold text-gray-900">Saldo iniziale conto</h3>
+            <p className="text-xs text-gray-500">
+              Rilevato dal PDF. Conferma o modifica per un calcolo saldo corretto.
+            </p>
+          </div>
+        </div>
+
+        {saldoMeta.saldoFinaleAmount != null && (
+          <div className="text-xs text-gray-500 mb-3 p-2 bg-gray-50 rounded-lg">
+            <span>Saldo finale rilevato: </span>
+            <span className="font-semibold text-gray-700">{fmtEur(saldoMeta.saldoFinaleAmount)}</span>
+            {saldoMeta.saldoFinaleDate && <span> al {fmtDate(saldoMeta.saldoFinaleDate)}</span>}
+          </div>
+        )}
+
+        <div className="space-y-3">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Saldo iniziale (€)</label>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={amount}
+              onChange={e => setAmount(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-sky-500 outline-none text-sm"
+              placeholder="Es. 12345.67"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Data saldo iniziale</label>
+            <input
+              type="date"
+              value={date}
+              onChange={e => setDate(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-sky-500 outline-none text-sm"
+            />
+          </div>
+        </div>
+
+        <div className="flex gap-2 justify-end mt-5">
+          <Button variant="outline" onClick={onSkip} disabled={saving}>
+            Salta
+          </Button>
+          <Button
+            onClick={handleConfirm}
+            disabled={saving || !amount || !date}
+          >
+            {saving ? 'Salvataggio...' : 'Conferma saldo iniziale'}
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============================================================
 // TRANSACTION ROW
 // ============================================================
 function TxRow({ tx, selected, checked, selectMode, onClick, onCheck, onDoubleClick, suggestionScore }: {
@@ -399,11 +498,6 @@ function TxRow({ tx, selected, checked, selectMode, onClick, onCheck, onDoubleCl
       {tx.direction_needs_review && (
         <span className="hidden md:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 flex-shrink-0">
           Da verificare
-        </span>
-      )}
-      {tx.counterparty_needs_review && (
-        <span className="hidden lg:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-orange-100 text-orange-700 flex-shrink-0">
-          Controparte da verificare
         </span>
       )}
       {tx.reconciliation_status === 'matched' && (
@@ -664,6 +758,18 @@ export default function BancaPage() {
   const [aiLoading, setAiLoading] = useState(false)
   const [embeddingHealth, setEmbeddingHealth] = useState<BankEmbeddingHealth | null>(null)
 
+  // Server-side KPI + balance
+  const [kpiAggregates, setKpiAggregates] = useState<BankTxAggregates | null>(null)
+  const [computedBalance, setComputedBalance] = useState<BankComputedBalance[] | null>(null)
+  const [saldoCleanupRows, setSaldoCleanupRows] = useState<BankSaldoRow[] | null>(null)
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'info' | 'error' } | null>(null)
+
+  // Saldo iniziale dialog
+  const [saldoDialog, setSaldoDialog] = useState<{
+    amount: number; date: string; bankAccountId: string;
+    parseResult: BankParseResult; filename: string;
+  } | null>(null)
+
   // Extraction refs
   const [extractionRunning, setExtractionRunning] = useState(false)
   const [extractionProgress, setExtractionProgress] = useState<{ processed: number; total: number } | null>(null)
@@ -731,6 +837,13 @@ export default function BancaPage() {
     setExtractionRunning(false)
   }, [companyId, extractionRunning])
 
+  // Auto-dismiss toast
+  useEffect(() => {
+    if (!toast) return
+    const timer = setTimeout(() => setToast(null), 3500)
+    return () => clearTimeout(timer)
+  }, [toast])
+
   // Debounce text query
   useEffect(() => {
     clearTimeout(queryDebounceRef.current)
@@ -774,7 +887,16 @@ export default function BancaPage() {
     } catch (e: any) { console.error(e) }
     setLoading(false)
     setLoadingMore(false)
-    if (reset) void refreshEmbeddingHealth()
+    if (reset) {
+      void refreshEmbeddingHealth()
+      // Fire server-side KPI aggregate + computed balance in parallel
+      fetchBankTxAggregates(companyId, buildFilters())
+        .then(setKpiAggregates)
+        .catch(e => console.warn('[KPI aggregates]', e))
+      fetchBankComputedBalance(companyId)
+        .then(setComputedBalance)
+        .catch(e => console.warn('[Computed balance]', e))
+    }
   }, [companyId, refreshEmbeddingHealth, buildFilters, page, bankAccounts])
 
   // Initial load + reload when filters change
@@ -787,6 +909,14 @@ export default function BancaPage() {
     loadData(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [companyId, debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds?.join(',')])
+
+  // One-time saldo cleanup check on mount
+  useEffect(() => {
+    if (!companyId) return
+    fetchBankSaldoRows(companyId)
+      .then(rows => { if (rows.length > 0) setSaldoCleanupRows(rows) })
+      .catch(e => console.warn('[Saldo cleanup check]', e))
+  }, [companyId])
 
   // Load next page when page increments
   useEffect(() => {
@@ -973,14 +1103,17 @@ export default function BancaPage() {
 
   const handleBulkVerify = async () => {
     if (selectedIds.size === 0) return
+    const count = selectedIds.size
     try {
       await verifyBankTransactions(Array.from(selectedIds))
       setTransactions(prev => prev.map(tx =>
         selectedIds.has(tx.id) ? { ...tx, direction_needs_review: false } : tx
       ))
       clearSelection()
+      setSelectMode(false)
+      setToast({ message: `${count} moviment${count === 1 ? 'o verificato' : 'i verificati'} con successo`, type: 'success' })
     } catch (e: any) {
-      alert('Errore verifica: ' + e.message)
+      setToast({ message: 'Errore verifica: ' + e.message, type: 'error' })
     }
   }
 
@@ -1139,6 +1272,24 @@ export default function BancaPage() {
 
       const bankAccountId = await ensureBankAccount(companyId, { iban: undefined, bankName: 'Monte dei Paschi', accountHolder: undefined })
 
+      // Check if opening balance is already confirmed for this bank account
+      const balanceData = await fetchBankComputedBalance(companyId, bankAccountId)
+      const isBalanceConfirmed = balanceData?.[0]?.opening_balance_confirmed ?? false
+
+      // If not confirmed and saldo metadata was found, show saldo dialog before continuing
+      if (!isBalanceConfirmed && parseResult.saldoMetadata &&
+          (parseResult.saldoMetadata.saldoInizialeAmount != null || parseResult.saldoMetadata.saldoFinaleAmount != null)) {
+        setSaldoDialog({
+          amount: parseResult.saldoMetadata.saldoInizialeAmount ?? parseResult.saldoMetadata.saldoFinaleAmount ?? 0,
+          date: parseResult.saldoMetadata.saldoInizialeDate ?? parseResult.saldoMetadata.saldoFinaleDate ?? '',
+          bankAccountId,
+          parseResult,
+          filename: file.name,
+        })
+        setImporting(false)
+        return
+      }
+
       if (parseResult.summaryCandidates.length > 0) {
         const items = parseResult.summaryCandidates.map((tx, idx) => ({
           ...tx,
@@ -1187,6 +1338,44 @@ export default function BancaPage() {
     setImporting(false)
     if (fileRef.current) fileRef.current.value = ''
   }, [companyId, finalizeImport])
+
+  // Resume import after saldo dialog (confirm or skip)
+  const resumeImportAfterSaldo = useCallback(async () => {
+    if (!saldoDialog) return
+    const { parseResult, bankAccountId, filename } = saldoDialog
+    setSaldoDialog(null)
+    setImporting(true)
+
+    try {
+      if (parseResult.summaryCandidates.length > 0) {
+        const items = parseResult.summaryCandidates.map((tx, idx) => ({
+          ...tx,
+          _id: `summary-${idx}-${tx.date}-${tx.amount}`,
+          include: false,
+        }))
+        setSummaryReview({ items, parseResult, bankAccountId, filename })
+        setImporting(false)
+        return
+      }
+      await finalizeImport(filename, parseResult, bankAccountId, [])
+    } catch (e: any) {
+      const emptyStats: BankImportStats = {
+        raw_parsed_count: 0, dropped_missing_required_count: 0,
+        dedup_edge_count: 0, dedup_client_count: 0, dedup_db_count: 0, saved_count: 0,
+        failed_chunks_count: 0, warnings_count: 0, side_rule_count: 0,
+        semantic_override_count: 0, unknown_side_count: 0, qc_fail_count: 0,
+        summary_candidates_count: 0, llm_description_attempted_count: 0,
+        llm_description_resolved_count: 0, counterparty_unknown_count: 0,
+        counterparty_llm_attempted_count: 0, counterparty_llm_resolved_count: 0,
+        counterparty_review_count: 0, llm_batch_fail_count: 0,
+        raw_integrity_suspect_count: 0, raw_overlap_resolved_count: 0,
+        raw_overlap_failed_count: 0,
+      }
+      setImportResult({ saved: 0, duplicates: 0, dedup_db_count: 0, errors: [e.message], warnings: [], stats: emptyStats })
+    }
+    setImporting(false)
+    if (fileRef.current) fileRef.current.value = ''
+  }, [saldoDialog, finalizeImport])
 
   // Filters are now server-side — `transactions` already contains filtered results
 
@@ -1276,14 +1465,11 @@ export default function BancaPage() {
     setAiLoading(false)
   }
 
-  // KPI su dati caricati
-  const totalIn = transactions
-    .filter(t => txDirection(t) === 'in')
-    .reduce((s, t) => s + Math.abs(Number(t.amount || 0)), 0)
-  const totalOut = transactions
-    .filter(t => txDirection(t) === 'out')
-    .reduce((s, t) => s + Math.abs(Number(t.amount || 0)), 0)
-  const latestBalance = transactions[0]?.balance
+  // KPI from server-side RPC (not paginated data)
+  const totalIn = kpiAggregates?.total_in ?? 0
+  const totalOut = kpiAggregates?.total_out ?? 0
+  const balanceInfo = computedBalance?.[0] ?? null
+  const latestBalance = balanceInfo?.opening_balance_confirmed ? balanceInfo.computed_balance : null
   const uniqueTypes = [...new Set(transactions.map(t => t.transaction_type).filter(Boolean))]
   const hasDateFilter = !!(dateFrom || dateTo)
 
@@ -1350,8 +1536,8 @@ export default function BancaPage() {
             </p>
           )}
 
-          {/* KPI aggiornati con filtri */}
-          {transactions.length > 0 && (
+          {/* KPI from server-side aggregates */}
+          {(kpiAggregates || transactions.length > 0) && (
             <div className="grid grid-cols-3 gap-3">
               <Card>
                 <CardContent className="p-3">
@@ -1372,7 +1558,18 @@ export default function BancaPage() {
               <Card>
                 <CardContent className="p-3">
                   <p className="text-[10px] text-muted-foreground uppercase">Ultimo saldo</p>
-                  <p className="text-lg font-bold">{latestBalance != null ? fmtEur(latestBalance) : '—'}</p>
+                  {latestBalance != null ? (
+                    <>
+                      <p className={`text-lg font-bold ${latestBalance >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>
+                        {fmtEur(latestBalance)}
+                      </p>
+                      {balanceInfo?.latest_tx_date && (
+                        <p className="text-[9px] text-gray-400">al {fmtDate(balanceInfo.latest_tx_date)}</p>
+                      )}
+                    </>
+                  ) : (
+                    <p className="text-sm text-gray-400">Non configurato</p>
+                  )}
                 </CardContent>
               </Card>
             </div>
@@ -1462,6 +1659,48 @@ export default function BancaPage() {
                 )}
               </div>
               <button className="text-gray-400 hover:text-gray-600 flex-shrink-0" onClick={() => setImportResult(null)}>
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+
+          {/* Saldo cleanup banner */}
+          {saldoCleanupRows && saldoCleanupRows.length > 0 && (
+            <div className="flex items-start gap-3 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+              <AlertTriangle className="h-4 w-4 text-amber-600 flex-shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <p className="text-sm font-medium text-amber-800">
+                  Trovati {saldoCleanupRows.length} movimenti "SALDO" importati come transazioni
+                </p>
+                <p className="text-xs text-amber-700 mt-1">
+                  Queste righe di saldo (SALDO INIZIALE/FINALE) gonfiano i totali Entrate/Uscite.
+                </p>
+                <ul className="text-xs text-amber-600 mt-1 space-y-0.5">
+                  {saldoCleanupRows.slice(0, 5).map((r) => (
+                    <li key={r.id}>• {fmtDate(r.date)} — {r.description} — {fmtEur(r.amount)}</li>
+                  ))}
+                  {saldoCleanupRows.length > 5 && <li>...e altri {saldoCleanupRows.length - 5}</li>}
+                </ul>
+                <div className="flex gap-2 mt-2">
+                  <Button variant="destructive" size="sm" onClick={async () => {
+                    try {
+                      await deleteBankTransactions(saldoCleanupRows.map(r => r.id))
+                      setToast({ message: `${saldoCleanupRows.length} righe SALDO eliminate`, type: 'success' })
+                      setSaldoCleanupRows(null)
+                      loadData(true)
+                    } catch (e: any) {
+                      setToast({ message: 'Errore pulizia: ' + e.message, type: 'error' })
+                    }
+                  }}>
+                    <Trash2 className="h-3.5 w-3.5 mr-1.5" />
+                    Elimina {saldoCleanupRows.length} righe SALDO
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => setSaldoCleanupRows(null)}>
+                    Ignora
+                  </Button>
+                </div>
+              </div>
+              <button onClick={() => setSaldoCleanupRows(null)} className="text-amber-400 hover:text-amber-600 flex-shrink-0">
                 <X className="h-4 w-4" />
               </button>
             </div>
@@ -1659,6 +1898,21 @@ export default function BancaPage() {
         </div>
       )}
 
+      {saldoDialog && (
+        <SaldoInizialeDialog
+          saldoMeta={{
+            saldoInizialeAmount: saldoDialog.amount,
+            saldoInizialeDate: saldoDialog.date,
+          }}
+          bankAccountId={saldoDialog.bankAccountId}
+          onConfirm={() => {
+            setToast({ message: 'Saldo iniziale salvato', type: 'success' })
+            resumeImportAfterSaldo()
+          }}
+          onSkip={() => resumeImportAfterSaldo()}
+        />
+      )}
+
       {summaryReview && (
         <SummaryReviewModal
           items={summaryReview.items}
@@ -1692,6 +1946,22 @@ export default function BancaPage() {
 
       <ConfirmDeleteModal open={deleteModal.open} count={deleteModal.ids.length}
         onConfirm={handleDelete} onCancel={() => !deleting && setDeleteModal({ open: false, ids: [] })} />
+
+      {/* Toast notification */}
+      {toast && (
+        <div className={`fixed bottom-4 right-4 z-50 flex items-center gap-2 px-4 py-3 rounded-lg shadow-lg text-sm font-medium transition-all ${
+          toast.type === 'success' ? 'bg-emerald-600 text-white' :
+          toast.type === 'error' ? 'bg-red-600 text-white' :
+          'bg-sky-600 text-white'
+        }`}>
+          {toast.type === 'success' && <CheckCircle className="h-4 w-4" />}
+          {toast.type === 'error' && <AlertCircle className="h-4 w-4" />}
+          {toast.message}
+          <button onClick={() => setToast(null)} className="ml-2 text-white/70 hover:text-white">
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
     </div>
   )
 }
