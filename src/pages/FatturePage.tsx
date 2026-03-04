@@ -1,6 +1,6 @@
 // src/pages/FatturePage.tsx — v5
 // Date filter + AI search (Haiku) + removed Fix Nomi
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useRef, useEffect, useSyncExternalStore } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { processInvoiceFile, TIPO, MP, REG } from '@/lib/invoiceParser';
 import {
@@ -12,10 +12,13 @@ import { listInstallmentsForInvoice, type InvoiceInstallment } from '@/lib/scade
 import { aiSearchInvoices, type AISearchResult } from '@/lib/aiSearch';
 import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
-import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client';
-import { getValidAccessToken } from '@/lib/getValidAccessToken';
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges';
 import { ReconciledIcon, ReconciliationDot } from '@/components/ReconciliationIndicators';
+import {
+  subscribeExtraction, getExtractionState,
+  startExtraction, loadExtractionStats as loadExtStats,
+  type ExtractionState,
+} from '@/lib/extractionStore';
 
 // ============================================================
 // LOOKUPS
@@ -678,57 +681,30 @@ export default function FatturePage() {
   const [aiSearching, setAiSearching] = useState(false);
   const [aiError, setAiError] = useState('');
 
-  // ── Invoice extraction summary (AI) ──
-  const [extractionRunning, setExtractionRunning] = useState(false);
-  const [extractionProgress, setExtractionProgress] = useState<{ processed: number; total: number } | null>(null);
-  const [extractionStats, setExtractionStats] = useState<{ ready: number; pending: number; total: number } | null>(null);
+  // ── Invoice extraction summary (AI) — lives in module-level store so it survives navigation ──
+  const ext = useSyncExternalStore(subscribeExtraction, getExtractionState);
+  const extractionRunning = ext.running;
+  const extractionProgress = ext.running ? { processed: ext.processed, total: ext.total } : null;
+  const extractionStats = ext.stats;
 
-  const runExtraction = useCallback(async () => {
-    if (!companyId || extractionRunning) return;
-    setExtractionRunning(true);
-    setExtractionProgress({ processed: 0, total: invoices.length });
-    let totalProcessed = 0;
-    try {
-      const token = await getValidAccessToken();
-      while (true) {
-        const res = await fetch(`${SUPABASE_URL}/functions/v1/invoice-extract-summary`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY, 'Authorization': `Bearer ${token}` },
-          body: JSON.stringify({ company_id: companyId, batch_size: 50 }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-        totalProcessed += (data.processed || 0);
-        setExtractionProgress({ processed: totalProcessed, total: totalProcessed + (data.total_pending || 0) });
-        if ((data.total_pending || 0) <= 0) break;
-      }
-      // Refresh extraction stats after completion
-      loadExtractionStats();
-    } catch (e: any) {
-      console.error('[Invoice Extraction]', e);
-      alert(`Errore estrazione: ${e.message || e}`);
+  // Show error alert once when extraction fails
+  const lastExtError = useRef<string | null>(null);
+  useEffect(() => {
+    if (ext.error && ext.error !== lastExtError.current) {
+      lastExtError.current = ext.error;
+      alert(`Errore estrazione: ${ext.error}`);
     }
-    setExtractionRunning(false);
-  }, [companyId, extractionRunning, invoices.length]);
+    if (!ext.error) lastExtError.current = null;
+  }, [ext.error]);
 
-  const loadExtractionStats = useCallback(async () => {
+  const runExtraction = useCallback(() => {
     if (!companyId) return;
-    try {
-      const token = await getValidAccessToken();
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/invoice-extract-summary`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY, 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ company_id: companyId, batch_size: 0 }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setExtractionStats({
-          ready: (invoices.length - (data.total_pending || 0)),
-          pending: data.total_pending || 0,
-          total: invoices.length,
-        });
-      }
-    } catch { /* ignore */ }
+    startExtraction(companyId, invoices.length);
+  }, [companyId, invoices.length]);
+
+  const loadExtractionStats = useCallback(() => {
+    if (!companyId) return;
+    loadExtStats(companyId, invoices.length);
   }, [companyId, invoices.length]);
 
   const reload = useCallback(async () => {
