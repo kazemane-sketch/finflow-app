@@ -20,6 +20,8 @@ import {
 } from '@/lib/bankParser'
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
 import { getValidAccessToken, type AccessTokenError } from '@/lib/getValidAccessToken'
+import { useReconciliationBadges } from '@/hooks/useReconciliationBadges'
+import { ReconciliationDot } from '@/components/ReconciliationIndicators'
 
 import BankTxDetail, {
   txTypeLabel as _txTypeLabel,
@@ -336,8 +338,8 @@ function SummaryReviewModal({
 // ============================================================
 // TRANSACTION ROW
 // ============================================================
-function TxRow({ tx, selected, onClick, onDoubleClick }: {
-  tx: any; selected: boolean; onClick: (e: MouseEvent<HTMLDivElement>) => void; onDoubleClick?: (e: MouseEvent<HTMLDivElement>) => void
+function TxRow({ tx, selected, onClick, onDoubleClick, suggestionScore }: {
+  tx: any; selected: boolean; onClick: (e: MouseEvent<HTMLDivElement>) => void; onDoubleClick?: (e: MouseEvent<HTMLDivElement>) => void; suggestionScore?: number
 }) {
   const direction = txDirection(tx)
   const isIn = direction === 'in'
@@ -391,6 +393,9 @@ function TxRow({ tx, selected, onClick, onDoubleClick }: {
         <span title="Riconciliato" className="flex-shrink-0">
           <CheckCircle className="h-3.5 w-3.5 text-emerald-500" />
         </span>
+      )}
+      {tx.reconciliation_status !== 'matched' && suggestionScore != null && (
+        <ReconciliationDot score={suggestionScore} txId={tx.id} />
       )}
       <div className="text-right flex-shrink-0">
         <p className={`text-sm font-bold ${isIn ? 'text-emerald-700' : 'text-red-700'}`}>
@@ -603,6 +608,7 @@ async function askBankAiSearch(body: BankAiSearchRequest): Promise<BankAiSearchR
 export default function BancaPage() {
   const { company } = useCompany()
   const companyId = company?.id || null
+  const { txScores } = useReconciliationBadges()
 
   const [transactions, setTransactions] = useState<any[]>([])
   const [bankAccounts, setBankAccounts] = useState<any[]>([])
@@ -1539,6 +1545,7 @@ export default function BancaPage() {
                       selected={selectedIds.has(tx.id) || (!isMultiSelect && selectedTx?.id === tx.id)}
                       onClick={(e) => handleRowClick(tx, e)}
                       onDoubleClick={() => handleRowDoubleClick(tx)}
+                      suggestionScore={txScores.get(tx.id)}
                     />
                   ))}
               </div>

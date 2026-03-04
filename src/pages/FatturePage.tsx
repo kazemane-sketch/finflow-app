@@ -12,6 +12,9 @@ import { listInstallmentsForInvoice, type InvoiceInstallment } from '@/lib/scade
 import { aiSearchInvoices, type AISearchResult } from '@/lib/aiSearch';
 import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
+import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client';
+import { useReconciliationBadges } from '@/hooks/useReconciliationBadges';
+import { ReconciledIcon, ReconciliationDot } from '@/components/ReconciliationIndicators';
 
 // ============================================================
 // LOOKUPS
@@ -240,7 +243,7 @@ function ImportProgress({ phase, current, total, logs }: { phase: 'reading' | 's
 // ============================================================
 // SIDEBAR CARD
 // ============================================================
-function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck }: { inv: DBInvoice; selected: boolean; checked: boolean; selectMode: boolean; onSelect: () => void; onCheck: () => void }) {
+function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, isMatched, suggestionScore }: { inv: DBInvoice; selected: boolean; checked: boolean; selectMode: boolean; onSelect: () => void; onCheck: () => void; isMatched?: boolean; suggestionScore?: number }) {
   const nc = inv.doc_type === 'TD04' || inv.doc_type === 'TD05';
   const cp = (inv.counterparty || {}) as any;
   const displayName = cp?.denom || inv.source_filename || 'Sconosciuto';
@@ -249,7 +252,7 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck }: 
       {selectMode && <input type="checkbox" checked={checked} onChange={onCheck} className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />}
       <div className="flex-1 min-w-0" onClick={onSelect}>
         <div className="flex justify-between items-center"><span className="text-xs font-semibold text-gray-800 truncate max-w-[55%]">{displayName}</span><span className={`text-xs font-bold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(inv.total_amount)}</span></div>
-        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className="flex gap-1">{nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}<span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></span></div>
+        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className="flex items-center gap-1">{isMatched && <ReconciledIcon size={12} />}{!isMatched && suggestionScore != null && <ReconciliationDot score={suggestionScore} />}{nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}<span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></span></div>
       </div>
     </div>
   );
@@ -645,6 +648,7 @@ export default function FatturePage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const companyId = company?.id || null;
+  const { matchedInvoiceIds, invoiceScores } = useReconciliationBadges();
   const [invoices, setInvoices] = useState<DBInvoice[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<DBInvoiceDetail | null>(null);
@@ -673,6 +677,56 @@ export default function FatturePage() {
   const [aiSearching, setAiSearching] = useState(false);
   const [aiError, setAiError] = useState('');
 
+  // ── Invoice extraction summary (AI) ──
+  const [extractionRunning, setExtractionRunning] = useState(false);
+  const [extractionProgress, setExtractionProgress] = useState<{ processed: number; total: number } | null>(null);
+  const [extractionStats, setExtractionStats] = useState<{ ready: number; pending: number; total: number } | null>(null);
+
+  const runExtraction = useCallback(async () => {
+    if (!companyId || extractionRunning) return;
+    setExtractionRunning(true);
+    setExtractionProgress({ processed: 0, total: invoices.length });
+    let totalProcessed = 0;
+    try {
+      while (true) {
+        const res = await fetch(`${SUPABASE_URL}/functions/v1/invoice-extract-summary`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
+          body: JSON.stringify({ company_id: companyId, batch_size: 50 }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        totalProcessed += (data.processed || 0);
+        setExtractionProgress({ processed: totalProcessed, total: totalProcessed + (data.total_pending || 0) });
+        if ((data.total_pending || 0) <= 0) break;
+      }
+      // Refresh extraction stats after completion
+      loadExtractionStats();
+    } catch (e: any) {
+      console.error('[Invoice Extraction]', e);
+    }
+    setExtractionRunning(false);
+  }, [companyId, extractionRunning, invoices.length]);
+
+  const loadExtractionStats = useCallback(async () => {
+    if (!companyId) return;
+    try {
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/invoice-extract-summary`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
+        body: JSON.stringify({ company_id: companyId, batch_size: 0 }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setExtractionStats({
+          ready: (invoices.length - (data.total_pending || 0)),
+          pending: data.total_pending || 0,
+          total: invoices.length,
+        });
+      }
+    } catch { /* ignore */ }
+  }, [companyId, invoices.length]);
+
   const reload = useCallback(async () => {
     if (!companyId) return;
     setLoadingList(true);
@@ -680,6 +734,7 @@ export default function FatturePage() {
     setLoadingList(false);
   }, [companyId]);
   useEffect(() => { reload(); }, [reload]);
+  useEffect(() => { if (invoices.length > 0) loadExtractionStats(); }, [invoices.length, loadExtractionStats]);
 
   useEffect(() => {
     if (!selectedId || !companyId) { setDetail(null); setInstallments([]); return; }
@@ -829,6 +884,21 @@ export default function FatturePage() {
         <span className="text-sm font-bold text-green-700">Totale: {fmtEur(stats.totalAmount)}</span>
         <button onClick={() => fileRef.current?.click()} className="px-3 py-1.5 text-xs font-semibold bg-sky-600 text-white rounded-lg hover:bg-sky-700">📥 Importa</button>
         <input ref={fileRef} type="file" multiple accept=".xml,.p7m,.zip" onChange={e => e.target.files && handleImport(e.target.files)} className="hidden" />
+        {invoices.length > 0 && (
+          <button
+            onClick={runExtraction}
+            disabled={extractionRunning || (extractionStats?.pending === 0)}
+            className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-purple-700 bg-purple-50 border border-purple-200 rounded-lg hover:bg-purple-100 disabled:opacity-50"
+          >
+            {extractionRunning ? (
+              <>⏳ Estrazione: {extractionProgress?.processed ?? 0}/{extractionProgress?.total ?? '?'}</>
+            ) : extractionStats?.pending === 0 ? (
+              <>✅ AI: {extractionStats?.ready ?? 0}/{extractionStats?.total ?? 0} pronti</>
+            ) : (
+              <>✨ Estrai dettagli AI{extractionStats ? ` (${extractionStats.pending} pending)` : ''}</>
+            )}
+          </button>
+        )}
       </div>
 
       {importing && <div className="px-4 pt-3 print:hidden"><ImportProgress phase={importPhase} current={importCurrent} total={importTotal} logs={importLogs} /></div>}
@@ -911,7 +981,7 @@ export default function FatturePage() {
           <div className="flex-1 overflow-y-auto">
             {loadingList || companyLoading ? <div className="text-center py-8 text-gray-400 text-sm">Caricamento...</div>
               : filtered.length === 0 ? <div className="text-center py-8 text-gray-400 text-sm">{invoices.length === 0 ? 'Nessuna fattura importata' : 'Nessun risultato'}</div>
-              : filtered.map(inv => <InvoiceCard key={inv.id} inv={inv} selected={selectedId === inv.id} checked={checked.has(inv.id)} selectMode={selectMode} onSelect={() => setSelectedId(inv.id)} onCheck={() => toggleCheck(inv.id)} />)}
+              : filtered.map(inv => <InvoiceCard key={inv.id} inv={inv} selected={selectedId === inv.id} checked={checked.has(inv.id)} selectMode={selectMode} onSelect={() => setSelectedId(inv.id)} onCheck={() => toggleCheck(inv.id)} isMatched={matchedInvoiceIds.has(inv.id)} suggestionScore={invoiceScores.get(inv.id)} />)}
           </div>
         </div>
         {/* Detail */}

@@ -44,23 +44,44 @@ const tools = [
   {
     name: "get_invoices",
     description:
-      "Cerca fatture dell'azienda con filtri opzionali. Ritorna: number, date, total_amount, direction, doc_type, counterparty, status.",
+      "Cerca fatture dell'azienda con filtri opzionali. Ritorna: number, date, total_amount, direction, doc_type, counterparty, status. Per ricerche full-text (prodotti, CIG, CUP, codici), usa search_invoices.",
     input_schema: {
       type: "object" as const,
       properties: {
         counterparty: { type: "string", description: "Nome controparte (ricerca parziale ILIKE)" },
+        piva: { type: "string", description: "P.IVA o codice fiscale controparte (ricerca parziale)" },
         date_from: { type: "string", description: "Data inizio YYYY-MM-DD" },
         date_to: { type: "string", description: "Data fine YYYY-MM-DD" },
         direction: { type: "string", enum: ["in", "out"], description: "in = attive (vendita), out = passive (acquisto)" },
         doc_type: { type: "string", description: "Tipo documento FatturaPA: TD01, TD04, TD24, etc." },
         number_contains: { type: "string", description: "Ricerca parziale nel numero fattura" },
+        line_description: { type: "string", description: "Cerca nelle descrizioni righe fattura (ILIKE)" },
+        keyword: { type: "string", description: "Cerca nelle keywords estratte dall'AI (da extracted_summary)" },
+        amount_min: { type: "number", description: "Importo totale minimo" },
+        amount_max: { type: "number", description: "Importo totale massimo" },
         limit: { type: "number", description: "Max risultati (default 20, max 100)" },
       },
     },
   },
   {
+    name: "search_invoices",
+    description:
+      "Ricerca full-text nelle fatture: cerca in righe fattura, keywords estratte dall'AI (extracted_summary), numero fattura, nome controparte. Usa per domande tipo 'fatture con prodotto X', 'fattura con CIG...', 'fatture con keyword Y'.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        query: { type: "string", description: "Testo da cercare (prodotti, codici, CIG, CUP, riferimenti)" },
+        direction: { type: "string", enum: ["in", "out"], description: "in = attive, out = passive" },
+        date_from: { type: "string", description: "Data inizio YYYY-MM-DD" },
+        date_to: { type: "string", description: "Data fine YYYY-MM-DD" },
+        limit: { type: "number", description: "Max risultati (default 20, max 100)" },
+      },
+      required: ["query"],
+    },
+  },
+  {
     name: "get_invoice_detail",
-    description: "Dettaglio completo di una singola fattura: righe, importi, rate associate.",
+    description: "Dettaglio completo di una singola fattura: righe, importi, rate associate, extracted_summary AI.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -131,22 +152,29 @@ const tools = [
   },
   {
     name: "get_counterparties",
-    description: "Lista controparti dell'azienda con statistiche aggregate.",
+    description: "Lista controparti dell'azienda con statistiche aggregate (fatturato, crediti, debiti). Supporta filtri per ruolo e ordinamento.",
     input_schema: {
       type: "object" as const,
       properties: {
         search: { type: "string", description: "Ricerca nel nome (ILIKE)" },
-        limit: { type: "number", description: "Default 20" },
+        role: { type: "string", enum: ["client", "supplier", "both"], description: "Filtra per ruolo: client = clienti, supplier = fornitori, both = entrambi" },
+        order_by: { type: "string", enum: ["name", "fatturato_desc", "credito_desc", "debito_desc"], description: "Ordinamento (default: name)" },
+        date_from: { type: "string", description: "Data inizio per statistiche aggregate YYYY-MM-DD" },
+        date_to: { type: "string", description: "Data fine per statistiche aggregate YYYY-MM-DD" },
+        limit: { type: "number", description: "Default 20, max 100" },
       },
     },
   },
   {
     name: "get_company_stats",
     description:
-      "KPI generali: n. fatture attive/passive, n. movimenti, totale scaduto, totale da incassare, totale da pagare, saldo banca.",
+      "KPI generali: n. fatture attive/passive, n. movimenti, totale scaduto, totale da incassare, totale da pagare, saldo banca, top 5 clienti/fornitori per fatturato.",
     input_schema: {
       type: "object" as const,
-      properties: {},
+      properties: {
+        date_from: { type: "string", description: "Data inizio YYYY-MM-DD per filtrare conteggi fatture e movimenti" },
+        date_to: { type: "string", description: "Data fine YYYY-MM-DD per filtrare conteggi fatture e movimenti" },
+      },
     },
   },
   {
@@ -210,6 +238,26 @@ async function handleGetInvoices(sql: SqlClient, companyId: string, args: Record
     conditions.push(`i.number ILIKE '%' || $${idx} || '%'`);
     params.push(args.number_contains); idx++;
   }
+  if (args.piva) {
+    conditions.push(`(i.counterparty->>'piva' ILIKE '%' || $${idx} || '%' OR i.counterparty->>'cf' ILIKE '%' || $${idx} || '%')`);
+    params.push(args.piva); idx++;
+  }
+  if (args.line_description) {
+    conditions.push(`EXISTS (SELECT 1 FROM invoice_lines il WHERE il.invoice_id = i.id AND il.description ILIKE '%' || $${idx} || '%')`);
+    params.push(args.line_description); idx++;
+  }
+  if (args.keyword) {
+    conditions.push(`i.extracted_summary::text ILIKE '%' || $${idx} || '%'`);
+    params.push(args.keyword); idx++;
+  }
+  if (typeof args.amount_min === "number") {
+    conditions.push(`i.total_amount >= $${idx}`);
+    params.push(args.amount_min); idx++;
+  }
+  if (typeof args.amount_max === "number") {
+    conditions.push(`i.total_amount <= $${idx}`);
+    params.push(args.amount_max); idx++;
+  }
 
   const limit = Math.min(Number(args.limit) || 20, 100);
   params.push(limit);
@@ -219,6 +267,57 @@ async function handleGetInvoices(sql: SqlClient, companyId: string, args: Record
             i.direction, i.doc_type, i.counterparty->>'denom' as counterparty_name,
             i.counterparty->>'piva' as counterparty_vat,
             i.payment_status, i.reconciliation_status, i.source_filename
+     FROM invoices i
+     WHERE ${conditions.join(" AND ")}
+     ORDER BY i.date DESC
+     LIMIT $${idx}`,
+    params,
+  );
+}
+
+async function handleSearchInvoices(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const queryText = String(args.query || "").trim();
+  if (!queryText) return [];
+
+  const words = queryText.split(/\s+/).filter((w: string) => w.length >= 2);
+  if (words.length === 0) return [];
+
+  const conditions = ["i.company_id = $1"];
+  const params: unknown[] = [companyId];
+  let idx = 2;
+
+  for (const word of words) {
+    conditions.push(`(
+      EXISTS (SELECT 1 FROM invoice_lines il WHERE il.invoice_id = i.id AND il.description ILIKE '%' || $${idx} || '%')
+      OR i.extracted_summary::text ILIKE '%' || $${idx} || '%'
+      OR i.number ILIKE '%' || $${idx} || '%'
+      OR i.counterparty->>'denom' ILIKE '%' || $${idx} || '%'
+    )`);
+    params.push(word); idx++;
+  }
+
+  if (args.direction) {
+    conditions.push(`i.direction = $${idx}`);
+    params.push(args.direction); idx++;
+  }
+  if (args.date_from) {
+    conditions.push(`i.date >= $${idx}::date`);
+    params.push(args.date_from); idx++;
+  }
+  if (args.date_to) {
+    conditions.push(`i.date <= $${idx}::date`);
+    params.push(args.date_to); idx++;
+  }
+
+  const limit = Math.min(Number(args.limit) || 20, 100);
+  params.push(limit);
+
+  return await sql.unsafe(
+    `SELECT i.id, i.number, i.date, i.total_amount, i.direction, i.doc_type,
+            i.counterparty->>'denom' as counterparty_name,
+            i.payment_status, i.extraction_status,
+            (SELECT string_agg(il.description, ' | ' ORDER BY il.line_number)
+             FROM invoice_lines il WHERE il.invoice_id = i.id) as line_descriptions
      FROM invoices i
      WHERE ${conditions.join(" AND ")}
      ORDER BY i.date DESC
@@ -408,37 +507,123 @@ async function handleGetCounterparties(sql: SqlClient, companyId: string, args: 
     conditions.push(`cp.name ILIKE '%' || $${idx} || '%'`);
     params.push(args.search); idx++;
   }
+  if (args.role === "client") {
+    conditions.push(`cp.type IN ('client', 'both')`);
+  } else if (args.role === "supplier") {
+    conditions.push(`cp.type IN ('supplier', 'both')`);
+  }
+
+  let dateFilter = "";
+  if (args.date_from) {
+    dateFilter += ` AND inv.date >= $${idx}::date`;
+    params.push(args.date_from); idx++;
+  }
+  if (args.date_to) {
+    dateFilter += ` AND inv.date <= $${idx}::date`;
+    params.push(args.date_to); idx++;
+  }
+
+  const orderBy = args.order_by === "fatturato_desc" ? "agg.fatturato_totale DESC NULLS LAST"
+    : args.order_by === "credito_desc" ? "agg.credito_residuo DESC NULLS LAST"
+    : args.order_by === "debito_desc" ? "agg.debito_residuo DESC NULLS LAST"
+    : "cp.name";
 
   const limit = Math.min(Number(args.limit) || 20, 100);
   params.push(limit);
 
   return await sql.unsafe(
     `SELECT cp.id, cp.name, cp.vat_number, cp.fiscal_code, cp.type,
-            (SELECT count(*) FROM invoices i WHERE i.counterparty_id = cp.id AND i.direction = 'in') as fatture_attive,
-            (SELECT count(*) FROM invoices i WHERE i.counterparty_id = cp.id AND i.direction = 'out') as fatture_passive,
-            (SELECT coalesce(sum(amount_due - paid_amount), 0) FROM invoice_installments ii WHERE ii.counterparty_id = cp.id AND ii.direction = 'out' AND ii.status IN ('pending','overdue','partial')) as debito_residuo,
-            (SELECT coalesce(sum(amount_due - paid_amount), 0) FROM invoice_installments ii WHERE ii.counterparty_id = cp.id AND ii.direction = 'in' AND ii.status IN ('pending','overdue','partial')) as credito_residuo
+            coalesce(agg.fatture_attive, 0) as fatture_attive,
+            coalesce(agg.fatture_passive, 0) as fatture_passive,
+            coalesce(agg.fatturato_totale, 0) as fatturato_totale,
+            coalesce(agg.credito_residuo, 0) as credito_residuo,
+            coalesce(agg.debito_residuo, 0) as debito_residuo
      FROM counterparties cp
+     LEFT JOIN LATERAL (
+       SELECT
+         count(*) FILTER (WHERE inv.direction = 'in') as fatture_attive,
+         count(*) FILTER (WHERE inv.direction = 'out') as fatture_passive,
+         coalesce(sum(inv.total_amount), 0) as fatturato_totale,
+         coalesce(sum(CASE WHEN inv.direction = 'in' THEN ii_agg.residuo ELSE 0 END), 0) as credito_residuo,
+         coalesce(sum(CASE WHEN inv.direction = 'out' THEN ii_agg.residuo ELSE 0 END), 0) as debito_residuo
+       FROM invoices inv
+       LEFT JOIN LATERAL (
+         SELECT coalesce(sum(ii.amount_due - ii.paid_amount), 0) as residuo
+         FROM invoice_installments ii
+         WHERE ii.invoice_id = inv.id AND ii.status IN ('pending','overdue','partial')
+       ) ii_agg ON true
+       WHERE inv.counterparty_id = cp.id${dateFilter}
+     ) agg ON true
      WHERE ${conditions.join(" AND ")}
-     ORDER BY cp.name
+     ORDER BY ${orderBy}
      LIMIT $${idx}`,
     params,
   );
 }
 
-async function handleGetCompanyStats(sql: SqlClient, companyId: string) {
+async function handleGetCompanyStats(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const params: unknown[] = [companyId];
+  let idx = 2;
+
+  let invDateFilter = "";
+  let btDateFilter = "";
+  if (args.date_from) {
+    invDateFilter += ` AND date >= $${idx}::date`;
+    btDateFilter += ` AND date >= $${idx}::date`;
+    params.push(args.date_from); idx++;
+  }
+  if (args.date_to) {
+    invDateFilter += ` AND date <= $${idx}::date`;
+    btDateFilter += ` AND date <= $${idx}::date`;
+    params.push(args.date_to); idx++;
+  }
+
   const [stats] = await sql.unsafe(
     `SELECT
-      (SELECT count(*) FROM invoices WHERE company_id = $1 AND direction = 'in') as fatture_attive,
-      (SELECT count(*) FROM invoices WHERE company_id = $1 AND direction = 'out') as fatture_passive,
-      (SELECT count(*) FROM bank_transactions WHERE company_id = $1) as movimenti_totali,
+      (SELECT count(*) FROM invoices WHERE company_id = $1 AND direction = 'in'${invDateFilter}) as fatture_attive,
+      (SELECT count(*) FROM invoices WHERE company_id = $1 AND direction = 'out'${invDateFilter}) as fatture_passive,
+      (SELECT count(*) FROM bank_transactions WHERE company_id = $1${btDateFilter}) as movimenti_totali,
       (SELECT coalesce(sum(amount_due - paid_amount), 0) FROM invoice_installments WHERE company_id = $1 AND direction = 'out' AND status IN ('pending', 'overdue', 'partial')) as totale_da_pagare,
       (SELECT coalesce(sum(amount_due - paid_amount), 0) FROM invoice_installments WHERE company_id = $1 AND direction = 'in' AND status IN ('pending', 'overdue', 'partial')) as totale_da_incassare,
       (SELECT coalesce(sum(amount_due - paid_amount), 0) FROM invoice_installments WHERE company_id = $1 AND status = 'overdue') as totale_scaduto,
-      (SELECT count(*) FROM bank_transactions WHERE company_id = $1 AND reconciliation_status = 'unmatched') as movimenti_non_riconciliati`,
-    [companyId],
+      (SELECT count(*) FROM bank_transactions WHERE company_id = $1 AND reconciliation_status = 'unmatched') as movimenti_non_riconciliati,
+      (SELECT coalesce(sum(amount), 0) FROM bank_transactions WHERE company_id = $1) as saldo_banca`,
+    params,
   );
-  return stats;
+
+  // Build top5 date filter with i. prefix
+  let top5DateFilter = "";
+  if (args.date_from && args.date_to) {
+    top5DateFilter = ` AND i.date >= $2::date AND i.date <= $3::date`;
+  } else if (args.date_from) {
+    top5DateFilter = ` AND i.date >= $2::date`;
+  } else if (args.date_to) {
+    top5DateFilter = ` AND i.date <= $2::date`;
+  }
+
+  const topClienti = await sql.unsafe(
+    `SELECT cp.name, coalesce(sum(i.total_amount), 0) as fatturato
+     FROM counterparties cp
+     JOIN invoices i ON i.counterparty_id = cp.id AND i.direction = 'in'
+     WHERE cp.company_id = $1${top5DateFilter}
+     GROUP BY cp.id, cp.name
+     ORDER BY fatturato DESC
+     LIMIT 5`,
+    params,
+  );
+
+  const topFornitori = await sql.unsafe(
+    `SELECT cp.name, coalesce(sum(i.total_amount), 0) as fatturato
+     FROM counterparties cp
+     JOIN invoices i ON i.counterparty_id = cp.id AND i.direction = 'out'
+     WHERE cp.company_id = $1${top5DateFilter}
+     GROUP BY cp.id, cp.name
+     ORDER BY fatturato DESC
+     LIMIT 5`,
+    params,
+  );
+
+  return { ...stats, top_5_clienti: topClienti, top_5_fornitori: topFornitori };
 }
 
 async function handleSuggestReconciliation(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
@@ -599,6 +784,8 @@ async function executeToolHandler(
   switch (toolName) {
     case "get_invoices":
       return handleGetInvoices(sql, companyId, toolInput);
+    case "search_invoices":
+      return handleSearchInvoices(sql, companyId, toolInput);
     case "get_invoice_detail":
       return handleGetInvoiceDetail(sql, companyId, toolInput);
     case "get_bank_transactions":
@@ -612,7 +799,7 @@ async function executeToolHandler(
     case "get_counterparties":
       return handleGetCounterparties(sql, companyId, toolInput);
     case "get_company_stats":
-      return handleGetCompanyStats(sql, companyId);
+      return handleGetCompanyStats(sql, companyId, toolInput);
     case "suggest_reconciliation":
       return handleSuggestReconciliation(sql, companyId, toolInput);
     case "search_knowledge_base":
@@ -627,6 +814,15 @@ async function executeToolHandler(
 const SYSTEM_PROMPT = `Sei l'assistente AI di FinFlow, un gestionale finanziario per PMI italiane. Rispondi in italiano, in modo pratico e preciso.
 
 Hai accesso ai dati dell'azienda tramite le seguenti funzioni. Quando l'utente chiede informazioni, usa le funzioni per recuperare dati reali. Non inventare mai dati. Per importi usa il formato italiano (1.234,56 €). Quando analizzi movimenti bancari, presta particolare attenzione al campo raw_text e extracted_refs per trovare riferimenti a fatture, mandati, contratti, rate.
+
+STRATEGIA DI RICERCA FATTURE:
+- Per filtri strutturati (controparte, data, importo, tipo doc): usa get_invoices
+- Per ricerca testuale (prodotti, CIG, CUP, codici, keywords): usa search_invoices — cerca nelle righe fattura, extracted_summary, numero e controparte
+- Per dettaglio singola fattura con extracted_summary AI: usa get_invoice_detail
+
+CONTROPARTI: get_counterparties supporta ordinamento per fatturato, credito o debito (order_by). Usa role per filtrare clienti/fornitori. Supporta date_from/date_to per statistiche nel periodo.
+
+STATISTICHE: get_company_stats ora include saldo_banca e top 5 clienti/fornitori per fatturato. Supporta filtri date per periodo specifico.
 
 Hai anche accesso alla Knowledge Base aziendale tramite search_knowledge_base. Se l'utente chiede informazioni su documenti caricati (contratti, regolamenti, procedure, manuali), cerca prima nella knowledge base.
 

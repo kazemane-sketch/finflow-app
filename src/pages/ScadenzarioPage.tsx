@@ -5,9 +5,10 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { CalendarClock, Receipt, ArrowDownLeft, ArrowUpRight, Search, Filter, Landmark, PencilLine, Sparkles, X } from 'lucide-react'
+import { CalendarClock, Receipt, ArrowDownLeft, ArrowUpRight, Search, Filter, Landmark, PencilLine, Sparkles, X, CheckCircle2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { useCompany } from '@/hooks/useCompany'
+import { useReconciliationBadges } from '@/hooks/useReconciliationBadges'
 import { supabase } from '@/integrations/supabase/client'
 import { fmtDate, fmtEur } from '@/lib/utils'
 import BankTxDetail from '@/components/BankTxDetail'
@@ -161,6 +162,7 @@ export default function ScadenzarioPage() {
   const { company } = useCompany()
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
+  const { installmentScores } = useReconciliationBadges()
 
   const [activeTab, setActiveTab] = useState<'all' | 'incassi' | 'pagamenti' | 'iva'>('all')
   const [periodPreset, setPeriodPreset] = useState<ScadenzarioFilters['periodPreset']>('next_30')
@@ -1405,9 +1407,17 @@ export default function ScadenzarioPage() {
                                 )}
                               </td>
                               <td className="px-3 py-2">
-                                <span className={`text-[11px] px-2 py-1 rounded-full font-medium ${rowStatusBadge(row.status)}`}>
-                                  {row.status_label}
-                                </span>
+                                <div className="flex items-center gap-1">
+                                  <span className={`text-[11px] px-2 py-1 rounded-full font-medium ${rowStatusBadge(row.status)}`}>
+                                    {row.status_label}
+                                  </span>
+                                  {row.status === 'paid' && row.kind === 'installment' && (
+                                    <CheckCircle2 className="h-3 w-3 text-emerald-500" />
+                                  )}
+                                  {row.kind === 'installment' && row.status !== 'paid' && installmentScores.has(row.id) && (
+                                    <span title={`Suggerimento AI: ${installmentScores.get(row.id)}%`} className={`w-2 h-2 rounded-full animate-pulse ${(installmentScores.get(row.id) || 0) >= 85 ? 'bg-red-500' : 'bg-amber-500'}`} />
+                                  )}
+                                </div>
                               </td>
                               <td className={`px-3 py-2 text-right font-medium ${row.days > 0 ? 'text-red-700' : row.days < 0 ? 'text-emerald-700' : 'text-amber-700'}`}>
                                 {row.days > 0 ? `+${row.days}` : row.days}
