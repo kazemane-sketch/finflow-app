@@ -824,11 +824,21 @@ export default function FatturePage() {
 
   // ── AI Search handler ──
   const handleAISearch = useCallback(async () => {
-    if (!query.trim() || !invoices.length) return;
+    if (!query.trim() || !companyId) return;
     setAiSearching(true); setAiError('');
     try {
-      // Pass direction-filtered invoices to AI search
-      const dirInvoices = directionFilter === 'all' ? invoices : invoices.filter(i => i.direction === directionFilter);
+      // Load a fresh batch of invoices WITHOUT text filter, so AI can search the full dataset.
+      // Only apply direction filter (not text query, not date filter).
+      const freshResult = await loadInvoices(companyId, {
+        direction: directionFilter,
+        status: 'all',
+      }, { page: 0, pageSize: 500 });
+      const dirInvoices = freshResult.data;
+      if (!dirInvoices.length) {
+        setAiError('Nessuna fattura disponibile per la ricerca AI.');
+        setAiSearching(false);
+        return;
+      }
       const result = await aiSearchInvoices(query, dirInvoices);
       setAiResult(result);
     } catch (e: any) {
@@ -836,7 +846,7 @@ export default function FatturePage() {
       setAiResult(null);
     }
     setAiSearching(false);
-  }, [query, invoices, directionFilter]);
+  }, [query, companyId, directionFilter]);
 
   // Clear AI results when query changes (user is typing)
   const handleQueryChange = (val: string) => {

@@ -333,7 +333,7 @@ export async function loadInvoices(
     if (filters?.dateTo) q = q.lte('date', filters.dateTo);
     if (filters?.query) {
       const p = `%${filters.query}%`;
-      q = q.or(`number.ilike.${p},source_filename.ilike.${p}`);
+      q = q.or(`number.ilike.${p},source_filename.ilike.${p},counterparty->>denom.ilike.${p},counterparty->>name.ilike.${p}`);
     }
   }
 
@@ -379,7 +379,7 @@ export async function loadInvoiceStats(
     if (filters?.direction && filters.direction !== 'all') q = q.eq('direction', filters.direction);
     if (filters?.dateFrom) q = q.gte('date', filters.dateFrom);
     if (filters?.dateTo) q = q.lte('date', filters.dateTo);
-    if (filters?.query) { const p = `%${filters.query}%`; q = q.or(`number.ilike.${p},source_filename.ilike.${p}`); }
+    if (filters?.query) { const p = `%${filters.query}%`; q = q.or(`number.ilike.${p},source_filename.ilike.${p},counterparty->>denom.ilike.${p},counterparty->>name.ilike.${p}`); }
     if (status) q = q.eq('payment_status', status);
     return q;
   };
