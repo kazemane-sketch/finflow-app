@@ -44,7 +44,7 @@ export async function aiSearchInvoices(
   allInvoices: DBInvoice[]
 ): Promise<AISearchResult> {
   // 1. Call Edge Function
-  const { data, error } = await supabase.functions.invoke('ai-search-invoices', {
+  const { data, error } = await supabase.functions.invoke('invoice-ai-search', {
     body: { query },
   });
 

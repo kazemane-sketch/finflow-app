@@ -6,10 +6,13 @@ import { processInvoiceFile, TIPO, MP, REG } from '@/lib/invoiceParser';
 import {
   saveInvoicesToDB, loadInvoices, loadInvoiceDetail, loadInvoiceStats,
   deleteInvoices, updateInvoice, verifyPassword,
+  fetchInvoiceAggregates,
   type DBInvoice, type DBInvoiceDetail, type InvoiceUpdate, type InvoiceFilters,
+  type InvoiceAggregates,
 } from '@/lib/invoiceSaver';
 import { listInstallmentsForInvoice, type InvoiceInstallment } from '@/lib/scadenzario';
-import { aiSearchInvoices, type AISearchResult } from '@/lib/aiSearch';
+import { supabase } from '@/integrations/supabase/client';
+import { getValidAccessToken } from '@/lib/getValidAccessToken';
 import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges';
@@ -646,6 +649,114 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 }
 
 // ============================================================
+// INVOICE AI SEARCH — Types + Helpers (mirrors BancaPage pattern)
+// ============================================================
+type InvoiceAiFilterSpec = {
+  date_from?: string | null;
+  date_to?: string | null;
+  direction?: 'in' | 'out' | null;
+  counterparty_pattern?: string | null;
+  amount_min?: number | null;
+  amount_max?: number | null;
+  payment_status?: string[] | null;
+  doc_types?: string[] | null;
+};
+
+type InvoiceAiSearchResponse = {
+  mode: 'filter' | 'analysis';
+  answer?: string;
+  filter?: InvoiceAiFilterSpec;
+  candidate_ids?: string[];
+  candidate_count?: number;
+  used_count?: number;
+  model?: string;
+  request_id?: string;
+  error?: string;
+  error_code?: string;
+  hint?: string;
+  details?: string;
+};
+
+type InvoiceAiResult = {
+  text: string;
+  mode: 'filter' | 'analysis';
+  isError: boolean;
+  requestId?: string;
+  candidateIds?: string[];
+};
+
+function normalizeCandidateIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((v): v is string => typeof v === 'string' && v.length > 0);
+}
+
+async function invokeInvoiceAiSearch(
+  body: Record<string, unknown>,
+  token: string,
+): Promise<InvoiceAiSearchResponse> {
+  const supabaseUrl = (import.meta as any).env?.VITE_SUPABASE_URL
+    ?? 'https://xtuofcwvimaffcpqboou.supabase.co';
+  const anonKey = (import.meta as any).env?.VITE_SUPABASE_ANON_KEY
+    ?? '';
+
+  const res = await fetch(`${supabaseUrl}/functions/v1/invoice-ai-search`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: anonKey,
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok && !data?.mode) {
+    const msg = data?.error || data?.message || `HTTP ${res.status}`;
+    const err = new Error(msg) as any;
+    err.status = res.status;
+    err.errorCode = data?.error_code;
+    err.hint = data?.hint;
+    err.details = data?.details;
+    throw err;
+  }
+
+  return {
+    mode: data.mode || 'analysis',
+    answer: data.answer,
+    filter: data.filter,
+    candidate_ids: normalizeCandidateIds(data.candidate_ids),
+    candidate_count: data.candidate_count,
+    used_count: data.used_count,
+    model: data.model,
+    request_id: data.request_id,
+    error: data.error,
+    error_code: data.error_code,
+    hint: data.hint,
+    details: data.details,
+  };
+}
+
+async function askInvoiceAiSearch(
+  body: Record<string, unknown>,
+): Promise<InvoiceAiSearchResponse> {
+  let token = await getValidAccessToken();
+  try {
+    return await invokeInvoiceAiSearch(body, token);
+  } catch (e: any) {
+    if (e?.status === 401) {
+      // Retry once with refreshed token
+      const { data: refreshData, error: refreshErr } = await supabase.auth.refreshSession();
+      if (refreshErr || !refreshData?.session?.access_token) {
+        throw new Error('Sessione scaduta — effettua nuovamente il login.');
+      }
+      token = refreshData.session.access_token;
+      return await invokeInvoiceAiSearch(body, token);
+    }
+    throw e;
+  }
+}
+
+// ============================================================
 // MAIN PAGE
 // ============================================================
 export default function FatturePage() {
@@ -685,14 +796,19 @@ export default function FatturePage() {
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [deleteModal, setDeleteModal] = useState<{ open: boolean; ids: string[] }>({ open: false, ids: [] });
 
-  // ── NEW: Date filter ──
+  // ── Date filter ──
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
 
-  // ── NEW: AI search ──
-  const [aiResult, setAiResult] = useState<AISearchResult | null>(null);
+  // ── AI search (BancaPage-style: filter + analysis modes) ──
+  const [aiResult, setAiResult] = useState<InvoiceAiResult | null>(null);
   const [aiSearching, setAiSearching] = useState(false);
   const [aiError, setAiError] = useState('');
+
+  // ── AI filter state (structured filters from AI classification) ──
+  const [amountMin, setAmountMin] = useState<number | undefined>(undefined);
+  const [amountMax, setAmountMax] = useState<number | undefined>(undefined);
+  const [counterpartyPattern, setCounterpartyPattern] = useState<string | undefined>(undefined);
 
   // ── Invoice extraction summary (AI) — lives in module-level store so it survives navigation ──
   const ext = useSyncExternalStore(subscribeExtraction, getExtractionState);
@@ -727,14 +843,22 @@ export default function FatturePage() {
     return () => clearTimeout(queryDebounceRef.current);
   }, [query]);
 
+  const resetAllFilters = useCallback(() => {
+    setDateFrom(''); setDateTo(''); setStatusFilter('all');
+    setAmountMin(undefined); setAmountMax(undefined); setCounterpartyPattern(undefined);
+  }, []);
+
   const buildFilters = useCallback((): InvoiceFilters => ({
     direction: directionFilter,
     status: statusFilter,
     dateFrom: dateFrom || undefined,
     dateTo: dateTo || undefined,
     query: debouncedQuery || undefined,
-    candidateIds: aiResult?.ids?.length ? aiResult.ids : undefined,
-  }), [directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.ids]);
+    candidateIds: aiResult?.candidateIds?.length ? aiResult.candidateIds : undefined,
+    amountMin,
+    amountMax,
+    counterpartyPattern,
+  }), [directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.candidateIds, amountMin, amountMax, counterpartyPattern]);
 
   const reload = useCallback(async (reset = true) => {
     if (!companyId) return;
@@ -751,11 +875,12 @@ export default function FatturePage() {
       const result = await loadInvoices(companyId, filters, { page: currentPage, pageSize: PAGE_SIZE });
       if (reset) {
         setInvoices(result.data);
-        // Load stats + tab counts in parallel
+        // Load stats + tab counts in parallel (pass all filter fields including amount/counterparty)
+        const statsFilters = { direction: filters.direction, dateFrom: filters.dateFrom, dateTo: filters.dateTo, query: filters.query, amountMin: filters.amountMin, amountMax: filters.amountMax, counterpartyPattern: filters.counterpartyPattern };
         const [stats, inStats, outStats] = await Promise.all([
-          loadInvoiceStats(companyId, { direction: filters.direction, dateFrom: filters.dateFrom, dateTo: filters.dateTo, query: filters.query }),
-          loadInvoiceStats(companyId, { direction: 'in', dateFrom: filters.dateFrom, dateTo: filters.dateTo, query: filters.query }),
-          loadInvoiceStats(companyId, { direction: 'out', dateFrom: filters.dateFrom, dateTo: filters.dateTo, query: filters.query }),
+          loadInvoiceStats(companyId, statsFilters),
+          loadInvoiceStats(companyId, { ...statsFilters, direction: 'in' }),
+          loadInvoiceStats(companyId, { ...statsFilters, direction: 'out' }),
         ]);
         setServerStats(stats);
         setTabCounts({ in: inStats.total, out: outStats.total });
@@ -775,7 +900,7 @@ export default function FatturePage() {
     setPage(0); setAllLoaded(false); setInvoices([]); setTotalCount(0);
     reload(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [companyId, directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.ids?.join(',')]);
+  }, [companyId, directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.candidateIds?.join(','), amountMin, amountMax, counterpartyPattern]);
 
   // Load next page
   useEffect(() => { if (page > 0) reload(false); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [page]);
@@ -822,36 +947,71 @@ export default function FatturePage() {
     setSelectedId(invoiceIdParam);
   }, [searchParams, invoices]);
 
-  // ── AI Search handler ──
+  // ── AI Search handler (BancaPage-style: classify → filter/analysis) ──
   const handleAISearch = useCallback(async () => {
     if (!query.trim() || !companyId) return;
-    setAiSearching(true); setAiError('');
+    setAiSearching(true); setAiError(''); setAiResult(null);
+    resetAllFilters();
     try {
-      // Load a fresh batch of invoices WITHOUT text filter, so AI can search the full dataset.
-      // Only apply direction filter (not text query, not date filter).
-      const freshResult = await loadInvoices(companyId, {
-        direction: directionFilter,
-        status: 'all',
-      }, { page: 0, pageSize: 500 });
-      const dirInvoices = freshResult.data;
-      if (!dirInvoices.length) {
-        setAiError('Nessuna fattura disponibile per la ricerca AI.');
-        setAiSearching(false);
-        return;
+      const result = await askInvoiceAiSearch({
+        query,
+        company_id: companyId,
+        direction: 'all', // search across all directions
+      });
+
+      console.log('[Fatture AI] raw result:', JSON.stringify({ mode: result.mode, hasFilter: !!result.filter, filter: result.filter }));
+
+      // Filter mode: AI returned structured filters → apply locally
+      const isFilterMode = (result.mode === 'filter' || !!result.filter) && result.filter;
+      if (isFilterMode) {
+        console.log('[Fatture AI] filter mode:', result.filter);
+        const f = result.filter!;
+        setDateFrom(f.date_from || '');
+        setDateTo(f.date_to || '');
+        if (f.direction === 'in' || f.direction === 'out') setDirectionFilter(f.direction);
+        if (Array.isArray(f.payment_status) && f.payment_status.length === 1) {
+          setStatusFilter(f.payment_status[0] as any);
+        }
+        setAmountMin(typeof f.amount_min === 'number' ? f.amount_min : undefined);
+        setAmountMax(typeof f.amount_max === 'number' ? f.amount_max : undefined);
+        setCounterpartyPattern(f.counterparty_pattern || undefined);
+        // Clear text query — AI converted it to structured filters
+        setQuery('');
+        clearTimeout(queryDebounceRef.current);
+        setDebouncedQuery('');
+        setAiResult({
+          text: '',
+          mode: 'filter',
+          isError: false,
+          requestId: result.request_id,
+          candidateIds: [], // empty = use regular filters
+        });
+      } else {
+        // Analysis mode — use candidateIds
+        console.log('[Fatture AI] analysis mode, candidate_ids:', result.candidate_ids?.length);
+        setAiResult({
+          text: '',
+          mode: 'analysis',
+          isError: false,
+          requestId: result.request_id,
+          candidateIds: result.candidate_ids || [],
+        });
       }
-      const result = await aiSearchInvoices(query, dirInvoices);
-      setAiResult(result);
     } catch (e: any) {
-      setAiError(e.message || 'Errore ricerca AI');
-      setAiResult(null);
+      console.error('[Fatture AI] error:', e);
+      const errText = [
+        e.message || 'Errore ricerca AI',
+        e.hint ? `💡 ${e.hint}` : '',
+      ].filter(Boolean).join(' — ');
+      setAiResult({ text: errText, mode: 'analysis', isError: true });
     }
     setAiSearching(false);
-  }, [query, companyId, directionFilter]);
+  }, [query, companyId, resetAllFilters]);
 
-  // Clear AI results when query changes (user is typing)
+  // Clear AI results + filters when query changes (user is typing)
   const handleQueryChange = (val: string) => {
     setQuery(val);
-    if (aiResult) setAiResult(null);
+    if (aiResult) { setAiResult(null); resetAllFilters(); }
     if (aiError) setAiError('');
   };
 
@@ -982,7 +1142,8 @@ export default function FatturePage() {
               <input
                 value={query}
                 onChange={e => handleQueryChange(e.target.value)}
-                placeholder={directionFilter === 'out' ? '🔍 Cerca cliente, articolo...' : '🔍 Cerca fornitore, articolo...'}
+                onKeyDown={e => { if (e.key === 'Enter' && query.trim()) handleAISearch(); }}
+                placeholder={directionFilter === 'out' ? '🔍 Cerca o Invio per AI ✨' : '🔍 Cerca o Invio per AI ✨'}
                 className="flex-1 px-2.5 py-1.5 text-xs border rounded-lg bg-gray-50 outline-none focus:ring-1 focus:ring-sky-400"
               />
               <button
@@ -995,13 +1156,11 @@ export default function FatturePage() {
               </button>
             </div>
 
-            {/* AI search result indicator */}
-            {aiResult && (
-              <div className="flex items-center gap-1.5 px-2 py-1 bg-violet-50 border border-violet-200 rounded-lg">
-                <span className="text-[10px] text-violet-700 font-semibold flex-1">
-                  ✨ AI: {aiResult.ids.length} risultat{aiResult.ids.length === 1 ? 'o' : 'i'} per "{query}"
-                </span>
-                <button onClick={() => { setAiResult(null); setQuery(''); }} className="text-violet-500 hover:text-violet-700 text-xs font-bold">✕</button>
+            {/* AI search result indicator — only show for errors */}
+            {aiResult && aiResult.isError && (
+              <div className="flex items-center gap-1.5 px-2 py-1 bg-red-50 border border-red-200 rounded-lg">
+                <span className="text-[10px] text-red-600 flex-1">⚠ {aiResult.text}</span>
+                <button onClick={() => { setAiResult(null); setQuery(''); resetAllFilters(); }} className="text-red-400 hover:text-red-600 text-xs font-bold">✕</button>
               </div>
             )}
             {aiError && (

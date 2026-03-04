@@ -304,6 +304,9 @@ export interface InvoiceFilters {
   dateTo?: string;
   query?: string;
   candidateIds?: string[];
+  amountMin?: number;
+  amountMax?: number;
+  counterpartyPattern?: string;
 }
 
 export async function loadInvoices(
@@ -334,6 +337,13 @@ export async function loadInvoices(
     if (filters?.query) {
       const p = `%${filters.query}%`;
       q = q.or(`number.ilike.${p},source_filename.ilike.${p},counterparty->>denom.ilike.${p},counterparty->>name.ilike.${p}`);
+    }
+    // Amount range (total_amount is always positive — no ABS needed)
+    if (filters?.amountMin != null) q = q.gte('total_amount', filters.amountMin);
+    if (filters?.amountMax != null) q = q.lte('total_amount', filters.amountMax);
+    // Counterparty name pattern
+    if (filters?.counterpartyPattern) {
+      q = q.ilike('counterparty->>denom', `%${filters.counterpartyPattern}%`);
     }
   }
 
@@ -380,6 +390,9 @@ export async function loadInvoiceStats(
     if (filters?.dateFrom) q = q.gte('date', filters.dateFrom);
     if (filters?.dateTo) q = q.lte('date', filters.dateTo);
     if (filters?.query) { const p = `%${filters.query}%`; q = q.or(`number.ilike.${p},source_filename.ilike.${p},counterparty->>denom.ilike.${p},counterparty->>name.ilike.${p}`); }
+    if (filters?.amountMin != null) q = q.gte('total_amount', filters.amountMin);
+    if (filters?.amountMax != null) q = q.lte('total_amount', filters.amountMax);
+    if (filters?.counterpartyPattern) q = q.ilike('counterparty->>denom', `%${filters.counterpartyPattern}%`);
     if (status) q = q.eq('payment_status', status);
     return q;
   };
@@ -391,6 +404,51 @@ export async function loadInvoiceStats(
     daPagare: pending.count ?? 0,
     scadute: overdue.count ?? 0,
     pagate: paid.count ?? 0,
+  };
+}
+
+// ─── Server-side KPI aggregates (via RPC) ────────────────────
+
+export interface InvoiceAggregates {
+  total_count: number;
+  pending_count: number;
+  overdue_count: number;
+  paid_count: number;
+  total_amount: number;
+  counterparty_count: number;
+}
+
+export async function fetchInvoiceAggregates(
+  companyId: string,
+  filters?: InvoiceFilters,
+): Promise<InvoiceAggregates> {
+  const params: Record<string, unknown> = { p_company_id: companyId };
+
+  if (filters?.candidateIds?.length) {
+    params.p_candidate_ids = filters.candidateIds;
+  } else {
+    params.p_direction = filters?.direction || 'all';
+    params.p_status = filters?.status || 'all';
+    if (filters?.dateFrom) params.p_date_from = filters.dateFrom;
+    if (filters?.dateTo) params.p_date_to = filters.dateTo;
+    if (filters?.query) params.p_query = filters.query;
+  }
+
+  // Amount / counterparty filters (applied regardless of candidateIds mode)
+  if (filters?.amountMin != null) params.p_amount_min = filters.amountMin;
+  if (filters?.amountMax != null) params.p_amount_max = filters.amountMax;
+  if (filters?.counterpartyPattern) params.p_counterparty_pattern = filters.counterpartyPattern;
+
+  const { data, error } = await supabase.rpc('invoice_aggregates', params);
+  if (error) throw new Error(error.message);
+  const row = Array.isArray(data) ? data[0] : data;
+  return {
+    total_count: Number(row?.total_count || 0),
+    pending_count: Number(row?.pending_count || 0),
+    overdue_count: Number(row?.overdue_count || 0),
+    paid_count: Number(row?.paid_count || 0),
+    total_amount: Number(row?.total_amount || 0),
+    counterparty_count: Number(row?.counterparty_count || 0),
   };
 }
 
