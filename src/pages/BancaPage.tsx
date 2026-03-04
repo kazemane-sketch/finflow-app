@@ -1395,6 +1395,8 @@ export default function BancaPage() {
       return
     }
     setAiLoading(true); setAiResult(null)
+    // Reset ALL filters before AI search — each search starts completely fresh
+    setDateFrom(''); setDateTo(''); setDirFilter('all'); setTypeFilter('all')
     try {
       // AI search always searches across ALL data — don't restrict by current date/direction filters.
       // If the query is time-related (e.g. "ottobre"), the AI will return filter mode with appropriate dates.
@@ -1430,23 +1432,19 @@ export default function BancaPage() {
         setQuery('')
         clearTimeout(queryDebounceRef.current)
         setDebouncedQuery('')
-        // Show AI answer without candidateIds (let regular filters work)
+        // Filters applied silently — no text box needed
         setAiResult({
-          text: result.answer || 'Filtri applicati.',
+          text: '',
           mode: 'analysis',
           isError: false,
           requestId: result.request_id,
           candidateIds: [], // empty = use regular filters
         })
       } else {
-        // Analysis mode: use candidateIds as before
+        // Analysis mode: use candidateIds — no verbose text shown
         console.log('AI result candidate_ids:', result.candidate_ids)
-        const scopeLine = `\n\nScope AI: ${Number(result.candidate_count || 0)} candidati · ${(result.candidate_ids || []).length} pertinenti` +
-          ` · mode: ${result.mode || 'n/d'}` +
-          `${result.model ? ` · modello: ${result.model}` : ''}` +
-          `${result.request_id ? ` · request: ${result.request_id}` : ''}`
         setAiResult({
-          text: `${result.answer || 'Nessuna risposta AI.'}${scopeLine}`,
+          text: '',
           mode: 'analysis',
           isError: false,
           requestId: result.request_id,
@@ -1768,14 +1766,24 @@ export default function BancaPage() {
                     : <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-gray-400" />}
                   <input
                     value={query}
-                    onChange={e => { setQuery(e.target.value); setAiResult(null) }}
+                    onChange={e => {
+                      setQuery(e.target.value)
+                      if (aiResult) {
+                        // Clear previous AI search + any AI-applied filters
+                        setAiResult(null)
+                        setDateFrom(''); setDateTo(''); setDirFilter('all'); setTypeFilter('all')
+                      }
+                    }}
                     onKeyDown={e => e.key === 'Enter' && handleAiSearch()}
                     placeholder="Cerca... · Premi Invio per ricerca AI 🤖"
                     className={`w-full pl-8 pr-8 py-1.5 text-sm border rounded-md focus:outline-none focus:ring-2 ${
                       aiResult ? (aiResult.isError ? 'border-red-300 focus:ring-red-400 bg-red-50' : 'border-purple-300 focus:ring-purple-400 bg-purple-50') : 'border-gray-200 focus:ring-sky-500'
                     }`}
                   />
-                  {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => { setQuery(''); setAiResult(null) }}><X className="h-3.5 w-3.5" /></button>}
+                  {query && <button className="absolute right-2 top-1.5 text-gray-400 hover:text-gray-600" onClick={() => {
+                    setQuery(''); setAiResult(null)
+                    setDateFrom(''); setDateTo(''); setDirFilter('all'); setTypeFilter('all')
+                  }}><X className="h-3.5 w-3.5" /></button>}
                 </div>
                 {(['all', 'in', 'out', 'review'] as const).map(d => (
                   <button key={d} onClick={() => setDirFilter(d)}
@@ -1819,8 +1827,8 @@ export default function BancaPage() {
                 )}
               </div>
 
-              {/* AI result */}
-              {aiResult && (
+              {/* AI result — only show for errors; successful searches apply silently */}
+              {aiResult && aiResult.isError && (
                 <div className={`flex items-start gap-2 p-3 rounded-lg border ${
                   aiResult.isError ? 'bg-red-50 border-red-200' : 'bg-purple-50 border-purple-100'
                 }`}>
