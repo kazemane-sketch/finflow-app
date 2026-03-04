@@ -2,6 +2,10 @@
  * Module-level singleton store for invoice AI extraction.
  * Survives React component unmounts so the extraction loop
  * keeps running even when the user navigates away from FatturePage.
+ *
+ * Compatible with React's useSyncExternalStore:
+ * - subscribe must NOT call the listener during subscription
+ * - getSnapshot must return a referentially stable object (same ref when state unchanged)
  */
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client';
 import { getValidAccessToken } from '@/lib/getValidAccessToken';
@@ -11,11 +15,10 @@ export interface ExtractionState {
   processed: number;
   total: number;
   error: string | null;
-  /** Stats loaded once, updated after extraction completes */
   stats: { ready: number; pending: number; total: number } | null;
 }
 
-type Listener = (s: ExtractionState) => void;
+type Listener = () => void;
 
 let state: ExtractionState = {
   running: false,
@@ -25,21 +28,25 @@ let state: ExtractionState = {
   stats: null,
 };
 
+// Frozen snapshot — only replaced when state actually changes
+let snapshot: ExtractionState = { ...state };
+
 const listeners = new Set<Listener>();
 
-function notify() {
-  const snapshot = { ...state };
-  listeners.forEach((l) => l(snapshot));
+function emit() {
+  // Create a new frozen snapshot so React detects the change
+  snapshot = { ...state };
+  listeners.forEach((l) => l());
 }
 
+/** useSyncExternalStore-compatible: returns the same object ref until state changes */
 export function getExtractionState(): ExtractionState {
-  return { ...state };
+  return snapshot;
 }
 
+/** useSyncExternalStore-compatible: must NOT call listener during subscribe */
 export function subscribeExtraction(listener: Listener): () => void {
   listeners.add(listener);
-  // Immediately push current state
-  listener({ ...state });
   return () => { listeners.delete(listener); };
 }
 
@@ -65,7 +72,7 @@ export async function loadExtractionStats(companyId: string, invoiceCount: numbe
           total: invoiceCount,
         },
       };
-      notify();
+      emit();
     }
   } catch { /* ignore */ }
 }
@@ -74,7 +81,7 @@ export async function startExtraction(companyId: string, invoiceCount: number) {
   if (state.running) return;
 
   state = { running: true, processed: 0, total: invoiceCount, error: null, stats: state.stats };
-  notify();
+  emit();
 
   let totalProcessed = 0;
   try {
@@ -98,7 +105,7 @@ export async function startExtraction(companyId: string, invoiceCount: number) {
         processed: totalProcessed,
         total: totalProcessed + (data.total_pending || 0),
       };
-      notify();
+      emit();
 
       if ((data.total_pending || 0) <= 0) break;
     }
@@ -109,9 +116,9 @@ export async function startExtraction(companyId: string, invoiceCount: number) {
     const msg = e?.message || String(e);
     console.error('[Invoice Extraction]', msg);
     state = { ...state, error: msg };
-    notify();
+    emit();
   }
 
   state = { ...state, running: false };
-  notify();
+  emit();
 }
