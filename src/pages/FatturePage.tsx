@@ -721,12 +721,8 @@ async function askInvoiceAiSearch(
     return await invokeInvoiceAiSearch(body, token);
   } catch (e: any) {
     if (e?.status === 401) {
-      // Retry once with refreshed token
-      const { data: refreshData, error: refreshErr } = await supabase.auth.refreshSession();
-      if (refreshErr || !refreshData?.session?.access_token) {
-        throw new Error('Sessione scaduta — effettua nuovamente il login.');
-      }
-      token = refreshData.session.access_token;
+      // Retry once with force-refreshed token (same strategy as BancaPage)
+      token = await getValidAccessToken({ forceRefresh: true });
       return await invokeInvoiceAiSearch(body, token);
     }
     throw e;

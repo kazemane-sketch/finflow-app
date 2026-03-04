@@ -15,8 +15,7 @@ function createAccessTokenError(message: string, extra?: Partial<AccessTokenErro
 }
 
 /**
- * Check if a JWT is expired or about to expire (within bufferSeconds).
- * Returns true if the token should be refreshed proactively.
+ * Decode JWT exp claim and check if it's expired or about to expire.
  */
 function isTokenExpiringSoon(token: string, bufferSeconds = 60): boolean {
   try {
@@ -29,38 +28,62 @@ function isTokenExpiringSoon(token: string, bufferSeconds = 60): boolean {
     if (typeof exp !== 'number') return true
     return Date.now() / 1000 > exp - bufferSeconds
   } catch {
-    return true // if we can't decode, assume expired
+    return true
   }
 }
 
+/**
+ * Get a valid (non-expired) access token for edge function calls.
+ *
+ * Strategy:
+ * 1. Check cached session — if token is valid (>60s remaining), use it
+ * 2. Otherwise, call getUser() which makes a network request and
+ *    triggers the Supabase client's auto-refresh internally
+ *    (same mechanism that keeps regular .from() queries working)
+ * 3. After getUser(), re-read the session for the fresh token
+ * 4. If still invalid, try explicit refreshSession() as last resort
+ */
 export async function getValidAccessToken(opts?: { forceRefresh?: boolean }): Promise<string> {
   const forceRefresh = opts?.forceRefresh === true
 
+  // Step 1: check cached session (skip if forceRefresh)
   if (!forceRefresh) {
     const { data: sessionData } = await supabase.auth.getSession()
     const token = sessionData?.session?.access_token
-    // Only use cached token if it's still valid for at least 60 more seconds
     if (token && !isTokenExpiringSoon(token)) return token
   }
 
-  // Token is expired/expiring/missing — force refresh
-  const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession()
-    .catch(() => ({ data: null as any, error: new Error('refresh_failed') as Error }))
-
-  const refreshedToken = refreshed?.session?.access_token
-  if (refreshedToken && !isTokenExpiringSoon(refreshedToken, 5)) return refreshedToken
-
-  if (refreshError) {
-    throw createAccessTokenError('Sessione non valida o scaduta.', {
-      status: 401,
-      errorCode: 'AUTH_REFRESH_FAILED',
-      hint: 'Effettua nuovamente il login e riprova.',
-    })
+  // Step 2: call getUser() — this hits /auth/v1/user and the Supabase
+  // client will auto-refresh the access token if it's expired.
+  // This is the SAME auto-refresh mechanism that makes regular
+  // supabase.from(...).select() work even with expired tokens.
+  try {
+    const { error: userError } = await supabase.auth.getUser()
+    if (!userError) {
+      // Auto-refresh succeeded — read the updated session
+      const { data: freshSession } = await supabase.auth.getSession()
+      const freshToken = freshSession?.session?.access_token
+      if (freshToken && !isTokenExpiringSoon(freshToken, 5)) return freshToken
+    }
+  } catch {
+    // getUser failed — fall through to refreshSession
   }
 
-  throw createAccessTokenError('Sessione assente: effettua nuovamente il login.', {
+  // Step 3: explicit refreshSession as last resort
+  try {
+    const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession()
+    if (!refreshError) {
+      const refreshedToken = refreshed?.session?.access_token
+      if (refreshedToken && !isTokenExpiringSoon(refreshedToken, 5)) return refreshedToken
+    }
+  } catch {
+    // refresh failed
+  }
+
+  // All strategies exhausted — session is truly dead
+  throw createAccessTokenError('Sessione scaduta: effettua nuovamente il login.', {
     status: 401,
-    errorCode: 'AUTH_SESSION_MISSING',
-    hint: 'Rifai login e riprova.',
+    errorCode: 'AUTH_SESSION_EXPIRED',
+    hint: 'La sessione è scaduta. Ricarica la pagina o effettua il logout e login.',
   })
 }
