@@ -529,35 +529,17 @@ function TxRow({ tx, selected, checked, selectMode, onClick, onCheck, onDoubleCl
 // ============================================================
 // AI SEARCH
 // ============================================================
-type BankAiMode = 'analysis'
-
 type BankAiSearchRequest = {
   query: string
   company_id: string
-  direction?: 'all' | 'in' | 'out'
-  date_from?: string | null
-  date_to?: string | null
-  limit?: number
-}
-
-type BankAiFilterSpec = {
-  date_from?: string | null
-  date_to?: string | null
-  direction?: 'in' | 'out' | null
-  transaction_types?: string[] | null
-  counterparty_pattern?: string | null
-  amount_min?: number | null
-  amount_max?: number | null
 }
 
 type BankAiSearchResponse = {
-  mode: BankAiMode | 'filter'
-  answer?: string
-  used_count?: number
-  candidate_count?: number
-  candidate_ids?: string[]
-  filter?: BankAiFilterSpec
-  model?: string
+  query_type: 'deterministic' | 'semantic' | 'mixed'
+  ids: string[]
+  total: number
+  explanation: string
+  filters: any[]
   request_id?: string
 }
 
@@ -647,16 +629,12 @@ async function invokeBankAiWithBearer(body: BankAiSearchRequest, accessToken: st
     })
   }
 
-  const responseMode = payload?.mode === 'filter' ? 'filter' : 'analysis'
-
   return {
-    mode: responseMode as BankAiSearchResponse['mode'],
-    answer: typeof payload?.answer === 'string' ? payload.answer : undefined,
-    used_count: Number(payload?.used_count || 0),
-    candidate_count: Number(payload?.candidate_count || 0),
-    candidate_ids: normalizeCandidateIds(payload?.candidate_ids ?? payload?.candidateIds),
-    filter: payload?.filter && typeof payload.filter === 'object' ? payload.filter as BankAiFilterSpec : undefined,
-    model: typeof payload?.model === 'string' ? payload.model : undefined,
+    query_type: payload?.query_type || 'deterministic',
+    ids: normalizeCandidateIds(payload?.ids),
+    total: Number(payload?.total || 0),
+    explanation: typeof payload?.explanation === 'string' ? payload.explanation : '',
+    filters: Array.isArray(payload?.filters) ? payload.filters : [],
     request_id: typeof payload?.request_id === 'string' ? payload.request_id : requestId,
   }
 }
@@ -758,7 +736,7 @@ export default function BancaPage() {
   const [editSaving, setEditSaving] = useState(false)
 
   // AI search
-  const [aiResult, setAiResult] = useState<{ text: string; mode: BankAiMode; isError: boolean; requestId?: string; candidateIds?: string[] } | null>(null)
+  const [aiResult, setAiResult] = useState<{ text: string; isError: boolean; requestId?: string; candidateIds?: string[]; total?: number } | null>(null)
   const [aiLoading, setAiLoading] = useState(false)
   const [embeddingHealth, setEmbeddingHealth] = useState<BankEmbeddingHealth | null>(null)
 
@@ -1403,70 +1381,34 @@ export default function BancaPage() {
   const handleAiSearch = async () => {
     if (!query.trim()) return
     if (!companyId) {
-      setAiResult({ text: 'Azienda non selezionata.', mode: 'analysis', isError: true })
+      setAiResult({ text: 'Azienda non selezionata.', isError: true })
       return
     }
     setAiLoading(true); setAiResult(null)
     // Reset ALL filters before AI search — each search starts completely fresh
     resetAllFilters()
     try {
-      // AI search always searches across ALL data — don't restrict by current date/direction filters.
-      // If the query is time-related (e.g. "ottobre"), the AI will return filter mode with appropriate dates.
-      const payload: BankAiSearchRequest = {
-        query,
-        company_id: companyId,
-        direction: 'all',
-        date_from: null,
-        date_to: null,
-        limit: 500,
-      }
+      const result = await askBankAiSearch({ query, company_id: companyId })
 
-      const result = await askBankAiSearch(payload)
+      console.log('[Banca AI] result:', JSON.stringify({ query_type: result.query_type, total: result.total, explanation: result.explanation?.slice(0, 80) }))
 
-      console.log('[Banca AI] raw result:', JSON.stringify({ mode: result.mode, hasFilter: !!result.filter, filter: result.filter, answer: result.answer?.slice(0, 80) }))
+      const ids = result.ids || []
+      // Clear text query — AI handles filtering server-side via SQL;
+      // leaving it would cause the text filter to double-filter results.
+      // Also clear debounced query immediately + cancel pending debounce timer
+      // to prevent a race where the 300ms debounce fires AFTER aiResult.
+      setQuery('')
+      clearTimeout(queryDebounceRef.current)
+      setDebouncedQuery('')
 
-      // Filter mode: AI returned structured filter params → apply locally
-      // Check both mode === 'filter' and presence of filter object (defensive)
-      const isFilterMode = (result.mode === 'filter' || !!result.filter) && result.filter
-      if (isFilterMode) {
-        console.log('[Banca AI] filter mode:', result.filter)
-        const f = result.filter!
-        // Reset all filters first, then apply AI-determined ones
-        setDateFrom(f.date_from || '')
-        setDateTo(f.date_to || '')
-        setDirFilter(f.direction === 'in' || f.direction === 'out' ? f.direction : 'all')
-        setTypeFilter(Array.isArray(f.transaction_types) && f.transaction_types.length === 1 ? f.transaction_types[0] : 'all')
-        // Apply amount range and counterparty filters
-        setAmountMin(typeof f.amount_min === 'number' ? f.amount_min : undefined)
-        setAmountMax(typeof f.amount_max === 'number' ? f.amount_max : undefined)
-        setCounterpartyPattern(f.counterparty_pattern || undefined)
-        // Clear text query — AI has converted it to structured filters;
-        // leaving it would cause the text filter to exclude all transactions.
-        // Also clear debounced query immediately + cancel pending debounce timer
-        // to prevent a race condition where the 300ms debounce fires AFTER aiResult
-        // triggers loadData, causing a second loadData with empty query.
-        setQuery('')
-        clearTimeout(queryDebounceRef.current)
-        setDebouncedQuery('')
-        // Filters applied silently — no text box needed
-        setAiResult({
-          text: '',
-          mode: 'analysis',
-          isError: false,
-          requestId: result.request_id,
-          candidateIds: [], // empty = use regular filters
-        })
-      } else {
-        // Analysis mode: use candidateIds — no verbose text shown
-        console.log('AI result candidate_ids:', result.candidate_ids)
-        setAiResult({
-          text: '',
-          mode: 'analysis',
-          isError: false,
-          requestId: result.request_id,
-          candidateIds: result.candidate_ids || [],
-        })
-      }
+      setAiResult({
+        text: result.explanation || `Trovati ${result.total} risultati`,
+        isError: false,
+        requestId: result.request_id,
+        // If 0 results, use nil UUID sentinel so .in('id', [...]) returns empty
+        candidateIds: ids.length > 0 ? ids : ['00000000-0000-0000-0000-000000000000'],
+        total: result.total,
+      })
     } catch (e: any) {
       const err = e as BankAiErrorPayload
       const reason = String(err?.message || 'Errore AI non disponibile').trim()
@@ -1476,19 +1418,14 @@ export default function BancaPage() {
       const hintLine = err?.hint ? `\nSuggerimento: ${err.hint}` : ''
       console.error('[Banca AI] bank-ai-search failed', {
         company_id: companyId,
-        operation: 'bank-ai-search',
         error_code: err?.errorCode,
-        code: statusLine,
         details: reason,
-        request_id: err?.requestId,
       })
       setAiResult({
-        text: `Errore ricerca AI remota.\n${statusLine}${reqLine}${codeLine}\nDettaglio: ${reason}${hintLine}\nUsa "Riprova" per rilanciare la richiesta.`,
-        mode: 'analysis',
+        text: `Errore ricerca AI.\n${statusLine}${reqLine}${codeLine}\nDettaglio: ${reason}${hintLine}`,
         isError: true,
         requestId: err?.requestId,
       })
-
     }
     setAiLoading(false)
   }
@@ -1842,28 +1779,29 @@ export default function BancaPage() {
                 )}
               </div>
 
-              {/* AI result — only show for errors; successful searches apply silently */}
-              {aiResult && aiResult.isError && (
-                <div className={`flex items-start gap-2 p-3 rounded-lg border ${
-                  aiResult.isError ? 'bg-red-50 border-red-200' : 'bg-purple-50 border-purple-100'
-                }`}>
-                  <Sparkles className={`h-3.5 w-3.5 flex-shrink-0 mt-0.5 ${aiResult.isError ? 'text-red-500' : 'text-purple-500'}`} />
-                  <p className={`flex-1 text-xs whitespace-pre-wrap ${aiResult.isError ? 'text-red-900' : 'text-purple-900'}`}>{aiResult.text}</p>
+              {/* AI result — explanation for success, error box for failures */}
+              {aiResult && (aiResult.isError ? (
+                <div className="flex items-start gap-2 p-3 rounded-lg border bg-red-50 border-red-200">
+                  <Sparkles className="h-3.5 w-3.5 flex-shrink-0 mt-0.5 text-red-500" />
+                  <p className="flex-1 text-xs whitespace-pre-wrap text-red-900">{aiResult.text}</p>
                   <div className="flex items-center gap-1 flex-shrink-0">
-                    {aiResult.isError && (
-                      <Button variant="outline" size="sm" onClick={handleAiSearch} disabled={aiLoading}>
-                        {aiLoading ? 'Riprovo...' : 'Riprova'}
-                      </Button>
-                    )}
-                    <button
-                      onClick={() => setAiResult(null)}
-                      className={`${aiResult.isError ? 'text-red-300 hover:text-red-500' : 'text-purple-300 hover:text-purple-500'} flex-shrink-0`}
-                    >
+                    <Button variant="outline" size="sm" onClick={handleAiSearch} disabled={aiLoading}>
+                      {aiLoading ? 'Riprovo...' : 'Riprova'}
+                    </Button>
+                    <button onClick={() => { setAiResult(null); resetAllFilters() }} className="text-red-300 hover:text-red-500 flex-shrink-0">
                       <X className="h-3.5 w-3.5" />
                     </button>
                   </div>
                 </div>
-              )}
+              ) : aiResult.text ? (
+                <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-violet-50 border border-violet-200 rounded-lg">
+                  <Sparkles className="h-3 w-3 text-violet-500 flex-shrink-0" />
+                  <span className="text-[11px] text-violet-700 flex-1">{aiResult.text} — <strong>{aiResult.total ?? 0}</strong> risultati</span>
+                  <button onClick={() => { setAiResult(null); resetAllFilters() }} className="text-violet-400 hover:text-violet-600 flex-shrink-0">
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              ) : null)}
             </div>
           )}
 

@@ -649,40 +649,23 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 }
 
 // ============================================================
-// INVOICE AI SEARCH — Types + Helpers (mirrors BancaPage pattern)
+// INVOICE AI SEARCH — Types + Helpers
 // ============================================================
-type InvoiceAiFilterSpec = {
-  date_from?: string | null;
-  date_to?: string | null;
-  direction?: 'in' | 'out' | null;
-  counterparty_pattern?: string | null;
-  amount_min?: number | null;
-  amount_max?: number | null;
-  payment_status?: string[] | null;
-  doc_types?: string[] | null;
-};
-
 type InvoiceAiSearchResponse = {
-  mode: 'filter' | 'analysis';
-  answer?: string;
-  filter?: InvoiceAiFilterSpec;
-  candidate_ids?: string[];
-  candidate_count?: number;
-  used_count?: number;
-  model?: string;
+  query_type: 'deterministic';
+  ids: string[];
+  total: number;
+  explanation: string;
+  filters: any[];
   request_id?: string;
-  error?: string;
-  error_code?: string;
-  hint?: string;
-  details?: string;
 };
 
 type InvoiceAiResult = {
   text: string;
-  mode: 'filter' | 'analysis';
   isError: boolean;
   requestId?: string;
   candidateIds?: string[];
+  total?: number;
 };
 
 function normalizeCandidateIds(raw: unknown): string[] {
@@ -710,7 +693,7 @@ async function invokeInvoiceAiSearch(
   });
 
   const data = await res.json().catch(() => ({}));
-  if (!res.ok && !data?.mode) {
+  if (!res.ok) {
     const msg = data?.error || data?.message || `HTTP ${res.status}`;
     const err = new Error(msg) as any;
     err.status = res.status;
@@ -721,18 +704,12 @@ async function invokeInvoiceAiSearch(
   }
 
   return {
-    mode: data.mode || 'analysis',
-    answer: data.answer,
-    filter: data.filter,
-    candidate_ids: normalizeCandidateIds(data.candidate_ids),
-    candidate_count: data.candidate_count,
-    used_count: data.used_count,
-    model: data.model,
+    query_type: data.query_type || 'deterministic',
+    ids: normalizeCandidateIds(data.ids),
+    total: Number(data.total || 0),
+    explanation: typeof data.explanation === 'string' ? data.explanation : '',
+    filters: Array.isArray(data.filters) ? data.filters : [],
     request_id: data.request_id,
-    error: data.error,
-    error_code: data.error_code,
-    hint: data.hint,
-    details: data.details,
   };
 }
 
@@ -947,7 +924,7 @@ export default function FatturePage() {
     setSelectedId(invoiceIdParam);
   }, [searchParams, invoices]);
 
-  // ── AI Search handler (BancaPage-style: classify → filter/analysis) ──
+  // ── AI Search handler — edge function handles all filtering server-side ──
   const handleAISearch = useCallback(async () => {
     if (!query.trim() || !companyId) return;
     setAiSearching(true); setAiError(''); setAiResult(null);
@@ -956,54 +933,31 @@ export default function FatturePage() {
       const result = await askInvoiceAiSearch({
         query,
         company_id: companyId,
-        direction: 'all', // search across all directions
       });
 
-      console.log('[Fatture AI] raw result:', JSON.stringify({ mode: result.mode, hasFilter: !!result.filter, filter: result.filter }));
+      console.log('[Fatture AI] result:', JSON.stringify({ query_type: result.query_type, total: result.total, explanation: result.explanation?.slice(0, 80) }));
 
-      // Filter mode: AI returned structured filters → apply locally
-      const isFilterMode = (result.mode === 'filter' || !!result.filter) && result.filter;
-      if (isFilterMode) {
-        console.log('[Fatture AI] filter mode:', result.filter);
-        const f = result.filter!;
-        setDateFrom(f.date_from || '');
-        setDateTo(f.date_to || '');
-        if (f.direction === 'in' || f.direction === 'out') setDirectionFilter(f.direction);
-        if (Array.isArray(f.payment_status) && f.payment_status.length === 1) {
-          setStatusFilter(f.payment_status[0] as any);
-        }
-        setAmountMin(typeof f.amount_min === 'number' ? f.amount_min : undefined);
-        setAmountMax(typeof f.amount_max === 'number' ? f.amount_max : undefined);
-        setCounterpartyPattern(f.counterparty_pattern || undefined);
-        // Clear text query — AI converted it to structured filters
-        setQuery('');
-        clearTimeout(queryDebounceRef.current);
-        setDebouncedQuery('');
-        setAiResult({
-          text: '',
-          mode: 'filter',
-          isError: false,
-          requestId: result.request_id,
-          candidateIds: [], // empty = use regular filters
-        });
-      } else {
-        // Analysis mode — use candidateIds
-        console.log('[Fatture AI] analysis mode, candidate_ids:', result.candidate_ids?.length);
-        setAiResult({
-          text: '',
-          mode: 'analysis',
-          isError: false,
-          requestId: result.request_id,
-          candidateIds: result.candidate_ids || [],
-        });
-      }
+      const ids = result.ids || [];
+      // Clear text query — AI handles filtering server-side via SQL
+      setQuery('');
+      clearTimeout(queryDebounceRef.current);
+      setDebouncedQuery('');
+
+      setAiResult({
+        text: result.explanation || `Trovate ${result.total} fatture`,
+        isError: false,
+        requestId: result.request_id,
+        // If 0 results, use nil UUID sentinel so .in('id', [...]) returns empty
+        candidateIds: ids.length > 0 ? ids : ['00000000-0000-0000-0000-000000000000'],
+        total: result.total,
+      });
     } catch (e: any) {
       console.error('[Fatture AI] error:', e);
       const errText = [
         e.message || 'Errore ricerca AI',
-        e.hint ? `💡 ${e.hint}` : '',
+        e.hint ? `Suggerimento: ${e.hint}` : '',
       ].filter(Boolean).join(' — ');
-      setAiResult({ text: errText, mode: 'analysis', isError: true });
+      setAiResult({ text: errText, isError: true });
     }
     setAiSearching(false);
   }, [query, companyId, resetAllFilters]);
@@ -1156,13 +1110,18 @@ export default function FatturePage() {
               </button>
             </div>
 
-            {/* AI search result indicator — only show for errors */}
-            {aiResult && aiResult.isError && (
+            {/* AI search result — explanation for success, error for failures */}
+            {aiResult && (aiResult.isError ? (
               <div className="flex items-center gap-1.5 px-2 py-1 bg-red-50 border border-red-200 rounded-lg">
                 <span className="text-[10px] text-red-600 flex-1">⚠ {aiResult.text}</span>
-                <button onClick={() => { setAiResult(null); setQuery(''); resetAllFilters(); }} className="text-red-400 hover:text-red-600 text-xs font-bold">✕</button>
+                <button onClick={() => { setAiResult(null); resetAllFilters(); }} className="text-red-400 hover:text-red-600 text-xs font-bold">✕</button>
               </div>
-            )}
+            ) : aiResult.text ? (
+              <div className="flex items-center gap-1.5 px-2.5 py-1.5 bg-violet-50 border border-violet-200 rounded-lg">
+                <span className="text-[11px] text-violet-700 flex-1">✨ {aiResult.text} — <strong>{aiResult.total ?? 0}</strong> risultati</span>
+                <button onClick={() => { setAiResult(null); resetAllFilters(); }} className="text-violet-400 hover:text-violet-600 text-xs font-bold">✕</button>
+              </div>
+            ) : null)}
             {aiError && (
               <div className="flex items-center gap-1.5 px-2 py-1 bg-red-50 border border-red-200 rounded-lg">
                 <span className="text-[10px] text-red-600 flex-1">⚠ {aiError}</span>
