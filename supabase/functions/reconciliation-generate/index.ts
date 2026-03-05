@@ -42,30 +42,137 @@ interface Suggestion {
 
 type SqlClient = ReturnType<typeof postgres>;
 
+/* ─── RULE 1: Direction mapping (ABSOLUTE, NO EXCEPTIONS) ─── */
+
+/**
+ * Determine which invoice direction to match for a given bank transaction.
+ *
+ * DB convention:
+ *   - invoice direction = 'out' → fattura ATTIVA (emessa da noi, il cliente ci paga)
+ *   - invoice direction = 'in'  → fattura PASSIVA (ricevuta, noi paghiamo il fornitore)
+ *
+ * Bank transaction:
+ *   - amount > 0 (entrata) → il cliente ci paga → match fatture ATTIVE (direction='out')
+ *   - amount < 0 (uscita)  → noi paghiamo       → match fatture PASSIVE (direction='in')
+ */
+function getExpectedInvoiceDirection(txAmount: number): string {
+  return txAmount > 0 ? "out" : "in";
+}
+
+/* ─── RULE 2: Counterparty matching ─── */
+
+const LEGAL_SUFFIXES = new Set([
+  "SRL", "S.R.L.", "SPA", "S.P.A.", "SRLS", "S.R.L.S.",
+  "SAS", "S.A.S.", "SNC", "S.N.C.", "SS", "DI", "E", "&",
+  "S.R.L", "S.P.A", "SOCIETA", "UNIPERSONALE",
+]);
+
+/**
+ * Check if the bank transaction counterparty matches the invoice counterparty.
+ * Uses significant word matching (ignoring legal suffixes like SRL, SPA).
+ * Returns true if no TX counterparty is available (can't filter).
+ */
+function counterpartyMatches(txName: string | null, invName: string | null): boolean {
+  if (!txName || txName.length < 3) return true; // no TX counterparty → don't filter
+  if (!invName || invName.length < 3) return false; // TX has name but invoice doesn't → no match
+
+  const txWords = txName.toUpperCase().split(/[\s.,()]+/)
+    .filter(w => w.length > 2 && !LEGAL_SUFFIXES.has(w));
+  const invUpper = invName.toUpperCase();
+
+  // At least one significant word from TX name must be in invoice counterparty
+  return txWords.some(w => invUpper.includes(w));
+}
+
+/* ─── RULE 3: Invoice ref parser (strict matching) ─── */
+
+interface RefParts {
+  number: string;       // "371"
+  suffix: string | null; // "FE"
+  year: string | null;   // "24"
+  fullYear: number | null; // 2024
+  fullRef: string;       // "371/FE/24" (original)
+  withFullYear: string | null; // "371/FE/2024"
+  withoutYear: string | null;  // "371/FE"
+}
+
+/**
+ * Parse an invoice reference into structured parts.
+ * Handles: "371/FE/24", "371/FE/2024", "371/FE", "5250425719", "SAA25/84119"
+ */
+function parseInvoiceRef(ref: string): RefParts {
+  // Pattern: NUM/SUFFIX/YEAR  (e.g. 371/FE/24, 309/FE/25, 123/NC/2024)
+  const slashMatch = ref.match(/^(\d+)\/(FE|PA|NC|NE|FA)\/(\d{2,4})$/i);
+  if (slashMatch) {
+    const num = slashMatch[1];
+    const suffix = slashMatch[2].toUpperCase();
+    const yearStr = slashMatch[3];
+    const fullYear = yearStr.length === 2 ? 2000 + parseInt(yearStr) : parseInt(yearStr);
+    return {
+      number: num,
+      suffix,
+      year: yearStr,
+      fullYear,
+      fullRef: ref,
+      withFullYear: `${num}/${suffix}/${fullYear}`,
+      withoutYear: `${num}/${suffix}`,
+    };
+  }
+
+  // Pattern: NUM/SUFFIX (no year, e.g. 371/FE)
+  const noYearMatch = ref.match(/^(\d+)\/(FE|PA|NC|NE|FA)$/i);
+  if (noYearMatch) {
+    return {
+      number: noYearMatch[1],
+      suffix: noYearMatch[2].toUpperCase(),
+      year: null,
+      fullYear: null,
+      fullRef: ref,
+      withFullYear: null,
+      withoutYear: ref,
+    };
+  }
+
+  // Pattern: pure long numeric (e.g. "5250425719" — SDD invoice number)
+  const pureNumMatch = ref.match(/^(\d{6,})$/);
+  if (pureNumMatch) {
+    return {
+      number: pureNumMatch[1],
+      suffix: null,
+      year: null,
+      fullYear: null,
+      fullRef: ref,
+      withFullYear: null,
+      withoutYear: ref,
+    };
+  }
+
+  // Fallback: keep as-is but extract numeric part
+  return {
+    number: ref.replace(/[^0-9]/g, ""),
+    suffix: null,
+    year: null,
+    fullYear: null,
+    fullRef: ref,
+    withFullYear: null,
+    withoutYear: ref,
+  };
+}
+
 /* ─── ref extraction helpers ──────────── */
 
 /**
  * Normalize all the different field names the AI extraction uses for invoice refs.
- * The Anthropic extraction produces inconsistent schemas across batches:
- *   - `invoice_refs` (array) — the canonical name
- *   - `numeri_fattura` (array) — Italian plural
- *   - `numero_fattura` (string or array) — Italian singular
- *   - `fatture` (array)
- *   - `riferimenti_fattura` (array)
+ * The Anthropic extraction produces inconsistent schemas across batches.
  */
 function extractInvoiceRefs(refs: Record<string, unknown> | null): string[] {
   if (!refs) return [];
-  // Don't process error records
   if (typeof refs.error === "string") return [];
 
   const results: string[] = [];
 
-  // Array fields
   const arrayFields = [
-    "invoice_refs",
-    "numeri_fattura",
-    "fatture",
-    "riferimenti_fattura",
+    "invoice_refs", "numeri_fattura", "fatture", "riferimenti_fattura",
   ];
   for (const field of arrayFields) {
     const val = refs[field];
@@ -76,7 +183,6 @@ function extractInvoiceRefs(refs: Record<string, unknown> | null): string[] {
     }
   }
 
-  // Single-string fields
   for (const field of ["numero_fattura"]) {
     const val = refs[field];
     if (typeof val === "string" && val.length >= 2) results.push(val.trim());
@@ -86,11 +192,7 @@ function extractInvoiceRefs(refs: Record<string, unknown> | null): string[] {
 }
 
 /**
- * Normalize all the different field names for mandate SDD IDs.
- *   - `mandate_id` (string) — canonical
- *   - `codice_mandato_sdd` (string)
- *   - `mandato_sdd` (string)
- *   - `codici_mandato_sdd` (array)
+ * Normalize mandate SDD IDs from various field names.
  */
 function extractMandateId(refs: Record<string, unknown> | null): string | null {
   if (!refs) return null;
@@ -111,12 +213,6 @@ function extractMandateId(refs: Record<string, unknown> | null): string | null {
 
 /**
  * Parse raw_text for invoice references when AI extraction didn't capture them.
- * Handles common MPS bank statement formats:
- *   - "RI: 381/FE/25 377/FE/25 ... CAUS:"
- *   - "Fattura num. 5250425719 del 10/11/2025"
- *   - "RIF.FATT: FATTURA N. 193 DEL 31-12-2024"
- *   - "SALDO FATTURA N. 309 DEL 16 FEBBRAIO 2026"
- *   - Standalone XXX/FE/YY patterns
  */
 function parseRawTextForRefs(rawText: string | null): string[] {
   if (!rawText) return [];
@@ -132,7 +228,7 @@ function parseRawTextForRefs(rawText: string | null): string[] {
     }
   }
 
-  // Pattern 2: Standalone XXX/FE/YY patterns (if not already captured)
+  // Pattern 2: Standalone XXX/FE/YY patterns
   for (const m of rawText.matchAll(/(\d+\/FE\/\d{2,4})/gi)) {
     refs.push(m[1]);
   }
@@ -169,32 +265,98 @@ async function matchByInvoiceRefs(
   remainingAmount: number,
 ): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
+  const expectedDirection = getExpectedInvoiceDirection(Number(tx.amount));
 
   for (const ref of invoiceRefs) {
     if (!ref || ref.length < 2) continue;
 
-    // Extract numeric-only part for flexible matching
-    const numericPart = ref.replace(/[^0-9]/g, "");
+    const rp = parseInvoiceRef(ref);
 
-    const matches = await sql.unsafe(
-      `SELECT i.id as invoice_id, i.number, i.total_amount,
-              ii.id as installment_id, ii.amount_due, ii.paid_amount, ii.due_date, ii.status
-       FROM invoices i
-       LEFT JOIN invoice_installments ii
-         ON ii.invoice_id = i.id AND ii.status IN ('pending','overdue','partial')
-       WHERE i.company_id = $1
-         AND (
-           i.number = $2
-           OR i.number ILIKE '%' || $2 || '%'
-           OR $2 ILIKE '%' || i.number || '%'
-           OR (length($3) >= 3 AND i.number ILIKE '%' || $3 || '%')
-         )
-       ORDER BY i.date DESC
-       LIMIT 10`,
-      [companyId, ref, numericPart],
+    // Build strict matching conditions.
+    // NEVER use loose ILIKE with short strings. Match must be EXACT on the number part.
+    //
+    // Conditions (OR):
+    //   1. i.number = fullRef           ("371/FE/24" = "371/FE/24")
+    //   2. i.number = withFullYear      ("371/FE/24" matches "371/FE/2024")
+    //   3. i.number = withoutYear       ("371/FE/24" matches "371/FE")
+    //   4. i.number = number only       (for pure numeric refs like "5250425719")
+    //   5. i.number starts with number/ (for "371" matches "371/FE" or "371/FE/2024")
+    //      BUT only if number has >= 3 digits to prevent "9" matching "309/FE"
+    //
+    // Year filter: if ref has year, invoice date must be in that year.
+    // Direction filter: ALWAYS applied, no exceptions.
+
+    const matchClauses: string[] = [];
+    const params: (string | number)[] = [companyId, expectedDirection];
+    let paramIdx = 3;
+
+    // Condition 1: exact match on full ref
+    matchClauses.push(`i.number = $${paramIdx}`);
+    params.push(rp.fullRef);
+    paramIdx++;
+
+    // Condition 2: match with full year (if applicable)
+    if (rp.withFullYear && rp.withFullYear !== rp.fullRef) {
+      matchClauses.push(`i.number = $${paramIdx}`);
+      params.push(rp.withFullYear);
+      paramIdx++;
+    }
+
+    // Condition 3: match without year (if applicable)
+    if (rp.withoutYear && rp.withoutYear !== rp.fullRef) {
+      matchClauses.push(`i.number = $${paramIdx}`);
+      params.push(rp.withoutYear);
+      paramIdx++;
+    }
+
+    // Condition 4: pure number match (only for long numeric refs >= 6 digits)
+    if (rp.suffix === null && rp.number.length >= 6) {
+      matchClauses.push(`i.number = $${paramIdx}`);
+      params.push(rp.number);
+      paramIdx++;
+    }
+
+    // Condition 5: number starts with N/ pattern (only if N >= 3 digits)
+    // "371" → matches "371/FE", "371/FE/2024", etc.
+    // BUT "9" does NOT match "309/FE" — that's the critical fix
+    if (rp.number.length >= 3 && rp.suffix === null) {
+      matchClauses.push(`i.number LIKE $${paramIdx}`);
+      params.push(`${rp.number}/%`);
+      paramIdx++;
+    }
+
+    if (matchClauses.length === 0) continue;
+
+    // Year filter clause
+    let yearClause = "";
+    if (rp.fullYear) {
+      yearClause = ` AND EXTRACT(YEAR FROM i.date) = $${paramIdx}`;
+      params.push(rp.fullYear);
+      paramIdx++;
+    }
+
+    const query = `
+      SELECT i.id as invoice_id, i.number, i.total_amount, i.date,
+             i.counterparty->>'denom' as counterparty_name,
+             ii.id as installment_id, ii.amount_due, ii.paid_amount, ii.due_date, ii.status
+      FROM invoices i
+      LEFT JOIN invoice_installments ii
+        ON ii.invoice_id = i.id AND ii.status IN ('pending','overdue','partial')
+      WHERE i.company_id = $1
+        AND i.direction = $2
+        AND (${matchClauses.join(" OR ")})
+        ${yearClause}
+      ORDER BY i.date DESC
+      LIMIT 20`;
+
+    const matches = await sql.unsafe(query, params);
+
+    // RULE 2: Post-filter by counterparty (when TX has counterparty info)
+    const filteredMatches = matches.filter((m: Record<string, unknown>) =>
+      counterpartyMatches(tx.counterparty_name, m.counterparty_name as string | null)
     );
 
-    for (const m of matches) {
+    for (const m of filteredMatches) {
       const instRemaining = m.installment_id
         ? Math.abs(Number(m.amount_due) - Number(m.paid_amount || 0))
         : Math.abs(Number(m.total_amount));
@@ -203,25 +365,32 @@ async function matchByInvoiceRefs(
       if (m.installment_id && instRemaining < 0.01) continue;
 
       const amountDiff = Math.abs(remainingAmount - instRemaining);
-      const amountRatio =
-        remainingAmount > 0 ? amountDiff / remainingAmount : 1;
+      const amountRatio = remainingAmount > 0 ? amountDiff / remainingAmount : 1;
 
-      // Base score is HIGH because we have explicit ref match
-      let score = 92;
-      let reason = `Riferimento fattura "${ref}" nel testo operazione \u2192 Fatt. ${m.number}`;
+      // If amount is WAY off (> 50% difference), lower confidence significantly
+      // A ref match with wildly different amount is suspicious
+      let score: number;
+      let reason = `Rif. fattura "${ref}" → Fatt. ${m.number} (${m.counterparty_name})`;
 
       if (amountRatio < 0.05) {
         score = 98;
         reason += " + importo corrispondente";
       } else if (amountRatio < 0.15) {
         score = 95;
-        reason += ` (diff \u20AC${amountDiff.toFixed(2)})`;
+        reason += ` (diff €${amountDiff.toFixed(2)})`;
+      } else if (amountRatio < 0.50) {
+        score = 88;
+        reason += ` (diff €${amountDiff.toFixed(2)} — verificare)`;
+      } else {
+        // Amount > 50% off — still include but with lower confidence
+        score = 75;
+        reason += ` (⚠ diff €${amountDiff.toFixed(2)} — importo molto diverso)`;
       }
 
       suggestions.push({
         bank_transaction_id: tx.id,
-        installment_id: m.installment_id || null,
-        invoice_id: m.invoice_id,
+        installment_id: (m.installment_id as string) || null,
+        invoice_id: m.invoice_id as string,
         match_score: score,
         match_reason: reason,
         proposed_by: "deterministic",
@@ -248,6 +417,7 @@ async function matchByMandate(
   remainingAmount: number,
 ): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
+  const expectedDirection = getExpectedInvoiceDirection(Number(tx.amount));
 
   // Find counterparty from other transactions with same mandate
   const mandateMatches = await sql.unsafe(
@@ -278,18 +448,17 @@ async function matchByMandate(
      FROM invoice_installments ii
      JOIN invoices inv ON inv.id = ii.invoice_id
      WHERE ii.company_id = $1
+       AND inv.direction = $2
        AND ii.status IN ('pending','overdue','partial')
-       AND inv.counterparty->>'denom' ILIKE '%' || $2 || '%'
-       AND abs(ii.amount_due - ii.paid_amount) BETWEEN $3 * 0.85 AND $3 * 1.15
-     ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $3) ASC
+       AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
+       AND abs(ii.amount_due - ii.paid_amount) BETWEEN $4 * 0.85 AND $4 * 1.15
+     ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $4) ASC
      LIMIT 5`,
-    [companyId, cpWord, remainingAmount],
+    [companyId, expectedDirection, cpWord, remainingAmount],
   );
 
   for (const m of openInst) {
-    const instRemaining = Math.abs(
-      Number(m.amount_due) - Number(m.paid_amount),
-    );
+    const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
     if (instRemaining < 0.01) continue;
     const amountDiff = Math.abs(remainingAmount - instRemaining);
 
@@ -298,7 +467,7 @@ async function matchByMandate(
       installment_id: m.installment_id,
       invoice_id: m.invoice_id,
       match_score: 85,
-      match_reason: `Mandato SDD "${mandateId}" \u2192 controparte ${cpName} + importo simile`,
+      match_reason: `Mandato SDD "${mandateId}" → ${cpName} + importo simile`,
       proposed_by: "deterministic",
       rule_id: null,
       suggestion_data: {
@@ -322,6 +491,7 @@ async function matchByCounterpartyAmount(
   remainingAmount: number,
 ): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
+  const expectedDirection = getExpectedInvoiceDirection(Number(tx.amount));
 
   if (!tx.counterparty_name) return [];
   const cpWord = tx.counterparty_name.split(/\s+/)[0];
@@ -329,35 +499,31 @@ async function matchByCounterpartyAmount(
 
   const cpMatches = await sql.unsafe(
     `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
-            ii.amount_due, ii.paid_amount, ii.status, ii.direction,
+            ii.amount_due, ii.paid_amount, ii.status,
             inv.number as invoice_number,
             inv.counterparty->>'denom' as counterparty_name
      FROM invoice_installments ii
      JOIN invoices inv ON inv.id = ii.invoice_id
      WHERE ii.company_id = $1
+       AND inv.direction = $2
        AND ii.status IN ('pending','overdue','partial')
-       AND inv.counterparty->>'denom' ILIKE '%' || $2 || '%'
-       AND abs(ii.amount_due - ii.paid_amount) BETWEEN $3 * 0.90 AND $3 * 1.10
-     ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $3) ASC
+       AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
+       AND abs(ii.amount_due - ii.paid_amount) BETWEEN $4 * 0.90 AND $4 * 1.10
+     ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $4) ASC
      LIMIT 5`,
-    [companyId, cpWord, remainingAmount],
+    [companyId, expectedDirection, cpWord, remainingAmount],
   );
 
   for (const m of cpMatches) {
-    const instRemaining = Math.abs(
-      Number(m.amount_due) - Number(m.paid_amount),
-    );
+    const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
     if (instRemaining < 0.01) continue;
     const amountDiff = Math.abs(remainingAmount - instRemaining);
-    const amountRatio =
-      remainingAmount > 0 ? amountDiff / remainingAmount : 1;
-    const daysDiff =
-      tx.date && m.due_date
-        ? Math.abs(
-            (new Date(tx.date).getTime() - new Date(m.due_date).getTime()) /
-              86400000,
-          )
-        : 999;
+    const amountRatio = remainingAmount > 0 ? amountDiff / remainingAmount : 1;
+    const daysDiff = tx.date && m.due_date
+      ? Math.abs(
+          (new Date(tx.date).getTime() - new Date(m.due_date).getTime()) / 86400000,
+        )
+      : 999;
 
     let score = 65;
     if (amountRatio < 0.05 && daysDiff < 30) score = 85;
@@ -370,7 +536,7 @@ async function matchByCounterpartyAmount(
       installment_id: m.installment_id,
       invoice_id: m.invoice_id,
       match_score: score,
-      match_reason: `Controparte "${m.counterparty_name}" + importo simile (diff \u20AC${amountDiff.toFixed(2)})${daysDiff < 30 ? " + data vicina" : ""}`,
+      match_reason: `Controparte "${m.counterparty_name}" + importo simile (diff €${amountDiff.toFixed(2)})${daysDiff < 30 ? " + data vicina" : ""}`,
       proposed_by: "deterministic",
       rule_id: null,
       suggestion_data: {
@@ -420,17 +586,12 @@ async function generateForTransaction(
     invoiceRefs = parseRawTextForRefs(tx.raw_text);
   }
 
-  // ── Level 1: Match by invoice refs (highest priority, score 92-98) ──
+  // ── Level 1: Match by invoice refs (highest priority, score 75-98) ──
   if (invoiceRefs.length > 0) {
     const refMatches = await matchByInvoiceRefs(
-      sql,
-      companyId,
-      tx,
-      invoiceRefs,
-      remainingAmount,
+      sql, companyId, tx, invoiceRefs, remainingAmount,
     );
     if (refMatches.length > 0) {
-      // Found ref matches — return them, don't fall through to lower levels
       return dedup(refMatches, 20);
     }
   }
@@ -438,11 +599,7 @@ async function generateForTransaction(
   // ── Level 2: Match by mandate SDD (score 85) ──
   if (mandateId) {
     const mandateMatches = await matchByMandate(
-      sql,
-      companyId,
-      tx,
-      mandateId,
-      remainingAmount,
+      sql, companyId, tx, mandateId, remainingAmount,
     );
     if (mandateMatches.length > 0) {
       return dedup(mandateMatches, 5);
@@ -451,10 +608,7 @@ async function generateForTransaction(
 
   // ── Level 3: Fallback — counterparty + amount (score 65-85) ──
   const fallback = await matchByCounterpartyAmount(
-    sql,
-    companyId,
-    tx,
-    remainingAmount,
+    sql, companyId, tx, remainingAmount,
   );
   return dedup(fallback, 5);
 }
@@ -484,9 +638,6 @@ Deno.serve(async (req) => {
   const sql = postgres(dbUrl, { max: 1 });
 
   try {
-    // Get unmatched/partial transactions — include raw_text for fallback parsing.
-    // Don't require extraction_status='ready' since raw_text parsing works on any TX.
-    // Prioritize 'ready' transactions (they have AI-extracted refs) first.
     const rows: TxRow[] = await sql`
       SELECT id, date, amount, counterparty_name, transaction_type,
              extracted_refs, raw_text, direction, reconciled_amount
@@ -528,7 +679,6 @@ Deno.serve(async (req) => {
       txProcessed++;
     }
 
-    // Count totals (include partial in unmatched count for display)
     const [{ pending_count }] = await sql`
       SELECT count(*)::int as pending_count
       FROM reconciliation_suggestions
