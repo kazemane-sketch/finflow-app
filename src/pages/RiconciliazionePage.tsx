@@ -252,6 +252,11 @@ function invoiceNumberMatchesRef(invoiceNumber: string, ref: string): boolean {
   return invUp === refUp
 }
 
+/** Net amount = gross - commission. Used for ALL amount comparisons in reconciliation. */
+function getTxNetAmount(tx: { amount: number; commission_amount?: number | null }): number {
+  return Math.abs(Number(tx.amount)) - Math.abs(Number(tx.commission_amount || 0))
+}
+
 /* ─── main component ─────────────────────────── */
 
 export default function RiconciliazionePage() {
@@ -307,6 +312,15 @@ export default function RiconciliazionePage() {
   const [closingReason, setClosingReason] = useState('commissione_bancaria')
   const [closingAmount, setClosingAmount] = useState('')
   const [closingInProgress, setClosingInProgress] = useState(false)
+
+  // Post-reconciliation dialog (remainder after matching)
+  const [postReconDialog, setPostReconDialog] = useState<{
+    txId: string
+    invoiceNumber: string | null
+    reconcileAmount: number
+    remainder: number            // residuo sul TX dopo riconciliazione
+    commissionAmount: number     // commissione del TX (per pre-selezione)
+  } | null>(null)
 
   // Detail popup (double-click)
   const [detailPopup, setDetailPopup] = useState<{ type: 'bank_tx' | 'invoice'; id: string } | null>(null)
@@ -496,6 +510,57 @@ export default function RiconciliazionePage() {
     setGenerating(false)
   }, [companyId, generating, loadKpis, loadSuggestions])
 
+  // ─── auto-close remainder (shared helper) ───
+  const autoCloseRemainder = useCallback(async (txId: string, amount: number, reason: string) => {
+    if (!companyId) return
+    try {
+      const { data: { user } } = await supabase.auth.getUser()
+
+      // Fetch current TX state
+      const { data: txData } = await supabase
+        .from('bank_transactions')
+        .select('reconciled_amount, amount, commission_amount')
+        .eq('id', txId)
+        .single()
+      if (!txData) return
+
+      const newReconciled = Number(txData.reconciled_amount || 0) + amount
+      const txNet = Math.abs(Number(txData.amount)) - Math.abs(Number(txData.commission_amount || 0))
+      const newStatus = newReconciled >= txNet - 0.01 ? 'matched' : 'partial'
+
+      const { error: e1 } = await supabase.from('bank_transactions')
+        .update({ reconciled_amount: newReconciled, reconciliation_status: newStatus })
+        .eq('id', txId)
+      if (e1) throw e1
+
+      // Log with adjustment
+      await supabase.from('reconciliation_log').insert({
+        company_id: companyId,
+        bank_transaction_id: txId,
+        proposed_by: 'manual',
+        accepted: true,
+        user_id: user?.id,
+        match_score: 100,
+        match_reason: `Chiusura automatica: ${reason}`,
+        adjustment_amount: amount,
+        adjustment_reason: reason,
+      })
+
+      // Expire pending suggestions if fully matched
+      if (newStatus === 'matched') {
+        await supabase.from('reconciliation_suggestions')
+          .update({ status: 'expired' })
+          .eq('bank_transaction_id', txId)
+          .eq('status', 'pending')
+
+        // Remove from unmatched list
+        setUnmatchedTxs(prev => prev.filter(t => t.id !== txId))
+      }
+    } catch (err: unknown) {
+      console.error('autoCloseRemainder error:', errMsg(err))
+    }
+  }, [companyId])
+
   // ─── confirm suggestion (partial reconciliation aware + dialog for diff > 1€) ─
   const confirmSuggestion = useCallback(async (suggestion: SuggestionRow, overrideAmount?: number) => {
     if (!companyId) return
@@ -508,8 +573,9 @@ export default function RiconciliazionePage() {
       const tx = suggestion.bank_transaction
       const inst = suggestion.installment
 
-      // Calculate remaining amounts
-      const txRemaining = tx ? Math.abs(Number(tx.amount)) - Number(tx.reconciled_amount || 0) : 0
+      // Calculate remaining amounts (using NET = gross - commission)
+      const txNetAmount = tx ? getTxNetAmount(tx) : 0
+      const txRemaining = tx ? txNetAmount - Number(tx.reconciled_amount || 0) : 0
       const instRemaining = inst ? Number(inst.amount_due) - Number(inst.paid_amount || 0) : 0
 
       // If diff > 1€ and no override → show dialog instead of proceeding
@@ -559,7 +625,7 @@ export default function RiconciliazionePage() {
 
       // 3. Update bank transaction: increment reconciled_amount, set status
       const newTxReconciled = Number(tx?.reconciled_amount || 0) + reconcileAmount
-      const txFullyMatched = tx ? newTxReconciled >= Math.abs(Number(tx.amount)) - 0.01 : false
+      const txFullyMatched = tx ? newTxReconciled >= txNetAmount - 0.01 : false
       const newTxStatus = txFullyMatched ? 'matched' : 'partial'
       const { error: e3 } = await supabase
         .from('bank_transactions')
@@ -617,13 +683,33 @@ export default function RiconciliazionePage() {
       }
 
       toast.success(`Riconciliazione confermata (${fmtEur(reconcileAmount)})`)
-      await Promise.all([loadKpis(), loadSuggestions()])
+
+      // Post-reconciliation remainder dialog
+      if (!txFullyMatched && tx) {
+        const remainder = txNetAmount - newTxReconciled
+        const commission = Math.abs(Number(tx.commission_amount || 0))
+
+        if (remainder > 0.10) {
+          setPostReconDialog({
+            txId: tx.id,
+            invoiceNumber: suggestion.invoice?.number || suggestion.invoice_id || null,
+            reconcileAmount,
+            remainder,
+            commissionAmount: commission,
+          })
+        } else if (remainder > 0.001) {
+          // Auto-close rounding ≤ 0.10€
+          await autoCloseRemainder(tx.id, remainder, 'arrotondamento')
+        }
+      }
+
+      await Promise.all([loadKpis(), loadSuggestions(), loadUnmatched()])
     } catch (err: unknown) {
       const msg = errMsg(err)
       toast.error(`Errore conferma: ${msg}`)
     }
     setConfirmingId(null)
-  }, [companyId, loadKpis, loadSuggestions])
+  }, [companyId, loadKpis, loadSuggestions, loadUnmatched, autoCloseRemainder])
 
   // ─── reject suggestion ─────────────────────
   const rejectSuggestion = useCallback(async (suggestion: SuggestionRow) => {
@@ -701,8 +787,8 @@ export default function RiconciliazionePage() {
       const tx = unmatchedTxs.find(t => t.id === txId)
       if (!tx) throw new Error('Transazione non trovata')
 
-      // Calculate partial reconciliation amounts
-      const txAmount = Math.abs(Number(tx.amount))
+      // Calculate partial reconciliation amounts (using NET = gross - commission)
+      const txAmount = getTxNetAmount(tx)
       const txReconciledAlready = Number(tx.reconciled_amount || 0)
       const txRemaining = txAmount - txReconciledAlready
       const instRemaining = Number(installment.amount_due) - Number(installment.paid_amount)
@@ -799,13 +885,33 @@ export default function RiconciliazionePage() {
         i.id === installment.id ? { ...i, paid_amount: newPaid, status: newStatus } : i
       ).filter(i => i.status !== 'paid'))
       setSelectedTxId(null)
-      await loadKpis()
+
+      // Post-reconciliation remainder dialog
+      if (!txFullyMatched) {
+        const remainder = txAmount - newTxReconciled  // txAmount is already net
+        const commission = Math.abs(Number(tx.commission_amount || 0))
+
+        if (remainder > 0.10) {
+          setPostReconDialog({
+            txId: tx.id,
+            invoiceNumber: installment.invoice_number,
+            reconcileAmount,
+            remainder,
+            commissionAmount: commission,
+          })
+        } else if (remainder > 0.001) {
+          // Auto-close rounding ≤ 0.10€
+          await autoCloseRemainder(tx.id, remainder, 'arrotondamento')
+        }
+      }
+
+      await Promise.all([loadKpis(), loadUnmatched()])
     } catch (err: unknown) {
       const msg = errMsg(err)
       toast.error(`Errore: ${msg}`)
     }
     setConfirmingId(null)
-  }, [companyId, unmatchedTxs, loadKpis])
+  }, [companyId, unmatchedTxs, loadKpis, loadUnmatched, autoCloseRemainder])
 
   // ─── delete reconciliation (undo) ─────────
   const deleteReconciliation = useCallback(async (recon: ReconciledRow) => {
@@ -921,7 +1027,8 @@ export default function RiconciliazionePage() {
 
       // 1. Update bank_transaction.reconciled_amount
       const newReconciled = Number(tx.reconciled_amount || 0) + amount
-      const newStatus = newReconciled >= Math.abs(Number(tx.amount)) - 0.01 ? 'matched' : 'partial'
+      const txNet = getTxNetAmount(tx)
+      const newStatus = newReconciled >= txNet - 0.01 ? 'matched' : 'partial'
       const { error: e1 } = await supabase.from('bank_transactions')
         .update({ reconciled_amount: newReconciled, reconciliation_status: newStatus })
         .eq('id', reconRow.bank_transaction_id)
@@ -965,6 +1072,31 @@ export default function RiconciliazionePage() {
     }
     setClosingInProgress(false)
   }, [companyId, loadKpis, loadReconciled])
+
+  // ─── handle post-reconciliation action ──────
+  const handlePostReconAction = useCallback(async (action: 'commission' | 'abbuono' | 'skip') => {
+    if (!postReconDialog) return
+    if (action === 'skip') {
+      setPostReconDialog(null)
+      return
+    }
+
+    const reason = action === 'commission' ? 'commissione_bancaria' : 'abbuono_passivo'
+
+    try {
+      await autoCloseRemainder(postReconDialog.txId, postReconDialog.remainder, reason)
+      setPostReconDialog(null)
+
+      const reasonLabels: Record<string, string> = {
+        commissione_bancaria: 'Commissione bancaria',
+        abbuono_passivo: 'Abbuono',
+      }
+      toast.success(`Residuo di ${fmtEur(postReconDialog.remainder)} chiuso come ${reasonLabels[reason] || reason}`)
+      await Promise.all([loadKpis(), loadSuggestions(), loadUnmatched()])
+    } catch (err: unknown) {
+      toast.error(`Errore chiusura residuo: ${errMsg(err)}`)
+    }
+  }, [postReconDialog, autoCloseRemainder, loadKpis, loadSuggestions, loadUnmatched])
 
   // ─── tab change handler ────────────────────
   const handleTabChange = (tab: string) => {
@@ -1061,7 +1193,7 @@ export default function RiconciliazionePage() {
     if (!tx) return []
 
     const txAmount = Number(tx.amount)
-    const absAmount = Math.abs(txAmount)
+    const absAmount = getTxNetAmount(tx)  // netto: lordo - commissione
 
     // Direction filter: amount > 0 (entrata) → fattura attiva (direction='out')
     //                   amount < 0 (uscita)  → fattura passiva (direction='in')
@@ -1526,7 +1658,7 @@ export default function RiconciliazionePage() {
                   const txRefs = extractClientInvoiceRefs(tx.extracted_refs, tx.raw_text)
                   const isPartial = tx.reconciliation_status === 'partial'
                   const txReconciledAmt = Number(tx.reconciled_amount || 0)
-                  const txAvailable = txAbs - txReconciledAmt
+                  const txAvailable = netAmt - txReconciledAmt
                   return (
                     <button
                       key={tx.id}
@@ -1571,7 +1703,7 @@ export default function RiconciliazionePage() {
                       </div>
                       {isPartial && (
                         <p className="text-[10px] text-orange-600 mt-0.5 pl-3.5">
-                          Disponibile: {fmtEur(txAvailable)} (di {fmtEur(txAbs)})
+                          Disponibile: {fmtEur(txAvailable)} (di {fmtEur(netAmt)})
                         </p>
                       )}
                     </button>
@@ -1774,9 +1906,9 @@ export default function RiconciliazionePage() {
                     const isConfirmingDelete = confirmDeleteId === r.id
                     const isDeleting = deletingReconId === r.id
 
-                    // Difference calculation: TX total vs what's been reconciled on the TX
+                    // Difference calculation: TX NET total vs what's been reconciled on the TX
                     const txTotalReconciled = Number(tx.reconciled_amount || 0)
-                    const txRemainder = absAmount - txTotalReconciled
+                    const txRemainder = netAmt - txTotalReconciled
                     const txHasRemainder = txRemainder > 0.01
                     const isClosingThis = closingDiffId === r.id
 
@@ -1979,6 +2111,15 @@ export default function RiconciliazionePage() {
           instRemaining={pendingConfirm.instRemaining}
           onChoice={handleConfirmChoice}
           onCancel={() => setPendingConfirm(null)}
+        />
+      )}
+
+      {/* ──── Post-reconciliation remainder dialog ──── */}
+      {postReconDialog && (
+        <PostReconciliationDialog
+          dialog={postReconDialog}
+          onClose={() => setPostReconDialog(null)}
+          onAction={handlePostReconAction}
         />
       )}
 
@@ -2266,9 +2407,10 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
   if (!tx) return null
 
   const txDir = txDirection(tx)
-  const absAmount = Math.abs(Number(tx.amount))
+  const absAmount = Math.abs(Number(tx.amount))  // gross (for display)
+  const netAmount = getTxNetAmount(tx)            // net = gross - commission (for calculations)
   const txReconciledAlready = Number(tx.reconciled_amount || 0)
-  const txRemainingAmount = absAmount - txReconciledAlready
+  const txRemainingAmount = netAmount - txReconciledAlready
   const instRemaining = inst ? Number(inst.amount_due) - Number(inst.paid_amount) : null
   const invoiceDenom = inv?.counterparty && typeof inv.counterparty === 'object'
     ? (inv.counterparty as any).denom || 'N.D.'
@@ -2380,7 +2522,7 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
               </div>
               {txReconciledAlready > 0.01 && (
                 <p className="text-[10px] text-orange-600 mt-0.5">
-                  Disponibile: {fmtEur(txRemainingAmount)} (di {fmtEur(absAmount)})
+                  Disponibile: {fmtEur(txRemainingAmount)} (di {fmtEur(netAmount)})
                 </p>
               )}
             </div>
@@ -2451,6 +2593,104 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
             </div>
           )}
         </div>
+      </div>
+    </div>
+  )
+}
+
+/* ─── Post-Reconciliation Dialog ─────────────── */
+
+function PostReconciliationDialog({ dialog, onClose, onAction }: {
+  dialog: { txId: string; invoiceNumber: string | null; reconcileAmount: number; remainder: number; commissionAmount: number }
+  onClose: () => void
+  onAction: (action: 'commission' | 'abbuono' | 'skip') => void
+}) {
+  // Check if remainder matches the commission amount (±0.10€)
+  const commissionMatch = dialog.commissionAmount > 0 &&
+    Math.abs(dialog.remainder - dialog.commissionAmount) < 0.10
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[2px]" onClick={onClose}>
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 space-y-4" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center gap-2">
+          <CheckCircle2 className="h-5 w-5 text-emerald-500" />
+          <h3 className="text-sm font-semibold text-gray-800">Riconciliazione completata</h3>
+        </div>
+
+        <p className="text-xs text-gray-600">
+          Movimento {fmtEur(dialog.reconcileAmount)} abbinato a Fatt. {dialog.invoiceNumber || 'N.D.'}
+        </p>
+
+        <div className="bg-orange-50 rounded-lg px-3 py-2">
+          <p className="text-xs text-orange-700">
+            Residuo sul movimento: <strong>{fmtEur(dialog.remainder)}</strong>
+          </p>
+          {commissionMatch && (
+            <p className="text-[10px] text-orange-600 mt-0.5">
+              (commissione bancaria rilevata: {fmtEur(dialog.commissionAmount)})
+            </p>
+          )}
+        </div>
+
+        {commissionMatch ? (
+          // Single prominent button when commission matches remainder
+          <div className="space-y-2">
+            <button
+              onClick={() => onAction('commission')}
+              className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium bg-emerald-600 text-white hover:bg-emerald-700 transition-colors"
+            >
+              <CheckCircle2 className="h-4 w-4" />
+              Chiudi come commissione ({fmtEur(dialog.remainder)})
+            </button>
+            <button
+              onClick={() => onAction('skip')}
+              className="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-xs font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 transition-colors"
+            >
+              <Search className="h-3.5 w-3.5" />
+              Abbina altro — lascia parziale
+            </button>
+          </div>
+        ) : (
+          // Three options when no commission match
+          <div className="space-y-2">
+            <button
+              onClick={() => onAction('commission')}
+              className="w-full flex items-center gap-3 p-3 rounded-lg border border-gray-200 hover:bg-orange-50 hover:border-orange-300 transition-colors text-left"
+            >
+              <div className="shrink-0 w-8 h-8 rounded-full bg-orange-100 flex items-center justify-center">
+                <CircleDollarSign className="h-4 w-4 text-orange-600" />
+              </div>
+              <div className="flex-1">
+                <p className="text-xs font-medium text-gray-800">Commissione bancaria</p>
+                <p className="text-[10px] text-gray-500 mt-0.5">Chiudi {fmtEur(dialog.remainder)} come costo bancario</p>
+              </div>
+            </button>
+            <button
+              onClick={() => onAction('abbuono')}
+              className="w-full flex items-center gap-3 p-3 rounded-lg border border-gray-200 hover:bg-blue-50 hover:border-blue-300 transition-colors text-left"
+            >
+              <div className="shrink-0 w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center">
+                <FileText className="h-4 w-4 text-blue-600" />
+              </div>
+              <div className="flex-1">
+                <p className="text-xs font-medium text-gray-800">Abbuono</p>
+                <p className="text-[10px] text-gray-500 mt-0.5">Chiudi {fmtEur(dialog.remainder)} come abbuono</p>
+              </div>
+            </button>
+            <button
+              onClick={() => onAction('skip')}
+              className="w-full flex items-center gap-3 p-3 rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors text-left"
+            >
+              <div className="shrink-0 w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center">
+                <Search className="h-4 w-4 text-gray-500" />
+              </div>
+              <div className="flex-1">
+                <p className="text-xs font-medium text-gray-800">Abbina altro</p>
+                <p className="text-[10px] text-gray-500 mt-0.5">Lascia il movimento parziale per abbinare un'altra rata</p>
+              </div>
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )

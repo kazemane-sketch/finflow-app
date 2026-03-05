@@ -27,6 +27,12 @@ interface TxRow {
   raw_text: string | null;
   direction: string;
   reconciled_amount: number;
+  commission_amount: number | null;
+}
+
+/** Net amount = gross - commission. All matching uses net. */
+function getTxNetAmount(tx: TxRow): number {
+  return Math.abs(Number(tx.amount)) - Math.abs(Number(tx.commission_amount || 0));
 }
 
 interface Suggestion {
@@ -573,8 +579,8 @@ async function generateForTransaction(
   companyId: string,
   tx: TxRow,
 ): Promise<Suggestion[]> {
-  const absAmount = Math.abs(Number(tx.amount));
-  const remainingAmount = absAmount - Number(tx.reconciled_amount || 0);
+  const netAmount = getTxNetAmount(tx);
+  const remainingAmount = netAmount - Number(tx.reconciled_amount || 0);
   if (remainingAmount < 0.01) return [];
 
   // ── Normalize refs from the inconsistent AI extraction schemas ──
@@ -640,7 +646,7 @@ Deno.serve(async (req) => {
   try {
     const rows: TxRow[] = await sql`
       SELECT id, date, amount, counterparty_name, transaction_type,
-             extracted_refs, raw_text, direction, reconciled_amount
+             extracted_refs, raw_text, direction, reconciled_amount, commission_amount
       FROM bank_transactions
       WHERE company_id = ${companyId}
         AND reconciliation_status IN ('unmatched', 'partial')
