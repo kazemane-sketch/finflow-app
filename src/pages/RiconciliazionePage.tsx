@@ -68,6 +68,7 @@ interface UnmatchedTx {
   raw_text: string | null
   extraction_status: string | null
   commission_amount: number | null
+  extracted_refs: Record<string, unknown> | null
 }
 
 interface OpenInstallment {
@@ -159,6 +160,46 @@ function directionIcon(dir: string | null) {
   if (dir === 'in') return { color: 'text-emerald-600', bg: 'bg-emerald-50', label: 'Entrata' }
   if (dir === 'out') return { color: 'text-red-600', bg: 'bg-red-50', label: 'Uscita' }
   return { color: 'text-gray-600', bg: 'bg-gray-50', label: 'N.D.' }
+}
+
+/** Client-side extraction of invoice refs from extracted_refs + raw_text (mirrors edge function logic) */
+function extractClientInvoiceRefs(refs: Record<string, unknown> | null, rawText: string | null): string[] {
+  const results: string[] = []
+  if (refs && typeof refs.error !== 'string') {
+    for (const field of ['invoice_refs', 'numeri_fattura', 'fatture', 'riferimenti_fattura']) {
+      const val = refs[field]
+      if (Array.isArray(val)) {
+        for (const v of val) { if (typeof v === 'string' && v.length >= 2) results.push(v.trim()) }
+      }
+    }
+    for (const field of ['numero_fattura']) {
+      const val = refs[field]
+      if (typeof val === 'string' && val.length >= 2) results.push(val.trim())
+    }
+  }
+  // Fallback: parse raw_text
+  if (results.length === 0 && rawText) {
+    for (const m of rawText.matchAll(/RI:\s*([\d\/\w\s]+?)(?:CAUS|$)/gi)) {
+      for (const part of m[1].trim().split(/\s+/)) {
+        if (/^\d+\/\w+\/\d{2,4}$/.test(part)) results.push(part)
+      }
+    }
+    for (const m of rawText.matchAll(/(\d+\/FE\/\d{2,4})/gi)) results.push(m[1])
+    for (const m of rawText.matchAll(/(?:Fattura|Fatt\.?)\s+(?:num\.?|n\.?)\s*(\S+)/gi)) results.push(m[1].replace(/[,;.]$/, ''))
+    for (const m of rawText.matchAll(/SALDO\s+FATTURA\s+N\.?\s*(\S+)/gi)) results.push(m[1].replace(/[,;.]$/, ''))
+  }
+  return [...new Set(results)].filter(r => r.length >= 2)
+}
+
+/** Check if an invoice number matches a ref (flexible: contains, numeric-only) */
+function invoiceNumberMatchesRef(invoiceNumber: string, ref: string): boolean {
+  const numLower = invoiceNumber.toLowerCase()
+  const refLower = ref.toLowerCase()
+  if (numLower.includes(refLower) || refLower.includes(numLower)) return true
+  // Numeric-only match
+  const numOnly = ref.replace(/[^0-9]/g, '')
+  if (numOnly.length >= 3 && numLower.includes(numOnly)) return true
+  return false
 }
 
 /* ─── main component ─────────────────────────── */
@@ -259,9 +300,9 @@ export default function RiconciliazionePage() {
     if (!companyId) return
     const { data } = await supabase
       .from('bank_transactions')
-      .select('id, date, amount, counterparty_name, description, transaction_type, direction, raw_text, extraction_status, commission_amount')
+      .select('id, date, amount, counterparty_name, description, transaction_type, direction, raw_text, extraction_status, commission_amount, extracted_refs')
       .eq('company_id', companyId)
-      .eq('reconciliation_status', 'unmatched')
+      .in('reconciliation_status', ['unmatched', 'partial'])
       .order('date', { ascending: false })
       .limit(500)
     if (data) setUnmatchedTxs(data as UnmatchedTx[])
@@ -798,35 +839,53 @@ export default function RiconciliazionePage() {
     if (!tx) return []
 
     const absAmount = Math.abs(Number(tx.amount))
-    const txDir = txDirection(tx)
 
-    // Filter installments by direction match and amount proximity
+    // Extract invoice refs for this TX (prioritization)
+    const txInvoiceRefs = extractClientInvoiceRefs(tx.extracted_refs, tx.raw_text)
+
+    // Filter installments with remaining amount > 0
     let filtered = openInstallments.filter(inst => {
-      // Direction: bank in → invoice out (payment received), bank out → invoice in (payment made)
-      // Actually: bank_in matches receivable installments (direction=attivo), bank_out matches payable (direction=passivo)
       const remaining = Number(inst.amount_due) - Number(inst.paid_amount)
       if (remaining <= 0) return false
       return true
     })
 
-    // Sort by amount similarity
-    filtered = filtered.map(inst => {
+    // Enrich with match data: ref match (priority 0) or amount similarity (priority 1)
+    let enriched = filtered.map(inst => {
       const remaining = Number(inst.amount_due) - Number(inst.paid_amount)
       const diff = Math.abs(absAmount - remaining)
       const ratio = absAmount > 0 ? diff / absAmount : 1
-      return { ...inst, _diff: diff, _ratio: ratio }
-    }).sort((a, b) => a._ratio - b._ratio)
+
+      // Check if this installment's invoice matches any extracted ref
+      const refMatch = txInvoiceRefs.length > 0 && inst.invoice_number
+        ? txInvoiceRefs.some(ref => invoiceNumberMatchesRef(inst.invoice_number!, ref))
+        : false
+      const matchedRef = refMatch && inst.invoice_number
+        ? txInvoiceRefs.find(ref => invoiceNumberMatchesRef(inst.invoice_number!, ref)) || null
+        : null
+
+      return {
+        ...inst,
+        _diff: diff,
+        _ratio: ratio,
+        _priority: refMatch ? 0 : 1,
+        _refMatch: refMatch,
+        _matchedRef: matchedRef,
+      }
+    })
+    // Sort: ref-matched first (priority 0), then by amount closeness
+    .sort((a, b) => a._priority - b._priority || a._ratio - b._ratio)
 
     // Apply search filter
     if (candidateSearch.trim()) {
       const q = candidateSearch.toLowerCase()
-      filtered = filtered.filter(inst =>
+      enriched = enriched.filter(inst =>
         (inst.counterparty_name || '').toLowerCase().includes(q) ||
         (inst.invoice_number || '').toLowerCase().includes(q)
       )
     }
 
-    return filtered.slice(0, 50)
+    return enriched.slice(0, 50)
   }, [selectedTxId, unmatchedTxs, openInstallments, candidateSearch])
 
   // Filtered reconciled rows
@@ -996,33 +1055,178 @@ export default function RiconciliazionePage() {
               )}
 
               {/* Suggestion cards — grouped by bank transaction */}
-              {groupedSuggestions.map(group => (
-                <div key={group.txId} className={group.items.length > 1 ? 'space-y-2' : ''}>
-                  {group.items.length > 1 && (
-                    <div className="flex items-center gap-2 ml-3">
-                      <span className="text-[10px] font-medium text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full">
-                        {group.items.length} alternative per lo stesso movimento
-                      </span>
+              {groupedSuggestions.map(group => {
+                // Check if this group is a cumulative ref-match (all items from invoice_ref level)
+                const isRefGroup = group.items.length > 1 &&
+                  group.items.every(s => s.suggestion_data?.level === 'invoice_ref')
+                const tx0 = group.items[0]?.bank_transaction
+
+                if (isRefGroup && tx0) {
+                  // ── Cumulative invoice-ref card ──
+                  const txDir = txDirection(tx0)
+                  const absAmount = Math.abs(Number(tx0.amount))
+                  const hasComm = tx0.commission_amount != null && Number(tx0.commission_amount) !== 0
+                  const sign = txDir === 'in' ? '+' : '-'
+                  const netAmt = hasComm ? absAmount - Math.abs(Number(tx0.commission_amount)) : absAmount
+                  const totalInstRemaining = group.items.reduce((sum, s) => {
+                    const ir = s.installment ? Number(s.installment.amount_due) - Number(s.installment.paid_amount) : 0
+                    return sum + ir
+                  }, 0)
+                  const sumDiff = Math.abs(netAmt - totalInstRemaining)
+                  const sumClose = netAmt > 0 ? sumDiff / netAmt < 0.05 : false
+
+                  return (
+                    <div key={group.txId} className="bg-white border-2 border-emerald-200 rounded-lg overflow-hidden">
+                      {/* Header: TX info */}
+                      <div className={`px-4 py-3 ${txDir === 'in' ? 'bg-emerald-50' : 'bg-red-50'} border-b border-emerald-200`}>
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <Landmark className="h-4 w-4 text-gray-500" />
+                            <span className="text-sm font-semibold text-gray-800">{tx0.counterparty_name || 'N.D.'}</span>
+                            <span className={`text-sm font-bold ${txDir === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
+                              {sign}{fmtEur(hasComm ? netAmt : absAmount)}
+                            </span>
+                            {hasComm && <span className="text-[10px] text-gray-400">lordo {sign}{fmtEur(absAmount)}</span>}
+                            <span className="text-[10px] text-gray-400">{fmtDate(tx0.date)}</span>
+                            <button
+                              onClick={() => navigate(`/banca?txId=${tx0.id}`)}
+                              className="p-0.5 rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+                              title="Vai al movimento in Banca"
+                            >
+                              <ExternalLink className="h-3 w-3" />
+                            </button>
+                          </div>
+                          <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full">
+                            📌 {group.items.length} fatture citate nel testo
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Invoice list */}
+                      <div className="divide-y">
+                        {group.items.map(s => {
+                          const inv = s.invoice
+                          const inst = s.installment
+                          const instRem = inst ? Number(inst.amount_due) - Number(inst.paid_amount) : 0
+                          const invoiceDenom = inv?.counterparty && typeof inv.counterparty === 'object'
+                            ? (inv.counterparty as any).denom || 'N.D.' : 'N.D.'
+
+                          return (
+                            <div key={s.id} className="px-4 py-2 flex items-center justify-between hover:bg-gray-50/50 transition-colors">
+                              <div className="flex items-center gap-3 min-w-0">
+                                <span className="text-[10px] text-emerald-600">📌</span>
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-xs font-medium text-gray-800 truncate">{invoiceDenom}</span>
+                                    {inv?.number && (
+                                      <span className="text-[10px] text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded font-semibold">
+                                        {inv.number}
+                                      </span>
+                                    )}
+                                    {inst && (
+                                      <span className="text-[10px] text-gray-400">Rata {inst.installment_no}</span>
+                                    )}
+                                    {inv && (
+                                      <button
+                                        onClick={() => navigate(`/fatture?invoiceId=${inv.id}`)}
+                                        className="p-0.5 rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+                                        title="Vai alla fattura"
+                                      >
+                                        <ExternalLink className="h-2.5 w-2.5" />
+                                      </button>
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-2 mt-0.5">
+                                    {inst && <span className="text-[10px] text-gray-400">Scad. {fmtDate(inst.due_date)}</span>}
+                                    <span className={`text-[10px] ${scoreBadge(s.match_score)} px-1 py-0.5 rounded`}>
+                                      {s.match_score}%
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <span className="text-xs font-semibold text-blue-700">{fmtEur(instRem)}</span>
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    onClick={() => rejectSuggestion(s)}
+                                    disabled={rejectingId === s.id || confirmingId === s.id}
+                                    className="p-1 rounded text-red-400 hover:bg-red-50 disabled:opacity-40 transition-colors"
+                                    title="Rifiuta"
+                                  >
+                                    <XCircle className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={() => confirmSuggestion(s)}
+                                    disabled={confirmingId === s.id || rejectingId === s.id}
+                                    className="flex items-center gap-0.5 px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
+                                  >
+                                    {confirmingId === s.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />}
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+
+                      {/* Footer: totals comparison */}
+                      <div className="px-4 py-2.5 bg-gray-50 border-t flex items-center justify-between">
+                        <div className="flex items-center gap-4 text-xs">
+                          <span className="text-gray-500">Totale fatture: <strong className="text-blue-700">{fmtEur(totalInstRemaining)}</strong></span>
+                          <span className="text-gray-400">|</span>
+                          <span className="text-gray-500">Importo movimento: <strong className={txDir === 'in' ? 'text-emerald-700' : 'text-red-700'}>{fmtEur(netAmt)}</strong></span>
+                          {sumClose ? (
+                            <span className="text-[10px] text-emerald-600 font-medium bg-emerald-50 px-1.5 py-0.5 rounded">✅ Importi corrispondono</span>
+                          ) : (
+                            <span className="text-[10px] text-orange-600 bg-orange-50 px-1.5 py-0.5 rounded">Diff: {fmtEur(sumDiff)}</span>
+                          )}
+                        </div>
+                        <button
+                          onClick={async () => {
+                            for (const s of group.items) {
+                              try { await confirmSuggestion(s) } catch { /* continue */ }
+                            }
+                          }}
+                          disabled={bulkConfirming}
+                          className="flex items-center gap-1 px-3 py-1 text-[11px] font-medium rounded-md bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
+                        >
+                          <Check className="h-3 w-3" />
+                          Conferma tutte ({group.items.length})
+                        </button>
+                      </div>
                     </div>
-                  )}
-                  <div className={group.items.length > 1 ? 'pl-3 border-l-2 border-blue-200 space-y-2' : ''}>
-                    {group.items.map(s => (
-                      <SuggestionCard
-                        key={s.id}
-                        suggestion={s}
-                        onConfirm={() => confirmSuggestion(s)}
-                        onReject={() => rejectSuggestion(s)}
-                        confirming={confirmingId === s.id}
-                        rejecting={rejectingId === s.id}
-                        onBankTxDoubleClick={(txId) => setDetailPopup({ type: 'bank_tx', id: txId })}
-                        onInvoiceDoubleClick={(invId) => setDetailPopup({ type: 'invoice', id: invId })}
-                        onNavigateTx={(txId) => navigate(`/banca?txId=${txId}`)}
-                        onNavigateInvoice={(invId) => navigate(`/fatture?invoiceId=${invId}`)}
-                      />
-                    ))}
+                  )
+                }
+
+                // ── Standard grouped rendering (alternatives or mixed levels) ──
+                return (
+                  <div key={group.txId} className={group.items.length > 1 ? 'space-y-2' : ''}>
+                    {group.items.length > 1 && (
+                      <div className="flex items-center gap-2 ml-3">
+                        <span className="text-[10px] font-medium text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full">
+                          {group.items.length} alternative per lo stesso movimento
+                        </span>
+                      </div>
+                    )}
+                    <div className={group.items.length > 1 ? 'pl-3 border-l-2 border-blue-200 space-y-2' : ''}>
+                      {group.items.map(s => (
+                        <SuggestionCard
+                          key={s.id}
+                          suggestion={s}
+                          onConfirm={() => confirmSuggestion(s)}
+                          onReject={() => rejectSuggestion(s)}
+                          confirming={confirmingId === s.id}
+                          rejecting={rejectingId === s.id}
+                          onBankTxDoubleClick={(txId) => setDetailPopup({ type: 'bank_tx', id: txId })}
+                          onInvoiceDoubleClick={(invId) => setDetailPopup({ type: 'invoice', id: invId })}
+                          onNavigateTx={(txId) => navigate(`/banca?txId=${txId}`)}
+                          onNavigateInvoice={(invId) => navigate(`/fatture?invoiceId=${invId}`)}
+                        />
+                      ))}
+                    </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </>
           )}
         </TabsContent>
@@ -1058,6 +1262,7 @@ export default function RiconciliazionePage() {
                   const hasComm = tx.commission_amount != null && Number(tx.commission_amount) !== 0
                   const sign = tx.direction === 'in' ? '+' : '-'
                   const netAmt = hasComm ? txAbs - Math.abs(Number(tx.commission_amount)) : txAbs
+                  const txRefs = extractClientInvoiceRefs(tx.extracted_refs, tx.raw_text)
                   return (
                     <button
                       key={tx.id}
@@ -1074,6 +1279,11 @@ export default function RiconciliazionePage() {
                           <span className="text-xs font-medium text-gray-800 truncate">
                             {tx.counterparty_name || 'N.D.'}
                           </span>
+                          {txRefs.length > 0 && (
+                            <span className="text-[9px] text-emerald-700 bg-emerald-50 px-1 py-0.5 rounded shrink-0" title={`Rif. fatture: ${txRefs.join(', ')}`}>
+                              📌{txRefs.length}
+                            </span>
+                          )}
                         </div>
                         <div className="text-right shrink-0 ml-2">
                           <span className={`text-xs font-semibold ${tx.direction === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
@@ -1135,24 +1345,27 @@ export default function RiconciliazionePage() {
                   </div>
                 ) : candidates.map((inst: any) => {
                   const remaining = Number(inst.amount_due) - Number(inst.paid_amount)
-                  const tx = unmatchedTxs.find(t => t.id === selectedTxId)
-                  const txAbs = tx ? Math.abs(Number(tx.amount)) : 0
-                  const diff = Math.abs(txAbs - remaining)
-                  const ratio = txAbs > 0 ? diff / txAbs : 1
+                  const isRefMatch = inst._refMatch === true
+                  const matchedRef = inst._matchedRef
 
                   return (
                     <div
                       key={inst.id}
-                      className="px-3 py-2.5 border-b last:border-b-0 hover:bg-gray-50 transition-colors"
+                      className={`px-3 py-2.5 border-b last:border-b-0 hover:bg-gray-50 transition-colors ${isRefMatch ? 'bg-emerald-50/50' : ''}`}
                     >
                       <div className="flex items-center justify-between">
                         <div className="min-w-0">
-                          <div className="flex items-center gap-2">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            {isRefMatch && (
+                              <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded flex items-center gap-0.5">
+                                <span>📌</span> Ref. nel movimento
+                              </span>
+                            )}
                             <span className="text-xs font-medium text-gray-800">
                               {inst.counterparty_name || 'N.D.'}
                             </span>
                             {inst.invoice_number && (
-                              <span className="text-[10px] text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded">
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded ${isRefMatch ? 'text-emerald-700 bg-emerald-100 font-semibold' : 'text-blue-600 bg-blue-50'}`}>
                                 {inst.invoice_number}
                               </span>
                             )}
@@ -1162,11 +1375,11 @@ export default function RiconciliazionePage() {
                             <span className="text-[10px] text-gray-500">
                               Residuo: {fmtEur(remaining)}
                             </span>
-                            {ratio < 0.05 && (
+                            {inst._ratio < 0.05 && (
                               <span className="text-[10px] text-emerald-600 font-medium">Importo coincidente</span>
                             )}
-                            {ratio >= 0.05 && ratio < 0.15 && (
-                              <span className="text-[10px] text-amber-600">Diff: {fmtEur(diff)}</span>
+                            {inst._ratio >= 0.05 && inst._ratio < 0.15 && (
+                              <span className="text-[10px] text-amber-600">Diff: {fmtEur(inst._diff)}</span>
                             )}
                           </div>
                         </div>

@@ -910,10 +910,31 @@ export default function FatturePage() {
 
   useEffect(() => {
     const invoiceIdParam = searchParams.get('invoiceId');
-    if (!invoiceIdParam) return;
-    if (!invoices.some(inv => inv.id === invoiceIdParam)) return;
-    setSelectedId(invoiceIdParam);
-  }, [searchParams, invoices]);
+    if (!invoiceIdParam || !companyId) return;
+
+    // If already in current list, just select it
+    if (invoices.some(inv => inv.id === invoiceIdParam)) {
+      setSelectedId(invoiceIdParam);
+      return;
+    }
+
+    // Invoice not in current list — might be in different direction tab.
+    // Fetch its direction from DB and auto-switch the tab if needed.
+    supabase
+      .from('invoices')
+      .select('id, direction')
+      .eq('id', invoiceIdParam)
+      .single()
+      .then(({ data }) => {
+        if (!data) return;
+        const neededDir = data.direction === 'attivo' ? 'out' : 'in';
+        if (neededDir !== directionFilter) {
+          setDirectionFilter(neededDir);
+          // directionFilter change triggers reload → invoices update →
+          // this effect re-runs → invoice found → auto-selected
+        }
+      });
+  }, [searchParams, invoices, companyId, directionFilter]);
 
   // ── AI Search handler — edge function handles all filtering server-side ──
   const handleAISearch = useCallback(async () => {
