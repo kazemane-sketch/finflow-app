@@ -915,26 +915,29 @@ export default function FatturePage() {
     // If already in current list, select it and clean up URL
     if (invoices.some(inv => inv.id === invoiceIdParam)) {
       setSelectedId(invoiceIdParam);
-      // Clean up the search param to avoid re-triggering
       searchParams.delete('invoiceId');
       setSearchParams(searchParams, { replace: true });
       return;
     }
 
-    // Invoice not in current list — might be in different direction tab.
-    // Fetch its direction from DB and auto-switch the tab if needed.
+    // Invoice not in current list — might be in different direction tab or beyond page 1.
+    // Fetch direction from DB, set selectedId immediately so detail panel loads,
+    // and switch direction tab if needed.
     supabase
       .from('invoices')
       .select('id, direction')
       .eq('id', invoiceIdParam)
+      .eq('company_id', companyId)
       .single()
       .then(({ data }) => {
         if (!data) return;
-        const neededDir = data.direction === 'attivo' ? 'out' : 'in';
+        // DB stores 'in' (passive) or 'out' (active) — same values as directionFilter
+        const neededDir = data.direction as 'in' | 'out';
+        // Set selectedId immediately so detail loading effect starts
+        setSelectedId(invoiceIdParam);
         if (neededDir !== directionFilter) {
           setDirectionFilter(neededDir);
-          // directionFilter change triggers reload → invoices update →
-          // this effect re-runs → invoice found → auto-selected → URL cleaned
+          // Tab switch triggers reload → invoices update → effect re-runs → invoice found → URL cleaned
         }
       });
   }, [searchParams, invoices, companyId, directionFilter]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1055,7 +1058,9 @@ export default function FatturePage() {
     pagate: serverStats?.pagate ?? invoices.filter(i => i.payment_status === 'paid').length,
     counterparties: new Set(invoices.map(i => (i.counterparty as any)?.denom || i.source_filename)).size,
   };
-  const selectedInvoice = invoices.find(i => i.id === selectedId);
+  // Use invoice from list if available, otherwise fall back to detail loaded by ID
+  // (handles deep-link case where invoice isn't in the visible page of results)
+  const selectedInvoice = invoices.find(i => i.id === selectedId) ?? (selectedId && detail ? detail : null);
   const allFilteredChecked = invoices.length > 0 && invoices.every(i => checked.has(i.id));
 
   return (
