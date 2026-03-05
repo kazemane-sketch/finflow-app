@@ -11,8 +11,7 @@ import {
   type InvoiceAggregates,
 } from '@/lib/invoiceSaver';
 import { listInstallmentsForInvoice, type InvoiceInstallment } from '@/lib/scadenzario';
-import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client';
-import { getValidAccessToken } from '@/lib/getValidAccessToken';
+import { supabase } from '@/integrations/supabase/client';
 import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges';
@@ -651,78 +650,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 // ============================================================
 // INVOICE AI SEARCH — Types + Helpers
 // ============================================================
-type InvoiceAiSearchResponse = {
-  query_type: 'deterministic';
-  ids: string[];
-  total: number;
-  explanation: string;
-  filters: any[];
-  request_id?: string;
-};
-
-type InvoiceAiResult = {
-  text: string;
-  isError: boolean;
-  requestId?: string;
-  candidateIds?: string[];
-  total?: number;
-};
-
-function normalizeCandidateIds(raw: unknown): string[] {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter((v): v is string => typeof v === 'string' && v.length > 0);
-}
-
-async function invokeInvoiceAiSearch(
-  body: Record<string, unknown>,
-  token: string,
-): Promise<InvoiceAiSearchResponse> {
-  const res = await fetch(`${SUPABASE_URL}/functions/v1/invoice-ai-search`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = data?.error || data?.message || `HTTP ${res.status}`;
-    const err = new Error(msg) as any;
-    err.status = res.status;
-    err.errorCode = data?.error_code;
-    err.hint = data?.hint;
-    err.details = data?.details;
-    throw err;
-  }
-
-  return {
-    query_type: data.query_type || 'deterministic',
-    ids: normalizeCandidateIds(data.ids),
-    total: Number(data.total || 0),
-    explanation: typeof data.explanation === 'string' ? data.explanation : '',
-    filters: Array.isArray(data.filters) ? data.filters : [],
-    request_id: data.request_id,
-  };
-}
-
-async function askInvoiceAiSearch(
-  body: Record<string, unknown>,
-): Promise<InvoiceAiSearchResponse> {
-  let token = await getValidAccessToken();
-  try {
-    return await invokeInvoiceAiSearch(body, token);
-  } catch (e: any) {
-    if (e?.status === 401) {
-      // Retry once with force-refreshed token (same strategy as BancaPage)
-      token = await getValidAccessToken({ forceRefresh: true });
-      return await invokeInvoiceAiSearch(body, token);
-    }
-    throw e;
-  }
-}
+// AI search helpers — shared module (no duplication)
+import { askInvoiceAiSearch, type InvoiceAiResult } from '@/lib/invoiceAiSearch';
 
 // ============================================================
 // MAIN PAGE

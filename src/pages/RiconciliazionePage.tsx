@@ -14,6 +14,7 @@ import { getValidAccessToken } from '@/lib/getValidAccessToken'
 import { fmtDate, fmtEur } from '@/lib/utils'
 import { mpLabel, tpLabel } from '@/lib/invoiceParser'
 import BankTxDetail, { txTypeLabel, txTypeBadge, txDirection } from '@/components/BankTxDetail'
+import { askInvoiceAiSearch, type InvoiceAiResult } from '@/lib/invoiceAiSearch'
 
 /* ─── types ──────────────────────────────────── */
 
@@ -283,6 +284,8 @@ export default function RiconciliazionePage() {
   )
   const [assistedSearch, setAssistedSearch] = useState('')
   const [candidateSearch, setCandidateSearch] = useState('')
+  const [candidateAiResult, setCandidateAiResult] = useState<InvoiceAiResult | null>(null)
+  const [candidateAiSearching, setCandidateAiSearching] = useState(false)
 
   // Reconciled tab state
   const [reconciledSearch, setReconciledSearch] = useState('')
@@ -984,6 +987,40 @@ export default function RiconciliazionePage() {
     )
   }, [unmatchedTxs, assistedSearch])
 
+  // ─── AI search for candidates ────────────
+  const handleCandidateAISearch = useCallback(async () => {
+    if (!candidateSearch.trim() || !companyId) return
+    setCandidateAiSearching(true)
+    setCandidateAiResult(null)
+    try {
+      const result = await askInvoiceAiSearch({
+        query: candidateSearch,
+        company_id: companyId,
+      })
+      console.log('[Riconciliazione AI] result:', JSON.stringify({
+        query_type: result.query_type, total: result.total,
+        explanation: result.explanation?.slice(0, 80),
+      }))
+      const ids = result.ids || []
+      setCandidateSearch('')
+      setCandidateAiResult({
+        text: result.explanation || `Trovate ${result.total} fatture`,
+        isError: false,
+        requestId: result.request_id,
+        candidateIds: ids.length > 0 ? ids : ['00000000-0000-0000-0000-000000000000'],
+        total: result.total,
+      })
+    } catch (e: any) {
+      console.error('[Riconciliazione AI] error:', e)
+      const errText = [
+        e.message || 'Errore ricerca AI',
+        e.hint ? `Suggerimento: ${e.hint}` : '',
+      ].filter(Boolean).join(' — ')
+      setCandidateAiResult({ text: errText, isError: true })
+    }
+    setCandidateAiSearching(false)
+  }, [candidateSearch, companyId])
+
   // ─── candidates for selected tx ────────────
   const candidates = useMemo(() => {
     if (!selectedTxId) return []
@@ -1003,12 +1040,19 @@ export default function RiconciliazionePage() {
     // Counterparty name for prioritization (normalized lowercase)
     const txCounterparty = (tx.counterparty_name || '').toLowerCase().trim()
 
-    // Filter installments: remaining > 0 AND matching direction
+    // AI search active? Build a Set of invoice IDs for fast lookup
+    const aiInvoiceIds = candidateAiResult?.candidateIds?.length
+      ? new Set(candidateAiResult.candidateIds)
+      : null
+
+    // Filter installments: remaining > 0 AND matching direction (AND AI filter if active)
     let filtered = openInstallments.filter(inst => {
       const remaining = Number(inst.amount_due) - Number(inst.paid_amount)
       if (remaining <= 0) return false
       // Direction filter: only show invoices matching the expected direction
       if (inst.direction !== expectedDirection) return false
+      // AI filter: only show installments for AI-matched invoices
+      if (aiInvoiceIds && !aiInvoiceIds.has(inst.invoice_id)) return false
       return true
     })
 
@@ -1058,7 +1102,7 @@ export default function RiconciliazionePage() {
     }
 
     return enriched.slice(0, 50)
-  }, [selectedTxId, unmatchedTxs, openInstallments, candidateSearch])
+  }, [selectedTxId, unmatchedTxs, openInstallments, candidateSearch, candidateAiResult])
 
   // Filtered reconciled rows
   const filteredReconciled = useMemo(() => {
@@ -1452,7 +1496,7 @@ export default function RiconciliazionePage() {
                   return (
                     <button
                       key={tx.id}
-                      onClick={() => setSelectedTxId(isSelected ? null : tx.id)}
+                      onClick={() => { setSelectedTxId(isSelected ? null : tx.id); setCandidateAiResult(null); setCandidateSearch('') }}
                       onDoubleClick={() => setDetailPopup({ type: 'bank_tx', id: tx.id })}
                       title="Doppio click per dettaglio"
                       className={`w-full text-left px-3 py-2 border-b last:border-b-0 transition-colors ${
@@ -1515,17 +1559,46 @@ export default function RiconciliazionePage() {
               </div>
 
               {selectedTxId && (
-                <div className="px-3 py-2 border-b">
-                  <div className="relative">
-                    <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
-                    <input
-                      type="text"
-                      value={candidateSearch}
-                      onChange={e => setCandidateSearch(e.target.value)}
-                      placeholder="Filtra per controparte, fattura..."
-                      className="w-full pl-8 pr-3 py-1.5 text-xs border rounded-md focus:outline-none focus:ring-1 focus:ring-purple-400"
-                    />
+                <div className="px-3 py-2 border-b space-y-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <div className="relative flex-1">
+                      <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
+                      <input
+                        type="text"
+                        value={candidateSearch}
+                        onChange={e => { setCandidateSearch(e.target.value); if (candidateAiResult && !e.target.value.trim()) setCandidateAiResult(null) }}
+                        onKeyDown={e => { if (e.key === 'Enter' && candidateSearch.trim()) handleCandidateAISearch() }}
+                        placeholder="Cerca o Invio per AI ✨"
+                        className="w-full pl-8 pr-3 py-1.5 text-xs border rounded-md focus:outline-none focus:ring-1 focus:ring-purple-400"
+                      />
+                    </div>
+                    <button
+                      onClick={handleCandidateAISearch}
+                      disabled={!candidateSearch.trim() || candidateAiSearching}
+                      className={`px-2 py-1.5 text-xs font-semibold rounded-md border transition-all ${
+                        candidateAiSearching
+                          ? 'bg-violet-100 text-violet-600 border-violet-300 animate-pulse'
+                          : candidateAiResult
+                            ? 'bg-violet-600 text-white border-violet-600'
+                            : 'bg-white text-violet-600 border-violet-300 hover:bg-violet-50 disabled:opacity-40 disabled:cursor-not-allowed'
+                      }`}
+                      title="Ricerca AI"
+                    >
+                      {candidateAiSearching ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+                    </button>
                   </div>
+                  {/* AI result explanation bar */}
+                  {candidateAiResult && (candidateAiResult.isError ? (
+                    <div className="flex items-center gap-1.5 px-2 py-1 bg-red-50 border border-red-200 rounded-md">
+                      <span className="text-[10px] text-red-600 flex-1">⚠ {candidateAiResult.text}</span>
+                      <button onClick={() => setCandidateAiResult(null)} className="text-red-400 hover:text-red-600 text-xs font-bold">✕</button>
+                    </div>
+                  ) : candidateAiResult.text ? (
+                    <div className="flex items-center gap-1.5 px-2 py-1 bg-violet-50 border border-violet-200 rounded-md">
+                      <span className="text-[10px] text-violet-700 flex-1">✨ {candidateAiResult.text} — <strong>{candidates.length}</strong> rate corrispondenti</span>
+                      <button onClick={() => setCandidateAiResult(null)} className="text-violet-400 hover:text-violet-600 text-xs font-bold">✕</button>
+                    </div>
+                  ) : null)}
                 </div>
               )}
 
