@@ -11,7 +11,7 @@ import {
   type InvoiceAggregates,
 } from '@/lib/invoiceSaver';
 import { listInstallmentsForInvoice, type InvoiceInstallment } from '@/lib/scadenzario';
-import { supabase } from '@/integrations/supabase/client';
+import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client';
 import { getValidAccessToken } from '@/lib/getValidAccessToken';
 import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
@@ -677,16 +677,11 @@ async function invokeInvoiceAiSearch(
   body: Record<string, unknown>,
   token: string,
 ): Promise<InvoiceAiSearchResponse> {
-  const supabaseUrl = (import.meta as any).env?.VITE_SUPABASE_URL
-    ?? 'https://xtuofcwvimaffcpqboou.supabase.co';
-  const anonKey = (import.meta as any).env?.VITE_SUPABASE_ANON_KEY
-    ?? '';
-
-  const res = await fetch(`${supabaseUrl}/functions/v1/invoice-ai-search`, {
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/invoice-ai-search`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      apikey: anonKey,
+      apikey: SUPABASE_ANON_KEY,
       Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(body),

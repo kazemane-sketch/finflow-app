@@ -323,8 +323,22 @@ export async function loadInvoices(
     .select(INVOICE_LIST_COLS, { count: 'exact' })
     .eq('company_id', companyId);
 
+  let overrideCount: number | null = null;
+
   if (filters?.candidateIds?.length) {
-    q = q.in('id', filters.candidateIds);
+    // Sentinel UUID → guaranteed empty result
+    const SENTINEL = '00000000-0000-0000-0000-000000000000';
+    if (filters.candidateIds.length === 1 && filters.candidateIds[0] === SENTINEL) {
+      return { data: [], count: 0 };
+    }
+    // Paginate through candidateIds client-side: pass only the current page
+    // slice to .in() to avoid exceeding PostgREST URL length limits (~8KB).
+    const pageIds = filters.candidateIds.slice(from, to + 1);
+    if (pageIds.length === 0) {
+      return { data: [], count: filters.candidateIds.length };
+    }
+    q = q.in('id', pageIds);
+    overrideCount = filters.candidateIds.length;
   } else {
     if (filters?.direction && filters.direction !== 'all') {
       q = q.eq('direction', filters.direction);
@@ -347,21 +361,25 @@ export async function loadInvoices(
     }
   }
 
-  q = q.order('date', { ascending: false }).range(from, to);
+  // When candidateIds pagination is active, skip .range() — pagination is handled by ID slicing
+  q = q.order('date', { ascending: false });
+  if (overrideCount == null) q = q.range(from, to);
+
   const { data, error, count } = await q;
   if (error) throw new Error(error.message);
   const rows = (data || []) as DBInvoice[];
 
   // Enrich counterparty status
   const hasLinkedCounterparty = rows.some((r) => Boolean(r.counterparty_id));
-  if (!hasLinkedCounterparty) return { data: rows, count: count ?? 0 };
+  const totalCount = overrideCount ?? count ?? 0;
+  if (!hasLinkedCounterparty) return { data: rows, count: totalCount };
 
   const { data: statuses, error: statusErr } = await supabase
     .from('counterparties')
     .select('id, status')
     .eq('company_id', companyId);
 
-  if (statusErr || !statuses) return { data: rows, count: count ?? 0 };
+  if (statusErr || !statuses) return { data: rows, count: totalCount };
 
   const statusMap = new Map<string, string>(
     statuses
@@ -376,7 +394,7 @@ export async function loadInvoices(
       : row.counterparty_status_snapshot,
   }));
 
-  return { data: enriched, count: count ?? 0 };
+  return { data: enriched, count: totalCount };
 }
 
 /** Load invoice stats (counts by status) — lightweight HEAD queries */

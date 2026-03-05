@@ -862,7 +862,23 @@ export async function loadBankTransactions(
     .eq('company_id', companyId);
 
   if (filters?.candidateIds?.length) {
-    q = q.in('id', filters.candidateIds);
+    // Sentinel UUID → guaranteed empty result
+    const SENTINEL = '00000000-0000-0000-0000-000000000000';
+    if (filters.candidateIds.length === 1 && filters.candidateIds[0] === SENTINEL) {
+      return { data: [], count: 0 };
+    }
+    // Paginate through candidateIds client-side: pass only the current page
+    // slice to .in() to avoid exceeding PostgREST URL length limits (~8KB).
+    const pageIds = filters.candidateIds.slice(from, to + 1);
+    if (pageIds.length === 0) {
+      return { data: [], count: filters.candidateIds.length };
+    }
+    q = q.in('id', pageIds);
+    // No .range() needed — pagination is already handled by slicing candidateIds.
+    q = q.order('date', { ascending: false });
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+    return { data: data || [], count: filters.candidateIds.length };
   } else {
     if (filters?.direction === 'in') {
       q = q.eq('direction', 'in');
