@@ -2,7 +2,7 @@
 // Date filter + AI search (Haiku) + removed Fix Nomi
 import { useState, useCallback, useRef, useEffect, useSyncExternalStore } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { processInvoiceFile, TIPO, MP, REG } from '@/lib/invoiceParser';
+import { processInvoiceFile, TIPO, MP, REG, mpLabel, tpLabel } from '@/lib/invoiceParser';
 import {
   saveInvoicesToDB, loadInvoices, loadInvoiceDetail, loadInvoiceStats,
   deleteInvoices, updateInvoice, verifyPassword,
@@ -36,7 +36,7 @@ const NAT: Record<string, string> = {
   'N6.6': 'Elettronici', 'N6.7': 'Edile', 'N6.8': 'Energia', 'N6.9': 'RC altri',
   N7: 'IVA in altro UE',
 };
-const CPC: Record<string, string> = { TP01: 'A rate', TP02: 'Completo', TP03: 'Anticipo' };
+// CPC removed — now using shared TP + tpLabel from invoiceParser
 const ESI: Record<string, string> = { I: 'Immediata', D: 'Differita', S: 'Split payment' };
 const RIT: Record<string, string> = { RT01: 'Pers. fisiche', RT02: 'Pers. giuridiche', RT03: 'INPS', RT04: 'ENASARCO', RT05: 'ENPAM' };
 const STATUS_LABELS: Record<string, string> = { pending: 'Da Pagare', overdue: 'Scaduta', paid: 'Pagata' };
@@ -572,14 +572,14 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           <tbody>
             {b?.pagamenti?.length > 0 ? b.pagamenti.map((p: any, i: number) => (
               <tr key={i} className="border-b border-gray-100">
-                <td className="text-left px-1.5 py-1">{p.modalita ? `${p.modalita} (${MP[p.modalita] || ''})` : ''}{b.condPag ? ` - ${b.condPag} (${CPC[b.condPag] || ''})` : ''}</td>
+                <td className="text-left px-1.5 py-1">{p.modalita ? mpLabel(p.modalita) : ''}{b.condPag ? ` — ${tpLabel(b.condPag)}` : ''}</td>
                 <td className="text-left px-1.5 py-1">{p.iban || ''}</td>
                 <td className="text-right px-1.5 py-1">{p.scadenza ? fmtDate(p.scadenza) : ''}</td>
                 <td className="text-right px-1.5 py-1 font-bold">{p.importo ? fmtEur(safeFloat(p.importo)) : ''}</td>
               </tr>
             )) : (
               <tr><td colSpan={4} className="text-left px-1.5 py-1 text-gray-400">
-                {invoice.payment_method ? `${invoice.payment_method} (${MP[invoice.payment_method] || ''})` : 'Nessun dettaglio'} — Scadenza: {invoice.payment_due_date ? fmtDate(invoice.payment_due_date) : '—'} — {fmtEur(invoice.total_amount)}
+                {invoice.payment_method ? mpLabel(invoice.payment_method) : 'Nessun dettaglio'} — Scadenza: {invoice.payment_due_date ? fmtDate(invoice.payment_due_date) : '—'} — {fmtEur(invoice.total_amount)}
               </td></tr>
             )}
           </tbody>

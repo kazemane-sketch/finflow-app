@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from 'react-router-dom'
+import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/hooks/useAuth'
 import { useCompany } from '@/hooks/useCompany'
 import { Button } from '@/components/ui/button'
@@ -16,6 +16,8 @@ import {
   Menu,
   X,
   Sparkles,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { supabase } from '@/integrations/supabase/client'
@@ -35,6 +37,7 @@ const nav = [
 export default function AppLayout() {
   const { user, signOut } = useAuth()
   const { company } = useCompany()
+  const navigate = useNavigate()
   const [open, setOpen] = useState(false)
   const [reconBadge, setReconBadge] = useState(0)
 
@@ -119,6 +122,23 @@ export default function AppLayout() {
         </header>
 
         <main className="flex-1 overflow-y-auto">
+          {/* Global navigation arrows */}
+          <div className="sticky top-0 z-10 flex items-center gap-1 px-4 py-1.5 bg-white/80 backdrop-blur-sm border-b border-gray-100">
+            <button
+              onClick={() => navigate(-1)}
+              className="p-1 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
+              title="Indietro"
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </button>
+            <button
+              onClick={() => navigate(1)}
+              className="p-1 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
+              title="Avanti"
+            >
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          </div>
           <Outlet />
         </main>
       </div>

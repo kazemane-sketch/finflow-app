@@ -25,6 +25,7 @@ interface TxRow {
   transaction_type: string | null;
   extracted_refs: Record<string, unknown> | null;
   direction: string;
+  reconciled_amount: number;
 }
 
 interface Suggestion {
@@ -47,6 +48,9 @@ async function generateForTransaction(
 ): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
   const absAmount = Math.abs(Number(tx.amount));
+  // Use remaining amount (total - already reconciled) for matching
+  const remainingAmount = absAmount - Number(tx.reconciled_amount || 0);
+  if (remainingAmount < 0.01) return []; // Fully reconciled, skip
   const refs = tx.extracted_refs || {};
 
   // ── Level 1: Deterministic match by invoice_refs ──
@@ -65,11 +69,13 @@ async function generateForTransaction(
       );
 
       for (const m of matches) {
-        const compareAmount = m.installment_id
+        const instRemaining = m.installment_id
           ? Math.abs(Number(m.amount_due) - Number(m.paid_amount || 0))
           : Math.abs(Number(m.total_amount));
-        const amountDiff = Math.abs(absAmount - compareAmount);
-        const amountRatio = absAmount > 0 ? amountDiff / absAmount : 1;
+        // Skip fully paid installments
+        if (m.installment_id && instRemaining < 0.01) continue;
+        const amountDiff = Math.abs(remainingAmount - instRemaining);
+        const amountRatio = remainingAmount > 0 ? amountDiff / remainingAmount : 1;
 
         let score = 70;
         let reason = `Riferimento fattura "${ref}" nel testo operazione`;
@@ -113,16 +119,17 @@ async function generateForTransaction(
            AND abs(ii.amount_due - ii.paid_amount) BETWEEN $3 * 0.90 AND $3 * 1.10
          ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $3) ASC
          LIMIT 5`,
-        [companyId, cpWord, absAmount],
+        [companyId, cpWord, remainingAmount],
       );
 
       for (const m of cpMatches) {
         // Skip if already suggested by ref match
         if (suggestions.some((s) => s.installment_id === m.installment_id)) continue;
 
-        const remaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
-        const amountDiff = Math.abs(absAmount - remaining);
-        const amountRatio = absAmount > 0 ? amountDiff / absAmount : 1;
+        const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
+        if (instRemaining < 0.01) continue; // Skip fully paid
+        const amountDiff = Math.abs(remainingAmount - instRemaining);
+        const amountRatio = remainingAmount > 0 ? amountDiff / remainingAmount : 1;
         const daysDiff = tx.date && m.due_date
           ? Math.abs((new Date(tx.date).getTime() - new Date(m.due_date).getTime()) / 86400000)
           : 999;
@@ -172,21 +179,22 @@ async function generateForTransaction(
            AND abs(ii.amount_due - ii.paid_amount) BETWEEN $3 * 0.85 AND $3 * 1.15
          ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $3) ASC
          LIMIT 3`,
-        [companyId, cpName.split(/\s+/)[0], absAmount],
+        [companyId, cpName.split(/\s+/)[0], remainingAmount],
       );
 
       for (const m of openInstallments) {
         if (suggestions.some((s) => s.installment_id === m.installment_id)) continue;
 
-        const remaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
-        const amountDiff = Math.abs(absAmount - remaining);
+        const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
+        if (instRemaining < 0.01) continue; // Skip fully paid
+        const amountDiff = Math.abs(remainingAmount - instRemaining);
 
         suggestions.push({
           bank_transaction_id: tx.id,
           installment_id: m.installment_id,
           invoice_id: m.invoice_id,
           match_score: 80,
-          match_reason: `Stesso mandato SDD "${refs.mandate_id}" → controparte ${cpName}`,
+          match_reason: `Stesso mandato SDD "${refs.mandate_id}" -> controparte ${cpName}`,
           proposed_by: "deterministic",
           rule_id: null,
           suggestion_data: { mandate_id: refs.mandate_id, counterparty: cpName, amount_diff: amountDiff },
@@ -231,13 +239,15 @@ Deno.serve(async (req) => {
   const sql = postgres(dbUrl, { max: 1 });
 
   try {
-    // Get unmatched transactions with extracted refs ready
+    // Get unmatched AND partially reconciled transactions with extracted refs ready
     const rows: TxRow[] = await sql`
-      SELECT id, date, amount, counterparty_name, transaction_type, extracted_refs, direction
+      SELECT id, date, amount, counterparty_name, transaction_type,
+             extracted_refs, direction, reconciled_amount
       FROM bank_transactions
       WHERE company_id = ${companyId}
-        AND reconciliation_status = 'unmatched'
+        AND reconciliation_status IN ('unmatched', 'partial')
         AND extraction_status = 'ready'
+        AND abs(amount) - reconciled_amount > 0.01
         AND id NOT IN (
           SELECT DISTINCT bank_transaction_id
           FROM reconciliation_suggestions
@@ -270,7 +280,7 @@ Deno.serve(async (req) => {
       txProcessed++;
     }
 
-    // Count totals
+    // Count totals (include partial in unmatched count for display)
     const [{ pending_count }] = await sql`
       SELECT count(*)::int as pending_count
       FROM reconciliation_suggestions
@@ -280,7 +290,8 @@ Deno.serve(async (req) => {
     const [{ unmatched_count }] = await sql`
       SELECT count(*)::int as unmatched_count
       FROM bank_transactions
-      WHERE company_id = ${companyId} AND reconciliation_status = 'unmatched'
+      WHERE company_id = ${companyId}
+        AND reconciliation_status IN ('unmatched', 'partial')
     `;
 
     const [{ matched_count }] = await sql`

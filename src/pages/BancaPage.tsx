@@ -1,5 +1,6 @@
 // src/pages/BancaPage.tsx
 import { useState, useEffect, useCallback, useRef, type MouseEvent } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { useCompany } from '@/hooks/useCompany'
@@ -699,6 +700,7 @@ export default function BancaPage() {
   const { company } = useCompany()
   const companyId = company?.id || null
   const { txScores, refresh: refreshBadges } = useReconciliationBadges()
+  const [searchParams, setSearchParams] = useSearchParams()
 
   const [transactions, setTransactions] = useState<any[]>([])
   const [bankAccounts, setBankAccounts] = useState<any[]>([])
@@ -925,6 +927,20 @@ export default function BancaPage() {
     observer.observe(bottomRef.current)
     return () => observer.disconnect()
   }, [allLoaded, loadingMore, loading])
+
+  // Deep-link: ?txId= → auto-open transaction detail
+  useEffect(() => {
+    const txId = searchParams.get('txId')
+    if (!txId || !transactions.length) return
+    const tx = transactions.find((t: any) => t.id === txId)
+    if (tx) {
+      setSelectedTx(tx)
+      loadBankTransactionDetail(tx.id).then(full => { if (full) setSelectedTx(full) })
+    }
+    // Clean up the search param to avoid re-triggering
+    searchParams.delete('txId')
+    setSearchParams(searchParams, { replace: true })
+  }, [searchParams, transactions]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Quick date filters
   const setQuickDate = (type: string) => {

@@ -315,5 +315,18 @@ export function reparseXml(rawXml: string): ParsedInvoice {
 
 // Lookup tables
 export const TIPO: Record<string, string> = { TD01: "Fattura", TD02: "Acconto/Anticipo", TD03: "Acconto Parcella", TD04: "Nota di Credito", TD05: "Nota di Debito", TD06: "Parcella", TD07: "Fatt. semplificata", TD08: "NC semplificata", TD16: "Integr. RC interno", TD17: "Integr. servizi UE", TD18: "Integr. beni UE", TD19: "Integr. art.17", TD20: "Autofattura", TD24: "Fatt. differita", TD25: "Fatt. differita (b)", TD26: "Cess. ammortizzabili", TD27: "Autoconsumo", TD28: "Acq. San Marino" };
-export const MP: Record<string, string> = { MP01: "Contanti", MP02: "Assegno", MP03: "Assegno circ.", MP05: "Bonifico", MP08: "Carta", MP09: "RID", MP10: "RID utenze", MP12: "RIBA", MP13: "MAV", MP14: "Quietanza erario", MP16: "Domic. bancaria", MP17: "Domic. postale", MP18: "Boll. postale", MP19: "SEPA DD", MP20: "SEPA CORE", MP21: "SEPA B2B", MP22: "Trattenuta", MP23: "PagoPA" };
+export const MP: Record<string, string> = { MP01: "Contanti", MP02: "Assegno", MP03: "Assegno circ.", MP04: "Contanti presso Tesoreria", MP05: "Bonifico", MP06: "Vaglia cambiario", MP07: "Bollettino bancario", MP08: "Carta di pagamento", MP09: "RID", MP10: "RID utenze", MP11: "RID veloce", MP12: "RIBA", MP13: "MAV", MP14: "Quietanza erario", MP15: "Giroconto su conti di contabilità speciale", MP16: "Domic. bancaria", MP17: "Domic. postale", MP18: "Boll. postale", MP19: "SEPA DD", MP20: "SEPA CORE", MP21: "SEPA B2B", MP22: "Trattenuta", MP23: "PagoPA" };
+export const TP: Record<string, string> = { TP01: "A rate", TP02: "Unica soluzione", TP03: "Anticipo" };
 export const REG: Record<string, string> = { RF01: "Ordinario", RF02: "Minimi", RF04: "Agricoltura", RF05: "Sali/tabacchi", RF06: "Fiammiferi", RF07: "Editoria", RF11: "Agenzie viaggio", RF12: "Agriturismo", RF14: "Beni usati", RF15: "Aste", RF16: "IVA per cassa", RF17: "IVA cassa PA", RF18: "Altro", RF19: "Forfettario" };
+
+/** Human-readable label for payment method code (e.g. "MP08 — Carta di pagamento") */
+export function mpLabel(code: string | null | undefined): string {
+  if (!code) return ''
+  return MP[code] ? `${code} — ${MP[code]}` : code
+}
+
+/** Human-readable label for payment terms code (e.g. "TP02 — Unica soluzione") */
+export function tpLabel(code: string | null | undefined): string {
+  if (!code) return ''
+  return TP[code] ? `${code} — ${TP[code]}` : code
+}

@@ -1,16 +1,17 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams, useNavigate } from 'react-router-dom'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   Link2, CheckCircle2, XCircle, Sparkles, RefreshCw, ChevronRight,
   ArrowRightLeft, Loader2, AlertTriangle, Search, FileText, Landmark,
-  ChevronDown, X, Check, Zap, Trash2, Unlink,
+  ChevronDown, X, Check, Zap, Trash2, Unlink, ExternalLink,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { useCompany } from '@/hooks/useCompany'
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 import { getValidAccessToken } from '@/lib/getValidAccessToken'
 import { fmtDate, fmtEur } from '@/lib/utils'
+import { mpLabel, tpLabel } from '@/lib/invoiceParser'
 import BankTxDetail, { txTypeLabel, txTypeBadge, txDirection } from '@/components/BankTxDetail'
 
 /* ─── types ──────────────────────────────────── */
@@ -36,6 +37,7 @@ interface SuggestionRow {
     direction: string | null
     reconciliation_status: string | null
     commission_amount: number | null
+    reconciled_amount: number | null
   } | null
   invoice: {
     id: string
@@ -236,7 +238,7 @@ export default function RiconciliazionePage() {
       .select(`
         id, bank_transaction_id, installment_id, invoice_id,
         match_score, match_reason, proposed_by, suggestion_data, status, created_at,
-        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount),
+        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount, reconciled_amount),
         invoice:invoices(id, number, counterparty, total_amount, date),
         installment:invoice_installments(id, installment_no, due_date, amount_due, paid_amount, status, direction)
       `)
@@ -381,54 +383,82 @@ export default function RiconciliazionePage() {
     setGenerating(false)
   }, [companyId, generating, loadKpis, loadSuggestions])
 
-  // ─── confirm suggestion ────────────────────
+  // ─── confirm suggestion (partial reconciliation aware) ────────────────────
   const confirmSuggestion = useCallback(async (suggestion: SuggestionRow) => {
     if (!companyId) return
     setConfirmingId(suggestion.id)
     try {
       const { data: { user } } = await supabase.auth.getUser()
       const userId = user?.id
+      const now = new Date().toISOString()
+      const today = now.slice(0, 10)
+      const tx = suggestion.bank_transaction
+      const inst = suggestion.installment
+
+      // Calculate remaining amounts
+      const txRemaining = tx ? Math.abs(Number(tx.amount)) - Number(tx.reconciled_amount || 0) : 0
+      const instRemaining = inst ? Number(inst.amount_due) - Number(inst.paid_amount || 0) : 0
+
+      // Reconcile amount = min of what's available on both sides
+      const reconcileAmount = inst ? Math.min(txRemaining, instRemaining) : txRemaining
+
+      // Validation: if nothing left to reconcile, expire suggestion
+      if (reconcileAmount < 0.01) {
+        await supabase.from('reconciliation_suggestions')
+          .update({ status: 'expired', resolved_at: now })
+          .eq('id', suggestion.id)
+        toast.error('Movimento o rata già completamente riconciliato')
+        setSuggestions(prev => prev.filter(s => s.id !== suggestion.id))
+        setConfirmingId(null)
+        return
+      }
 
       // 1. Mark suggestion as accepted
       const { error: e1 } = await supabase
         .from('reconciliation_suggestions')
-        .update({ status: 'accepted', resolved_at: new Date().toISOString(), resolved_by: userId })
+        .update({ status: 'accepted', resolved_at: now, resolved_by: userId })
         .eq('id', suggestion.id)
       if (e1) throw e1
 
-      // 2. Create reconciliation record
+      // 2. Create reconciliation record (with amount + installment_id)
       const { error: e2 } = await supabase
         .from('reconciliations')
         .insert({
           company_id: companyId,
           invoice_id: suggestion.invoice_id!,
           bank_transaction_id: suggestion.bank_transaction_id,
+          installment_id: suggestion.installment_id,
+          reconciled_amount: reconcileAmount,
           match_type: toMatchType(suggestion.proposed_by),
           confidence: suggestion.match_score / 100,
           match_reason: suggestion.match_reason,
           confirmed_by: userId,
-          confirmed_at: new Date().toISOString(),
+          confirmed_at: now,
         })
       if (e2) throw e2
 
-      // 3. Update bank transaction status
+      // 3. Update bank transaction: increment reconciled_amount, set status
+      const newTxReconciled = Number(tx?.reconciled_amount || 0) + reconcileAmount
+      const txFullyMatched = tx ? newTxReconciled >= Math.abs(Number(tx.amount)) - 0.01 : false
+      const newTxStatus = txFullyMatched ? 'matched' : 'partial'
       const { error: e3 } = await supabase
         .from('bank_transactions')
-        .update({ reconciliation_status: 'matched' })
+        .update({ reconciled_amount: newTxReconciled, reconciliation_status: newTxStatus })
         .eq('id', suggestion.bank_transaction_id)
       if (e3) throw e3
 
       // 4. Update installment paid_amount if installment match
-      if (suggestion.installment_id && suggestion.installment && suggestion.bank_transaction) {
-        const txAmount = Math.abs(Number(suggestion.bank_transaction.amount))
-        const newPaid = Number(suggestion.installment.paid_amount) + txAmount
-        const newStatus = newPaid >= Number(suggestion.installment.amount_due) ? 'paid' : 'partial'
+      let instFullyPaid = false
+      if (suggestion.installment_id && inst && tx) {
+        const newPaid = Number(inst.paid_amount) + reconcileAmount
+        instFullyPaid = newPaid >= Number(inst.amount_due) - 0.01
+        const newInstStatus = instFullyPaid ? 'paid' : 'partial'
         const { error: e4 } = await supabase
           .from('invoice_installments')
           .update({
             paid_amount: newPaid,
-            status: newStatus,
-            last_payment_date: suggestion.bank_transaction.date || new Date().toISOString().slice(0, 10),
+            status: newInstStatus,
+            last_payment_date: tx.date || today,
           })
           .eq('id', suggestion.installment_id)
         if (e4) throw e4
@@ -448,23 +478,32 @@ export default function RiconciliazionePage() {
         match_reason: suggestion.match_reason,
       })
 
-      // 6. Expire other pending suggestions for same bank transaction
-      await supabase
-        .from('reconciliation_suggestions')
-        .update({ status: 'expired' })
-        .eq('bank_transaction_id', suggestion.bank_transaction_id)
-        .eq('status', 'pending')
-        .neq('id', suggestion.id)
+      // 6. Expire suggestions that are no longer viable
+      // If TX fully matched → expire ALL pending suggestions for this TX
+      if (txFullyMatched) {
+        await supabase
+          .from('reconciliation_suggestions')
+          .update({ status: 'expired' })
+          .eq('bank_transaction_id', suggestion.bank_transaction_id)
+          .eq('status', 'pending')
+      }
+      // If installment fully paid → expire ALL pending suggestions for this installment
+      if (instFullyPaid && suggestion.installment_id) {
+        await supabase
+          .from('reconciliation_suggestions')
+          .update({ status: 'expired' })
+          .eq('installment_id', suggestion.installment_id)
+          .eq('status', 'pending')
+      }
 
-      toast.success('Riconciliazione confermata')
-      setSuggestions(prev => prev.filter(s => s.bank_transaction_id !== suggestion.bank_transaction_id))
-      await loadKpis()
+      toast.success(`Riconciliazione confermata (${fmtEur(reconcileAmount)})`)
+      await Promise.all([loadKpis(), loadSuggestions()])
     } catch (err: unknown) {
       const msg = errMsg(err)
       toast.error(`Errore conferma: ${msg}`)
     }
     setConfirmingId(null)
-  }, [companyId, loadKpis])
+  }, [companyId, loadKpis, loadSuggestions])
 
   // ─── reject suggestion ─────────────────────
   const rejectSuggestion = useCallback(async (suggestion: SuggestionRow) => {
@@ -504,12 +543,23 @@ export default function RiconciliazionePage() {
 
   // ─── bulk confirm high-confidence ──────────
   const bulkConfirmHigh = useCallback(async () => {
+    // For groups with multiple alternatives, only confirm the best (highest score)
     const highConf = suggestions.filter(s => s.match_score >= 90)
     if (!highConf.length) return
     setBulkConfirming(true)
+
+    // Deduplicate: pick only the best suggestion per bank_transaction_id
+    const bestPerTx = new Map<string, SuggestionRow>()
+    for (const s of highConf) {
+      const existing = bestPerTx.get(s.bank_transaction_id)
+      if (!existing || s.match_score > existing.match_score) {
+        bestPerTx.set(s.bank_transaction_id, s)
+      }
+    }
+
     let ok = 0
     let fail = 0
-    for (const s of highConf) {
+    for (const s of bestPerTx.values()) {
       try {
         await confirmSuggestion(s)
         ok++
@@ -531,36 +581,55 @@ export default function RiconciliazionePage() {
       const tx = unmatchedTxs.find(t => t.id === txId)
       if (!tx) throw new Error('Transazione non trovata')
 
-      // Create reconciliation
+      // Calculate partial reconciliation amounts
+      const txAmount = Math.abs(Number(tx.amount))
+      const instRemaining = Number(installment.amount_due) - Number(installment.paid_amount)
+      const reconcileAmount = Math.min(txAmount, instRemaining)
+
+      if (reconcileAmount < 0.01) {
+        toast.error('Importo insufficiente per riconciliare')
+        setConfirmingId(null)
+        return
+      }
+
+      const now = new Date().toISOString()
+
+      // Create reconciliation (with amount + installment_id)
       const { error: e1 } = await supabase.from('reconciliations').insert({
         company_id: companyId,
         invoice_id: installment.invoice_id,
         bank_transaction_id: txId,
+        installment_id: installment.id,
+        reconciled_amount: reconcileAmount,
         match_type: 'manual',
         confidence: 1.0,
         match_reason: 'Abbinamento manuale',
         confirmed_by: user?.id,
-        confirmed_at: new Date().toISOString(),
+        confirmed_at: now,
       })
       if (e1) throw e1
 
-      // Update bank tx
+      // Update bank tx with reconciled_amount
+      const newTxReconciled = reconcileAmount // For manual match on unmatched TX, starts at 0
+      const txFullyMatched = newTxReconciled >= txAmount - 0.01
       const { error: e2 } = await supabase
         .from('bank_transactions')
-        .update({ reconciliation_status: 'matched' })
+        .update({
+          reconciled_amount: newTxReconciled,
+          reconciliation_status: txFullyMatched ? 'matched' : 'partial',
+        })
         .eq('id', txId)
       if (e2) throw e2
 
       // Update installment
-      const txAmount = Math.abs(Number(tx.amount))
-      const newPaid = Number(installment.paid_amount) + txAmount
-      const newStatus = newPaid >= Number(installment.amount_due) ? 'paid' : 'partial'
+      const newPaid = Number(installment.paid_amount) + reconcileAmount
+      const newStatus = newPaid >= Number(installment.amount_due) - 0.01 ? 'paid' : 'partial'
       const { error: e3 } = await supabase
         .from('invoice_installments')
         .update({
           paid_amount: newPaid,
           status: newStatus,
-          last_payment_date: tx.date || new Date().toISOString().slice(0, 10),
+          last_payment_date: tx.date || now.slice(0, 10),
         })
         .eq('id', installment.id)
       if (e3) throw e3
@@ -578,8 +647,24 @@ export default function RiconciliazionePage() {
         match_reason: 'Abbinamento manuale utente',
       })
 
-      toast.success('Riconciliazione manuale completata')
-      setUnmatchedTxs(prev => prev.filter(t => t.id !== txId))
+      // Expire impossible suggestions for this TX or installment
+      if (txFullyMatched) {
+        await supabase.from('reconciliation_suggestions')
+          .update({ status: 'expired' })
+          .eq('bank_transaction_id', txId)
+          .eq('status', 'pending')
+      }
+      if (newStatus === 'paid') {
+        await supabase.from('reconciliation_suggestions')
+          .update({ status: 'expired' })
+          .eq('installment_id', installment.id)
+          .eq('status', 'pending')
+      }
+
+      toast.success(`Riconciliazione manuale completata (${fmtEur(reconcileAmount)})`)
+      if (txFullyMatched) {
+        setUnmatchedTxs(prev => prev.filter(t => t.id !== txId))
+      }
       setOpenInstallments(prev => prev.map(i =>
         i.id === installment.id ? { ...i, paid_amount: newPaid, status: newStatus } : i
       ).filter(i => i.status !== 'paid'))
@@ -608,35 +693,54 @@ export default function RiconciliazionePage() {
 
       const installmentId = logRows?.[0]?.installment_id
 
-      // 2. Delete reconciliation row
+      // 2. Get the reconciled_amount from the reconciliation record (or fallback to TX amount)
+      const { data: reconRecord } = await supabase
+        .from('reconciliations')
+        .select('reconciled_amount, installment_id')
+        .eq('id', recon.id)
+        .single()
+      const reversalAmount = reconRecord?.reconciled_amount
+        ? Number(reconRecord.reconciled_amount)
+        : (recon.bank_transaction ? Math.abs(Number(recon.bank_transaction.amount)) : 0)
+      const reconInstallmentId = reconRecord?.installment_id || installmentId
+
+      // 3. Delete reconciliation row
       const { error: e1 } = await supabase
         .from('reconciliations')
         .delete()
         .eq('id', recon.id)
       if (e1) throw e1
 
-      // 3. Reset bank transaction status back to unmatched
+      // 4. Reverse bank transaction reconciled_amount
+      // First fetch current reconciled_amount to decrement
+      const { data: txData } = await supabase
+        .from('bank_transactions')
+        .select('reconciled_amount, amount')
+        .eq('id', recon.bank_transaction_id)
+        .single()
+      const newTxReconciled = Math.max(0, Number(txData?.reconciled_amount || 0) - reversalAmount)
+      const newTxStatus = newTxReconciled < 0.01 ? 'unmatched' : 'partial'
       const { error: e2 } = await supabase
         .from('bank_transactions')
-        .update({ reconciliation_status: 'unmatched' })
+        .update({ reconciled_amount: newTxReconciled, reconciliation_status: newTxStatus })
         .eq('id', recon.bank_transaction_id)
       if (e2) throw e2
 
-      // 4. Reverse installment paid_amount if we can identify the installment
-      if (installmentId && recon.bank_transaction) {
-        const txAmount = Math.abs(Number(recon.bank_transaction.amount))
+      // 5. Reverse installment paid_amount
+      const resolvedInstId = reconInstallmentId
+      if (resolvedInstId) {
         const { data: instData } = await supabase
           .from('invoice_installments')
           .select('paid_amount, amount_due')
-          .eq('id', installmentId)
+          .eq('id', resolvedInstId)
           .single()
         if (instData) {
-          const newPaid = Math.max(0, Number(instData.paid_amount) - txAmount)
-          const newStatus = newPaid <= 0 ? 'pending' : newPaid >= Number(instData.amount_due) ? 'paid' : 'partial'
+          const newPaid = Math.max(0, Number(instData.paid_amount) - reversalAmount)
+          const newStatus = newPaid <= 0 ? 'pending' : newPaid >= Number(instData.amount_due) - 0.01 ? 'paid' : 'partial'
           await supabase
             .from('invoice_installments')
             .update({ paid_amount: newPaid, status: newStatus })
-            .eq('id', installmentId)
+            .eq('id', resolvedInstId)
         }
       }
 
@@ -747,6 +851,24 @@ export default function RiconciliazionePage() {
   // Percentage KPI
   const matchPct = kpi.total > 0 ? Math.round((kpi.matched / kpi.total) * 100) : 0
   const highConfCount = suggestions.filter(s => s.match_score >= 90).length
+
+  // Group suggestions by bank_transaction_id for visual connector
+  const groupedSuggestions = useMemo(() => {
+    const groups: { txId: string; items: SuggestionRow[] }[] = []
+    const seen = new Map<string, number>()
+    for (const s of suggestions) {
+      const txId = s.bank_transaction_id
+      if (seen.has(txId)) {
+        groups[seen.get(txId)!].items.push(s)
+      } else {
+        seen.set(txId, groups.length)
+        groups.push({ txId, items: [s] })
+      }
+    }
+    return groups
+  }, [suggestions])
+
+  const navigate = useNavigate()
 
   // ─── render ───────────────────────────────
   if (loading) {
@@ -873,18 +995,33 @@ export default function RiconciliazionePage() {
                 </div>
               )}
 
-              {/* Suggestion cards */}
-              {suggestions.map(s => (
-                <SuggestionCard
-                  key={s.id}
-                  suggestion={s}
-                  onConfirm={() => confirmSuggestion(s)}
-                  onReject={() => rejectSuggestion(s)}
-                  confirming={confirmingId === s.id}
-                  rejecting={rejectingId === s.id}
-                  onBankTxDoubleClick={(txId) => setDetailPopup({ type: 'bank_tx', id: txId })}
-                  onInvoiceDoubleClick={(invId) => setDetailPopup({ type: 'invoice', id: invId })}
-                />
+              {/* Suggestion cards — grouped by bank transaction */}
+              {groupedSuggestions.map(group => (
+                <div key={group.txId} className={group.items.length > 1 ? 'space-y-2' : ''}>
+                  {group.items.length > 1 && (
+                    <div className="flex items-center gap-2 ml-3">
+                      <span className="text-[10px] font-medium text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full">
+                        {group.items.length} alternative per lo stesso movimento
+                      </span>
+                    </div>
+                  )}
+                  <div className={group.items.length > 1 ? 'pl-3 border-l-2 border-blue-200 space-y-2' : ''}>
+                    {group.items.map(s => (
+                      <SuggestionCard
+                        key={s.id}
+                        suggestion={s}
+                        onConfirm={() => confirmSuggestion(s)}
+                        onReject={() => rejectSuggestion(s)}
+                        confirming={confirmingId === s.id}
+                        rejecting={rejectingId === s.id}
+                        onBankTxDoubleClick={(txId) => setDetailPopup({ type: 'bank_tx', id: txId })}
+                        onInvoiceDoubleClick={(invId) => setDetailPopup({ type: 'invoice', id: invId })}
+                        onNavigateTx={(txId) => navigate(`/banca?txId=${txId}`)}
+                        onNavigateInvoice={(invId) => navigate(`/fatture?invoiceId=${invId}`)}
+                      />
+                    ))}
+                  </div>
+                </div>
               ))}
             </>
           )}
@@ -1245,6 +1382,7 @@ export default function RiconciliazionePage() {
               <InvoiceDetailPopup
                 invoice={detailPopupData}
                 onClose={() => setDetailPopup(null)}
+                onNavigate={(id) => navigate(`/fatture?invoiceId=${id}`)}
               />
             ) : (
               <div className="p-6 text-center text-sm text-gray-400">Dati non trovati</div>
@@ -1258,7 +1396,7 @@ export default function RiconciliazionePage() {
 
 /* ─── Invoice Detail Popup ────────────────────── */
 
-function InvoiceDetailPopup({ invoice, onClose }: { invoice: any; onClose: () => void }) {
+function InvoiceDetailPopup({ invoice, onClose, onNavigate }: { invoice: any; onClose: () => void; onNavigate?: (invoiceId: string) => void }) {
   const cp = invoice.counterparty
   const installments: any[] = invoice.installments || []
   const isAttivo = invoice.direction === 'attivo'
@@ -1266,7 +1404,18 @@ function InvoiceDetailPopup({ invoice, onClose }: { invoice: any; onClose: () =>
   return (
     <div className="h-full flex flex-col bg-white">
       <div className="flex items-center justify-between px-4 py-3 border-b flex-shrink-0">
-        <span className="text-sm font-semibold">Dettaglio fattura</span>
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold">Dettaglio fattura</span>
+          {onNavigate && (
+            <button
+              onClick={() => onNavigate(invoice.id)}
+              className="p-1 rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+              title="Vai alla fattura in Fatture"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
         <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1">
           <X className="h-4 w-4" />
         </button>
@@ -1312,13 +1461,13 @@ function InvoiceDetailPopup({ invoice, onClose }: { invoice: any; onClose: () =>
         {invoice.payment_method && (
           <div>
             <p className="text-[10px] text-gray-400 uppercase tracking-wide">Metodo pagamento</p>
-            <p className="text-xs text-gray-800 mt-0.5">{invoice.payment_method}</p>
+            <p className="text-xs text-gray-800 mt-0.5">{mpLabel(invoice.payment_method)}</p>
           </div>
         )}
         {invoice.payment_terms && (
           <div>
             <p className="text-[10px] text-gray-400 uppercase tracking-wide">Condizioni pagamento</p>
-            <p className="text-xs text-gray-800 mt-0.5">{invoice.payment_terms}</p>
+            <p className="text-xs text-gray-800 mt-0.5">{tpLabel(invoice.payment_terms)}</p>
           </div>
         )}
 
@@ -1389,7 +1538,7 @@ function KpiCard({ label, value, icon: Icon, color, bg, iconColor, sub }: {
 
 /* ─── Suggestion Card ────────────────────────── */
 
-function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting, onBankTxDoubleClick, onInvoiceDoubleClick }: {
+function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting, onBankTxDoubleClick, onInvoiceDoubleClick, onNavigateTx, onNavigateInvoice }: {
   suggestion: SuggestionRow
   onConfirm: () => void
   onReject: () => void
@@ -1397,6 +1546,8 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
   rejecting: boolean
   onBankTxDoubleClick?: (txId: string) => void
   onInvoiceDoubleClick?: (invoiceId: string) => void
+  onNavigateTx?: (txId: string) => void
+  onNavigateInvoice?: (invoiceId: string) => void
 }) {
   const [expanded, setExpanded] = useState(false)
   const tx = suggestion.bank_transaction
@@ -1407,10 +1558,16 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
 
   const txDir = txDirection(tx)
   const absAmount = Math.abs(Number(tx.amount))
+  const txReconciledAlready = Number(tx.reconciled_amount || 0)
+  const txRemainingAmount = absAmount - txReconciledAlready
   const instRemaining = inst ? Number(inst.amount_due) - Number(inst.paid_amount) : null
   const invoiceDenom = inv?.counterparty && typeof inv.counterparty === 'object'
     ? (inv.counterparty as any).denom || 'N.D.'
     : 'N.D.'
+
+  // Amount that would be reconciled if confirmed
+  const wouldReconcile = inst && instRemaining != null ? Math.min(txRemainingAmount, instRemaining) : txRemainingAmount
+  const amountDiff = inst && instRemaining != null ? Math.abs(txRemainingAmount - instRemaining) : 0
 
   return (
     <div className="bg-white border rounded-lg overflow-hidden hover:shadow-sm transition-shadow">
@@ -1432,6 +1589,16 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
               <span className="text-[10px] text-gray-400 bg-gray-50 px-1.5 py-0.5 rounded">
                 {proposedByLabel(suggestion.proposed_by)}
               </span>
+              {amountDiff > 0.01 && amountDiff <= 5 && (
+                <span className="text-[10px] text-orange-600 bg-orange-50 px-1.5 py-0.5 rounded">
+                  diff {fmtEur(amountDiff)}
+                </span>
+              )}
+              {amountDiff > 5 && (
+                <span className="text-[10px] text-red-600 bg-red-50 px-1.5 py-0.5 rounded flex items-center gap-0.5">
+                  <AlertTriangle className="h-2.5 w-2.5" /> diff {fmtEur(amountDiff)}
+                </span>
+              )}
             </div>
             <div className="flex items-center gap-1.5">
               <button
@@ -1446,7 +1613,7 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
                 onClick={onConfirm}
                 disabled={confirming || rejecting}
                 className="flex items-center gap-1 px-2.5 py-1 rounded-md text-sm font-medium bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
-                title="Conferma riconciliazione"
+                title={`Conferma riconciliazione (${fmtEur(wouldReconcile)})`}
               >
                 {confirming ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
                 Conferma
@@ -1465,6 +1632,15 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
               <div className="flex items-center gap-1.5 mb-1">
                 <Landmark className="h-3 w-3 text-gray-500" />
                 <span className="text-[10px] font-semibold uppercase text-gray-500">Movimento bancario</span>
+                {onNavigateTx && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onNavigateTx(tx.id) }}
+                    className="ml-auto p-0.5 rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+                    title="Vai al movimento in Banca"
+                  >
+                    <ExternalLink className="h-3 w-3" />
+                  </button>
+                )}
               </div>
               {(() => {
                 const hasComm = tx.commission_amount != null && Number(tx.commission_amount) !== 0
@@ -1493,6 +1669,11 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
                   {txTypeLabel(tx.transaction_type ?? undefined)}
                 </span>
               </div>
+              {txReconciledAlready > 0.01 && (
+                <p className="text-[10px] text-orange-600 mt-0.5">
+                  Disponibile: {fmtEur(txRemainingAmount)} (di {fmtEur(absAmount)})
+                </p>
+              )}
             </div>
 
             {/* Invoice/Installment side */}
@@ -1506,6 +1687,15 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
                 <span className="text-[10px] font-semibold uppercase text-gray-500">
                   {inst ? 'Rata fattura' : 'Fattura'}
                 </span>
+                {onNavigateInvoice && inv && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onNavigateInvoice(inv.id) }}
+                    className="ml-auto p-0.5 rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+                    title="Vai alla fattura in Fatture"
+                  >
+                    <ExternalLink className="h-3 w-3" />
+                  </button>
+                )}
               </div>
               {inst ? (
                 <>

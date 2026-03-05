@@ -5,13 +5,14 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { CalendarClock, Receipt, ArrowDownLeft, ArrowUpRight, Search, Filter, Landmark, PencilLine, Sparkles, X, CheckCircle2 } from 'lucide-react'
+import { CalendarClock, Receipt, ArrowDownLeft, ArrowUpRight, Search, Filter, Landmark, PencilLine, Sparkles, X, CheckCircle2, ExternalLink } from 'lucide-react'
 import { toast } from 'sonner'
 import { useCompany } from '@/hooks/useCompany'
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges'
 import { supabase } from '@/integrations/supabase/client'
 import { fmtDate, fmtEur } from '@/lib/utils'
 import BankTxDetail from '@/components/BankTxDetail'
+import { mpLabel, tpLabel } from '@/lib/invoiceParser'
 import {
   buildAging,
   listScadenzarioRows,
@@ -1800,7 +1801,7 @@ export default function ScadenzarioPage() {
             {detailInvoiceLoading ? (
               <div className="p-8 text-center text-sm text-gray-500">Caricamento dettaglio fattura...</div>
             ) : detailInvoiceData ? (
-              <ScadenzarioInvoicePopup invoice={detailInvoiceData} onClose={() => setDetailInvoiceId(null)} />
+              <ScadenzarioInvoicePopup invoice={detailInvoiceData} onClose={() => setDetailInvoiceId(null)} onNavigate={(id) => navigate(`/fatture?invoiceId=${id}`)} />
             ) : (
               <div className="p-8 text-center text-sm text-gray-500">Fattura non trovata</div>
             )}
@@ -1813,7 +1814,7 @@ export default function ScadenzarioPage() {
 
 /* ─── Invoice Detail Popup (Scadenzario) ──────── */
 
-function ScadenzarioInvoicePopup({ invoice, onClose }: { invoice: any; onClose: () => void }) {
+function ScadenzarioInvoicePopup({ invoice, onClose, onNavigate }: { invoice: any; onClose: () => void; onNavigate?: (invoiceId: string) => void }) {
   const cp = invoice.counterparty
   const installments: any[] = invoice.installments || []
   const isAttivo = invoice.direction === 'attivo'
@@ -1821,7 +1822,18 @@ function ScadenzarioInvoicePopup({ invoice, onClose }: { invoice: any; onClose: 
   return (
     <div className="h-full flex flex-col bg-white">
       <div className="flex items-center justify-between px-4 py-3 border-b flex-shrink-0">
-        <span className="text-sm font-semibold">Dettaglio fattura</span>
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold">Dettaglio fattura</span>
+          {onNavigate && (
+            <button
+              onClick={() => onNavigate(invoice.id)}
+              className="p-1 rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+              title="Vai alla fattura in Fatture"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
         <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1">
           <X className="h-4 w-4" />
         </button>
@@ -1867,13 +1879,13 @@ function ScadenzarioInvoicePopup({ invoice, onClose }: { invoice: any; onClose: 
         {invoice.payment_method && (
           <div>
             <p className="text-[10px] text-gray-400 uppercase tracking-wide">Metodo pagamento</p>
-            <p className="text-xs text-gray-800 mt-0.5">{invoice.payment_method}</p>
+            <p className="text-xs text-gray-800 mt-0.5">{mpLabel(invoice.payment_method)}</p>
           </div>
         )}
         {invoice.payment_terms && (
           <div>
             <p className="text-[10px] text-gray-400 uppercase tracking-wide">Condizioni pagamento</p>
-            <p className="text-xs text-gray-800 mt-0.5">{invoice.payment_terms}</p>
+            <p className="text-xs text-gray-800 mt-0.5">{tpLabel(invoice.payment_terms)}</p>
           </div>
         )}
 
