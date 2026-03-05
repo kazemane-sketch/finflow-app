@@ -1,6 +1,7 @@
 // src/pages/FatturePage.tsx — v5
 // Date filter + AI search (Haiku) + removed Fix Nomi
 import { useState, useCallback, useRef, useEffect, useSyncExternalStore } from 'react';
+import { createPortal } from 'react-dom';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { processInvoiceFile, TIPO, MP, REG, mpLabel, tpLabel } from '@/lib/invoiceParser';
 import {
@@ -284,11 +285,32 @@ function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove }: 
 }) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
-  const ref = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const dropRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ top: 0, left: 0, dropUp: false });
 
+  // Calculate dropdown position from button rect when opening
+  useEffect(() => {
+    if (!open || !btnRef.current) return;
+    const rect = btnRef.current.getBoundingClientRect();
+    const dropH = 240; // approximate max dropdown height
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const dropUp = spaceBelow < dropH && rect.top > dropH;
+    setPos({
+      top: dropUp ? rect.top - 4 : rect.bottom + 4,
+      left: Math.max(8, rect.right - 256), // 256px = w-64
+      dropUp,
+    });
+  }, [open]);
+
+  // Close on click outside (check both button and portal dropdown)
   useEffect(() => {
     if (!open) return;
-    const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    const handler = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (btnRef.current?.contains(t) || dropRef.current?.contains(t)) return;
+      setOpen(false);
+    };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [open]);
@@ -301,60 +323,71 @@ function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove }: 
 
   const isSuggested = suggestion && suggestion.confidence >= 70 && !current;
 
+  const dropdown = open ? createPortal(
+    <div ref={dropRef}
+      className="w-64 bg-white border border-gray-200 rounded-lg shadow-xl overflow-hidden"
+      style={{
+        position: 'fixed',
+        zIndex: 9999,
+        left: pos.left,
+        ...(pos.dropUp
+          ? { top: pos.top, transform: 'translateY(-100%)' }
+          : { top: pos.top }),
+      }}>
+      <div className="p-1.5 border-b">
+        <input autoFocus value={search} onChange={e => setSearch(e.target.value)}
+          className="w-full px-2 py-1 text-[11px] border border-gray-200 rounded focus:ring-1 focus:ring-sky-400 outline-none" placeholder="Cerca articolo..." />
+      </div>
+      <div className="max-h-48 overflow-y-auto">
+        {current && (
+          <button onClick={() => { onRemove(); setOpen(false); setSearch(''); }}
+            className="w-full text-left px-2.5 py-1.5 text-[11px] text-red-600 hover:bg-red-50 border-b border-gray-100">
+            ✕ Rimuovi assegnazione
+          </button>
+        )}
+        {isSuggested && !search && (
+          <button onClick={() => { onAssign(suggestion!.article.id); setOpen(false); setSearch(''); }}
+            className="w-full text-left px-2.5 py-1.5 text-[11px] bg-orange-50 text-orange-800 hover:bg-orange-100 border-b border-gray-100 flex items-center gap-1.5">
+            <span>⚡</span>
+            <span className="font-semibold">{suggestion!.article.code}</span>
+            <span className="text-gray-500">— {suggestion!.article.name}</span>
+            <span className="ml-auto text-[9px] text-orange-600">{Math.round(suggestion!.confidence)}%</span>
+          </button>
+        )}
+        {filtered.map(a => (
+          <button key={a.id}
+            onClick={() => { onAssign(a.id); setOpen(false); setSearch(''); }}
+            className={`w-full text-left px-2.5 py-1.5 text-[11px] hover:bg-sky-50 border-b border-gray-50 flex items-center gap-1.5 ${current?.article_id === a.id ? 'bg-sky-50 font-semibold' : ''}`}>
+            <span className="font-mono text-sky-700 font-semibold text-[10px] min-w-[52px]">{a.code}</span>
+            <span className="text-gray-700 truncate">{a.name}</span>
+          </button>
+        ))}
+        {filtered.length === 0 && <div className="px-2.5 py-2 text-[11px] text-gray-400 text-center">Nessun articolo trovato</div>}
+      </div>
+    </div>,
+    document.body
+  ) : null;
+
   return (
-    <div ref={ref} className="relative inline-block print:hidden">
+    <span className="inline-block print:hidden">
       {current ? (
-        <button onClick={() => setOpen(!open)}
+        <button ref={btnRef} onClick={() => setOpen(!open)}
           className="px-1.5 py-0.5 text-[9px] font-bold rounded bg-green-100 text-green-800 border border-green-300 hover:bg-green-200 transition-colors cursor-pointer whitespace-nowrap">
           {current.code}
         </button>
       ) : isSuggested ? (
-        <button onClick={() => setOpen(!open)}
+        <button ref={btnRef} onClick={() => setOpen(!open)}
           className="px-1.5 py-0.5 text-[9px] font-medium rounded bg-orange-50 text-orange-700 border border-orange-300 hover:bg-orange-100 transition-colors cursor-pointer whitespace-nowrap flex items-center gap-0.5">
           <span>⚡</span><span>{suggestion!.article.code}</span>
         </button>
       ) : (
-        <button onClick={() => setOpen(!open)}
+        <button ref={btnRef} onClick={() => setOpen(!open)}
           className="px-1.5 py-0.5 text-[9px] text-gray-400 rounded border border-dashed border-gray-300 hover:border-gray-400 hover:text-gray-600 transition-colors cursor-pointer whitespace-nowrap">
           + Art.
         </button>
       )}
-
-      {open && (
-        <div className="absolute right-0 top-full mt-1 w-64 bg-white border border-gray-200 rounded-lg shadow-xl z-50 overflow-hidden">
-          <div className="p-1.5 border-b">
-            <input autoFocus value={search} onChange={e => setSearch(e.target.value)}
-              className="w-full px-2 py-1 text-[11px] border border-gray-200 rounded focus:ring-1 focus:ring-sky-400 outline-none" placeholder="Cerca articolo..." />
-          </div>
-          <div className="max-h-48 overflow-y-auto">
-            {current && (
-              <button onClick={() => { onRemove(); setOpen(false); setSearch(''); }}
-                className="w-full text-left px-2.5 py-1.5 text-[11px] text-red-600 hover:bg-red-50 border-b border-gray-100">
-                ✕ Rimuovi assegnazione
-              </button>
-            )}
-            {isSuggested && !search && (
-              <button onClick={() => { onAssign(suggestion!.article.id); setOpen(false); setSearch(''); }}
-                className="w-full text-left px-2.5 py-1.5 text-[11px] bg-orange-50 text-orange-800 hover:bg-orange-100 border-b border-gray-100 flex items-center gap-1.5">
-                <span>⚡</span>
-                <span className="font-semibold">{suggestion!.article.code}</span>
-                <span className="text-gray-500">— {suggestion!.article.name}</span>
-                <span className="ml-auto text-[9px] text-orange-600">{Math.round(suggestion!.confidence)}%</span>
-              </button>
-            )}
-            {filtered.map(a => (
-              <button key={a.id}
-                onClick={() => { onAssign(a.id); setOpen(false); setSearch(''); }}
-                className={`w-full text-left px-2.5 py-1.5 text-[11px] hover:bg-sky-50 border-b border-gray-50 flex items-center gap-1.5 ${current?.article_id === a.id ? 'bg-sky-50 font-semibold' : ''}`}>
-                <span className="font-mono text-sky-700 font-semibold text-[10px] min-w-[52px]">{a.code}</span>
-                <span className="text-gray-700 truncate">{a.name}</span>
-              </button>
-            ))}
-            {filtered.length === 0 && <div className="px-2.5 py-2 text-[11px] text-gray-400 text-center">Nessun articolo trovato</div>}
-          </div>
-        </div>
-      )}
-    </div>
+      {dropdown}
+    </span>
   );
 }
 
@@ -427,35 +460,44 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     const companyId = company?.id;
     if (!companyId || !invoice?.id) return;
     const location = extractLocation(lineDesc);
+    const art = articles.find(a => a.id === articleId);
+
+    // Optimistic update BEFORE the network call — badge appears instantly
+    const prevMap = { ...lineArticleMap };
+    const prevSuggestions = { ...aiSuggestions };
+    setLineArticleMap(prev => ({
+      ...prev,
+      [lineId]: {
+        article_id: articleId, code: art?.code || '', name: art?.name || '',
+        assigned_by: 'manual', verified: true, location,
+      },
+    }));
+    setAiSuggestions(prev => { const n = { ...prev }; delete n[lineId]; return n; });
 
     try {
       // upsert handles both INSERT and UPDATE via onConflict: 'invoice_line_id'
       await assignArticleToLine(companyId, lineId, invoice.id, articleId, lineData, 'manual', undefined, location);
-
-      // Update local state
-      const art = articles.find(a => a.id === articleId);
-      setLineArticleMap(prev => ({
-        ...prev,
-        [lineId]: {
-          article_id: articleId, code: art?.code || '', name: art?.name || '',
-          assigned_by: 'manual', verified: true, location,
-        },
-      }));
-      // Remove AI suggestion if any
-      setAiSuggestions(prev => { const n = { ...prev }; delete n[lineId]; return n; });
     } catch (err: any) {
       console.error('Article assign error:', err);
+      // Revert optimistic update on failure
+      setLineArticleMap(prevMap);
+      setAiSuggestions(prevSuggestions);
     }
-  }, [company?.id, invoice?.id, articles]);
+  }, [company?.id, invoice?.id, articles, lineArticleMap, aiSuggestions]);
 
   const handleRemoveArticle = useCallback(async (lineId: string) => {
+    // Optimistic update BEFORE the network call
+    const prevMap = { ...lineArticleMap };
+    setLineArticleMap(prev => { const n = { ...prev }; delete n[lineId]; return n; });
+
     try {
       await removeLineAssignment(lineId);
-      setLineArticleMap(prev => { const n = { ...prev }; delete n[lineId]; return n; });
     } catch (err: any) {
       console.error('Article remove error:', err);
+      // Revert optimistic update on failure
+      setLineArticleMap(prevMap);
     }
-  }, []);
+  }, [lineArticleMap]);
 
   useEffect(() => {
     if (detail?.raw_xml) {
