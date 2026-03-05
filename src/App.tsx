@@ -12,6 +12,7 @@ import ScadenzarioPage from '@/pages/ScadenzarioPage'
 import ImpostazioniPage from '@/pages/ImpostazioniPage'
 import IvaPage from '@/pages/IvaPage'
 import AiChatPage from '@/pages/AiChatPage'
+import ArticoliPage from '@/pages/ArticoliPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth()
@@ -49,6 +50,7 @@ export default function App() {
           <Route path="/" element={<DashboardPage />} />
           <Route path="/fatture" element={<FatturePage />} />
           <Route path="/controparti" element={<ContropartiPage />} />
+          <Route path="/articoli" element={<ArticoliPage />} />
           <Route path="/banca" element={<BancaPage />} />
           <Route path="/riconciliazione" element={<RiconciliazionePage />} />
           <Route path="/scadenzario" element={<ScadenzarioPage />} />
