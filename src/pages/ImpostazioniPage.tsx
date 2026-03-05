@@ -18,7 +18,7 @@ type SettingsTab = 'generale' | 'categorie' | 'progetti' | 'piano-conti'
 const TABS: { key: SettingsTab; label: string; icon: typeof Settings }[] = [
   { key: 'generale', label: 'Generale', icon: Settings },
   { key: 'categorie', label: 'Categorie', icon: Tag },
-  { key: 'progetti', label: 'Progetti', icon: FolderKanban },
+  { key: 'progetti', label: 'Centri di Costo', icon: FolderKanban },
   { key: 'piano-conti', label: 'Piano dei Conti', icon: BookOpen },
 ]
 

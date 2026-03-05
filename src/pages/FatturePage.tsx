@@ -31,10 +31,12 @@ import { matchWithLearnedRules, extractLocation } from '@/lib/articleMatching';
 import {
   loadCategories, loadProjects, loadChartOfAccounts,
   loadInvoiceClassification, saveInvoiceClassification,
-  loadInvoiceProjects, addInvoiceProject, updateInvoiceProjectPercentage, removeInvoiceProject,
+  loadInvoiceProjects, saveInvoiceProjects,
+  loadLineClassifications, saveLineCategoryAndAccount,
   CATEGORY_TYPE_LABELS, SECTION_LABELS,
   type Category, type Project, type ChartAccount,
   type InvoiceClassification, type InvoiceProjectAssignment,
+  type LineClassification,
 } from '@/lib/classificationService';
 
 // ============================================================
@@ -429,8 +431,14 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [selAccountId, setSelAccountId] = useState<string | null>(null);
   const [classifDirty, setClassifDirty] = useState(false);
   const [classifSaving, setClassifSaving] = useState(false);
-  const [addProjId, setAddProjId] = useState('');
-  const [addProjPct, setAddProjPct] = useState('100');
+  // Multi-CdC state: local editable rows with percentage/amount toggle
+  type CdcMode = 'percentage' | 'amount';
+  type CdcRow = { project_id: string; percentage: number; amount: number | null };
+  const [cdcMode, setCdcMode] = useState<CdcMode>('percentage');
+  const [cdcRows, setCdcRows] = useState<CdcRow[]>([]);
+  const [addCdcId, setAddCdcId] = useState('');
+  // Line-level classification overrides (category + account per line)
+  const [lineClassifs, setLineClassifs] = useState<Record<string, LineClassification>>({});
 
   // Load articles + existing assignments when invoice changes
   useEffect(() => {
@@ -488,12 +496,13 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     let cancelled = false;
     (async () => {
       try {
-        const [cats, projs, accs, classif, iProjs] = await Promise.all([
+        const [cats, projs, accs, classif, iProjs, lineClf] = await Promise.all([
           loadCategories(companyId, true),
           loadProjects(companyId, true),
           loadChartOfAccounts(companyId),
           loadInvoiceClassification(invoice.id),
           loadInvoiceProjects(invoice.id),
+          loadLineClassifications(invoice.id),
         ]);
         if (cancelled) return;
         setAllCategories(cats);
@@ -501,6 +510,13 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setAllAccounts(accs.filter(a => !a.is_header && a.active));
         setClassification(classif);
         setInvProjects(iProjs);
+        setLineClassifs(lineClf);
+        // Initialize local CdC rows from DB assignments
+        setCdcRows(iProjs.map(ip => ({
+          project_id: ip.project_id,
+          percentage: Number(ip.percentage),
+          amount: ip.amount ?? null,
+        })));
         setSelCategoryId(classif?.category_id || null);
         setSelAccountId(classif?.account_id || null);
         setClassifDirty(false);
@@ -509,38 +525,96 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     return () => { cancelled = true; };
   }, [company?.id, invoice?.id]);
 
+  // Unified save: classification + CdC rows (batch)
   const handleSaveClassification = useCallback(async () => {
     const companyId = company?.id;
     if (!companyId || !invoice?.id) return;
     setClassifSaving(true);
     try {
+      // Save category + account
       await saveInvoiceClassification(companyId, invoice.id, selCategoryId, selAccountId);
+      // Save CdC rows (batch delete+insert)
+      const total = Math.abs(invoice.total_amount || 0);
+      const rowsToSave = cdcRows.map(r => ({
+        project_id: r.project_id,
+        percentage: r.percentage,
+        amount: cdcMode === 'amount' ? r.amount : (total > 0 ? Math.round(total * r.percentage / 100 * 100) / 100 : null),
+      }));
+      await saveInvoiceProjects(companyId, invoice.id, rowsToSave);
+      // Reload from DB to sync
+      const freshProjs = await loadInvoiceProjects(invoice.id);
+      setInvProjects(freshProjs);
+      setCdcRows(freshProjs.map(ip => ({
+        project_id: ip.project_id,
+        percentage: Number(ip.percentage),
+        amount: ip.amount ?? null,
+      })));
       setClassifDirty(false);
     } catch (e: any) { console.error('Save classification error:', e); }
     setClassifSaving(false);
-  }, [company?.id, invoice?.id, selCategoryId, selAccountId]);
+  }, [company?.id, invoice?.id, selCategoryId, selAccountId, cdcRows, cdcMode]);
 
-  const handleAddProject = useCallback(async () => {
-    const companyId = company?.id;
-    if (!companyId || !invoice?.id || !addProjId) return;
-    const pct = Math.min(100, Math.max(0, Number(addProjPct) || 100));
-    // Check total % won't exceed 100
-    const currentTotal = invProjects.reduce((s, p) => s + Number(p.percentage), 0);
-    if (currentTotal + pct > 100) { alert(`Percentuale totale supererebbe 100% (attuale: ${currentTotal}%)`); return; }
-    try {
-      await addInvoiceProject(companyId, invoice.id, addProjId, pct);
-      setInvProjects(await loadInvoiceProjects(invoice.id));
-      setAddProjId('');
-      setAddProjPct('100');
-    } catch (e: any) { console.error('Add project error:', e); }
-  }, [company?.id, invoice?.id, addProjId, addProjPct, invProjects]);
+  // Local CdC row management (no DB calls)
+  const handleAddCdc = useCallback(() => {
+    if (!addCdcId) return;
+    const total = Math.abs(invoice?.total_amount || 0);
+    const currentPct = cdcRows.reduce((s, r) => s + r.percentage, 0);
+    const remainPct = Math.max(0, 100 - currentPct);
+    setCdcRows(prev => [...prev, {
+      project_id: addCdcId,
+      percentage: remainPct,
+      amount: total > 0 ? Math.round(total * remainPct / 100 * 100) / 100 : null,
+    }]);
+    setAddCdcId('');
+    setClassifDirty(true);
+  }, [addCdcId, cdcRows, invoice?.total_amount]);
 
-  const handleRemoveProject = useCallback(async (assignmentId: string) => {
-    try {
-      await removeInvoiceProject(assignmentId);
-      setInvProjects(prev => prev.filter(p => p.id !== assignmentId));
-    } catch (e: any) { console.error('Remove project error:', e); }
+  const handleRemoveCdc = useCallback((projectId: string) => {
+    setCdcRows(prev => prev.filter(r => r.project_id !== projectId));
+    setClassifDirty(true);
   }, []);
+
+  const handleCdcPctChange = useCallback((projectId: string, pct: number) => {
+    const total = Math.abs(invoice?.total_amount || 0);
+    setCdcRows(prev => prev.map(r =>
+      r.project_id === projectId
+        ? { ...r, percentage: pct, amount: total > 0 ? Math.round(total * pct / 100 * 100) / 100 : null }
+        : r
+    ));
+    setClassifDirty(true);
+  }, [invoice?.total_amount]);
+
+  const handleCdcAmtChange = useCallback((projectId: string, amt: number) => {
+    const total = Math.abs(invoice?.total_amount || 0);
+    setCdcRows(prev => prev.map(r =>
+      r.project_id === projectId
+        ? { ...r, amount: amt, percentage: total > 0 ? Math.round(amt / total * 100 * 100) / 100 : 0 }
+        : r
+    ));
+    setClassifDirty(true);
+  }, [invoice?.total_amount]);
+
+  // Line-level classification: update category or account for a single line
+  const handleLineClassifChange = useCallback(async (lineId: string, field: 'category_id' | 'account_id', value: string | null) => {
+    // Optimistic update
+    setLineClassifs(prev => ({
+      ...prev,
+      [lineId]: {
+        ...prev[lineId],
+        invoice_line_id: lineId,
+        category_id: field === 'category_id' ? value : (prev[lineId]?.category_id ?? null),
+        account_id: field === 'account_id' ? value : (prev[lineId]?.account_id ?? null),
+      },
+    }));
+    try {
+      const current = lineClassifs[lineId];
+      await saveLineCategoryAndAccount(
+        lineId,
+        field === 'category_id' ? value : (current?.category_id ?? null),
+        field === 'account_id' ? value : (current?.account_id ?? null),
+      );
+    } catch (e: any) { console.error('Save line classification error:', e); }
+  }, [lineClassifs]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }) => {
     const companyId = company?.id;
@@ -825,51 +899,146 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               </div>
             )}
 
-            {/* Progetti assegnati */}
+            {/* Centri di costo — multi-CdC with %/amount */}
             {allProjects.length > 0 && (
               <div className="space-y-2">
                 <div className="flex items-center gap-3">
-                  <label className="text-xs font-medium text-gray-600 w-24 flex-shrink-0">Progetti:</label>
-                  <div className="flex flex-wrap gap-1.5 flex-1">
-                    {invProjects.map(ip => {
-                      const proj = ip.project || allProjects.find(p => p.id === ip.project_id);
-                      return (
-                        <span key={ip.id} className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold rounded-full border"
-                          style={{ backgroundColor: proj?.color ? `${proj.color}15` : '#f3f4f6', borderColor: proj?.color || '#e5e7eb', color: proj?.color || '#374151' }}>
-                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: proj?.color || '#9ca3af' }} />
-                          {proj?.code || '?'} {Number(ip.percentage)}%
-                          <button onClick={() => handleRemoveProject(ip.id)} className="ml-0.5 hover:text-red-600 transition-colors">x</button>
-                        </span>
-                      );
-                    })}
-                    {invProjects.length === 0 && <span className="text-xs text-gray-400 italic">Nessun progetto</span>}
+                  <label className="text-xs font-medium text-gray-600 w-24 flex-shrink-0">Centri di costo:</label>
+                  <div className="flex gap-3 items-center">
+                    <label className="flex items-center gap-1 text-[10px] text-gray-500 cursor-pointer">
+                      <input type="radio" name="cdcMode" checked={cdcMode === 'percentage'} onChange={() => setCdcMode('percentage')} className="w-3 h-3 accent-sky-600" />
+                      Percentuale
+                    </label>
+                    <label className="flex items-center gap-1 text-[10px] text-gray-500 cursor-pointer">
+                      <input type="radio" name="cdcMode" checked={cdcMode === 'amount'} onChange={() => setCdcMode('amount')} className="w-3 h-3 accent-sky-600" />
+                      Importo
+                    </label>
                   </div>
                 </div>
-                {/* Add project row */}
+
+                {/* CdC rows */}
+                {cdcRows.length > 0 ? (
+                  <div className="ml-[108px] space-y-1">
+                    {cdcRows.map(row => {
+                      const proj = allProjects.find(p => p.id === row.project_id);
+                      const invTotal = Math.abs(invoice?.total_amount || 0);
+                      return (
+                        <div key={row.project_id} className="flex items-center gap-2 rounded-md border border-gray-100 bg-gray-50/50 px-2 py-1">
+                          <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: proj?.color || '#9ca3af' }} />
+                          <span className="text-[10px] font-mono font-bold text-sky-700 min-w-[60px]">{proj?.code || '?'}</span>
+                          <span className="text-[10px] text-gray-600 flex-1 truncate">{proj?.name || ''}</span>
+                          {/* Percentage input */}
+                          <input
+                            type="number" min={0} max={100} step={0.01}
+                            value={row.percentage}
+                            onChange={e => handleCdcPctChange(row.project_id, Math.max(0, Math.min(100, Number(e.target.value) || 0)))}
+                            disabled={cdcMode === 'amount'}
+                            className={`w-16 px-1.5 py-0.5 text-[10px] border rounded text-center outline-none transition-colors ${
+                              cdcMode === 'percentage' ? 'border-sky-300 bg-white focus:ring-1 focus:ring-sky-400' : 'border-gray-200 bg-gray-100 text-gray-400'
+                            }`}
+                          />
+                          <span className="text-[10px] text-gray-400">%</span>
+                          {/* Amount display/input */}
+                          <input
+                            type="number" step={0.01}
+                            value={row.amount ?? (invTotal > 0 ? Math.round(invTotal * row.percentage / 100 * 100) / 100 : '')}
+                            onChange={e => handleCdcAmtChange(row.project_id, Math.max(0, Number(e.target.value) || 0))}
+                            disabled={cdcMode === 'percentage'}
+                            className={`w-24 px-1.5 py-0.5 text-[10px] border rounded text-right outline-none transition-colors ${
+                              cdcMode === 'amount' ? 'border-sky-300 bg-white focus:ring-1 focus:ring-sky-400' : 'border-gray-200 bg-gray-100 text-gray-400'
+                            }`}
+                          />
+                          <span className="text-[10px] text-gray-400 min-w-[8px]">€</span>
+                          {/* Remove */}
+                          <button onClick={() => handleRemoveCdc(row.project_id)}
+                            className="p-0.5 text-gray-300 hover:text-red-500 transition-colors text-xs font-bold leading-none">
+                            ×
+                          </button>
+                        </div>
+                      );
+                    })}
+
+                    {/* Totals row */}
+                    {(() => {
+                      const invTotal = Math.abs(invoice?.total_amount || 0);
+                      const totalPct = Math.round(cdcRows.reduce((s, r) => s + r.percentage, 0) * 100) / 100;
+                      const totalAmt = cdcRows.reduce((s, r) => s + (r.amount ?? (invTotal > 0 ? invTotal * r.percentage / 100 : 0)), 0);
+                      const restPct = Math.round((100 - totalPct) * 100) / 100;
+                      const restAmt = Math.round((invTotal - totalAmt) * 100) / 100;
+                      const isComplete = Math.abs(restPct) < 0.01;
+                      return (
+                        <div className="flex items-center gap-2 px-2 py-1 border-t border-gray-200 mt-1">
+                          <span className="text-[10px] font-semibold text-gray-500 flex-1">Totale:</span>
+                          <span className={`w-16 text-[10px] font-bold text-center ${isComplete ? 'text-green-600' : 'text-amber-600'}`}>
+                            {fmtNum(totalPct)}%
+                          </span>
+                          <span className="text-[10px] text-gray-400" />
+                          <span className={`w-24 text-[10px] font-bold text-right ${isComplete ? 'text-green-600' : 'text-amber-600'}`}>
+                            {fmtEur(totalAmt)}
+                          </span>
+                          <span className="min-w-[8px]" />
+                          <span className="w-[16px]" />
+                        </div>
+                      );
+                    })()}
+                    {(() => {
+                      const invTotal = Math.abs(invoice?.total_amount || 0);
+                      const totalPct = Math.round(cdcRows.reduce((s, r) => s + r.percentage, 0) * 100) / 100;
+                      const totalAmt = cdcRows.reduce((s, r) => s + (r.amount ?? (invTotal > 0 ? invTotal * r.percentage / 100 : 0)), 0);
+                      const restPct = Math.round((100 - totalPct) * 100) / 100;
+                      const restAmt = Math.round((invTotal - totalAmt) * 100) / 100;
+                      if (Math.abs(restPct) < 0.01) return null;
+                      return (
+                        <div className="flex items-center gap-2 px-2">
+                          <span className="text-[10px] text-amber-600 flex-1">Resta:</span>
+                          <span className="w-16 text-[10px] text-amber-600 text-center">{fmtNum(restPct)}%</span>
+                          <span className="text-[10px] text-gray-400" />
+                          <span className="w-24 text-[10px] text-amber-600 text-right">{fmtEur(restAmt)}</span>
+                          <span className="min-w-[8px]" />
+                          <span className="w-[16px]" />
+                        </div>
+                      );
+                    })()}
+                  </div>
+                ) : (
+                  <div className="ml-[108px]">
+                    <span className="text-xs text-gray-400 italic">Nessun centro di costo</span>
+                  </div>
+                )}
+
+                {/* Add CdC row */}
                 <div className="flex items-center gap-2 ml-[108px]">
-                  <select value={addProjId} onChange={e => setAddProjId(e.target.value)}
+                  <select value={addCdcId} onChange={e => setAddCdcId(e.target.value)}
                     className="flex-1 px-2 py-1 text-[11px] border border-gray-200 rounded-md bg-white focus:ring-1 focus:ring-sky-400 outline-none">
-                    <option value="">+ Aggiungi progetto...</option>
-                    {allProjects.filter(p => !invProjects.some(ip => ip.project_id === p.id)).map(p => (
-                      <option key={p.id} value={p.id}>{p.code} — {p.name}</option>
-                    ))}
+                    <option value="">+ Aggiungi centro di costo...</option>
+                    {(() => {
+                      const assignedIds = new Set(cdcRows.map(r => r.project_id));
+                      const parents = allProjects.filter(p => !p.parent_id);
+                      const children = allProjects.filter(p => !!p.parent_id);
+                      return parents.map(parent => {
+                        const kids = children.filter(c => c.parent_id === parent.id && !assignedIds.has(c.id));
+                        const hasKids = children.some(c => c.parent_id === parent.id);
+                        if (hasKids) {
+                          if (kids.length === 0) return null;
+                          return (
+                            <optgroup key={parent.id} label={`${parent.code} — ${parent.name}`}>
+                              {kids.map(c => (
+                                <option key={c.id} value={c.id}>{c.code} — {c.name}</option>
+                              ))}
+                            </optgroup>
+                          );
+                        } else {
+                          if (assignedIds.has(parent.id)) return null;
+                          return <option key={parent.id} value={parent.id}>{parent.code} — {parent.name}</option>;
+                        }
+                      });
+                    })()}
                   </select>
-                  <input type="number" min={1} max={100} value={addProjPct} onChange={e => setAddProjPct(e.target.value)}
-                    className="w-16 px-1.5 py-1 text-[11px] border border-gray-200 rounded-md text-center focus:ring-1 focus:ring-sky-400 outline-none"
-                    placeholder="%" />
-                  <button onClick={handleAddProject} disabled={!addProjId}
-                    className="px-2 py-1 text-[10px] font-semibold text-sky-700 bg-sky-50 border border-sky-200 rounded-md hover:bg-sky-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+                  <button onClick={handleAddCdc} disabled={!addCdcId}
+                    className="px-2.5 py-1 text-[10px] font-semibold text-sky-700 bg-sky-50 border border-sky-200 rounded-md hover:bg-sky-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
                     Aggiungi
                   </button>
                 </div>
-                {invProjects.length > 0 && (
-                  <div className="ml-[108px] text-[10px] text-gray-400">
-                    Totale: {invProjects.reduce((s, p) => s + Number(p.percentage), 0)}%
-                    {invProjects.reduce((s, p) => s + Number(p.percentage), 0) < 100 && (
-                      <span> ({100 - invProjects.reduce((s, p) => s + Number(p.percentage), 0)}% non attribuito)</span>
-                    )}
-                  </div>
-                )}
               </div>
             )}
 
@@ -898,6 +1067,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               <th className="text-right px-1.5 py-1.5 text-sky-700 font-bold text-[10px]">IVA %</th>
               <th className="text-right px-1.5 py-1.5 text-sky-700 font-bold text-[10px]">Totale</th>
               {articles.length > 0 && <th className="text-right px-1.5 py-1.5 text-sky-700 font-bold text-[10px] print:hidden">Articolo</th>}
+              {allCategories.length > 0 && <th className="text-center px-1 py-1.5 text-sky-700 font-bold text-[10px] print:hidden">Cat.</th>}
+              {allProjects.length > 0 && <th className="text-center px-1 py-1.5 text-sky-700 font-bold text-[10px] print:hidden">CdC</th>}
+              {allAccounts.length > 0 && <th className="text-center px-1 py-1.5 text-sky-700 font-bold text-[10px] print:hidden">Conto</th>}
             </tr></thead>
             <tbody>
               {(b?.linee || []).map((l: any, i: number) => {
@@ -924,6 +1096,46 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                       onRemove={() => handleRemoveArticle(lineId)}
                     />}
                   </td>}
+                  {/* Line-level Cat/CdC/Conto columns */}
+                  {allCategories.length > 0 && <td className="text-center px-1 py-1 print:hidden">
+                    {lineId && lineArticleMap[lineId] ? (
+                      <select
+                        value={lineClassifs[lineId]?.category_id || ''}
+                        onChange={e => handleLineClassifChange(lineId, 'category_id', e.target.value || null)}
+                        className="w-full max-w-[80px] px-0.5 py-0.5 text-[9px] border border-transparent rounded bg-transparent hover:border-gray-200 hover:bg-white focus:border-sky-300 focus:bg-white outline-none cursor-pointer"
+                        title={lineClassifs[lineId]?.category_id ? allCategories.find(c => c.id === lineClassifs[lineId]?.category_id)?.name : 'Eredita da fattura'}
+                      >
+                        <option value="" className="text-gray-400">{selCategoryId ? '← Fatt.' : '—'}</option>
+                        {allCategories.map(c => <option key={c.id} value={c.id}>{c.name.substring(0, 12)}</option>)}
+                      </select>
+                    ) : (
+                      <span className="text-[9px] text-gray-300 italic">{selCategoryId ? '← Fatt.' : '—'}</span>
+                    )}
+                  </td>}
+                  {allProjects.length > 0 && <td className="text-center px-1 py-1 print:hidden">
+                    {(() => {
+                      // CdC: display-only showing macro-level CdC assignment
+                      const cdcCodes = cdcRows.map(r => allProjects.find(p => p.id === r.project_id)?.code).filter(Boolean);
+                      return cdcCodes.length > 0
+                        ? <span className="text-[9px] text-gray-400" title={cdcCodes.join(', ')}>{cdcCodes.join(', ').substring(0, 12)}{cdcCodes.join(', ').length > 12 ? '…' : ''}</span>
+                        : <span className="text-[9px] text-gray-300 italic">—</span>;
+                    })()}
+                  </td>}
+                  {allAccounts.length > 0 && <td className="text-center px-1 py-1 print:hidden">
+                    {lineId && lineArticleMap[lineId] ? (
+                      <select
+                        value={lineClassifs[lineId]?.account_id || ''}
+                        onChange={e => handleLineClassifChange(lineId, 'account_id', e.target.value || null)}
+                        className="w-full max-w-[80px] px-0.5 py-0.5 text-[9px] border border-transparent rounded bg-transparent hover:border-gray-200 hover:bg-white focus:border-sky-300 focus:bg-white outline-none cursor-pointer"
+                        title={lineClassifs[lineId]?.account_id ? allAccounts.find(a => a.id === lineClassifs[lineId]?.account_id)?.name : 'Eredita da fattura'}
+                      >
+                        <option value="" className="text-gray-400">{selAccountId ? '← Fatt.' : '—'}</option>
+                        {allAccounts.map(a => <option key={a.id} value={a.id}>{a.code}</option>)}
+                      </select>
+                    ) : (
+                      <span className="text-[9px] text-gray-300 italic">{selAccountId ? '← Fatt.' : '—'}</span>
+                    )}
+                  </td>}
                 </tr>
                 );
               })}
@@ -946,6 +1158,43 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                       })}
                       onRemove={() => handleRemoveArticle(l.id)}
                     />
+                  </td>}
+                  {/* Line-level Cat/CdC/Conto — fallback rows */}
+                  {allCategories.length > 0 && <td className="text-center px-1 py-1 print:hidden">
+                    {lineArticleMap[l.id] ? (
+                      <select
+                        value={lineClassifs[l.id]?.category_id || ''}
+                        onChange={e => handleLineClassifChange(l.id, 'category_id', e.target.value || null)}
+                        className="w-full max-w-[80px] px-0.5 py-0.5 text-[9px] border border-transparent rounded bg-transparent hover:border-gray-200 hover:bg-white focus:border-sky-300 focus:bg-white outline-none cursor-pointer"
+                      >
+                        <option value="" className="text-gray-400">{selCategoryId ? '← Fatt.' : '—'}</option>
+                        {allCategories.map(c => <option key={c.id} value={c.id}>{c.name.substring(0, 12)}</option>)}
+                      </select>
+                    ) : (
+                      <span className="text-[9px] text-gray-300 italic">{selCategoryId ? '← Fatt.' : '—'}</span>
+                    )}
+                  </td>}
+                  {allProjects.length > 0 && <td className="text-center px-1 py-1 print:hidden">
+                    {(() => {
+                      const cdcCodes = cdcRows.map(r => allProjects.find(p => p.id === r.project_id)?.code).filter(Boolean);
+                      return cdcCodes.length > 0
+                        ? <span className="text-[9px] text-gray-400" title={cdcCodes.join(', ')}>{cdcCodes.join(', ').substring(0, 12)}</span>
+                        : <span className="text-[9px] text-gray-300 italic">—</span>;
+                    })()}
+                  </td>}
+                  {allAccounts.length > 0 && <td className="text-center px-1 py-1 print:hidden">
+                    {lineArticleMap[l.id] ? (
+                      <select
+                        value={lineClassifs[l.id]?.account_id || ''}
+                        onChange={e => handleLineClassifChange(l.id, 'account_id', e.target.value || null)}
+                        className="w-full max-w-[80px] px-0.5 py-0.5 text-[9px] border border-transparent rounded bg-transparent hover:border-gray-200 hover:bg-white focus:border-sky-300 focus:bg-white outline-none cursor-pointer"
+                      >
+                        <option value="" className="text-gray-400">{selAccountId ? '← Fatt.' : '—'}</option>
+                        {allAccounts.map(a => <option key={a.id} value={a.id}>{a.code}</option>)}
+                      </select>
+                    ) : (
+                      <span className="text-[9px] text-gray-300 italic">{selAccountId ? '← Fatt.' : '—'}</span>
+                    )}
                   </td>}
                 </tr>
               ))}

@@ -46,6 +46,7 @@ export interface Project {
   end_date: string | null;
   budget: number | null;
   sort_order: number;
+  parent_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -59,6 +60,7 @@ export interface ProjectCreate {
   start_date?: string | null;
   end_date?: string | null;
   budget?: number | null;
+  parent_id?: string | null;
 }
 
 export interface ChartAccount {
@@ -92,6 +94,8 @@ export interface InvoiceClassification {
   account_id: string | null;
   assigned_by: string;
   verified: boolean;
+  ai_confidence: number | null;
+  ai_reasoning: string | null;
   category?: Category | null;
   account?: ChartAccount | null;
 }
@@ -102,7 +106,9 @@ export interface InvoiceProjectAssignment {
   invoice_id: string;
   project_id: string;
   percentage: number;
+  amount: number | null;
   assigned_by: string;
+  ai_confidence: number | null;
   project?: Project | null;
 }
 
@@ -413,5 +419,73 @@ export async function removeInvoiceProject(id: string): Promise<void> {
     .from('invoice_projects')
     .delete()
     .eq('id', id);
+  if (error) throw error;
+}
+
+/** Batch save cost center allocations: delete all existing, insert new rows. */
+export async function saveInvoiceProjects(
+  companyId: string,
+  invoiceId: string,
+  assignments: { project_id: string; percentage: number; amount: number | null }[],
+): Promise<void> {
+  // Delete existing assignments for this invoice
+  const { error: delErr } = await supabase
+    .from('invoice_projects')
+    .delete()
+    .eq('invoice_id', invoiceId);
+  if (delErr) throw delErr;
+
+  if (assignments.length === 0) return;
+
+  const rows = assignments.map(a => ({
+    company_id: companyId,
+    invoice_id: invoiceId,
+    project_id: a.project_id,
+    percentage: a.percentage,
+    amount: a.amount,
+    assigned_by: 'manual' as const,
+  }));
+
+  const { error } = await supabase.from('invoice_projects').insert(rows as any);
+  if (error) throw error;
+}
+
+// ─── Line-level classification (category + account on invoice_line_articles) ───
+
+export interface LineClassification {
+  invoice_line_id: string;
+  category_id: string | null;
+  account_id: string | null;
+}
+
+/** Load line-level category/account overrides for all lines in an invoice. */
+export async function loadLineClassifications(invoiceId: string): Promise<Record<string, LineClassification>> {
+  const { data, error } = await supabase
+    .from('invoice_line_articles')
+    .select('invoice_line_id, category_id, account_id')
+    .eq('invoice_id', invoiceId);
+  if (error) throw error;
+  const map: Record<string, LineClassification> = {};
+  for (const row of (data || [])) {
+    map[row.invoice_line_id] = {
+      invoice_line_id: row.invoice_line_id,
+      category_id: row.category_id,
+      account_id: row.account_id,
+    };
+  }
+  return map;
+}
+
+/** Save category and/or account override for a single invoice line.
+ *  Only works if the line already has an invoice_line_articles row (article assigned). */
+export async function saveLineCategoryAndAccount(
+  lineId: string,
+  categoryId: string | null,
+  accountId: string | null,
+): Promise<void> {
+  const { error } = await supabase
+    .from('invoice_line_articles')
+    .update({ category_id: categoryId, account_id: accountId } as any)
+    .eq('invoice_line_id', lineId);
   if (error) throw error;
 }
