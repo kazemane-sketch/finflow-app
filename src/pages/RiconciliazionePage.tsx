@@ -286,6 +286,7 @@ export default function RiconciliazionePage() {
   const [candidateSearch, setCandidateSearch] = useState('')
   const [candidateAiResult, setCandidateAiResult] = useState<InvoiceAiResult | null>(null)
   const [candidateAiSearching, setCandidateAiSearching] = useState(false)
+  const [candidateAiInstallments, setCandidateAiInstallments] = useState<OpenInstallment[]>([])  // AI-fetched installments (not limited by loadOpenInstallments cap)
 
   // Reconciled tab state
   const [reconciledSearch, setReconciledSearch] = useState('')
@@ -992,6 +993,7 @@ export default function RiconciliazionePage() {
     if (!candidateSearch.trim() || !companyId) return
     setCandidateAiSearching(true)
     setCandidateAiResult(null)
+    setCandidateAiInstallments([])
     try {
       const result = await askInvoiceAiSearch({
         query: candidateSearch,
@@ -1000,8 +1002,39 @@ export default function RiconciliazionePage() {
       console.log('[Riconciliazione AI] result:', JSON.stringify({
         query_type: result.query_type, total: result.total,
         explanation: result.explanation?.slice(0, 80),
+        ids: result.ids,
       }))
       const ids = result.ids || []
+
+      // Fetch installments for matched invoices directly (bypasses the 1000-row limit
+      // of loadOpenInstallments which can miss invoices beyond the cap)
+      if (ids.length > 0) {
+        const { data: instData } = await supabase
+          .from('invoice_installments')
+          .select(`
+            id, invoice_id, installment_no, due_date, amount_due, paid_amount, status, direction,
+            invoice:invoices(number, counterparty)
+          `)
+          .eq('company_id', companyId)
+          .in('invoice_id', ids)
+          .in('status', ['pending', 'overdue', 'partial'])
+          .order('due_date', { ascending: true })
+        if (instData) {
+          setCandidateAiInstallments(instData.map((d: any) => ({
+            id: d.id,
+            invoice_id: d.invoice_id,
+            installment_no: d.installment_no,
+            due_date: d.due_date,
+            amount_due: d.amount_due,
+            paid_amount: d.paid_amount,
+            status: d.status,
+            direction: d.direction,
+            invoice_number: d.invoice?.number || null,
+            counterparty_name: d.invoice?.counterparty?.denom || null,
+          })))
+        }
+      }
+
       setCandidateSearch('')
       setCandidateAiResult({
         text: result.explanation || `Trovate ${result.total} fatture`,
@@ -1040,19 +1073,20 @@ export default function RiconciliazionePage() {
     // Counterparty name for prioritization (normalized lowercase)
     const txCounterparty = (tx.counterparty_name || '').toLowerCase().trim()
 
-    // AI search active? Build a Set of invoice IDs for fast lookup
-    const aiInvoiceIds = candidateAiResult?.candidateIds?.length
-      ? new Set(candidateAiResult.candidateIds)
-      : null
+    // When AI search is active, use the dedicated AI-fetched installments
+    // (loaded directly for matched invoice IDs, not subject to the 1000-row cap
+    // of loadOpenInstallments which can miss invoices beyond the limit).
+    // When AI is not active, use the pre-loaded openInstallments.
+    const sourceInstallments = candidateAiResult?.candidateIds?.length
+      ? candidateAiInstallments
+      : openInstallments
 
-    // Filter installments: remaining > 0 AND matching direction (AND AI filter if active)
-    let filtered = openInstallments.filter(inst => {
+    // Filter installments: remaining > 0 AND matching direction
+    let filtered = sourceInstallments.filter(inst => {
       const remaining = Number(inst.amount_due) - Number(inst.paid_amount)
       if (remaining <= 0) return false
       // Direction filter: only show invoices matching the expected direction
       if (inst.direction !== expectedDirection) return false
-      // AI filter: only show installments for AI-matched invoices
-      if (aiInvoiceIds && !aiInvoiceIds.has(inst.invoice_id)) return false
       return true
     })
 
@@ -1102,7 +1136,7 @@ export default function RiconciliazionePage() {
     }
 
     return enriched.slice(0, 50)
-  }, [selectedTxId, unmatchedTxs, openInstallments, candidateSearch, candidateAiResult])
+  }, [selectedTxId, unmatchedTxs, openInstallments, candidateSearch, candidateAiResult, candidateAiInstallments])
 
   // Filtered reconciled rows
   const filteredReconciled = useMemo(() => {
@@ -1496,7 +1530,7 @@ export default function RiconciliazionePage() {
                   return (
                     <button
                       key={tx.id}
-                      onClick={() => { setSelectedTxId(isSelected ? null : tx.id); setCandidateAiResult(null); setCandidateSearch('') }}
+                      onClick={() => { setSelectedTxId(isSelected ? null : tx.id); setCandidateAiResult(null); setCandidateAiInstallments([]); setCandidateSearch('') }}
                       onDoubleClick={() => setDetailPopup({ type: 'bank_tx', id: tx.id })}
                       title="Doppio click per dettaglio"
                       className={`w-full text-left px-3 py-2 border-b last:border-b-0 transition-colors ${
@@ -1566,7 +1600,7 @@ export default function RiconciliazionePage() {
                       <input
                         type="text"
                         value={candidateSearch}
-                        onChange={e => { setCandidateSearch(e.target.value); if (candidateAiResult && !e.target.value.trim()) setCandidateAiResult(null) }}
+                        onChange={e => { setCandidateSearch(e.target.value); if (candidateAiResult && !e.target.value.trim()) { setCandidateAiResult(null); setCandidateAiInstallments([]) } }}
                         onKeyDown={e => { if (e.key === 'Enter' && candidateSearch.trim()) handleCandidateAISearch() }}
                         placeholder="Cerca o Invio per AI ✨"
                         className="w-full pl-8 pr-3 py-1.5 text-xs border rounded-md focus:outline-none focus:ring-1 focus:ring-purple-400"
@@ -1591,12 +1625,12 @@ export default function RiconciliazionePage() {
                   {candidateAiResult && (candidateAiResult.isError ? (
                     <div className="flex items-center gap-1.5 px-2 py-1 bg-red-50 border border-red-200 rounded-md">
                       <span className="text-[10px] text-red-600 flex-1">⚠ {candidateAiResult.text}</span>
-                      <button onClick={() => setCandidateAiResult(null)} className="text-red-400 hover:text-red-600 text-xs font-bold">✕</button>
+                      <button onClick={() => { setCandidateAiResult(null); setCandidateAiInstallments([]) }} className="text-red-400 hover:text-red-600 text-xs font-bold">✕</button>
                     </div>
                   ) : candidateAiResult.text ? (
                     <div className="flex items-center gap-1.5 px-2 py-1 bg-violet-50 border border-violet-200 rounded-md">
                       <span className="text-[10px] text-violet-700 flex-1">✨ {candidateAiResult.text} — <strong>{candidates.length}</strong> rate corrispondenti</span>
-                      <button onClick={() => setCandidateAiResult(null)} className="text-violet-400 hover:text-violet-600 text-xs font-bold">✕</button>
+                      <button onClick={() => { setCandidateAiResult(null); setCandidateAiInstallments([]) }} className="text-violet-400 hover:text-violet-600 text-xs font-bold">✕</button>
                     </div>
                   ) : null)}
                 </div>
