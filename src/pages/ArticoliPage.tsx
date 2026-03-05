@@ -11,8 +11,10 @@ import {
   loadArticleStats, loadArticleLines, loadUnassignedLines, loadDashboardStats,
   loadCategories, assignArticleToLine, loadLearnedRules,
   removeLineAssignment, recordAssignmentFeedback,
+  loadClassificationCounts, markLineSkipped, markLinesSkippedBulk,
   type Article, type ArticleCreate, type ArticleStats, type ArticleLineRow,
   type UnassignedLine, type MatchResult, type DashboardArticleRow,
+  type ClassificationCounts,
 } from '@/lib/articlesService'
 import {
   matchWithLearnedRules, extractLocation, suggestKeywords,
@@ -23,7 +25,7 @@ import { toast } from 'sonner'
 import {
   Package, Plus, Search, Loader2, Trash2, Save, X, Check,
   XCircle, RefreshCw, Zap, BarChart3, Tag, ChevronRight,
-  CheckCircle2, AlertTriangle, Sparkles, Filter, Eye,
+  CheckCircle2, AlertTriangle, Sparkles, Filter, Eye, Ban,
 } from 'lucide-react'
 import {
   ResponsiveContainer, BarChart, CartesianGrid, XAxis, YAxis,
@@ -108,6 +110,21 @@ export default function ArticoliPage() {
   const [analyzeProgress, setAnalyzeProgress] = useState('')
   const [confirmingLineId, setConfirmingLineId] = useState<string | null>(null)
   const [invoicePopup, setInvoicePopup] = useState<string | null>(null) // invoice_id for popup
+
+  // ─ Assignment filters: matched section
+  const [filterMatchArticle, setFilterMatchArticle] = useState('')     // article_id or ''
+  const [filterMatchConfidence, setFilterMatchConfidence] = useState('') // '90','75','50','low',''
+
+  // ─ Assignment filters: unmatched section
+  const [filterUnmatchText, setFilterUnmatchText] = useState('')
+  const [filterUnmatchCounterparty, setFilterUnmatchCounterparty] = useState('')
+
+  // ─ Classification KPI counts
+  const [kpiCounts, setKpiCounts] = useState<ClassificationCounts>({ total: 0, classified: 0, skipped: 0 })
+
+  // ─ Skip loading state
+  const [skippingIds, setSkippingIds] = useState<Set<string>>(new Set())
+  const [bulkSkipping, setBulkSkipping] = useState(false)
 
   // ─ Dashboard state
   const [dashboardData, setDashboardData] = useState<DashboardArticleRow[]>([])
@@ -255,12 +272,19 @@ export default function ArticoliPage() {
     if (!companyId) return
     setAnalyzing(true)
     setAnalyzeProgress('Caricamento righe...')
+    // Reset filters on new analysis
+    setFilterMatchArticle('')
+    setFilterMatchConfidence('')
+    setFilterUnmatchText('')
+    setFilterUnmatchCounterparty('')
     try {
-      // Load articles, rules, and ALL unassigned lines (paginated, no limit)
-      const [arts, rules] = await Promise.all([
+      // Load articles, rules, counts, and ALL unassigned lines (paginated, no limit)
+      const [arts, rules, counts] = await Promise.all([
         loadArticles(companyId, { activeOnly: true }),
         loadLearnedRules(companyId),
+        loadClassificationCounts(companyId),
       ])
+      setKpiCounts(counts)
       setAnalyzeProgress('Caricamento righe fattura...')
       const lines = await loadUnassignedLines(companyId, (loaded) => {
         setAnalyzeProgress(`Caricate ${loaded} righe...`)
@@ -299,6 +323,7 @@ export default function ArticoliPage() {
       setUnassignedLines(prev => prev.filter(l => l.id !== line.id))
       matchResults.delete(line.id)
       setMatchResults(new Map(matchResults))
+      setKpiCounts(prev => ({ ...prev, classified: prev.classified + 1 }))
       toast.success(`Assegnato a ${match.article.code}`)
     } catch (err: any) {
       toast.error(`Errore: ${err.message}`)
@@ -318,34 +343,6 @@ export default function ArticoliPage() {
       console.error('Reject feedback error:', err)
     }
   }, [companyId, matchResults, unassignedLines])
-
-  // ─── Assignment: confirm all high confidence ─
-  const confirmAllHigh = useCallback(async () => {
-    if (!companyId) return
-    setAssignmentLoading(true)
-    let ok = 0, fail = 0
-    for (const [lineId, match] of matchResults) {
-      if (match.confidence < 75) continue
-      const line = unassignedLines.find(l => l.id === lineId)
-      if (!line) continue
-      try {
-        const location = extractLocation(line.description || '')
-        await assignArticleToLine(
-          companyId, line.id, line.invoice_id, match.article.id,
-          { quantity: line.quantity, unit_price: line.unit_price, total_price: line.total_price, vat_rate: line.vat_rate },
-          'ai_confirmed', match.confidence, location,
-        )
-        await recordAssignmentFeedback(companyId, match.article.id, line.description || '', true)
-        ok++
-      } catch {
-        fail++
-      }
-    }
-    toast.success(`Confermati ${ok} assegnamenti${fail ? `, ${fail} errori` : ''}`)
-    // Refresh
-    await analyzeUnassigned()
-    setAssignmentLoading(false)
-  }, [companyId, matchResults, unassignedLines, analyzeUnassigned])
 
   // ─── Dashboard: load ────────────────────────
   const loadDashboard = useCallback(async () => {
@@ -395,7 +392,7 @@ export default function ArticoliPage() {
     return { qty, rev, avg: qty > 0 ? rev / qty : 0, count }
   }, [dashboardData])
 
-  // ─── matched lines for assignment tab ───────
+  // ─── matched/unmatched base lists ───────────
   const matchedLines = useMemo(() => {
     return unassignedLines
       .filter(l => matchResults.has(l.id))
@@ -406,9 +403,123 @@ export default function ArticoliPage() {
     return unassignedLines.filter(l => !matchResults.has(l.id))
   }, [unassignedLines, matchResults])
 
-  const highConfCount = useMemo(() => {
-    return [...matchResults.values()].filter(m => m.confidence >= 75).length
+  // ─── unique articles from matches (for filter dropdown) ─
+  const matchedArticles = useMemo(() => {
+    const artMap = new Map<string, { id: string; code: string; name: string; count: number }>()
+    for (const [, match] of matchResults) {
+      const existing = artMap.get(match.article.id)
+      if (existing) { existing.count++ }
+      else { artMap.set(match.article.id, { id: match.article.id, code: match.article.code, name: match.article.name, count: 1 }) }
+    }
+    return [...artMap.values()].sort((a, b) => a.code.localeCompare(b.code))
   }, [matchResults])
+
+  // ─── filtered matched lines ───────────────────
+  const filteredMatchedLines = useMemo(() => {
+    let filtered = matchedLines
+    if (filterMatchArticle) {
+      filtered = filtered.filter(l => matchResults.get(l.id)?.article.id === filterMatchArticle)
+    }
+    if (filterMatchConfidence) {
+      filtered = filtered.filter(l => {
+        const conf = matchResults.get(l.id)?.confidence || 0
+        switch (filterMatchConfidence) {
+          case '90': return conf >= 90
+          case '75': return conf >= 75 && conf < 90
+          case '50': return conf >= 50 && conf < 75
+          case 'low': return conf < 50
+          default: return true
+        }
+      })
+    }
+    return filtered
+  }, [matchedLines, matchResults, filterMatchArticle, filterMatchConfidence])
+
+  // ─── unique counterparties from unmatched ─────
+  const unmatchedCounterparties = useMemo(() => {
+    const cpMap = new Map<string, number>()
+    for (const line of unmatchedLines) {
+      const cp = line.counterparty_name || '(sconosciuto)'
+      cpMap.set(cp, (cpMap.get(cp) || 0) + 1)
+    }
+    return [...cpMap.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count }))
+  }, [unmatchedLines])
+
+  // ─── filtered unmatched lines ─────────────────
+  const filteredUnmatchedLines = useMemo(() => {
+    let filtered = unmatchedLines
+    if (filterUnmatchText) {
+      const q = filterUnmatchText.toLowerCase()
+      filtered = filtered.filter(l => l.description?.toLowerCase().includes(q))
+    }
+    if (filterUnmatchCounterparty) {
+      if (filterUnmatchCounterparty === '(sconosciuto)') {
+        filtered = filtered.filter(l => !l.counterparty_name)
+      } else {
+        filtered = filtered.filter(l => l.counterparty_name === filterUnmatchCounterparty)
+      }
+    }
+    return filtered
+  }, [unmatchedLines, filterUnmatchText, filterUnmatchCounterparty])
+
+  // ─── Assignment: confirm all FILTERED visible lines ─
+  const confirmAllFiltered = useCallback(async () => {
+    if (!companyId) return
+    setAssignmentLoading(true)
+    let ok = 0, fail = 0
+    for (const line of filteredMatchedLines) {
+      const match = matchResults.get(line.id)
+      if (!match) continue
+      try {
+        const location = extractLocation(line.description || '')
+        await assignArticleToLine(
+          companyId, line.id, line.invoice_id, match.article.id,
+          { quantity: line.quantity, unit_price: line.unit_price, total_price: line.total_price, vat_rate: line.vat_rate },
+          'ai_confirmed', match.confidence, location,
+        )
+        await recordAssignmentFeedback(companyId, match.article.id, line.description || '', true)
+        ok++
+      } catch {
+        fail++
+      }
+    }
+    toast.success(`Confermati ${ok} assegnamenti${fail ? `, ${fail} errori` : ''}`)
+    // Refresh
+    await analyzeUnassigned()
+    setAssignmentLoading(false)
+  }, [companyId, filteredMatchedLines, matchResults, analyzeUnassigned])
+
+  // ─── Skip: single line ────────────────────────
+  const skipLine = useCallback(async (lineId: string) => {
+    setSkippingIds(prev => new Set([...prev, lineId]))
+    try {
+      await markLineSkipped(lineId)
+      setUnassignedLines(prev => prev.filter(l => l.id !== lineId))
+      matchResults.delete(lineId)
+      setMatchResults(new Map(matchResults))
+      setKpiCounts(prev => ({ ...prev, skipped: prev.skipped + 1 }))
+    } catch (err: any) {
+      toast.error(`Errore: ${err.message}`)
+    }
+    setSkippingIds(prev => { const next = new Set(prev); next.delete(lineId); return next })
+  }, [matchResults])
+
+  // ─── Skip: bulk filtered unmatched ─────────────
+  const skipAllFiltered = useCallback(async () => {
+    if (filteredUnmatchedLines.length === 0) return
+    setBulkSkipping(true)
+    const ids = filteredUnmatchedLines.map(l => l.id)
+    try {
+      await markLinesSkippedBulk(ids)
+      const idsSet = new Set(ids)
+      setUnassignedLines(prev => prev.filter(l => !idsSet.has(l.id)))
+      setKpiCounts(prev => ({ ...prev, skipped: prev.skipped + ids.length }))
+      toast.success(`${ids.length} righe marcate come non classificabili`)
+    } catch (err: any) {
+      toast.error(`Errore: ${err.message}`)
+    }
+    setBulkSkipping(false)
+  }, [filteredUnmatchedLines])
 
   // ─── render ─────────────────────────────────
   if (loading && articles.length === 0) {
@@ -877,46 +988,99 @@ export default function ArticoliPage() {
             </Card>
           ) : (
             <>
-              {/* Bulk confirm bar */}
-              {highConfCount > 0 && (
-                <div className="flex items-center justify-between bg-emerald-50 border border-emerald-200 rounded-lg px-4 py-2.5">
-                  <div className="flex items-center gap-2">
-                    <Zap className="h-4 w-4 text-emerald-600" />
-                    <span className="text-sm text-emerald-800">
-                      <strong>{highConfCount}</strong> righe con match &ge;75%
-                    </span>
+              {/* ── KPI Bar ── */}
+              {kpiCounts.total > 0 && (
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                  <div className="bg-gray-50 border rounded-lg px-3 py-2">
+                    <p className="text-[9px] text-gray-400 uppercase font-medium">Totale righe</p>
+                    <p className="text-sm font-bold text-gray-800">{kpiCounts.total.toLocaleString('it-IT')}</p>
                   </div>
-                  <Button
-                    onClick={confirmAllHigh}
-                    disabled={assignmentLoading}
-                    size="sm"
-                    className="bg-emerald-600 hover:bg-emerald-700"
-                  >
-                    {assignmentLoading ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : <Check className="h-3 w-3 mr-1" />}
-                    Conferma tutti
-                  </Button>
+                  <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                    <p className="text-[9px] text-emerald-600 uppercase font-medium">Con match</p>
+                    <p className="text-sm font-bold text-emerald-700">{matchedLines.length.toLocaleString('it-IT')}</p>
+                  </div>
+                  <div className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2">
+                    <p className="text-[9px] text-purple-600 uppercase font-medium">Classificate</p>
+                    <p className="text-sm font-bold text-purple-700">{kpiCounts.classified.toLocaleString('it-IT')}</p>
+                  </div>
+                  <div className="bg-orange-50 border border-orange-200 rounded-lg px-3 py-2">
+                    <p className="text-[9px] text-orange-600 uppercase font-medium">Non classificabili</p>
+                    <p className="text-sm font-bold text-orange-700">{kpiCounts.skipped.toLocaleString('it-IT')}</p>
+                  </div>
+                  <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">
+                    <p className="text-[9px] text-blue-600 uppercase font-medium">Da analizzare</p>
+                    <p className="text-sm font-bold text-blue-700">{unmatchedLines.length.toLocaleString('it-IT')}</p>
+                  </div>
                 </div>
               )}
 
-              {/* Summary */}
-              <div className="flex items-center gap-4 text-xs text-gray-500">
-                <span>{unassignedLines.length} righe non assegnate</span>
-                <span className="text-emerald-600 font-medium">{matchedLines.length} con match</span>
-                <span className="text-gray-400">{unmatchedLines.length} senza match</span>
-              </div>
-
-              {/* Matched lines */}
+              {/* ════ Matched Lines Section ════ */}
               {matchedLines.length > 0 && (
                 <Card>
                   <CardHeader className="pb-2">
                     <CardTitle className="text-sm flex items-center gap-2">
                       <CheckCircle2 className="h-4 w-4 text-emerald-500" />
                       Righe con match ({matchedLines.length})
+                      {(filterMatchArticle || filterMatchConfidence) && (
+                        <span className="text-[10px] text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full font-normal">
+                          Visualizzate: {filteredMatchedLines.length} di {matchedLines.length}
+                        </span>
+                      )}
                     </CardTitle>
                   </CardHeader>
+
+                  {/* Filter bar */}
+                  <div className="px-4 pb-3 flex flex-wrap items-center gap-2 border-b">
+                    <Filter className="h-3 w-3 text-gray-400 shrink-0" />
+
+                    <select
+                      value={filterMatchArticle}
+                      onChange={e => setFilterMatchArticle(e.target.value)}
+                      className="text-[11px] border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-emerald-400 max-w-[200px]"
+                    >
+                      <option value="">Tutti gli articoli</option>
+                      {matchedArticles.map(a => (
+                        <option key={a.id} value={a.id}>{a.code} — {a.name} ({a.count})</option>
+                      ))}
+                    </select>
+
+                    <select
+                      value={filterMatchConfidence}
+                      onChange={e => setFilterMatchConfidence(e.target.value)}
+                      className="text-[11px] border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-emerald-400"
+                    >
+                      <option value="">Tutte le confidence</option>
+                      <option value="90">≥ 90%</option>
+                      <option value="75">75–89%</option>
+                      <option value="50">50–74%</option>
+                      <option value="low">&lt; 50%</option>
+                    </select>
+
+                    {(filterMatchArticle || filterMatchConfidence) && (
+                      <button
+                        onClick={() => { setFilterMatchArticle(''); setFilterMatchConfidence('') }}
+                        className="text-[10px] text-gray-400 hover:text-gray-600 flex items-center gap-0.5"
+                      >
+                        <X className="h-3 w-3" /> Reset filtri
+                      </button>
+                    )}
+
+                    <div className="ml-auto">
+                      <Button
+                        onClick={confirmAllFiltered}
+                        disabled={assignmentLoading || filteredMatchedLines.length === 0}
+                        size="sm"
+                        className="bg-emerald-600 hover:bg-emerald-700 h-7 text-xs"
+                      >
+                        {assignmentLoading ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : <Check className="h-3 w-3 mr-1" />}
+                        Conferma {filteredMatchedLines.length === matchedLines.length ? 'tutti' : `${filteredMatchedLines.length} filtrati`}
+                      </Button>
+                    </div>
+                  </div>
+
                   <CardContent className="p-0">
                     <div className="max-h-[50vh] overflow-y-auto divide-y">
-                      {matchedLines.map(line => {
+                      {filteredMatchedLines.map(line => {
                         const match = matchResults.get(line.id)!
                         const isConfirming = confirmingLineId === line.id
                         return (
@@ -984,37 +1148,105 @@ export default function ArticoliPage() {
                 </Card>
               )}
 
-              {/* Unmatched lines */}
+              {/* ════ Unmatched Lines Section ════ */}
               {unmatchedLines.length > 0 && (
                 <Card>
                   <CardHeader className="pb-2">
                     <CardTitle className="text-sm flex items-center gap-2 text-gray-500">
                       <AlertTriangle className="h-4 w-4 text-gray-400" />
                       Senza match ({unmatchedLines.length})
+                      {(filterUnmatchText || filterUnmatchCounterparty) && (
+                        <span className="text-[10px] text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full font-normal">
+                          Visualizzate: {filteredUnmatchedLines.length} di {unmatchedLines.length}
+                        </span>
+                      )}
                     </CardTitle>
                   </CardHeader>
+
+                  {/* Filter bar + bulk skip */}
+                  <div className="px-4 pb-3 flex flex-wrap items-center gap-2 border-b">
+                    <Filter className="h-3 w-3 text-gray-400 shrink-0" />
+
+                    <div className="relative">
+                      <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3 w-3 text-gray-400" />
+                      <input
+                        value={filterUnmatchText}
+                        onChange={e => setFilterUnmatchText(e.target.value)}
+                        placeholder="Cerca descrizione..."
+                        className="text-[11px] border rounded pl-6 pr-2 py-1 w-[180px] focus:outline-none focus:ring-1 focus:ring-orange-400"
+                      />
+                    </div>
+
+                    <select
+                      value={filterUnmatchCounterparty}
+                      onChange={e => setFilterUnmatchCounterparty(e.target.value)}
+                      className="text-[11px] border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-orange-400 max-w-[220px]"
+                    >
+                      <option value="">Tutte le controparti</option>
+                      {unmatchedCounterparties.map(cp => (
+                        <option key={cp.name} value={cp.name}>{cp.name} ({cp.count})</option>
+                      ))}
+                    </select>
+
+                    {(filterUnmatchText || filterUnmatchCounterparty) && (
+                      <button
+                        onClick={() => { setFilterUnmatchText(''); setFilterUnmatchCounterparty('') }}
+                        className="text-[10px] text-gray-400 hover:text-gray-600 flex items-center gap-0.5"
+                      >
+                        <X className="h-3 w-3" /> Reset
+                      </button>
+                    )}
+
+                    <div className="ml-auto">
+                      <Button
+                        onClick={skipAllFiltered}
+                        disabled={bulkSkipping || filteredUnmatchedLines.length === 0}
+                        size="sm"
+                        variant="outline"
+                        className="h-7 text-xs text-orange-700 border-orange-300 hover:bg-orange-50"
+                      >
+                        {bulkSkipping ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : <Ban className="h-3 w-3 mr-1" />}
+                        Segna {filteredUnmatchedLines.length === unmatchedLines.length
+                          ? `tutti (${unmatchedLines.length})`
+                          : `${filteredUnmatchedLines.length} filtrati`} non classificabili
+                      </Button>
+                    </div>
+                  </div>
+
                   <CardContent className="p-0">
-                    <div className="max-h-[30vh] overflow-y-auto divide-y">
-                      {unmatchedLines.slice(0, 50).map(line => (
+                    <div className="max-h-[40vh] overflow-y-auto divide-y">
+                      {filteredUnmatchedLines.slice(0, 200).map(line => (
                         <div
                           key={line.id}
-                          className="px-4 py-2 text-[11px] cursor-pointer hover:bg-gray-50"
+                          className="px-4 py-2 text-[11px] hover:bg-gray-50 flex items-center gap-2"
                           onDoubleClick={() => setInvoicePopup(line.invoice_id)}
                           title="Doppio click per vedere la fattura"
                         >
-                          <p className="text-gray-600 line-clamp-1">{line.description || '(vuoto)'}</p>
-                          <div className="flex items-center gap-3 mt-0.5 text-[10px] text-gray-400">
-                            <span className="text-blue-500 hover:underline cursor-pointer" onClick={(e) => { e.stopPropagation(); setInvoicePopup(line.invoice_id) }}>
-                              Fatt. {line.invoice_number || '—'}
-                            </span>
-                            <span>{fmtDate(line.invoice_date)}</span>
-                            <span>{line.counterparty_name || '—'}</span>
-                            {line.total_price != null && <span>{fmtEur(line.total_price)}</span>}
+                          <div className="min-w-0 flex-1">
+                            <p className="text-gray-600 line-clamp-1">{line.description || '(vuoto)'}</p>
+                            <div className="flex items-center gap-3 mt-0.5 text-[10px] text-gray-400">
+                              <span className="text-blue-500 hover:underline cursor-pointer" onClick={(e) => { e.stopPropagation(); setInvoicePopup(line.invoice_id) }}>
+                                Fatt. {line.invoice_number || '—'}
+                              </span>
+                              <span>{fmtDate(line.invoice_date)}</span>
+                              <span>{line.counterparty_name || '—'}</span>
+                              {line.total_price != null && <span>{fmtEur(line.total_price)}</span>}
+                            </div>
                           </div>
+                          <button
+                            onClick={() => skipLine(line.id)}
+                            disabled={skippingIds.has(line.id)}
+                            className="p-1 rounded text-orange-400 hover:bg-orange-50 hover:text-orange-600 transition-colors shrink-0"
+                            title="Non classificabile"
+                          >
+                            {skippingIds.has(line.id) ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Ban className="h-3.5 w-3.5" />}
+                          </button>
                         </div>
                       ))}
-                      {unmatchedLines.length > 50 && (
-                        <p className="px-4 py-2 text-[10px] text-gray-400">...e altre {unmatchedLines.length - 50} righe</p>
+                      {filteredUnmatchedLines.length > 200 && (
+                        <p className="px-4 py-2 text-[10px] text-gray-400">
+                          ...e altre {filteredUnmatchedLines.length - 200} righe (usa i filtri per restringere)
+                        </p>
                       )}
                     </div>
                   </CardContent>

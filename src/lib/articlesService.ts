@@ -330,11 +330,75 @@ export async function loadLearnedRules(companyId: string): Promise<LearnedRule[]
   return (data || []) as LearnedRule[]
 }
 
+/* ─── Classification Counts ──────────────────── */
+
+export interface ClassificationCounts {
+  total: number
+  classified: number
+  skipped: number
+}
+
+/**
+ * Load classification counts for the KPI bar.
+ * - total: all invoice lines for this company
+ * - classified: lines with an entry in invoice_line_articles
+ * - skipped: lines with classification_status = 'skipped'
+ */
+export async function loadClassificationCounts(companyId: string): Promise<ClassificationCounts> {
+  const [{ count: total }, { count: classified }, { count: skipped }] = await Promise.all([
+    supabase
+      .from('invoice_lines')
+      .select('id, invoice:invoices!inner(company_id)', { count: 'exact', head: true })
+      .eq('invoice.company_id', companyId),
+    supabase
+      .from('invoice_line_articles')
+      .select('id', { count: 'exact', head: true })
+      .eq('company_id', companyId),
+    supabase
+      .from('invoice_lines')
+      .select('id, invoice:invoices!inner(company_id)', { count: 'exact', head: true })
+      .eq('invoice.company_id', companyId)
+      .eq('classification_status', 'skipped'),
+  ])
+  return { total: total || 0, classified: classified || 0, skipped: skipped || 0 }
+}
+
+/* ─── Skip (non-classificabile) ──────────────── */
+
+/**
+ * Mark a single invoice line as 'skipped' (non-classificabile).
+ */
+export async function markLineSkipped(lineId: string): Promise<void> {
+  const { error } = await supabase
+    .from('invoice_lines')
+    .update({ classification_status: 'skipped' } as any)
+    .eq('id', lineId)
+  if (error) throw error
+}
+
+/**
+ * Mark multiple invoice lines as 'skipped' in bulk.
+ * Batches by 100 to stay within Supabase .in() limits.
+ */
+export async function markLinesSkippedBulk(lineIds: string[]): Promise<void> {
+  if (lineIds.length === 0) return
+  const BATCH = 100
+  for (let i = 0; i < lineIds.length; i += BATCH) {
+    const batch = lineIds.slice(i, i + BATCH)
+    const { error } = await supabase
+      .from('invoice_lines')
+      .update({ classification_status: 'skipped' } as any)
+      .in('id', batch)
+    if (error) throw error
+  }
+}
+
 /* ─── Assignment ─────────────────────────────── */
 
 /**
  * Load ALL unassigned invoice lines (no LIMIT, no direction filter).
  * Paginates in batches of 1000 to bypass Supabase row limit.
+ * Excludes lines already assigned AND lines marked as 'skipped'.
  * Returns lines from both active and passive invoices.
  *
  * @param onProgress optional callback for UI progress (loaded so far)
@@ -359,7 +423,7 @@ export async function loadUnassignedLines(
     assignedPage++
   }
 
-  // Step 2: Load ALL invoice lines with invoice context (paginated, NO direction filter)
+  // Step 2: Load ALL invoice lines (paginated, exclude 'skipped')
   let allLines: any[] = []
   let page = 0
   while (true) {
@@ -369,9 +433,11 @@ export async function loadUnassignedLines(
       .from('invoice_lines')
       .select(`
         id, invoice_id, line_number, description, quantity, unit_price, total_price, vat_rate, article_code,
+        classification_status,
         invoice:invoices!inner(number, date, direction, company_id, counterparty)
       `)
       .eq('invoice.company_id', companyId)
+      .neq('classification_status', 'skipped')
       .order('invoice_id', { ascending: false })
       .range(from, to)
 
