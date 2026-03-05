@@ -126,6 +126,11 @@ export default function ArticoliPage() {
   const [skippingIds, setSkippingIds] = useState<Set<string>>(new Set())
   const [bulkSkipping, setBulkSkipping] = useState(false)
 
+  // ─ Article override (clickable badge → change suggested article)
+  const [articleOverrides, setArticleOverrides] = useState<Map<string, Article>>(new Map())
+  const [dropdownLineId, setDropdownLineId] = useState<string | null>(null)
+  const [dropdownSearch, setDropdownSearch] = useState('')
+
   // ─ Dashboard state
   const [dashboardData, setDashboardData] = useState<DashboardArticleRow[]>([])
   const [dashboardLoading, setDashboardLoading] = useState(false)
@@ -308,28 +313,47 @@ export default function ArticoliPage() {
     setAnalyzing(false)
   }, [companyId])
 
-  // ─── Assignment: confirm single ─────────────
+  // ─── Assignment: confirm single (with override support) ──
   const confirmAssignment = useCallback(async (line: UnassignedLine, match: MatchResult) => {
     if (!companyId) return
     setConfirmingLineId(line.id)
     try {
+      // Check if user changed the suggested article
+      const override = articleOverrides.get(line.id)
+      const finalArticle = override || match.article
+      const wasChanged = !!(override && override.id !== match.article.id)
+
       const location = extractLocation(line.description || '')
       await assignArticleToLine(
-        companyId, line.id, line.invoice_id, match.article.id,
+        companyId, line.id, line.invoice_id, finalArticle.id,
         { quantity: line.quantity, unit_price: line.unit_price, total_price: line.total_price, vat_rate: line.vat_rate },
-        'ai_confirmed', match.confidence, location,
+        wasChanged ? 'manual' : 'ai_confirmed',
+        wasChanged ? undefined : match.confidence,
+        location,
       )
-      await recordAssignmentFeedback(companyId, match.article.id, line.description || '', true)
+
+      if (wasChanged) {
+        // Reject feedback on original suggestion's rule
+        await recordAssignmentFeedback(companyId, match.article.id, line.description || '', false)
+        // Accept feedback for the user-chosen article
+        await recordAssignmentFeedback(companyId, finalArticle.id, line.description || '', true)
+      } else {
+        // Confirmed without changes → hit_count++ as before
+        await recordAssignmentFeedback(companyId, match.article.id, line.description || '', true)
+      }
+
+      // Cleanup
       setUnassignedLines(prev => prev.filter(l => l.id !== line.id))
       matchResults.delete(line.id)
       setMatchResults(new Map(matchResults))
+      setArticleOverrides(prev => { const next = new Map(prev); next.delete(line.id); return next })
       setKpiCounts(prev => ({ ...prev, classified: prev.classified + 1 }))
-      toast.success(`Assegnato a ${match.article.code}`)
+      toast.success(`Assegnato a ${finalArticle.code}`)
     } catch (err: any) {
       toast.error(`Errore: ${err.message}`)
     }
     setConfirmingLineId(null)
-  }, [companyId, matchResults])
+  }, [companyId, matchResults, articleOverrides])
 
   // ─── Assignment: reject single ──────────────
   const rejectAssignment = useCallback(async (lineId: string, match: MatchResult) => {
@@ -339,6 +363,8 @@ export default function ArticoliPage() {
       if (line) await recordAssignmentFeedback(companyId, match.article.id, line.description || '', false)
       matchResults.delete(lineId)
       setMatchResults(new Map(matchResults))
+      // Cleanup any override for this line
+      setArticleOverrides(prev => { const next = new Map(prev); next.delete(lineId); return next })
     } catch (err: any) {
       console.error('Reject feedback error:', err)
     }
@@ -462,7 +488,7 @@ export default function ArticoliPage() {
     return filtered
   }, [unmatchedLines, filterUnmatchText, filterUnmatchCounterparty])
 
-  // ─── Assignment: confirm all FILTERED visible lines ─
+  // ─── Assignment: confirm all FILTERED visible lines (with override support) ─
   const confirmAllFiltered = useCallback(async () => {
     if (!companyId) return
     setAssignmentLoading(true)
@@ -471,13 +497,25 @@ export default function ArticoliPage() {
       const match = matchResults.get(line.id)
       if (!match) continue
       try {
+        const override = articleOverrides.get(line.id)
+        const finalArticle = override || match.article
+        const wasChanged = !!(override && override.id !== match.article.id)
+
         const location = extractLocation(line.description || '')
         await assignArticleToLine(
-          companyId, line.id, line.invoice_id, match.article.id,
+          companyId, line.id, line.invoice_id, finalArticle.id,
           { quantity: line.quantity, unit_price: line.unit_price, total_price: line.total_price, vat_rate: line.vat_rate },
-          'ai_confirmed', match.confidence, location,
+          wasChanged ? 'manual' : 'ai_confirmed',
+          wasChanged ? undefined : match.confidence,
+          location,
         )
-        await recordAssignmentFeedback(companyId, match.article.id, line.description || '', true)
+
+        if (wasChanged) {
+          await recordAssignmentFeedback(companyId, match.article.id, line.description || '', false)
+          await recordAssignmentFeedback(companyId, finalArticle.id, line.description || '', true)
+        } else {
+          await recordAssignmentFeedback(companyId, match.article.id, line.description || '', true)
+        }
         ok++
       } catch {
         fail++
@@ -486,8 +524,9 @@ export default function ArticoliPage() {
     toast.success(`Confermati ${ok} assegnamenti${fail ? `, ${fail} errori` : ''}`)
     // Refresh
     await analyzeUnassigned()
+    setArticleOverrides(new Map())
     setAssignmentLoading(false)
-  }, [companyId, filteredMatchedLines, matchResults, analyzeUnassigned])
+  }, [companyId, filteredMatchedLines, matchResults, articleOverrides, analyzeUnassigned])
 
   // ─── Skip: single line ────────────────────────
   const skipLine = useCallback(async (lineId: string) => {
@@ -520,6 +559,25 @@ export default function ArticoliPage() {
     }
     setBulkSkipping(false)
   }, [filteredUnmatchedLines])
+
+  // ─── Inline article change (clickable badge) ─
+  const changeLineArticle = useCallback((lineId: string, newArticle: Article) => {
+    setArticleOverrides(prev => {
+      const next = new Map(prev)
+      next.set(lineId, newArticle)
+      return next
+    })
+    setDropdownLineId(null)
+    setDropdownSearch('')
+  }, [])
+
+  // ─── Close article dropdown on outside click ──
+  useEffect(() => {
+    if (!dropdownLineId) return
+    const handler = () => { setDropdownLineId(null); setDropdownSearch('') }
+    document.addEventListener('click', handler)
+    return () => document.removeEventListener('click', handler)
+  }, [dropdownLineId])
 
   // ─── render ─────────────────────────────────
   if (loading && articles.length === 0) {
@@ -1083,6 +1141,8 @@ export default function ArticoliPage() {
                       {filteredMatchedLines.map(line => {
                         const match = matchResults.get(line.id)!
                         const isConfirming = confirmingLineId === line.id
+                        const displayArticle = articleOverrides.get(line.id) || match.article
+                        const isOverridden = articleOverrides.has(line.id) && articleOverrides.get(line.id)!.id !== match.article.id
                         return (
                           <div
                             key={line.id}
@@ -1100,10 +1160,70 @@ export default function ArticoliPage() {
                                   }`}>
                                     {Math.round(match.confidence)}%
                                   </span>
-                                  <span className="text-[11px] font-mono font-bold text-orange-700 bg-orange-50 px-1.5 py-0.5 rounded">
-                                    {match.article.code}
+                                  {/* Clickable article badge with inline dropdown */}
+                                  <div className="relative">
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        setDropdownLineId(dropdownLineId === line.id ? null : line.id)
+                                        setDropdownSearch('')
+                                      }}
+                                      className={`text-[11px] font-mono font-bold px-1.5 py-0.5 rounded cursor-pointer transition-colors inline-flex items-center gap-0.5 ${
+                                        isOverridden
+                                          ? 'bg-purple-100 text-purple-700 ring-1 ring-purple-300'
+                                          : 'bg-orange-50 text-orange-700 hover:bg-orange-100'
+                                      }`}
+                                      title="Click per cambiare articolo"
+                                    >
+                                      {displayArticle.code} <ChevronRight className="h-3 w-3 rotate-90" />
+                                    </button>
+                                    {dropdownLineId === line.id && (
+                                      <div
+                                        className="absolute left-0 top-full mt-1 z-50 bg-white border rounded-lg shadow-xl w-[280px] max-h-[260px] overflow-hidden"
+                                        onClick={e => e.stopPropagation()}
+                                      >
+                                        <div className="p-2 border-b">
+                                          <input
+                                            autoFocus
+                                            value={dropdownSearch}
+                                            onChange={e => setDropdownSearch(e.target.value)}
+                                            placeholder="Cerca articolo..."
+                                            className="w-full text-[11px] border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-orange-400"
+                                            onClick={e => e.stopPropagation()}
+                                          />
+                                        </div>
+                                        <div className="overflow-y-auto max-h-[210px]">
+                                          {articles
+                                            .filter(a => a.active)
+                                            .filter(a => {
+                                              if (!dropdownSearch) return true
+                                              const q = dropdownSearch.toLowerCase()
+                                              return a.code.toLowerCase().includes(q) || a.name.toLowerCase().includes(q)
+                                            })
+                                            .map(a => (
+                                              <button
+                                                key={a.id}
+                                                onClick={() => changeLineArticle(line.id, a)}
+                                                className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-orange-50 transition-colors flex items-center gap-2 ${
+                                                  a.id === displayArticle.id ? 'bg-orange-100 font-bold' : ''
+                                                }`}
+                                              >
+                                                <span className="font-mono text-orange-700 shrink-0">{a.code}</span>
+                                                <span className="text-gray-600 truncate">{a.name}</span>
+                                                {a.id === match.article.id && (
+                                                  <span className="text-[9px] text-gray-400 ml-auto shrink-0">(suggerito)</span>
+                                                )}
+                                              </button>
+                                            ))
+                                          }
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                  <span className="text-[10px] text-gray-500">
+                                    {displayArticle.name}
+                                    {isOverridden && <span className="text-purple-500 ml-1 font-medium">(modificato)</span>}
                                   </span>
-                                  <span className="text-[10px] text-gray-500">{match.article.name}</span>
                                 </div>
                                 <p className="text-[11px] text-gray-700 mt-1 line-clamp-2">{line.description}</p>
                                 <div className="flex items-center gap-3 mt-1 text-[10px] text-gray-400">
@@ -1112,7 +1232,7 @@ export default function ArticoliPage() {
                                   </span>
                                   <span>{fmtDate(line.invoice_date)}</span>
                                   <span>{line.counterparty_name || '—'}</span>
-                                  {line.quantity != null && <span className="font-mono">{fmtNum(line.quantity)} {UNIT_SHORT[match.article.unit] || match.article.unit}</span>}
+                                  {line.quantity != null && <span className="font-mono">{fmtNum(line.quantity)} {UNIT_SHORT[displayArticle.unit] || displayArticle.unit}</span>}
                                   {line.total_price != null && <span className="font-semibold text-gray-600">{fmtEur(line.total_price)}</span>}
                                 </div>
                                 <div className="flex items-center gap-1 mt-1">
