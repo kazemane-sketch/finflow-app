@@ -450,7 +450,7 @@ export async function saveInvoiceProjects(
   if (error) throw error;
 }
 
-// ─── Line-level classification (category + account on invoice_line_articles) ───
+// ─── Line-level classification (category + account directly on invoice_lines) ───
 
 export interface LineClassification {
   invoice_line_id: string;
@@ -458,34 +458,92 @@ export interface LineClassification {
   account_id: string | null;
 }
 
-/** Load line-level category/account overrides for all lines in an invoice. */
+/** Load line-level category/account for all lines in an invoice.
+ *  Reads directly from invoice_lines — works independently of article assignment. */
 export async function loadLineClassifications(invoiceId: string): Promise<Record<string, LineClassification>> {
   const { data, error } = await supabase
-    .from('invoice_line_articles')
-    .select('invoice_line_id, category_id, account_id')
+    .from('invoice_lines')
+    .select('id, category_id, account_id')
     .eq('invoice_id', invoiceId);
   if (error) throw error;
   const map: Record<string, LineClassification> = {};
-  for (const row of (data || [])) {
-    map[row.invoice_line_id] = {
-      invoice_line_id: row.invoice_line_id,
-      category_id: row.category_id,
-      account_id: row.account_id,
-    };
+  for (const row of (data || []) as { id: string; category_id: string | null; account_id: string | null }[]) {
+    if (row.category_id || row.account_id) {
+      map[row.id] = {
+        invoice_line_id: row.id,
+        category_id: row.category_id,
+        account_id: row.account_id,
+      };
+    }
   }
   return map;
 }
 
-/** Save category and/or account override for a single invoice line.
- *  Only works if the line already has an invoice_line_articles row (article assigned). */
+/** Save category and/or account on a single invoice line.
+ *  Works independently of article assignment (updates invoice_lines directly). */
 export async function saveLineCategoryAndAccount(
   lineId: string,
   categoryId: string | null,
   accountId: string | null,
 ): Promise<void> {
   const { error } = await supabase
-    .from('invoice_line_articles')
+    .from('invoice_lines')
     .update({ category_id: categoryId, account_id: accountId } as any)
+    .eq('id', lineId);
+  if (error) throw error;
+}
+
+// ─── Line-level CdC (invoice_line_projects) ──────────────
+
+export interface LineProjectAssignment {
+  id: string;
+  invoice_line_id: string;
+  project_id: string;
+  percentage: number;
+  amount: number | null;
+}
+
+/** Load line-level CdC allocations for all lines in an invoice. */
+export async function loadLineProjects(invoiceId: string): Promise<Record<string, LineProjectAssignment[]>> {
+  const { data, error } = await supabase
+    .from('invoice_line_projects')
+    .select('id, invoice_line_id, project_id, percentage, amount')
+    .eq('invoice_id', invoiceId);
+  if (error) throw error;
+  const map: Record<string, LineProjectAssignment[]> = {};
+  for (const row of (data || []) as LineProjectAssignment[]) {
+    if (!map[row.invoice_line_id]) map[row.invoice_line_id] = [];
+    map[row.invoice_line_id].push(row);
+  }
+  return map;
+}
+
+/** Batch save line-level CdC allocations: delete existing for lineId, insert new rows. */
+export async function saveLineProjects(
+  companyId: string,
+  invoiceId: string,
+  lineId: string,
+  assignments: { project_id: string; percentage: number; amount: number | null }[],
+): Promise<void> {
+  // Delete existing assignments for this line
+  const { error: delErr } = await supabase
+    .from('invoice_line_projects')
+    .delete()
     .eq('invoice_line_id', lineId);
+  if (delErr) throw delErr;
+
+  if (assignments.length === 0) return;
+
+  const rows = assignments.map(a => ({
+    company_id: companyId,
+    invoice_id: invoiceId,
+    invoice_line_id: lineId,
+    project_id: a.project_id,
+    percentage: a.percentage,
+    amount: a.amount,
+    assigned_by: 'manual' as const,
+  }));
+
+  const { error } = await supabase.from('invoice_line_projects').insert(rows as any);
   if (error) throw error;
 }

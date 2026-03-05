@@ -1928,10 +1928,14 @@ export default function RiconciliazionePage() {
                               </span>
                               <span className={`text-xs font-bold shrink-0 ${txDir === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
                                 {sign}{fmtEur(netAmt)}
+                                {hasComm && <span className="text-[9px] font-normal text-gray-400 ml-0.5">netto</span>}
                               </span>
                             </div>
                             <div className="flex items-center gap-2 mt-0.5 pl-3.5">
                               <span className="text-[10px] text-gray-400">{fmtDate(tx.date)}</span>
+                              {hasComm && (
+                                <span className="text-[10px] text-gray-400">lordo {sign}{fmtEur(absAmount)} | comm. {fmtEur(Math.abs(Number(tx.commission_amount)))}</span>
+                              )}
                               {tx.description && (
                                 <span className="text-[10px] text-gray-400 truncate">{tx.description.slice(0, 60)}</span>
                               )}

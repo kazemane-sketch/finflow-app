@@ -12,7 +12,8 @@ import {
   type InvoiceAggregates, type InvoiceClassificationMeta,
 } from '@/lib/invoiceSaver';
 import { listInstallmentsForInvoice, type InvoiceInstallment } from '@/lib/scadenzario';
-import { supabase } from '@/integrations/supabase/client';
+import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client';
+import { getValidAccessToken } from '@/lib/getValidAccessToken';
 import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges';
@@ -33,10 +34,11 @@ import {
   loadInvoiceClassification, saveInvoiceClassification,
   loadInvoiceProjects, saveInvoiceProjects,
   loadLineClassifications, saveLineCategoryAndAccount,
+  loadLineProjects, saveLineProjects,
   CATEGORY_TYPE_LABELS, SECTION_LABELS,
   type Category, type Project, type ChartAccount,
   type InvoiceClassification, type InvoiceProjectAssignment,
-  type LineClassification,
+  type LineClassification, type LineProjectAssignment,
 } from '@/lib/classificationService';
 
 // ============================================================
@@ -453,6 +455,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [addCdcId, setAddCdcId] = useState('');
   // Line-level classification overrides (category + account per line)
   const [lineClassifs, setLineClassifs] = useState<Record<string, LineClassification>>({});
+  // Line-level CdC allocations (per line)
+  const [lineProjects, setLineProjects] = useState<Record<string, LineProjectAssignment[]>>({});
+  const [cdcPopoverLineId, setCdcPopoverLineId] = useState<string | null>(null);
+  // AI classification suggestion state
+  const [aiClassifStatus, setAiClassifStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
+  const [aiClassifResult, setAiClassifResult] = useState<any>(null);
 
   // Load articles + existing assignments when invoice changes
   useEffect(() => {
@@ -531,13 +539,14 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     let cancelled = false;
     (async () => {
       try {
-        const [cats, projs, accs, classif, iProjs, lineClf] = await Promise.all([
+        const [cats, projs, accs, classif, iProjs, lineClf, lineProj] = await Promise.all([
           loadCategories(companyId, true),
           loadProjects(companyId, true),
           loadChartOfAccounts(companyId),
           loadInvoiceClassification(invoice.id),
           loadInvoiceProjects(invoice.id),
           loadLineClassifications(invoice.id),
+          loadLineProjects(invoice.id),
         ]);
         if (cancelled) return;
         setAllCategories(cats);
@@ -546,6 +555,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setClassification(classif);
         setInvProjects(iProjs);
         setLineClassifs(lineClf);
+        setLineProjects(lineProj);
         // Initialize local CdC rows from DB assignments
         setCdcRows(iProjs.map(ip => ({
           project_id: ip.project_id,
@@ -650,6 +660,63 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       );
     } catch (e: any) { console.error('Save line classification error:', e); }
   }, [lineClassifs]);
+
+  // AI classification — request suggestion from edge function
+  const handleRequestAiClassification = useCallback(async () => {
+    if (!invoice?.id || !company?.id) return;
+    setAiClassifStatus('loading');
+    try {
+      const token = await getValidAccessToken();
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/classification-ai-suggest`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+          'apikey': SUPABASE_ANON_KEY,
+        },
+        body: JSON.stringify({ company_id: company.id, invoice_ids: [invoice.id] }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Errore AI');
+      const result = data.results?.[0] || null;
+      setAiClassifResult(result);
+      setAiClassifStatus('done');
+      // Reload classification data to reflect persisted suggestions
+      if (result) {
+        const [classif, lineClf, lineProj] = await Promise.all([
+          loadInvoiceClassification(invoice.id),
+          loadLineClassifications(invoice.id),
+          loadLineProjects(invoice.id),
+        ]);
+        if (classif) {
+          setClassification(classif);
+          setSelCategoryId(classif.category_id || selCategoryId);
+          setSelAccountId(classif.account_id || selAccountId);
+        }
+        setLineClassifs(lineClf);
+        setLineProjects(lineProj);
+      }
+    } catch (e: any) {
+      console.error('AI classification error:', e);
+      setAiClassifStatus('error');
+    }
+  }, [invoice?.id, company?.id, selCategoryId, selAccountId]);
+
+  // Confirm AI suggestion — set verified=true on invoice_classifications
+  const handleConfirmAiClassification = useCallback(async () => {
+    if (!invoice?.id || !company?.id || !aiClassifResult) return;
+    try {
+      const il = aiClassifResult.invoice_level;
+      // Save invoice-level as confirmed
+      await saveInvoiceClassification(company.id, invoice.id, il.category_id, il.account_id);
+      const classif = await loadInvoiceClassification(invoice.id);
+      setClassification(classif);
+      setSelCategoryId(classif?.category_id || null);
+      setSelAccountId(classif?.account_id || null);
+      setAiClassifResult(null);
+      setAiClassifStatus('idle');
+    } catch (e: any) { console.error('Confirm AI classification error:', e); }
+  }, [invoice?.id, company?.id, aiClassifResult]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }) => {
     const companyId = company?.id;
@@ -1086,6 +1153,60 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 </button>
               </div>
             )}
+
+            {/* AI Classification Suggestion */}
+            {aiClassifResult && !classification?.verified && (
+              <div className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2 mt-3">
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className="text-purple-600 text-sm">&#x2728;</span>
+                  <span className="text-xs font-semibold text-purple-800">Suggerimento AI</span>
+                  <span className="text-[10px] text-purple-500 ml-auto">
+                    Confidenza: {aiClassifResult.invoice_level?.confidence ?? 0}%
+                  </span>
+                </div>
+                {aiClassifResult.invoice_level?.reasoning && (
+                  <p className="text-[10px] text-purple-700 mb-2">{aiClassifResult.invoice_level.reasoning}</p>
+                )}
+                <div className="text-[10px] text-purple-600 mb-2">
+                  {aiClassifResult.lines?.length ?? 0} righe classificate
+                  {' '}({aiClassifResult.lines?.filter((l: any) => l.match_type === 'deterministic').length ?? 0} deterministiche,
+                  {' '}{aiClassifResult.lines?.filter((l: any) => l.match_type === 'ai').length ?? 0} AI)
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={handleConfirmAiClassification}
+                    className="px-2.5 py-1 text-xs font-semibold rounded bg-emerald-600 text-white hover:bg-emerald-700">
+                    Conferma
+                  </button>
+                  <button onClick={() => { setAiClassifResult(null); setAiClassifStatus('idle'); }}
+                    className="px-2.5 py-1 text-xs font-semibold rounded bg-gray-200 text-gray-700 hover:bg-gray-300">
+                    Ignora
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* AI Classification Trigger */}
+            {!classification && aiClassifStatus === 'idle' && !aiClassifResult && (
+              <div className="flex justify-end pt-2">
+                <button onClick={handleRequestAiClassification}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-purple-600 text-white hover:bg-purple-700 transition-colors">
+                  <span>&#x2728;</span>
+                  Suggerisci classificazione AI
+                </button>
+              </div>
+            )}
+            {aiClassifStatus === 'loading' && (
+              <div className="flex items-center gap-2 pt-2 text-xs text-purple-600">
+                <span className="animate-spin">&#x21BB;</span>
+                Classificazione AI in corso...
+              </div>
+            )}
+            {aiClassifStatus === 'error' && (
+              <div className="flex items-center gap-2 pt-2">
+                <span className="text-xs text-red-600">Errore classificazione AI</span>
+                <button onClick={() => setAiClassifStatus('idle')} className="text-xs text-sky-600 hover:underline">Riprova</button>
+              </div>
+            )}
           </div>
         </Sec>
       )}
@@ -1131,9 +1252,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                       onRemove={() => handleRemoveArticle(lineId)}
                     />}
                   </td>}
-                  {/* Line-level Cat/CdC/Conto columns */}
+                  {/* Line-level Cat/CdC/Conto columns — editable independently of article */}
                   {allCategories.length > 0 && <td className="text-center px-1 py-1 print:hidden">
-                    {lineId && lineArticleMap[lineId] ? (
+                    {lineId ? (
                       <select
                         value={lineClassifs[lineId]?.category_id || ''}
                         onChange={e => handleLineClassifChange(lineId, 'category_id', e.target.value || null)}
@@ -1144,20 +1265,102 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                         {allCategories.map(c => <option key={c.id} value={c.id}>{c.name.substring(0, 12)}</option>)}
                       </select>
                     ) : (
-                      <span className="text-[9px] text-gray-300 italic">{selCategoryId ? '← Fatt.' : '—'}</span>
+                      <span className="text-[9px] text-gray-300 italic">—</span>
                     )}
                   </td>}
-                  {allProjects.length > 0 && <td className="text-center px-1 py-1 print:hidden">
-                    {(() => {
-                      // CdC: display-only showing macro-level CdC assignment
-                      const cdcCodes = cdcRows.map(r => allProjects.find(p => p.id === r.project_id)?.code).filter(Boolean);
-                      return cdcCodes.length > 0
-                        ? <span className="text-[9px] text-gray-400" title={cdcCodes.join(', ')}>{cdcCodes.join(', ').substring(0, 12)}{cdcCodes.join(', ').length > 12 ? '…' : ''}</span>
-                        : <span className="text-[9px] text-gray-300 italic">—</span>;
-                    })()}
+                  {allProjects.length > 0 && <td className="text-center px-1 py-1 print:hidden relative">
+                    {lineId ? (
+                      <>
+                        <button
+                          onClick={() => setCdcPopoverLineId(cdcPopoverLineId === lineId ? null : lineId)}
+                          className="text-[9px] text-gray-500 hover:text-sky-700 hover:underline cursor-pointer w-full text-center"
+                          title="Clicca per assegnare CdC a questa riga"
+                        >
+                          {lineProjects[lineId]?.length
+                            ? lineProjects[lineId].map(lp => allProjects.find(p => p.id === lp.project_id)?.code).filter(Boolean).join(', ').substring(0, 12)
+                            : (cdcRows.length > 0 ? '← Fatt.' : '—')
+                          }
+                        </button>
+                        {cdcPopoverLineId === lineId && (
+                          <div className="absolute z-50 top-full right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-xl p-3 w-64" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center justify-between mb-2">
+                              <span className="text-[10px] font-semibold text-gray-700">CdC Riga</span>
+                              <button onClick={() => setCdcPopoverLineId(null)} className="text-gray-400 hover:text-gray-600 text-xs">x</button>
+                            </div>
+                            {(lineProjects[lineId] || []).map((lp, lpIdx) => {
+                              const proj = allProjects.find(p => p.id === lp.project_id);
+                              return (
+                                <div key={lp.id || lpIdx} className="flex items-center gap-1 mb-1">
+                                  <span className="text-[9px] text-gray-600 flex-1 truncate">{proj?.code} {proj?.name}</span>
+                                  <input type="number" min={0} max={100} step={1}
+                                    value={lp.percentage}
+                                    onChange={e => {
+                                      const pct = Math.max(0, Math.min(100, Number(e.target.value)));
+                                      setLineProjects(prev => ({
+                                        ...prev,
+                                        [lineId]: (prev[lineId] || []).map((r, ri) => ri === lpIdx ? { ...r, percentage: pct } : r),
+                                      }));
+                                    }}
+                                    className="w-12 text-[9px] text-right border rounded px-1 py-0.5"
+                                  />
+                                  <span className="text-[9px] text-gray-400">%</span>
+                                  <button onClick={() => {
+                                    setLineProjects(prev => ({
+                                      ...prev,
+                                      [lineId]: (prev[lineId] || []).filter((_, ri) => ri !== lpIdx),
+                                    }));
+                                  }} className="text-red-400 hover:text-red-600 text-[9px]">x</button>
+                                </div>
+                              );
+                            })}
+                            {/* Add CdC row */}
+                            <div className="flex items-center gap-1 mt-1">
+                              <select
+                                className="flex-1 text-[9px] border rounded px-1 py-0.5"
+                                value=""
+                                onChange={e => {
+                                  if (!e.target.value) return;
+                                  setLineProjects(prev => ({
+                                    ...prev,
+                                    [lineId]: [...(prev[lineId] || []), { id: crypto.randomUUID(), invoice_line_id: lineId, project_id: e.target.value, percentage: 100, amount: null }],
+                                  }));
+                                }}
+                              >
+                                <option value="">+ Aggiungi CdC</option>
+                                {allProjects.filter(p => !(lineProjects[lineId] || []).some(lp => lp.project_id === p.id)).map(p => (
+                                  <option key={p.id} value={p.id}>{p.code} - {p.name}</option>
+                                ))}
+                              </select>
+                            </div>
+                            {/* Save button */}
+                            <button
+                              onClick={async () => {
+                                if (!company?.id || !invoice?.id) return;
+                                try {
+                                  const toSave = (lineProjects[lineId] || []).map(lp => ({
+                                    project_id: lp.project_id,
+                                    percentage: lp.percentage,
+                                    amount: lp.amount,
+                                  }));
+                                  await saveLineProjects(company.id, invoice.id, lineId, toSave);
+                                  const fresh = await loadLineProjects(invoice.id);
+                                  setLineProjects(fresh);
+                                  setCdcPopoverLineId(null);
+                                } catch (e: any) { console.error('Save line CdC error:', e); }
+                              }}
+                              className="mt-2 w-full text-[10px] font-semibold bg-sky-600 text-white rounded px-2 py-1 hover:bg-sky-700"
+                            >
+                              Salva
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <span className="text-[9px] text-gray-300 italic">—</span>
+                    )}
                   </td>}
                   {allAccounts.length > 0 && <td className="text-center px-1 py-1 print:hidden">
-                    {lineId && lineArticleMap[lineId] ? (
+                    {lineId ? (
                       <select
                         value={lineClassifs[lineId]?.account_id || ''}
                         onChange={e => handleLineClassifChange(lineId, 'account_id', e.target.value || null)}
@@ -1168,7 +1371,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                         {allAccounts.map(a => <option key={a.id} value={a.id}>{a.code}</option>)}
                       </select>
                     ) : (
-                      <span className="text-[9px] text-gray-300 italic">{selAccountId ? '← Fatt.' : '—'}</span>
+                      <span className="text-[9px] text-gray-300 italic">—</span>
                     )}
                   </td>}
                 </tr>
@@ -1194,42 +1397,105 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                       onRemove={() => handleRemoveArticle(l.id)}
                     />
                   </td>}
-                  {/* Line-level Cat/CdC/Conto — fallback rows */}
+                  {/* Line-level Cat/CdC/Conto — fallback rows — editable independently */}
                   {allCategories.length > 0 && <td className="text-center px-1 py-1 print:hidden">
-                    {lineArticleMap[l.id] ? (
-                      <select
-                        value={lineClassifs[l.id]?.category_id || ''}
-                        onChange={e => handleLineClassifChange(l.id, 'category_id', e.target.value || null)}
-                        className="w-full max-w-[80px] px-0.5 py-0.5 text-[9px] border border-transparent rounded bg-transparent hover:border-gray-200 hover:bg-white focus:border-sky-300 focus:bg-white outline-none cursor-pointer"
-                      >
-                        <option value="" className="text-gray-400">{selCategoryId ? '← Fatt.' : '—'}</option>
-                        {allCategories.map(c => <option key={c.id} value={c.id}>{c.name.substring(0, 12)}</option>)}
-                      </select>
-                    ) : (
-                      <span className="text-[9px] text-gray-300 italic">{selCategoryId ? '← Fatt.' : '—'}</span>
-                    )}
+                    <select
+                      value={lineClassifs[l.id]?.category_id || ''}
+                      onChange={e => handleLineClassifChange(l.id, 'category_id', e.target.value || null)}
+                      className="w-full max-w-[80px] px-0.5 py-0.5 text-[9px] border border-transparent rounded bg-transparent hover:border-gray-200 hover:bg-white focus:border-sky-300 focus:bg-white outline-none cursor-pointer"
+                    >
+                      <option value="" className="text-gray-400">{selCategoryId ? '← Fatt.' : '—'}</option>
+                      {allCategories.map(c => <option key={c.id} value={c.id}>{c.name.substring(0, 12)}</option>)}
+                    </select>
                   </td>}
-                  {allProjects.length > 0 && <td className="text-center px-1 py-1 print:hidden">
-                    {(() => {
-                      const cdcCodes = cdcRows.map(r => allProjects.find(p => p.id === r.project_id)?.code).filter(Boolean);
-                      return cdcCodes.length > 0
-                        ? <span className="text-[9px] text-gray-400" title={cdcCodes.join(', ')}>{cdcCodes.join(', ').substring(0, 12)}</span>
-                        : <span className="text-[9px] text-gray-300 italic">—</span>;
-                    })()}
+                  {allProjects.length > 0 && <td className="text-center px-1 py-1 print:hidden relative">
+                    <button
+                      onClick={() => setCdcPopoverLineId(cdcPopoverLineId === l.id ? null : l.id)}
+                      className="text-[9px] text-gray-500 hover:text-sky-700 hover:underline cursor-pointer w-full text-center"
+                      title="Clicca per assegnare CdC a questa riga"
+                    >
+                      {lineProjects[l.id]?.length
+                        ? lineProjects[l.id].map(lp => allProjects.find(p => p.id === lp.project_id)?.code).filter(Boolean).join(', ').substring(0, 12)
+                        : (cdcRows.length > 0 ? '← Fatt.' : '—')
+                      }
+                    </button>
+                    {cdcPopoverLineId === l.id && (
+                      <div className="absolute z-50 top-full right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-xl p-3 w-64" onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-[10px] font-semibold text-gray-700">CdC Riga</span>
+                          <button onClick={() => setCdcPopoverLineId(null)} className="text-gray-400 hover:text-gray-600 text-xs">x</button>
+                        </div>
+                        {(lineProjects[l.id] || []).map((lp, lpIdx) => {
+                          const proj = allProjects.find(p => p.id === lp.project_id);
+                          return (
+                            <div key={lp.id || lpIdx} className="flex items-center gap-1 mb-1">
+                              <span className="text-[9px] text-gray-600 flex-1 truncate">{proj?.code} {proj?.name}</span>
+                              <input type="number" min={0} max={100} step={1}
+                                value={lp.percentage}
+                                onChange={e => {
+                                  const pct = Math.max(0, Math.min(100, Number(e.target.value)));
+                                  setLineProjects(prev => ({
+                                    ...prev,
+                                    [l.id]: (prev[l.id] || []).map((r, ri) => ri === lpIdx ? { ...r, percentage: pct } : r),
+                                  }));
+                                }}
+                                className="w-12 text-[9px] text-right border rounded px-1 py-0.5"
+                              />
+                              <span className="text-[9px] text-gray-400">%</span>
+                              <button onClick={() => {
+                                setLineProjects(prev => ({
+                                  ...prev,
+                                  [l.id]: (prev[l.id] || []).filter((_, ri) => ri !== lpIdx),
+                                }));
+                              }} className="text-red-400 hover:text-red-600 text-[9px]">x</button>
+                            </div>
+                          );
+                        })}
+                        <div className="flex items-center gap-1 mt-1">
+                          <select className="flex-1 text-[9px] border rounded px-1 py-0.5" value=""
+                            onChange={e => {
+                              if (!e.target.value) return;
+                              setLineProjects(prev => ({
+                                ...prev,
+                                [l.id]: [...(prev[l.id] || []), { id: crypto.randomUUID(), invoice_line_id: l.id, project_id: e.target.value, percentage: 100, amount: null }],
+                              }));
+                            }}
+                          >
+                            <option value="">+ Aggiungi CdC</option>
+                            {allProjects.filter(p => !(lineProjects[l.id] || []).some(lp => lp.project_id === p.id)).map(p => (
+                              <option key={p.id} value={p.id}>{p.code} - {p.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <button
+                          onClick={async () => {
+                            if (!company?.id || !invoice?.id) return;
+                            try {
+                              const toSave = (lineProjects[l.id] || []).map(lp => ({
+                                project_id: lp.project_id, percentage: lp.percentage, amount: lp.amount,
+                              }));
+                              await saveLineProjects(company.id, invoice.id, l.id, toSave);
+                              const fresh = await loadLineProjects(invoice.id);
+                              setLineProjects(fresh);
+                              setCdcPopoverLineId(null);
+                            } catch (e: any) { console.error('Save line CdC error:', e); }
+                          }}
+                          className="mt-2 w-full text-[10px] font-semibold bg-sky-600 text-white rounded px-2 py-1 hover:bg-sky-700"
+                        >
+                          Salva
+                        </button>
+                      </div>
+                    )}
                   </td>}
                   {allAccounts.length > 0 && <td className="text-center px-1 py-1 print:hidden">
-                    {lineArticleMap[l.id] ? (
-                      <select
-                        value={lineClassifs[l.id]?.account_id || ''}
-                        onChange={e => handleLineClassifChange(l.id, 'account_id', e.target.value || null)}
-                        className="w-full max-w-[80px] px-0.5 py-0.5 text-[9px] border border-transparent rounded bg-transparent hover:border-gray-200 hover:bg-white focus:border-sky-300 focus:bg-white outline-none cursor-pointer"
-                      >
-                        <option value="" className="text-gray-400">{selAccountId ? '← Fatt.' : '—'}</option>
-                        {allAccounts.map(a => <option key={a.id} value={a.id}>{a.code}</option>)}
-                      </select>
-                    ) : (
-                      <span className="text-[9px] text-gray-300 italic">{selAccountId ? '← Fatt.' : '—'}</span>
-                    )}
+                    <select
+                      value={lineClassifs[l.id]?.account_id || ''}
+                      onChange={e => handleLineClassifChange(l.id, 'account_id', e.target.value || null)}
+                      className="w-full max-w-[80px] px-0.5 py-0.5 text-[9px] border border-transparent rounded bg-transparent hover:border-gray-200 hover:bg-white focus:border-sky-300 focus:bg-white outline-none cursor-pointer"
+                    >
+                      <option value="" className="text-gray-400">{selAccountId ? '← Fatt.' : '—'}</option>
+                      {allAccounts.map(a => <option key={a.id} value={a.id}>{a.code}</option>)}
+                    </select>
                   </td>}
                 </tr>
               ))}
@@ -1437,6 +1703,46 @@ export default function FatturePage() {
   const [amountMin, setAmountMin] = useState<number | undefined>(undefined);
   const [amountMax, setAmountMax] = useState<number | undefined>(undefined);
   const [counterpartyPattern, setCounterpartyPattern] = useState<string | undefined>(undefined);
+
+  // ── Batch AI Classification ──
+  const [batchClassifRunning, setBatchClassifRunning] = useState(false);
+  const [batchClassifProgress, setBatchClassifProgress] = useState({ done: 0, total: 0 });
+
+  const runBatchAiClassification = useCallback(async () => {
+    const companyId = company?.id;
+    if (!companyId) return;
+    setBatchClassifRunning(true);
+    try {
+      // Find unclassified invoice IDs: get all invoices, then exclude those with existing classifications
+      const [{ data: allInvIds }, { data: classifiedIds }] = await Promise.all([
+        supabase.from('invoices').select('id').eq('company_id', companyId).eq('direction', directionFilter).limit(200),
+        supabase.from('invoice_classifications').select('invoice_id').eq('company_id', companyId),
+      ]);
+      const classifiedSet = new Set((classifiedIds || []).map((r: any) => r.invoice_id));
+      const ids = (allInvIds || []).map((r: any) => r.id).filter((id: string) => !classifiedSet.has(id)).slice(0, 50);
+      if (ids.length === 0) { setBatchClassifRunning(false); return; }
+      setBatchClassifProgress({ done: 0, total: ids.length });
+
+      const token = await getValidAccessToken();
+      // Process in batches of 10
+      for (let i = 0; i < ids.length; i += 10) {
+        const batch = ids.slice(i, i + 10);
+        await fetch(`${SUPABASE_URL}/functions/v1/classification-ai-suggest`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+            'apikey': SUPABASE_ANON_KEY,
+          },
+          body: JSON.stringify({ company_id: companyId, invoice_ids: batch }),
+        });
+        setBatchClassifProgress({ done: Math.min(i + 10, ids.length), total: ids.length });
+      }
+    } catch (e: any) {
+      console.error('Batch AI classification error:', e);
+    }
+    setBatchClassifRunning(false);
+  }, [company?.id, directionFilter]);
 
   // ── Invoice extraction summary (AI) — lives in module-level store so it survives navigation ──
   const ext = useSyncExternalStore(subscribeExtraction, getExtractionState);
@@ -1761,6 +2067,18 @@ export default function FatturePage() {
             ) : (
               <>✨ Estrai dettagli AI{extractionStats ? ` (${extractionStats.pending} pending)` : ''}</>
             )}
+          </button>
+        )}
+        {invoices.length > 0 && (
+          <button
+            onClick={runBatchAiClassification}
+            disabled={batchClassifRunning}
+            className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-purple-700 bg-purple-50 border border-purple-200 rounded-lg hover:bg-purple-100 disabled:opacity-50"
+          >
+            {batchClassifRunning
+              ? <>⏳ Classifica: {batchClassifProgress.done}/{batchClassifProgress.total}</>
+              : <>&#x2728; Classifica AI</>
+            }
           </button>
         )}
       </div>

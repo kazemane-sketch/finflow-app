@@ -59,6 +59,9 @@ const tools = [
         keyword: { type: "string", description: "Cerca nelle keywords estratte dall'AI (da extracted_summary)" },
         amount_min: { type: "number", description: "Importo totale minimo" },
         amount_max: { type: "number", description: "Importo totale massimo" },
+        classified: { type: "boolean", description: "true = solo fatture classificate, false = solo non classificate" },
+        category_name: { type: "string", description: "Filtra per nome categoria classificazione (ILIKE)" },
+        cost_center_code: { type: "string", description: "Filtra per codice centro di costo" },
         limit: { type: "number", description: "Max risultati (default 20, max 100)" },
       },
     },
@@ -249,6 +252,35 @@ const tools = [
       },
     },
   },
+  {
+    name: "get_classification_stats",
+    description:
+      "Statistiche sulla classificazione fatture: quante classificate/non classificate, breakdown per categoria, per centro di costo, per conto. Utile per domande tipo 'quante fatture sono classificate?', 'distribuzione per categoria'.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        date_from: { type: "string", description: "Data inizio YYYY-MM-DD" },
+        date_to: { type: "string", description: "Data fine YYYY-MM-DD" },
+        direction: { type: "string", enum: ["in", "out"], description: "out = attive, in = passive" },
+      },
+    },
+  },
+  {
+    name: "classify_invoice",
+    description:
+      "Classifica automaticamente fatture usando AI (matching deterministico + Claude Haiku). Input: lista di invoice_ids (max 10). Assegna categoria, conto, centro di costo a livello riga e fattura. Usa quando l'utente chiede di classificare fatture specifiche.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        invoice_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Lista UUID fatture da classificare (max 10)",
+        },
+      },
+      required: ["invoice_ids"],
+    },
+  },
 ];
 
 /* ─── tool handlers ───────────────────────── */
@@ -304,6 +336,20 @@ async function handleGetInvoices(sql: SqlClient, companyId: string, args: Record
   if (typeof args.amount_max === "number") {
     conditions.push(`i.total_amount <= $${idx}`);
     params.push(args.amount_max); idx++;
+  }
+  // Classification filters
+  if (args.classified === true) {
+    conditions.push(`EXISTS (SELECT 1 FROM invoice_classifications ic WHERE ic.invoice_id = i.id AND ic.verified = true)`);
+  } else if (args.classified === false) {
+    conditions.push(`NOT EXISTS (SELECT 1 FROM invoice_classifications ic WHERE ic.invoice_id = i.id)`);
+  }
+  if (args.category_name) {
+    conditions.push(`EXISTS (SELECT 1 FROM invoice_classifications ic JOIN categories c ON c.id = ic.category_id WHERE ic.invoice_id = i.id AND c.name ILIKE '%' || $${idx} || '%')`);
+    params.push(args.category_name); idx++;
+  }
+  if (args.cost_center_code) {
+    conditions.push(`EXISTS (SELECT 1 FROM invoice_projects ip JOIN projects p ON p.id = ip.project_id WHERE ip.invoice_id = i.id AND p.code = $${idx})`);
+    params.push(args.cost_center_code); idx++;
   }
 
   const limit = Math.min(Number(args.limit) || 20, 100);
@@ -678,7 +724,24 @@ async function handleGetCompanyStats(sql: SqlClient, companyId: string, args: Re
     params,
   );
 
-  return { ...stats, top_5_clienti: topClienti, top_5_fornitori: topFornitori };
+  // Classification stats
+  const [classifStats] = await sql.unsafe(
+    `SELECT
+      (SELECT count(*) FROM invoices i WHERE i.company_id = $1${invDateFilter}
+        AND EXISTS (SELECT 1 FROM invoice_classifications ic WHERE ic.invoice_id = i.id AND ic.verified = true)) as classificate_verificate,
+      (SELECT count(*) FROM invoices i WHERE i.company_id = $1${invDateFilter}
+        AND EXISTS (SELECT 1 FROM invoice_classifications ic WHERE ic.invoice_id = i.id AND ic.verified = false)) as classificate_ai,
+      (SELECT count(*) FROM invoices i WHERE i.company_id = $1${invDateFilter}
+        AND NOT EXISTS (SELECT 1 FROM invoice_classifications ic WHERE ic.invoice_id = i.id)) as non_classificate`,
+    params,
+  );
+
+  return {
+    ...stats,
+    top_5_clienti: topClienti,
+    top_5_fornitori: topFornitori,
+    classificazione: classifStats,
+  };
 }
 
 async function handleSuggestReconciliation(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
@@ -1024,6 +1087,138 @@ async function handleGetDistinctLineDescriptions(sql: SqlClient, companyId: stri
   );
 }
 
+async function handleGetClassificationStats(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const params: unknown[] = [companyId];
+  let idx = 2;
+
+  let invDateFilter = "";
+  let directionFilter = "";
+  if (args.date_from) {
+    invDateFilter += ` AND i.date >= $${idx}::date`;
+    params.push(args.date_from); idx++;
+  }
+  if (args.date_to) {
+    invDateFilter += ` AND i.date <= $${idx}::date`;
+    params.push(args.date_to); idx++;
+  }
+  if (args.direction) {
+    directionFilter = ` AND i.direction = $${idx}`;
+    params.push(args.direction); idx++;
+  }
+
+  const dateDir = invDateFilter + directionFilter;
+
+  // Overall counts
+  const [counts] = await sql.unsafe(
+    `SELECT
+      (SELECT count(*) FROM invoices i WHERE i.company_id = $1${dateDir}) as totale_fatture,
+      (SELECT count(*) FROM invoices i WHERE i.company_id = $1${dateDir}
+        AND EXISTS (SELECT 1 FROM invoice_classifications ic WHERE ic.invoice_id = i.id AND ic.verified = true)) as classificate_verificate,
+      (SELECT count(*) FROM invoices i WHERE i.company_id = $1${dateDir}
+        AND EXISTS (SELECT 1 FROM invoice_classifications ic WHERE ic.invoice_id = i.id AND ic.verified = false)) as classificate_ai,
+      (SELECT count(*) FROM invoices i WHERE i.company_id = $1${dateDir}
+        AND NOT EXISTS (SELECT 1 FROM invoice_classifications ic WHERE ic.invoice_id = i.id)) as non_classificate`,
+    params,
+  );
+
+  // Breakdown by category
+  const byCategory = await sql.unsafe(
+    `SELECT c.name as categoria, count(*) as n_fatture, coalesce(sum(i.total_amount), 0) as importo_totale
+     FROM invoice_classifications ic
+     JOIN invoices i ON i.id = ic.invoice_id
+     LEFT JOIN categories c ON c.id = ic.category_id
+     WHERE i.company_id = $1${dateDir}
+     GROUP BY c.name
+     ORDER BY n_fatture DESC
+     LIMIT 20`,
+    params,
+  );
+
+  // Breakdown by cost center
+  const byCostCenter = await sql.unsafe(
+    `SELECT p.code as cdc_codice, p.name as cdc_nome, count(DISTINCT ip.invoice_id) as n_fatture
+     FROM invoice_projects ip
+     JOIN invoices i ON i.id = ip.invoice_id
+     JOIN projects p ON p.id = ip.project_id
+     WHERE i.company_id = $1${dateDir}
+     GROUP BY p.code, p.name
+     ORDER BY n_fatture DESC
+     LIMIT 20`,
+    params,
+  );
+
+  // Breakdown by account
+  const byAccount = await sql.unsafe(
+    `SELECT coa.code as codice_conto, coa.name as nome_conto, count(*) as n_fatture
+     FROM invoice_classifications ic
+     JOIN invoices i ON i.id = ic.invoice_id
+     LEFT JOIN chart_of_accounts coa ON coa.id = ic.account_id
+     WHERE i.company_id = $1${dateDir} AND ic.account_id IS NOT NULL
+     GROUP BY coa.code, coa.name
+     ORDER BY n_fatture DESC
+     LIMIT 20`,
+    params,
+  );
+
+  return {
+    ...counts,
+    per_categoria: byCategory,
+    per_centro_di_costo: byCostCenter,
+    per_conto: byAccount,
+  };
+}
+
+async function handleClassifyInvoice(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const invoiceIds = args.invoice_ids;
+  if (!Array.isArray(invoiceIds) || invoiceIds.length === 0) {
+    return { error: "invoice_ids deve essere un array non vuoto" };
+  }
+  if (invoiceIds.length > 10) {
+    return { error: "Massimo 10 fatture per chiamata" };
+  }
+
+  // Call the classification-ai-suggest edge function internally
+  const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+
+  if (!supabaseUrl || !serviceRoleKey) {
+    return { error: "SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY non configurati" };
+  }
+
+  try {
+    const response = await fetch(`${supabaseUrl}/functions/v1/classification-ai-suggest`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${serviceRoleKey}`,
+      },
+      body: JSON.stringify({ invoice_ids: invoiceIds }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      return { error: `Errore classificazione: ${response.status} ${clip(errText, 200)}` };
+    }
+
+    const result = await response.json();
+    // Return a summarized version for chat context
+    const summary = {
+      stats: result.stats,
+      results: (result.results || []).map((r: Record<string, unknown>) => ({
+        invoice_id: r.invoice_id,
+        confidence: r.confidence,
+        category: r.category_name,
+        account: r.account_name,
+        cost_centers: r.cost_centers,
+        line_count: Array.isArray(r.lines) ? r.lines.length : 0,
+      })),
+    };
+    return summary;
+  } catch (err) {
+    return { error: `Errore chiamata classificazione: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
 async function executeToolHandler(
   sql: SqlClient,
   companyId: string,
@@ -1061,6 +1256,10 @@ async function executeToolHandler(
       return handleAggregateInvoiceLines(sql, companyId, toolInput);
     case "get_distinct_line_descriptions":
       return handleGetDistinctLineDescriptions(sql, companyId, toolInput);
+    case "get_classification_stats":
+      return handleGetClassificationStats(sql, companyId, toolInput);
+    case "classify_invoice":
+      return handleClassifyInvoice(sql, companyId, toolInput);
     default:
       return { error: `Tool sconosciuto: ${toolName}` };
   }
@@ -1101,6 +1300,13 @@ CONTROPARTI: get_counterparties supporta ordinamento per fatturato, credito o de
 STATISTICHE: get_company_stats ora include saldo_banca e top 5 clienti/fornitori per fatturato. Supporta filtri date per periodo specifico.
 
 Hai anche accesso alla Knowledge Base aziendale tramite search_knowledge_base. Se l'utente chiede informazioni su documenti caricati (contratti, regolamenti, procedure, manuali), cerca prima nella knowledge base.
+
+CLASSIFICAZIONE FATTURE:
+- get_classification_stats: per statistiche su quante fatture sono classificate, breakdown per categoria/CdC/conto. Usa per domande tipo "quante fatture sono classificate?", "distribuzione per categoria", "stato classificazione".
+- classify_invoice: per classificare automaticamente fatture specifiche (max 10). Usa matching deterministico + AI Haiku. Input: invoice_ids. Usa quando l'utente dice "classifica questa fattura", "classifica le fatture di [controparte]".
+- get_invoices con filtro classified=false: per trovare fatture da classificare.
+- get_invoices con filtro category_name o cost_center_code: per trovare fatture classificate con categoria/CdC specifico.
+- get_company_stats include sezione "classificazione" con conteggi fatture classificate/AI/non classificate.
 
 Quando presenti tabelle o elenchi, usa il formato markdown. Quando menzioni importi, specifica sempre se è un'entrata o un'uscita. Per le date usa il formato italiano (gg/mm/aaaa).`;
 
