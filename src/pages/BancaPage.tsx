@@ -931,16 +931,22 @@ export default function BancaPage() {
   // Deep-link: ?txId= → auto-open transaction detail
   useEffect(() => {
     const txId = searchParams.get('txId')
-    if (!txId || !transactions.length) return
+    if (!txId) return
+    // Wait for initial load to complete before deciding TX is missing
+    if (loading) return
+
     const tx = transactions.find((t: any) => t.id === txId)
     if (tx) {
       setSelectedTx(tx)
       loadBankTransactionDetail(tx.id).then(full => { if (full) setSelectedTx(full) })
+    } else {
+      // TX not in loaded list (different filters/page) — load directly from DB
+      loadBankTransactionDetail(txId).then(full => { if (full) setSelectedTx(full) })
     }
     // Clean up the search param to avoid re-triggering
     searchParams.delete('txId')
     setSearchParams(searchParams, { replace: true })
-  }, [searchParams, transactions]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [searchParams, transactions, loading]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Quick date filters
   const setQuickDate = (type: string) => {

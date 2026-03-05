@@ -730,7 +730,7 @@ async function askInvoiceAiSearch(
 export default function FatturePage() {
   const { company, loading: companyLoading, ensureCompany, refetch: refetchCompany } = useCompany();
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const companyId = company?.id || null;
   const { matchedInvoiceIds, invoiceScores, refresh: refreshBadges } = useReconciliationBadges();
   const [invoices, setInvoices] = useState<DBInvoice[]>([]);
@@ -912,9 +912,12 @@ export default function FatturePage() {
     const invoiceIdParam = searchParams.get('invoiceId');
     if (!invoiceIdParam || !companyId) return;
 
-    // If already in current list, just select it
+    // If already in current list, select it and clean up URL
     if (invoices.some(inv => inv.id === invoiceIdParam)) {
       setSelectedId(invoiceIdParam);
+      // Clean up the search param to avoid re-triggering
+      searchParams.delete('invoiceId');
+      setSearchParams(searchParams, { replace: true });
       return;
     }
 
@@ -931,10 +934,10 @@ export default function FatturePage() {
         if (neededDir !== directionFilter) {
           setDirectionFilter(neededDir);
           // directionFilter change triggers reload → invoices update →
-          // this effect re-runs → invoice found → auto-selected
+          // this effect re-runs → invoice found → auto-selected → URL cleaned
         }
       });
-  }, [searchParams, invoices, companyId, directionFilter]);
+  }, [searchParams, invoices, companyId, directionFilter]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── AI Search handler — edge function handles all filtering server-side ──
   const handleAISearch = useCallback(async () => {
