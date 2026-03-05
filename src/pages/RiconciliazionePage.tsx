@@ -4,7 +4,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   Link2, CheckCircle2, XCircle, Sparkles, RefreshCw, ChevronRight,
   ArrowRightLeft, Loader2, AlertTriangle, Search, FileText, Landmark,
-  ChevronDown, X, Check, Zap, Trash2, Unlink, ExternalLink,
+  ChevronDown, X, Check, Zap, Trash2, Unlink, ExternalLink, CircleDollarSign,
+  ArrowRight, Ban,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { useCompany } from '@/hooks/useCompany'
@@ -69,6 +70,8 @@ interface UnmatchedTx {
   extraction_status: string | null
   commission_amount: number | null
   extracted_refs: Record<string, unknown> | null
+  reconciled_amount: number | null
+  reconciliation_status: string | null
 }
 
 interface OpenInstallment {
@@ -93,6 +96,7 @@ interface ReconciledRow {
   match_reason: string | null
   confirmed_at: string | null
   created_at: string
+  reconciled_amount: number | null
   bank_transaction: {
     id: string
     date: string | null
@@ -102,6 +106,7 @@ interface ReconciledRow {
     transaction_type: string | null
     direction: string | null
     commission_amount: number | null
+    reconciled_amount: number | null
   } | null
   invoice: {
     id: string
@@ -115,6 +120,7 @@ interface ReconciledRow {
 
 interface KpiData {
   unmatched: number
+  partial: number
   pendingSuggestions: number
   matched: number
   total: number
@@ -219,7 +225,7 @@ export default function RiconciliazionePage() {
   const [unmatchedTxs, setUnmatchedTxs] = useState<UnmatchedTx[]>([])
   const [openInstallments, setOpenInstallments] = useState<OpenInstallment[]>([])
   const [reconciledRows, setReconciledRows] = useState<ReconciledRow[]>([])
-  const [kpi, setKpi] = useState<KpiData>({ unmatched: 0, pendingSuggestions: 0, matched: 0, total: 0 })
+  const [kpi, setKpi] = useState<KpiData>({ unmatched: 0, partial: 0, pendingSuggestions: 0, matched: 0, total: 0 })
 
   // UI state
   const [loading, setLoading] = useState(true)
@@ -240,6 +246,21 @@ export default function RiconciliazionePage() {
   const [deletingReconId, setDeletingReconId] = useState<string | null>(null)
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
 
+  // Reconciliation confirm dialog (amount difference)
+  const [pendingConfirm, setPendingConfirm] = useState<{
+    suggestion?: SuggestionRow
+    txId?: string
+    installment?: OpenInstallment
+    txRemaining: number
+    instRemaining: number
+  } | null>(null)
+
+  // Close difference dialog (Riconciliati tab)
+  const [closingDiffId, setClosingDiffId] = useState<string | null>(null)
+  const [closingReason, setClosingReason] = useState('commissione_bancaria')
+  const [closingAmount, setClosingAmount] = useState('')
+  const [closingInProgress, setClosingInProgress] = useState(false)
+
   // Detail popup (double-click)
   const [detailPopup, setDetailPopup] = useState<{ type: 'bank_tx' | 'invoice'; id: string } | null>(null)
   const [detailPopupData, setDetailPopupData] = useState<any>(null)
@@ -250,12 +271,15 @@ export default function RiconciliazionePage() {
     if (!companyId) return
     const [
       { count: unmatched },
+      { count: partial },
       { count: pendingSuggestions },
       { count: matched },
       { count: total },
     ] = await Promise.all([
       supabase.from('bank_transactions').select('id', { count: 'exact', head: true })
         .eq('company_id', companyId).eq('reconciliation_status', 'unmatched'),
+      supabase.from('bank_transactions').select('id', { count: 'exact', head: true })
+        .eq('company_id', companyId).eq('reconciliation_status', 'partial'),
       supabase.from('reconciliation_suggestions').select('id', { count: 'exact', head: true })
         .eq('company_id', companyId).eq('status', 'pending'),
       supabase.from('bank_transactions').select('id', { count: 'exact', head: true })
@@ -265,6 +289,7 @@ export default function RiconciliazionePage() {
     ])
     setKpi({
       unmatched: unmatched || 0,
+      partial: partial || 0,
       pendingSuggestions: pendingSuggestions || 0,
       matched: matched || 0,
       total: total || 0,
@@ -300,7 +325,7 @@ export default function RiconciliazionePage() {
     if (!companyId) return
     const { data } = await supabase
       .from('bank_transactions')
-      .select('id, date, amount, counterparty_name, description, transaction_type, direction, raw_text, extraction_status, commission_amount, extracted_refs')
+      .select('id, date, amount, counterparty_name, description, transaction_type, direction, raw_text, extraction_status, commission_amount, extracted_refs, reconciled_amount, reconciliation_status')
       .eq('company_id', companyId)
       .in('reconciliation_status', ['unmatched', 'partial'])
       .order('date', { ascending: false })
@@ -345,8 +370,8 @@ export default function RiconciliazionePage() {
       .from('reconciliations')
       .select(`
         id, invoice_id, bank_transaction_id, match_type, confidence,
-        match_reason, confirmed_at, created_at,
-        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, commission_amount),
+        match_reason, confirmed_at, created_at, reconciled_amount,
+        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, commission_amount, reconciled_amount),
         invoice:invoices(id, number, counterparty, total_amount, date, direction)
       `)
       .eq('company_id', companyId)
@@ -424,8 +449,8 @@ export default function RiconciliazionePage() {
     setGenerating(false)
   }, [companyId, generating, loadKpis, loadSuggestions])
 
-  // ─── confirm suggestion (partial reconciliation aware) ────────────────────
-  const confirmSuggestion = useCallback(async (suggestion: SuggestionRow) => {
+  // ─── confirm suggestion (partial reconciliation aware + dialog for diff > 1€) ─
+  const confirmSuggestion = useCallback(async (suggestion: SuggestionRow, overrideAmount?: number) => {
     if (!companyId) return
     setConfirmingId(suggestion.id)
     try {
@@ -440,8 +465,15 @@ export default function RiconciliazionePage() {
       const txRemaining = tx ? Math.abs(Number(tx.amount)) - Number(tx.reconciled_amount || 0) : 0
       const instRemaining = inst ? Number(inst.amount_due) - Number(inst.paid_amount || 0) : 0
 
-      // Reconcile amount = min of what's available on both sides
-      const reconcileAmount = inst ? Math.min(txRemaining, instRemaining) : txRemaining
+      // If diff > 1€ and no override → show dialog instead of proceeding
+      if (overrideAmount == null && inst && Math.abs(txRemaining - instRemaining) > 1) {
+        setPendingConfirm({ suggestion, txRemaining, instRemaining })
+        setConfirmingId(null)
+        return
+      }
+
+      // Use override if provided, otherwise min of what's available
+      const reconcileAmount = overrideAmount ?? (inst ? Math.min(txRemaining, instRemaining) : txRemaining)
 
       // Validation: if nothing left to reconcile, expire suggestion
       if (reconcileAmount < 0.01) {
@@ -614,7 +646,7 @@ export default function RiconciliazionePage() {
   }, [suggestions, confirmSuggestion, loadKpis, loadSuggestions])
 
   // ─── manual match (assisted tab) ───────────
-  const manualMatch = useCallback(async (txId: string, installment: OpenInstallment) => {
+  const manualMatch = useCallback(async (txId: string, installment: OpenInstallment, overrideAmount?: number) => {
     if (!companyId) return
     setConfirmingId(txId)
     try {
@@ -624,8 +656,18 @@ export default function RiconciliazionePage() {
 
       // Calculate partial reconciliation amounts
       const txAmount = Math.abs(Number(tx.amount))
+      const txReconciledAlready = Number(tx.reconciled_amount || 0)
+      const txRemaining = txAmount - txReconciledAlready
       const instRemaining = Number(installment.amount_due) - Number(installment.paid_amount)
-      const reconcileAmount = Math.min(txAmount, instRemaining)
+
+      // If diff > 1€ and no override → show dialog
+      if (overrideAmount == null && Math.abs(txRemaining - instRemaining) > 1) {
+        setPendingConfirm({ txId, installment, txRemaining, instRemaining })
+        setConfirmingId(null)
+        return
+      }
+
+      const reconcileAmount = overrideAmount ?? Math.min(txRemaining, instRemaining)
 
       if (reconcileAmount < 0.01) {
         toast.error('Importo insufficiente per riconciliare')
@@ -651,7 +693,7 @@ export default function RiconciliazionePage() {
       if (e1) throw e1
 
       // Update bank tx with reconciled_amount
-      const newTxReconciled = reconcileAmount // For manual match on unmatched TX, starts at 0
+      const newTxReconciled = txReconciledAlready + reconcileAmount
       const txFullyMatched = newTxReconciled >= txAmount - 0.01
       const { error: e2 } = await supabase
         .from('bank_transactions')
@@ -810,6 +852,73 @@ export default function RiconciliazionePage() {
     setDeletingReconId(null)
   }, [companyId, loadKpis, loadUnmatched, loadOpenInstallments])
 
+  // ─── handle confirm choice (from dialog) ───
+  const handleConfirmChoice = useCallback(async (chosenAmount: number) => {
+    if (!pendingConfirm) return
+    if (pendingConfirm.suggestion) {
+      await confirmSuggestion(pendingConfirm.suggestion, chosenAmount)
+    } else if (pendingConfirm.txId && pendingConfirm.installment) {
+      await manualMatch(pendingConfirm.txId, pendingConfirm.installment, chosenAmount)
+    }
+    setPendingConfirm(null)
+  }, [pendingConfirm, confirmSuggestion, manualMatch])
+
+  // ─── close difference (Riconciliati tab) ──
+  const closeDifference = useCallback(async (reconRow: ReconciledRow, amount: number, reason: string) => {
+    if (!companyId) return
+    setClosingInProgress(true)
+    try {
+      const { data: { user } } = await supabase.auth.getUser()
+      const tx = reconRow.bank_transaction
+      if (!tx) throw new Error('Movimento non trovato')
+
+      // 1. Update bank_transaction.reconciled_amount
+      const newReconciled = Number(tx.reconciled_amount || 0) + amount
+      const newStatus = newReconciled >= Math.abs(Number(tx.amount)) - 0.01 ? 'matched' : 'partial'
+      const { error: e1 } = await supabase.from('bank_transactions')
+        .update({ reconciled_amount: newReconciled, reconciliation_status: newStatus })
+        .eq('id', reconRow.bank_transaction_id)
+      if (e1) throw e1
+
+      // 2. Log with adjustment
+      await supabase.from('reconciliation_log').insert({
+        company_id: companyId,
+        bank_transaction_id: reconRow.bank_transaction_id,
+        invoice_id: reconRow.invoice_id,
+        proposed_by: 'manual',
+        accepted: true,
+        user_id: user?.id,
+        match_score: 100,
+        match_reason: `Chiusura differenza: ${reason}`,
+        adjustment_amount: amount,
+        adjustment_reason: reason,
+      })
+
+      // 3. If TX fully matched → expire pending suggestions
+      if (newStatus === 'matched') {
+        await supabase.from('reconciliation_suggestions')
+          .update({ status: 'expired' })
+          .eq('bank_transaction_id', reconRow.bank_transaction_id)
+          .eq('status', 'pending')
+      }
+
+      const reasonLabels: Record<string, string> = {
+        abbuono_attivo: 'Abbuono attivo',
+        abbuono_passivo: 'Abbuono passivo',
+        commissione_bancaria: 'Commissione bancaria',
+        arrotondamento: 'Arrotondamento',
+      }
+      toast.success(`Differenza di ${fmtEur(amount)} chiusa come ${reasonLabels[reason] || reason}`)
+      setClosingDiffId(null)
+      setClosingAmount('')
+      await Promise.all([loadKpis(), loadReconciled()])
+    } catch (err: unknown) {
+      const msg = errMsg(err)
+      toast.error(`Errore chiusura differenza: ${msg}`)
+    }
+    setClosingInProgress(false)
+  }, [companyId, loadKpis, loadReconciled])
+
   // ─── tab change handler ────────────────────
   const handleTabChange = (tab: string) => {
     const t = tab as 'suggestions' | 'assisted' | 'reconciled'
@@ -958,7 +1067,7 @@ export default function RiconciliazionePage() {
       </div>
 
       {/* ──── KPI Cards ──── */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
         <KpiCard
           label="Da riconciliare"
           value={kpi.unmatched}
@@ -967,6 +1076,17 @@ export default function RiconciliazionePage() {
           bg="bg-red-50"
           iconColor="text-red-500"
         />
+        {kpi.partial > 0 && (
+          <KpiCard
+            label="Parziali"
+            value={kpi.partial}
+            icon={ArrowRightLeft}
+            color="text-orange-700"
+            bg="bg-orange-50"
+            iconColor="text-orange-500"
+            sub="riconciliati parzialmente"
+          />
+        )}
         <KpiCard
           label="Suggerimenti AI"
           value={kpi.pendingSuggestions}
@@ -986,11 +1106,11 @@ export default function RiconciliazionePage() {
         <KpiCard
           label="Completamento"
           value={`${matchPct}%`}
-          icon={ArrowRightLeft}
+          icon={Zap}
           color="text-blue-700"
           bg="bg-blue-50"
           iconColor="text-blue-500"
-          sub={`${kpi.matched} / ${kpi.total} movimenti`}
+          sub={`${kpi.matched + kpi.partial} / ${kpi.total} movimenti`}
         />
       </div>
 
@@ -1263,6 +1383,9 @@ export default function RiconciliazionePage() {
                   const sign = tx.direction === 'in' ? '+' : '-'
                   const netAmt = hasComm ? txAbs - Math.abs(Number(tx.commission_amount)) : txAbs
                   const txRefs = extractClientInvoiceRefs(tx.extracted_refs, tx.raw_text)
+                  const isPartial = tx.reconciliation_status === 'partial'
+                  const txReconciledAmt = Number(tx.reconciled_amount || 0)
+                  const txAvailable = txAbs - txReconciledAmt
                   return (
                     <button
                       key={tx.id}
@@ -1279,6 +1402,11 @@ export default function RiconciliazionePage() {
                           <span className="text-xs font-medium text-gray-800 truncate">
                             {tx.counterparty_name || 'N.D.'}
                           </span>
+                          {isPartial && (
+                            <span className="text-[9px] font-medium text-orange-600 bg-orange-50 px-1.5 py-0.5 rounded-full shrink-0">
+                              Parziale
+                            </span>
+                          )}
                           {txRefs.length > 0 && (
                             <span className="text-[9px] text-emerald-700 bg-emerald-50 px-1 py-0.5 rounded shrink-0" title={`Rif. fatture: ${txRefs.join(', ')}`}>
                               📌{txRefs.length}
@@ -1300,6 +1428,11 @@ export default function RiconciliazionePage() {
                           <span className="text-[10px] text-gray-400 truncate">{tx.description}</span>
                         )}
                       </div>
+                      {isPartial && (
+                        <p className="text-[10px] text-orange-600 mt-0.5 pl-3.5">
+                          Disponibile: {fmtEur(txAvailable)} (di {fmtEur(txAbs)})
+                        </p>
+                      )}
                     </button>
                   )
                 })}
@@ -1434,7 +1567,7 @@ export default function RiconciliazionePage() {
               {/* Table */}
               <div className="border rounded-lg bg-white overflow-hidden">
                 {/* Header */}
-                <div className="grid grid-cols-[1fr_auto_1fr_auto] gap-0 bg-gray-50 border-b px-4 py-2.5 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                <div className="grid grid-cols-[1fr_auto_1fr_80px_auto] gap-0 bg-gray-50 border-b px-4 py-2.5 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
                   <div className="flex items-center gap-1.5">
                     <Landmark className="h-3 w-3" />
                     Movimento bancario
@@ -1444,6 +1577,7 @@ export default function RiconciliazionePage() {
                     <FileText className="h-3 w-3" />
                     Fattura
                   </div>
+                  <div className="text-right">Differenza</div>
                   <div className="text-right">Azioni</div>
                 </div>
 
@@ -1464,103 +1598,194 @@ export default function RiconciliazionePage() {
                     const isConfirmingDelete = confirmDeleteId === r.id
                     const isDeleting = deletingReconId === r.id
 
+                    // Difference calculation: TX total vs what's been reconciled on the TX
+                    const txTotalReconciled = Number(tx.reconciled_amount || 0)
+                    const txRemainder = absAmount - txTotalReconciled
+                    const txHasRemainder = txRemainder > 0.01
+                    const isClosingThis = closingDiffId === r.id
+
                     return (
-                      <div key={r.id} className="grid grid-cols-[1fr_auto_1fr_auto] gap-0 px-4 py-3 hover:bg-gray-50/50 items-center transition-colors">
-                        {/* Bank transaction */}
-                        <div
-                          className="cursor-pointer hover:opacity-80 min-w-0"
-                          onDoubleClick={() => setDetailPopup({ type: 'bank_tx', id: tx.id })}
-                          title="Doppio click per dettaglio"
-                        >
-                          <div className="flex items-center gap-2">
-                            <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${txDir === 'in' ? 'bg-emerald-500' : 'bg-red-500'}`} />
-                            <span className="text-xs font-medium text-gray-800 truncate">
-                              {tx.counterparty_name || 'N.D.'}
-                            </span>
-                            <span className={`text-xs font-bold shrink-0 ${txDir === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
-                              {sign}{fmtEur(netAmt)}
+                      <div key={r.id}>
+                        <div className="grid grid-cols-[1fr_auto_1fr_80px_auto] gap-0 px-4 py-3 hover:bg-gray-50/50 items-center transition-colors">
+                          {/* Bank transaction */}
+                          <div
+                            className="cursor-pointer hover:opacity-80 min-w-0"
+                            onDoubleClick={() => setDetailPopup({ type: 'bank_tx', id: tx.id })}
+                            title="Doppio click per dettaglio"
+                          >
+                            <div className="flex items-center gap-2">
+                              <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${txDir === 'in' ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                              <span className="text-xs font-medium text-gray-800 truncate">
+                                {tx.counterparty_name || 'N.D.'}
+                              </span>
+                              <span className={`text-xs font-bold shrink-0 ${txDir === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
+                                {sign}{fmtEur(netAmt)}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2 mt-0.5 pl-3.5">
+                              <span className="text-[10px] text-gray-400">{fmtDate(tx.date)}</span>
+                              {tx.description && (
+                                <span className="text-[10px] text-gray-400 truncate">{tx.description.slice(0, 60)}</span>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Arrow */}
+                          <div className="px-3 flex flex-col items-center">
+                            <Link2 className="h-4 w-4 text-emerald-500" />
+                            <span className={`text-[9px] mt-0.5 px-1.5 py-0.5 rounded-full font-medium ${
+                              r.match_type === 'auto' ? 'bg-blue-50 text-blue-600'
+                              : r.match_type === 'manual' ? 'bg-gray-100 text-gray-600'
+                              : 'bg-purple-50 text-purple-600'
+                            }`}>
+                              {r.match_type === 'auto' ? 'Auto' : r.match_type === 'manual' ? 'Manuale' : 'AI'}
                             </span>
                           </div>
-                          <div className="flex items-center gap-2 mt-0.5 pl-3.5">
-                            <span className="text-[10px] text-gray-400">{fmtDate(tx.date)}</span>
-                            {tx.description && (
-                              <span className="text-[10px] text-gray-400 truncate">{tx.description.slice(0, 60)}</span>
+
+                          {/* Invoice */}
+                          <div
+                            className="cursor-pointer hover:opacity-80 min-w-0"
+                            onDoubleClick={() => inv && setDetailPopup({ type: 'invoice', id: inv.id })}
+                            title="Doppio click per dettaglio"
+                          >
+                            {inv ? (
+                              <>
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs font-medium text-gray-800 truncate">{invoiceDenom}</span>
+                                  {inv.number && (
+                                    <span className="text-[10px] text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded shrink-0">
+                                      {inv.number}
+                                    </span>
+                                  )}
+                                  <span className="text-xs font-bold text-blue-700 shrink-0">
+                                    {fmtEur(inv.total_amount)}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-2 mt-0.5">
+                                  <span className="text-[10px] text-gray-400">{fmtDate(inv.date)}</span>
+                                </div>
+                              </>
+                            ) : (
+                              <span className="text-xs text-gray-400">Fattura non trovata</span>
+                            )}
+                          </div>
+
+                          {/* Difference column */}
+                          <div className="text-right">
+                            {txHasRemainder ? (
+                              <div>
+                                <span className={`text-xs font-bold ${
+                                  txRemainder < 5 ? 'text-emerald-600' :
+                                  txRemainder <= 50 ? 'text-orange-600' :
+                                  'text-red-600'
+                                }`}>
+                                  {fmtEur(txRemainder)}
+                                </span>
+                                <p className="text-[9px] text-gray-400">residuo</p>
+                              </div>
+                            ) : (
+                              <span className="text-[10px] text-emerald-500 font-medium">✓</span>
+                            )}
+                          </div>
+
+                          {/* Actions */}
+                          <div className="flex items-center gap-1 shrink-0 ml-2">
+                            {isConfirmingDelete ? (
+                              <div className="flex items-center gap-1">
+                                <button
+                                  onClick={() => deleteReconciliation(r)}
+                                  disabled={isDeleting}
+                                  className="flex items-center gap-1 px-2 py-1 text-[10px] font-medium rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
+                                >
+                                  {isDeleting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+                                  Conferma
+                                </button>
+                                <button
+                                  onClick={() => setConfirmDeleteId(null)}
+                                  disabled={isDeleting}
+                                  className="p-1 text-gray-400 hover:text-gray-600 transition-colors"
+                                >
+                                  <X className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+                            ) : (
+                              <>
+                                {txHasRemainder && txRemainder <= 50 && (
+                                  <button
+                                    onClick={() => {
+                                      setClosingDiffId(r.id)
+                                      setClosingAmount(txRemainder.toFixed(2))
+                                      setClosingReason('commissione_bancaria')
+                                    }}
+                                    className="p-1.5 rounded-md text-orange-400 hover:bg-orange-50 hover:text-orange-600 transition-colors"
+                                    title="Chiudi differenza"
+                                  >
+                                    <CircleDollarSign className="h-4 w-4" />
+                                  </button>
+                                )}
+                                <button
+                                  onClick={() => setConfirmDeleteId(r.id)}
+                                  className="p-1.5 rounded-md text-red-400 hover:bg-red-50 hover:text-red-600 transition-colors"
+                                  title="Elimina riconciliazione"
+                                >
+                                  <Unlink className="h-4 w-4" />
+                                </button>
+                              </>
                             )}
                           </div>
                         </div>
 
-                        {/* Arrow */}
-                        <div className="px-3 flex flex-col items-center">
-                          <Link2 className="h-4 w-4 text-emerald-500" />
-                          <span className={`text-[9px] mt-0.5 px-1.5 py-0.5 rounded-full font-medium ${
-                            r.match_type === 'auto' ? 'bg-blue-50 text-blue-600'
-                            : r.match_type === 'manual' ? 'bg-gray-100 text-gray-600'
-                            : 'bg-purple-50 text-purple-600'
-                          }`}>
-                            {r.match_type === 'auto' ? 'Auto' : r.match_type === 'manual' ? 'Manuale' : 'AI'}
-                          </span>
-                        </div>
-
-                        {/* Invoice */}
-                        <div
-                          className="cursor-pointer hover:opacity-80 min-w-0"
-                          onDoubleClick={() => inv && setDetailPopup({ type: 'invoice', id: inv.id })}
-                          title="Doppio click per dettaglio"
-                        >
-                          {inv ? (
-                            <>
-                              <div className="flex items-center gap-2">
-                                <span className="text-xs font-medium text-gray-800 truncate">{invoiceDenom}</span>
-                                {inv.number && (
-                                  <span className="text-[10px] text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded shrink-0">
-                                    {inv.number}
-                                  </span>
-                                )}
-                                <span className="text-xs font-bold text-blue-700 shrink-0">
-                                  {fmtEur(inv.total_amount)}
-                                </span>
+                        {/* Close difference inline dialog */}
+                        {isClosingThis && (
+                          <div className="px-4 pb-3 pt-1 bg-orange-50/50 border-t border-orange-100">
+                            <div className="flex items-center gap-3 flex-wrap">
+                              <div className="flex items-center gap-1.5">
+                                <label className="text-[10px] font-medium text-gray-600">Importo:</label>
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  value={closingAmount}
+                                  onChange={e => setClosingAmount(e.target.value)}
+                                  className="w-20 px-2 py-1 text-xs border rounded focus:outline-none focus:ring-1 focus:ring-orange-400"
+                                />
                               </div>
-                              <div className="flex items-center gap-2 mt-0.5">
-                                <span className="text-[10px] text-gray-400">{fmtDate(inv.date)}</span>
+                              <div className="flex items-center gap-1.5">
+                                <label className="text-[10px] font-medium text-gray-600">Motivo:</label>
+                                <select
+                                  value={closingReason}
+                                  onChange={e => setClosingReason(e.target.value)}
+                                  className="px-2 py-1 text-xs border rounded focus:outline-none focus:ring-1 focus:ring-orange-400"
+                                >
+                                  <option value="commissione_bancaria">Commissione bancaria</option>
+                                  <option value="abbuono_attivo">Abbuono attivo</option>
+                                  <option value="abbuono_passivo">Abbuono passivo</option>
+                                  <option value="arrotondamento">Arrotondamento</option>
+                                </select>
                               </div>
-                            </>
-                          ) : (
-                            <span className="text-xs text-gray-400">Fattura non trovata</span>
-                          )}
-                        </div>
-
-                        {/* Actions */}
-                        <div className="flex items-center gap-1 shrink-0 ml-2">
-                          {isConfirmingDelete ? (
-                            <div className="flex items-center gap-1">
                               <button
-                                onClick={() => deleteReconciliation(r)}
-                                disabled={isDeleting}
-                                className="flex items-center gap-1 px-2 py-1 text-[10px] font-medium rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
+                                onClick={() => {
+                                  const amt = parseFloat(closingAmount)
+                                  if (isNaN(amt) || amt < 0.01) {
+                                    toast.error('Importo non valido')
+                                    return
+                                  }
+                                  closeDifference(r, amt, closingReason)
+                                }}
+                                disabled={closingInProgress}
+                                className="flex items-center gap-1 px-2.5 py-1 text-[10px] font-medium rounded bg-orange-600 text-white hover:bg-orange-700 disabled:opacity-50 transition-colors"
                               >
-                                {isDeleting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
-                                Conferma
+                                {closingInProgress ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />}
+                                Chiudi
                               </button>
                               <button
-                                onClick={() => setConfirmDeleteId(null)}
-                                disabled={isDeleting}
+                                onClick={() => setClosingDiffId(null)}
                                 className="p-1 text-gray-400 hover:text-gray-600 transition-colors"
                               >
                                 <X className="h-3.5 w-3.5" />
                               </button>
                             </div>
-                          ) : (
-                            <>
-                              <button
-                                onClick={() => setConfirmDeleteId(r.id)}
-                                className="p-1.5 rounded-md text-red-400 hover:bg-red-50 hover:text-red-600 transition-colors"
-                                title="Elimina riconciliazione"
-                              >
-                                <Unlink className="h-4 w-4" />
-                              </button>
-                            </>
-                          )}
-                        </div>
+                          </div>
+                        )}
                       </div>
                     )
                   })}
@@ -1570,6 +1795,16 @@ export default function RiconciliazionePage() {
           )}
         </TabsContent>
       </Tabs>
+
+      {/* ──── Reconciliation confirm dialog (amount difference) ──── */}
+      {pendingConfirm && (
+        <ReconciliationConfirmDialog
+          txRemaining={pendingConfirm.txRemaining}
+          instRemaining={pendingConfirm.instRemaining}
+          onChoice={handleConfirmChoice}
+          onCancel={() => setPendingConfirm(null)}
+        />
+      )}
 
       {/* ──── Detail popup overlay ──── */}
       {detailPopup && (
@@ -1745,6 +1980,91 @@ function KpiCard({ label, value, icon: Icon, color, bg, iconColor, sub }: {
       </div>
       <p className={`text-2xl font-bold mt-1.5 ${color}`}>{value}</p>
       {sub && <p className="text-[10px] text-gray-500 mt-0.5">{sub}</p>}
+    </div>
+  )
+}
+
+/* ─── Reconciliation Confirm Dialog (amount difference) ─ */
+
+function ReconciliationConfirmDialog({ txRemaining, instRemaining, onChoice, onCancel }: {
+  txRemaining: number
+  instRemaining: number
+  onChoice: (amount: number) => void
+  onCancel: () => void
+}) {
+  const diff = Math.abs(txRemaining - instRemaining)
+  const txIsLarger = txRemaining > instRemaining
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[2px]"
+      onClick={onCancel}
+    >
+      <div
+        className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 space-y-4"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center gap-2 mb-1">
+          <AlertTriangle className="h-5 w-5 text-orange-500" />
+          <h3 className="text-sm font-semibold text-gray-800">Differenza importi</h3>
+        </div>
+
+        <p className="text-xs text-gray-600">
+          L'importo del movimento ({fmtEur(txRemaining)}) e della rata ({fmtEur(instRemaining)}) differiscono
+          di <span className="font-bold text-orange-600">{fmtEur(diff)}</span>.
+          Come vuoi procedere?
+        </p>
+
+        <div className="space-y-2">
+          {/* Option 1: Full TX amount */}
+          <button
+            onClick={() => onChoice(txRemaining)}
+            className="w-full flex items-center gap-3 p-3 rounded-lg border-2 border-transparent bg-emerald-50 hover:border-emerald-400 transition-colors text-left group"
+          >
+            <div className="shrink-0 w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center group-hover:bg-emerald-200 transition-colors">
+              <Landmark className="h-4 w-4 text-emerald-600" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-medium text-gray-800">Riconcilia importo intero del movimento</p>
+              <p className="text-[10px] text-gray-500 mt-0.5">
+                {fmtEur(txRemaining)} — {txIsLarger
+                  ? 'Il movimento verrà chiuso completamente. La rata risulterà con un surplus.'
+                  : 'Il movimento verrà chiuso. La rata avrà ancora un residuo da pagare.'}
+              </p>
+            </div>
+            <span className="text-xs font-bold text-emerald-700 shrink-0">{fmtEur(txRemaining)}</span>
+          </button>
+
+          {/* Option 2: Installment amount */}
+          <button
+            onClick={() => onChoice(instRemaining)}
+            className="w-full flex items-center gap-3 p-3 rounded-lg border-2 border-transparent bg-blue-50 hover:border-blue-400 transition-colors text-left group"
+          >
+            <div className="shrink-0 w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center group-hover:bg-blue-200 transition-colors">
+              <FileText className="h-4 w-4 text-blue-600" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-medium text-gray-800">Riconcilia solo importo rata</p>
+              <p className="text-[10px] text-gray-500 mt-0.5">
+                {fmtEur(instRemaining)} — La rata sarà completamente pagata.
+                {txIsLarger ? ' Il movimento resterà parziale con residuo disponibile.' : ''}
+              </p>
+            </div>
+            <span className="text-xs font-bold text-blue-700 shrink-0">{fmtEur(instRemaining)}</span>
+          </button>
+
+          {/* Cancel */}
+          <button
+            onClick={onCancel}
+            className="w-full flex items-center gap-3 p-3 rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors text-left"
+          >
+            <div className="shrink-0 w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center">
+              <Ban className="h-4 w-4 text-gray-500" />
+            </div>
+            <p className="text-xs text-gray-600">Annulla — non riconciliare</p>
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
