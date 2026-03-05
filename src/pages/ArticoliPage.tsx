@@ -9,18 +9,21 @@ import { useCompany } from '@/hooks/useCompany'
 import {
   loadArticles, createArticle, updateArticle, deleteArticle,
   loadArticleStats, loadArticleLines, loadUnassignedLines, loadDashboardStats,
-  loadCategories, matchLineToArticle, extractLocation, assignArticleToLine,
-  removeLineAssignment, recordAssignmentFeedback, suggestKeywords,
+  loadCategories, assignArticleToLine, loadLearnedRules,
+  removeLineAssignment, recordAssignmentFeedback,
   type Article, type ArticleCreate, type ArticleStats, type ArticleLineRow,
   type UnassignedLine, type MatchResult, type DashboardArticleRow,
 } from '@/lib/articlesService'
+import {
+  matchWithLearnedRules, extractLocation, suggestKeywords,
+} from '@/lib/articleMatching'
 import { supabase } from '@/integrations/supabase/client'
 import { fmtDate, fmtEur, fmtNum } from '@/lib/utils'
 import { toast } from 'sonner'
 import {
   Package, Plus, Search, Loader2, Trash2, Save, X, Check,
   XCircle, RefreshCw, Zap, BarChart3, Tag, ChevronRight,
-  CheckCircle2, AlertTriangle, Sparkles, Filter,
+  CheckCircle2, AlertTriangle, Sparkles, Filter, Eye,
 } from 'lucide-react'
 import {
   ResponsiveContainer, BarChart, CartesianGrid, XAxis, YAxis,
@@ -102,7 +105,9 @@ export default function ArticoliPage() {
   const [matchResults, setMatchResults] = useState<Map<string, MatchResult>>(new Map())
   const [assignmentLoading, setAssignmentLoading] = useState(false)
   const [analyzing, setAnalyzing] = useState(false)
+  const [analyzeProgress, setAnalyzeProgress] = useState('')
   const [confirmingLineId, setConfirmingLineId] = useState<string | null>(null)
+  const [invoicePopup, setInvoicePopup] = useState<string | null>(null) // invoice_id for popup
 
   // ─ Dashboard state
   const [dashboardData, setDashboardData] = useState<DashboardArticleRow[]>([])
@@ -245,22 +250,29 @@ export default function ArticoliPage() {
     }
   }, [draft.name, draft.keywords])
 
-  // ─── Assignment tab: analyze ────────────────
+  // ─── Assignment tab: analyze ALL lines ──────
   const analyzeUnassigned = useCallback(async () => {
     if (!companyId) return
     setAnalyzing(true)
+    setAnalyzeProgress('Caricamento righe...')
     try {
-      const [lines, arts] = await Promise.all([
-        loadUnassignedLines(companyId, 500),
+      // Load articles, rules, and ALL unassigned lines (paginated, no limit)
+      const [arts, rules] = await Promise.all([
         loadArticles(companyId, { activeOnly: true }),
+        loadLearnedRules(companyId),
       ])
+      setAnalyzeProgress('Caricamento righe fattura...')
+      const lines = await loadUnassignedLines(companyId, (loaded) => {
+        setAnalyzeProgress(`Caricate ${loaded} righe...`)
+      })
       setUnassignedLines(lines)
 
-      // Run matching for each line
+      // Run matching for each line: learned rules first, then keyword fallback
+      setAnalyzeProgress(`Matching ${lines.length} righe...`)
       const results = new Map<string, MatchResult>()
       for (const line of lines) {
         if (!line.description) continue
-        const match = matchLineToArticle(line.description, arts)
+        const match = matchWithLearnedRules(line.description, arts, rules)
         if (match) results.set(line.id, match)
       }
       setMatchResults(results)
@@ -268,6 +280,7 @@ export default function ArticoliPage() {
     } catch (err: any) {
       toast.error(`Errore analisi: ${err.message}`)
     }
+    setAnalyzeProgress('')
     setAnalyzing(false)
   }, [companyId])
 
@@ -850,7 +863,7 @@ export default function ArticoliPage() {
               className="bg-purple-600 hover:bg-purple-700"
             >
               {analyzing ? <Loader2 className="h-4 w-4 animate-spin mr-1.5" /> : <Sparkles className="h-4 w-4 mr-1.5" />}
-              {analyzing ? 'Analisi in corso...' : 'Analizza righe'}
+              {analyzing ? (analyzeProgress || 'Analisi in corso...') : 'Analizza tutte le righe'}
             </Button>
           </div>
 
@@ -907,7 +920,12 @@ export default function ArticoliPage() {
                         const match = matchResults.get(line.id)!
                         const isConfirming = confirmingLineId === line.id
                         return (
-                          <div key={line.id} className="px-4 py-3 hover:bg-gray-50/50 transition-colors">
+                          <div
+                            key={line.id}
+                            className="px-4 py-3 hover:bg-gray-50/50 transition-colors cursor-pointer"
+                            onDoubleClick={() => setInvoicePopup(line.invoice_id)}
+                            title="Doppio click per vedere la fattura"
+                          >
                             <div className="flex items-start justify-between gap-2">
                               <div className="min-w-0 flex-1">
                                 <div className="flex items-center gap-2 flex-wrap">
@@ -925,7 +943,9 @@ export default function ArticoliPage() {
                                 </div>
                                 <p className="text-[11px] text-gray-700 mt-1 line-clamp-2">{line.description}</p>
                                 <div className="flex items-center gap-3 mt-1 text-[10px] text-gray-400">
-                                  <span>Fatt. {line.invoice_number || '—'}</span>
+                                  <span className="text-blue-500 hover:underline cursor-pointer" onClick={(e) => { e.stopPropagation(); setInvoicePopup(line.invoice_id) }}>
+                                    Fatt. {line.invoice_number || '—'}
+                                  </span>
                                   <span>{fmtDate(line.invoice_date)}</span>
                                   <span>{line.counterparty_name || '—'}</span>
                                   {line.quantity != null && <span className="font-mono">{fmtNum(line.quantity)} {UNIT_SHORT[match.article.unit] || match.article.unit}</span>}
@@ -976,10 +996,17 @@ export default function ArticoliPage() {
                   <CardContent className="p-0">
                     <div className="max-h-[30vh] overflow-y-auto divide-y">
                       {unmatchedLines.slice(0, 50).map(line => (
-                        <div key={line.id} className="px-4 py-2 text-[11px]">
+                        <div
+                          key={line.id}
+                          className="px-4 py-2 text-[11px] cursor-pointer hover:bg-gray-50"
+                          onDoubleClick={() => setInvoicePopup(line.invoice_id)}
+                          title="Doppio click per vedere la fattura"
+                        >
                           <p className="text-gray-600 line-clamp-1">{line.description || '(vuoto)'}</p>
                           <div className="flex items-center gap-3 mt-0.5 text-[10px] text-gray-400">
-                            <span>Fatt. {line.invoice_number || '—'}</span>
+                            <span className="text-blue-500 hover:underline cursor-pointer" onClick={(e) => { e.stopPropagation(); setInvoicePopup(line.invoice_id) }}>
+                              Fatt. {line.invoice_number || '—'}
+                            </span>
                             <span>{fmtDate(line.invoice_date)}</span>
                             <span>{line.counterparty_name || '—'}</span>
                             {line.total_price != null && <span>{fmtEur(line.total_price)}</span>}
@@ -1138,6 +1165,155 @@ export default function ArticoliPage() {
           )}
         </TabsContent>
       </Tabs>
+
+      {/* Invoice detail popup (double-click from assignment tab) */}
+      {invoicePopup && (
+        <InvoiceDetailPopup invoiceId={invoicePopup} onClose={() => setInvoicePopup(null)} />
+      )}
+    </div>
+  )
+}
+
+/* ─── Invoice Detail Popup ───────────────────── */
+
+function InvoiceDetailPopup({ invoiceId, onClose }: {
+  invoiceId: string; onClose: () => void
+}) {
+  const [invoice, setInvoice] = useState<any>(null)
+  const [lines, setLines] = useState<any[]>([])
+  const [installments, setInstallments] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      setLoading(true)
+      try {
+        const [{ data: inv }, { data: ll }, { data: inst }] = await Promise.all([
+          supabase.from('invoices').select('*').eq('id', invoiceId).single(),
+          supabase.from('invoice_lines').select('*').eq('invoice_id', invoiceId).order('line_number'),
+          supabase.from('invoice_installments').select('*').eq('invoice_id', invoiceId).order('due_date'),
+        ])
+        if (cancelled) return
+        setInvoice(inv)
+        setLines(ll || [])
+        setInstallments(inst || [])
+      } catch (err) {
+        console.error('Invoice load error:', err)
+      }
+      setLoading(false)
+    }
+    load()
+    return () => { cancelled = true }
+  }, [invoiceId])
+
+  const cp = invoice?.counterparty as any
+  const cpName = cp?.denom || cp?.denominazione || '—'
+  const direction = invoice?.direction === 'out' ? 'Attiva (Emessa)' : 'Passiva (Ricevuta)'
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+      <div
+        className="bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[85vh] overflow-hidden mx-4"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-3 bg-gray-50 border-b">
+          <div className="flex items-center gap-3">
+            <Eye className="h-4 w-4 text-blue-500" />
+            <h3 className="font-semibold text-gray-900">
+              {loading ? 'Caricamento...' : `Fattura ${invoice?.number || '—'}`}
+            </h3>
+            {invoice && (
+              <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                invoice.direction === 'out' ? 'bg-emerald-100 text-emerald-700' : 'bg-blue-100 text-blue-700'
+              }`}>{direction}</span>
+            )}
+          </div>
+          <button onClick={onClose} className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-200 rounded-md transition-colors">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {loading ? (
+          <div className="flex items-center justify-center py-16">
+            <Loader2 className="h-6 w-6 animate-spin text-gray-400" />
+          </div>
+        ) : invoice ? (
+          <div className="overflow-y-auto max-h-[calc(85vh-56px)]">
+            {/* Invoice summary */}
+            <div className="px-5 py-4 grid grid-cols-2 sm:grid-cols-4 gap-3 border-b bg-gray-50/50">
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase">Numero</p>
+                <p className="text-sm font-semibold text-gray-800">{invoice.number}</p>
+              </div>
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase">Data</p>
+                <p className="text-sm font-semibold text-gray-800">{fmtDate(invoice.date)}</p>
+              </div>
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase">Controparte</p>
+                <p className="text-sm font-semibold text-gray-800 truncate">{cpName}</p>
+              </div>
+              <div>
+                <p className="text-[10px] text-gray-400 uppercase">Importo totale</p>
+                <p className="text-sm font-bold text-emerald-700">{fmtEur(invoice.total_amount)}</p>
+              </div>
+            </div>
+
+            {/* Lines table */}
+            <div className="px-5 py-3">
+              <h4 className="text-xs font-semibold text-gray-700 mb-2">Righe ({lines.length})</h4>
+              <div className="border rounded-lg overflow-hidden">
+                <table className="w-full text-[11px]">
+                  <thead className="bg-gray-50">
+                    <tr className="border-b">
+                      <th className="text-left px-3 py-2 font-medium text-gray-500 w-8">#</th>
+                      <th className="text-left px-3 py-2 font-medium text-gray-500">Descrizione</th>
+                      <th className="text-right px-3 py-2 font-medium text-gray-500">Qtà</th>
+                      <th className="text-right px-3 py-2 font-medium text-gray-500">P.Unit</th>
+                      <th className="text-right px-3 py-2 font-medium text-gray-500">Totale</th>
+                      <th className="text-right px-3 py-2 font-medium text-gray-500">IVA</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {lines.map((l, i) => (
+                      <tr key={l.id} className="hover:bg-gray-50/50">
+                        <td className="px-3 py-1.5 text-gray-400">{l.line_number || i + 1}</td>
+                        <td className="px-3 py-1.5 text-gray-800 max-w-[300px]">
+                          <p className="line-clamp-2">{l.description || '—'}</p>
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-mono">{l.quantity != null ? fmtNum(l.quantity) : '—'}</td>
+                        <td className="px-3 py-1.5 text-right">{l.unit_price != null ? fmtEur(l.unit_price) : '—'}</td>
+                        <td className="px-3 py-1.5 text-right font-semibold">{l.total_price != null ? fmtEur(l.total_price) : '—'}</td>
+                        <td className="px-3 py-1.5 text-right text-gray-500">{l.vat_rate != null ? `${l.vat_rate}%` : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Installments */}
+            {installments.length > 0 && (
+              <div className="px-5 py-3 border-t">
+                <h4 className="text-xs font-semibold text-gray-700 mb-2">Scadenze ({installments.length})</h4>
+                <div className="flex flex-wrap gap-2">
+                  {installments.map(inst => (
+                    <div key={inst.id} className="flex items-center gap-2 bg-gray-50 border rounded-lg px-3 py-1.5 text-[11px]">
+                      <span className="text-gray-500">{fmtDate(inst.due_date)}</span>
+                      <span className="font-semibold text-gray-800">{fmtEur(inst.amount)}</span>
+                      {inst.paid && <CheckCircle2 className="h-3 w-3 text-emerald-500" />}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="py-12 text-center text-sm text-gray-400">Fattura non trovata</div>
+        )}
+      </div>
     </div>
   )
 }

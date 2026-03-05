@@ -6,9 +6,21 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useAuth } from '@/hooks/useAuth'
 import { useCompany } from '@/hooks/useCompany'
-import { Settings, Building2, Landmark, Pencil, Trash2, Plus, X, AlertTriangle, CheckCircle } from 'lucide-react'
+import { Settings, Building2, Landmark, Pencil, Trash2, Plus, X, AlertTriangle, CheckCircle, Tag, FolderKanban, BookOpen } from 'lucide-react'
 import { supabase } from '@/integrations/supabase/client'
 import { saveOpeningBalance } from '@/lib/bankParser'
+import CategoriesTab from '@/components/settings/CategoriesTab'
+import ProjectsTab from '@/components/settings/ProjectsTab'
+import ChartOfAccountsTab from '@/components/settings/ChartOfAccountsTab'
+
+type SettingsTab = 'generale' | 'categorie' | 'progetti' | 'piano-conti'
+
+const TABS: { key: SettingsTab; label: string; icon: typeof Settings }[] = [
+  { key: 'generale', label: 'Generale', icon: Settings },
+  { key: 'categorie', label: 'Categorie', icon: Tag },
+  { key: 'progetti', label: 'Progetti', icon: FolderKanban },
+  { key: 'piano-conti', label: 'Piano dei Conti', icon: BookOpen },
+]
 
 // ============================================================
 // BANK ACCOUNT FORM MODAL
@@ -141,6 +153,9 @@ export default function ImpostazioniPage() {
   const { company, refetch: refetchCompany } = useCompany()
   const companyId = company?.id || null
 
+  // Tab state
+  const [activeTab, setActiveTab] = useState<SettingsTab>('generale')
+
   // Bank accounts
   const [bankAccounts, setBankAccounts] = useState<any[]>([])
   const [bankModal, setBankModal] = useState<{ account?: any } | null>(null)
@@ -253,6 +268,35 @@ export default function ImpostazioniPage() {
         <p className="text-muted-foreground text-sm mt-1">Configura il tuo profilo e le impostazioni aziendali</p>
       </div>
 
+      {/* Tab navigation */}
+      <div className="flex gap-1 border-b border-gray-200 -mb-2">
+        {TABS.map(t => {
+          const Icon = t.icon
+          const isActive = activeTab === t.key
+          return (
+            <button key={t.key} onClick={() => setActiveTab(t.key)}
+              className={`flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold border-b-2 transition-all ${
+                isActive
+                  ? 'text-sky-700 border-sky-500 bg-sky-50/50'
+                  : 'text-gray-400 border-transparent hover:text-gray-600 hover:bg-gray-50'
+              }`}>
+              <Icon className="h-3.5 w-3.5" />
+              {t.label}
+            </button>
+          )
+        })}
+      </div>
+
+      {/* Tab content */}
+      {activeTab === 'categorie' && companyId && <CategoriesTab companyId={companyId} />}
+      {activeTab === 'progetti' && companyId && <ProjectsTab companyId={companyId} />}
+      {activeTab === 'piano-conti' && companyId && <ChartOfAccountsTab companyId={companyId} />}
+      {(activeTab === 'categorie' || activeTab === 'progetti' || activeTab === 'piano-conti') && !companyId && (
+        <p className="text-sm text-gray-400 text-center py-8">Importa almeno una fattura per configurare le classificazioni</p>
+      )}
+
+      {/* Generale tab content */}
+      {activeTab === 'generale' && <>
       {/* Account */}
       <Card>
         <CardHeader>
@@ -459,8 +503,7 @@ export default function ImpostazioniPage() {
           </CardContent>
         </Card>
       )}
-
-
+      </>}
 
       {/* Modals */}
       {bankModal && companyId && (

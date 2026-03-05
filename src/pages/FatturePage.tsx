@@ -24,9 +24,18 @@ import {
   type ExtractionState,
 } from '@/lib/extractionStore';
 import {
-  loadArticles, matchLineToArticle, extractLocation, assignArticleToLine, removeLineAssignment,
+  loadArticles, assignArticleToLine, removeLineAssignment, recordAssignmentFeedback, loadLearnedRules,
   type Article, type MatchResult,
 } from '@/lib/articlesService';
+import { matchWithLearnedRules, extractLocation } from '@/lib/articleMatching';
+import {
+  loadCategories, loadProjects, loadChartOfAccounts,
+  loadInvoiceClassification, saveInvoiceClassification,
+  loadInvoiceProjects, addInvoiceProject, updateInvoiceProjectPercentage, removeInvoiceProject,
+  CATEGORY_TYPE_LABELS, SECTION_LABELS,
+  type Category, type Project, type ChartAccount,
+  type InvoiceClassification, type InvoiceProjectAssignment,
+} from '@/lib/classificationService';
 
 // ============================================================
 // LOOKUPS
@@ -410,6 +419,19 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [lineArticleMap, setLineArticleMap] = useState<Record<string, LineArticleInfo>>({});
   const [aiSuggestions, setAiSuggestions] = useState<Record<string, MatchResult>>({});
 
+  // ─── Classification state ───
+  const [allCategories, setAllCategories] = useState<Category[]>([]);
+  const [allProjects, setAllProjects] = useState<Project[]>([]);
+  const [allAccounts, setAllAccounts] = useState<ChartAccount[]>([]);
+  const [classification, setClassification] = useState<InvoiceClassification | null>(null);
+  const [invProjects, setInvProjects] = useState<InvoiceProjectAssignment[]>([]);
+  const [selCategoryId, setSelCategoryId] = useState<string | null>(null);
+  const [selAccountId, setSelAccountId] = useState<string | null>(null);
+  const [classifDirty, setClassifDirty] = useState(false);
+  const [classifSaving, setClassifSaving] = useState(false);
+  const [addProjId, setAddProjId] = useState('');
+  const [addProjPct, setAddProjPct] = useState('100');
+
   // Load articles + existing assignments when invoice changes
   useEffect(() => {
     const companyId = company?.id;
@@ -417,8 +439,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     let cancelled = false;
 
     (async () => {
-      // Load articles for this company
-      const arts = await loadArticles(companyId, { activeOnly: true });
+      // Load articles + learned rules for this company
+      const [arts, rules] = await Promise.all([
+        loadArticles(companyId, { activeOnly: true }),
+        loadLearnedRules(companyId),
+      ]);
       if (cancelled) return;
       setArticles(arts);
 
@@ -439,12 +464,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       }
       setLineArticleMap(map);
 
-      // Compute AI suggestions for unassigned lines
+      // Compute AI suggestions for unassigned lines (learned rules first, then keyword fallback)
       if (detail?.invoice_lines && arts.length > 0) {
         const suggestions: Record<string, MatchResult> = {};
         for (const line of detail.invoice_lines) {
           if (map[line.id]) continue; // already assigned
-          const match = matchLineToArticle(line.description, arts);
+          const match = matchWithLearnedRules(line.description, arts, rules);
           if (match && match.confidence >= 70) {
             suggestions[line.id] = match;
           }
@@ -455,6 +480,67 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
     return () => { cancelled = true; };
   }, [company?.id, invoice?.id, detail?.invoice_lines]);
+
+  // Load classification data (categories, projects, accounts, invoice assignments)
+  useEffect(() => {
+    const companyId = company?.id;
+    if (!companyId || !invoice?.id) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const [cats, projs, accs, classif, iProjs] = await Promise.all([
+          loadCategories(companyId, true),
+          loadProjects(companyId, true),
+          loadChartOfAccounts(companyId),
+          loadInvoiceClassification(invoice.id),
+          loadInvoiceProjects(invoice.id),
+        ]);
+        if (cancelled) return;
+        setAllCategories(cats);
+        setAllProjects(projs);
+        setAllAccounts(accs.filter(a => !a.is_header && a.active));
+        setClassification(classif);
+        setInvProjects(iProjs);
+        setSelCategoryId(classif?.category_id || null);
+        setSelAccountId(classif?.account_id || null);
+        setClassifDirty(false);
+      } catch (e) { console.error('Classification load error:', e); }
+    })();
+    return () => { cancelled = true; };
+  }, [company?.id, invoice?.id]);
+
+  const handleSaveClassification = useCallback(async () => {
+    const companyId = company?.id;
+    if (!companyId || !invoice?.id) return;
+    setClassifSaving(true);
+    try {
+      await saveInvoiceClassification(companyId, invoice.id, selCategoryId, selAccountId);
+      setClassifDirty(false);
+    } catch (e: any) { console.error('Save classification error:', e); }
+    setClassifSaving(false);
+  }, [company?.id, invoice?.id, selCategoryId, selAccountId]);
+
+  const handleAddProject = useCallback(async () => {
+    const companyId = company?.id;
+    if (!companyId || !invoice?.id || !addProjId) return;
+    const pct = Math.min(100, Math.max(0, Number(addProjPct) || 100));
+    // Check total % won't exceed 100
+    const currentTotal = invProjects.reduce((s, p) => s + Number(p.percentage), 0);
+    if (currentTotal + pct > 100) { alert(`Percentuale totale supererebbe 100% (attuale: ${currentTotal}%)`); return; }
+    try {
+      await addInvoiceProject(companyId, invoice.id, addProjId, pct);
+      setInvProjects(await loadInvoiceProjects(invoice.id));
+      setAddProjId('');
+      setAddProjPct('100');
+    } catch (e: any) { console.error('Add project error:', e); }
+  }, [company?.id, invoice?.id, addProjId, addProjPct, invProjects]);
+
+  const handleRemoveProject = useCallback(async (assignmentId: string) => {
+    try {
+      await removeInvoiceProject(assignmentId);
+      setInvProjects(prev => prev.filter(p => p.id !== assignmentId));
+    } catch (e: any) { console.error('Remove project error:', e); }
+  }, []);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }) => {
     const companyId = company?.id;
@@ -477,6 +563,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     try {
       // upsert handles both INSERT and UPDATE via onConflict: 'invoice_line_id'
       await assignArticleToLine(companyId, lineId, invoice.id, articleId, lineData, 'manual', undefined, location);
+      // Record feedback for manual assignment → creates a learned rule
+      if (lineDesc) {
+        recordAssignmentFeedback(companyId, articleId, lineDesc, true).catch(err =>
+          console.warn('Feedback record error:', err)
+        );
+      }
     } catch (err: any) {
       console.error('Article assign error:', err);
       // Revert optimistic update on failure
@@ -692,6 +784,107 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
       {/* Causali */}
       {b?.causali?.length > 0 && <Sec title="Causale (Note)">{b.causali.map((c: string, i: number) => <div key={i} className="text-xs text-gray-700 py-0.5">{c}</div>)}</Sec>}
+
+      {/* Classificazione fattura */}
+      {(allCategories.length > 0 || allAccounts.length > 0 || allProjects.length > 0) && (
+        <Sec title="Classificazione fattura">
+          <div className="space-y-3 print:hidden">
+            {/* Categoria */}
+            {allCategories.length > 0 && (
+              <div className="flex items-center gap-3">
+                <label className="text-xs font-medium text-gray-600 w-24 flex-shrink-0">Categoria:</label>
+                <select
+                  value={selCategoryId || ''}
+                  onChange={e => { setSelCategoryId(e.target.value || null); setClassifDirty(true); }}
+                  className="flex-1 px-2.5 py-1.5 text-xs border border-gray-200 rounded-md bg-white focus:ring-2 focus:ring-sky-400 outline-none">
+                  <option value="">— Nessuna —</option>
+                  {allCategories.map(c => (
+                    <option key={c.id} value={c.id}>{c.name} ({CATEGORY_TYPE_LABELS[c.type]})</option>
+                  ))}
+                </select>
+                {selCategoryId && (() => {
+                  const cat = allCategories.find(c => c.id === selCategoryId);
+                  return cat ? <span className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: cat.color }} /> : null;
+                })()}
+              </div>
+            )}
+
+            {/* Piano dei conti */}
+            {allAccounts.length > 0 && (
+              <div className="flex items-center gap-3">
+                <label className="text-xs font-medium text-gray-600 w-24 flex-shrink-0">Piano conti:</label>
+                <select
+                  value={selAccountId || ''}
+                  onChange={e => { setSelAccountId(e.target.value || null); setClassifDirty(true); }}
+                  className="flex-1 px-2.5 py-1.5 text-xs border border-gray-200 rounded-md bg-white focus:ring-2 focus:ring-sky-400 outline-none">
+                  <option value="">— Nessuno —</option>
+                  {allAccounts.map(a => (
+                    <option key={a.id} value={a.id}>{a.code} — {a.name}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {/* Progetti assegnati */}
+            {allProjects.length > 0 && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-3">
+                  <label className="text-xs font-medium text-gray-600 w-24 flex-shrink-0">Progetti:</label>
+                  <div className="flex flex-wrap gap-1.5 flex-1">
+                    {invProjects.map(ip => {
+                      const proj = ip.project || allProjects.find(p => p.id === ip.project_id);
+                      return (
+                        <span key={ip.id} className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold rounded-full border"
+                          style={{ backgroundColor: proj?.color ? `${proj.color}15` : '#f3f4f6', borderColor: proj?.color || '#e5e7eb', color: proj?.color || '#374151' }}>
+                          <span className="w-2 h-2 rounded-full" style={{ backgroundColor: proj?.color || '#9ca3af' }} />
+                          {proj?.code || '?'} {Number(ip.percentage)}%
+                          <button onClick={() => handleRemoveProject(ip.id)} className="ml-0.5 hover:text-red-600 transition-colors">x</button>
+                        </span>
+                      );
+                    })}
+                    {invProjects.length === 0 && <span className="text-xs text-gray-400 italic">Nessun progetto</span>}
+                  </div>
+                </div>
+                {/* Add project row */}
+                <div className="flex items-center gap-2 ml-[108px]">
+                  <select value={addProjId} onChange={e => setAddProjId(e.target.value)}
+                    className="flex-1 px-2 py-1 text-[11px] border border-gray-200 rounded-md bg-white focus:ring-1 focus:ring-sky-400 outline-none">
+                    <option value="">+ Aggiungi progetto...</option>
+                    {allProjects.filter(p => !invProjects.some(ip => ip.project_id === p.id)).map(p => (
+                      <option key={p.id} value={p.id}>{p.code} — {p.name}</option>
+                    ))}
+                  </select>
+                  <input type="number" min={1} max={100} value={addProjPct} onChange={e => setAddProjPct(e.target.value)}
+                    className="w-16 px-1.5 py-1 text-[11px] border border-gray-200 rounded-md text-center focus:ring-1 focus:ring-sky-400 outline-none"
+                    placeholder="%" />
+                  <button onClick={handleAddProject} disabled={!addProjId}
+                    className="px-2 py-1 text-[10px] font-semibold text-sky-700 bg-sky-50 border border-sky-200 rounded-md hover:bg-sky-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+                    Aggiungi
+                  </button>
+                </div>
+                {invProjects.length > 0 && (
+                  <div className="ml-[108px] text-[10px] text-gray-400">
+                    Totale: {invProjects.reduce((s, p) => s + Number(p.percentage), 0)}%
+                    {invProjects.reduce((s, p) => s + Number(p.percentage), 0) < 100 && (
+                      <span> ({100 - invProjects.reduce((s, p) => s + Number(p.percentage), 0)}% non attribuito)</span>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Save button */}
+            {classifDirty && (
+              <div className="flex justify-end pt-1">
+                <button onClick={handleSaveClassification} disabled={classifSaving}
+                  className="px-3 py-1.5 text-xs font-semibold text-white bg-sky-600 rounded-md hover:bg-sky-700 disabled:opacity-50 transition-colors">
+                  {classifSaving ? 'Salvataggio...' : 'Salva classificazione'}
+                </button>
+              </div>
+            )}
+          </div>
+        </Sec>
+      )}
 
       {/* Beni/Servizi */}
       <Sec title="Dettaglio Beni e Servizi">

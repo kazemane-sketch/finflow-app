@@ -1,8 +1,21 @@
 /**
- * Articles Service — CRUD, keyword matching, stats, assignment
+ * Articles Service — CRUD, stats, assignment, feedback loop
  * Pattern follows counterpartyService.ts
+ *
+ * NOTE: Pure matching functions (matchLineToArticle, matchWithLearnedRules,
+ * extractLocation, suggestKeywords) live in articleMatching.ts.
+ * They are re-exported here for backward compatibility.
  */
 import { supabase } from '@/integrations/supabase/client'
+
+// Re-export matching functions from the shared utility
+export {
+  matchLineToArticle,
+  matchWithLearnedRules,
+  extractLocation,
+  suggestKeywords,
+  type LearnedRule,
+} from '@/lib/articleMatching'
 
 /* ─── types ──────────────────────────────────── */
 
@@ -299,114 +312,79 @@ export async function loadArticleLines(
   }))
 }
 
-/* ─── Matching logic (deterministic, NO AI) ──── */
+/* ─── Learned Rules: load from DB ─────────────── */
+
+import type { LearnedRule } from '@/lib/articleMatching'
 
 /**
- * Match a line description against all articles using keyword matching.
- * Returns the best match above threshold, or null.
+ * Load all learned rules for a company from article_assignment_rules.
+ * Pre-load these before calling matchWithLearnedRules().
  */
-export function matchLineToArticle(
-  lineDescription: string,
-  articles: Article[],
-): MatchResult | null {
-  if (!lineDescription) return null
-  const desc = lineDescription.toUpperCase()
+export async function loadLearnedRules(companyId: string): Promise<LearnedRule[]> {
+  const { data, error } = await supabase
+    .from('article_assignment_rules')
+    .select('id, article_id, pattern, confidence, hit_count, reject_count, source')
+    .eq('company_id', companyId)
 
-  let bestMatch: MatchResult | null = null
-
-  for (const article of articles) {
-    const keywords = article.keywords || []
-    if (keywords.length === 0 || !article.active) continue
-
-    const matchedKeywords = keywords.filter(kw => desc.includes(kw.toUpperCase()))
-    if (matchedKeywords.length === 0) continue
-
-    const matchRatio = matchedKeywords.length / keywords.length
-    const confidence = Math.min(matchRatio * 100, 98)
-
-    if (!bestMatch || confidence > bestMatch.confidence) {
-      bestMatch = {
-        article,
-        confidence,
-        matchedKeywords,
-        totalKeywords: keywords.length,
-      }
-    }
-  }
-
-  return bestMatch
-}
-
-/**
- * Extract location/site from invoice line description.
- * Common patterns in CAVECO invoices.
- */
-export function extractLocation(description: string): string | null {
-  if (!description) return null
-  const patterns: RegExp[] = [
-    /Cava\s+([\w\s]+?)\s*\(([A-Z]{2})\)/i,           // "Cava Serle (BS)"
-    /Cava\s+([\w\s]+?)\s*[–\-]/i,                     // "Cava Ponte Lucano –"
-    /Stabilimento\s+(?:di\s+)?([\w]+)/i,               // "Stabilimento di Guidonia"
-    /([\w]+)\s*\((BS|RM|VC|VT|PG|AN)\)/i,             // "Paitone (BS)"
-  ]
-
-  for (const pattern of patterns) {
-    const match = description.match(pattern)
-    if (match) {
-      // If the pattern has a province group, include it
-      if (match[2]) return `${match[1].trim()} (${match[2]})`
-      return match[1].trim()
-    }
-  }
-  return null
-}
-
-/**
- * Suggest keywords from an article name.
- * Splits name into words, filters out short/common words, lowercases.
- */
-export function suggestKeywords(name: string): string[] {
-  if (!name) return []
-  const stopWords = new Set([
-    'di', 'da', 'a', 'in', 'per', 'con', 'su', 'e', 'il', 'la', 'lo', 'i', 'le', 'gli',
-    'un', 'una', 'del', 'della', 'dello', 'dei', 'delle', 'degli', 'al', 'alla', 'allo',
-    'mm', 'mt', 'kg', 'nr', 'pz', 'lt',
-  ])
-
-  return name
-    .split(/[\s\-–,;.()\/]+/)
-    .map(w => w.toLowerCase().trim())
-    .filter(w => w.length >= 2 && !stopWords.has(w))
+  if (error) throw error
+  return (data || []) as LearnedRule[]
 }
 
 /* ─── Assignment ─────────────────────────────── */
 
+/**
+ * Load ALL unassigned invoice lines (no LIMIT, no direction filter).
+ * Paginates in batches of 1000 to bypass Supabase row limit.
+ * Returns lines from both active and passive invoices.
+ *
+ * @param onProgress optional callback for UI progress (loaded so far)
+ */
 export async function loadUnassignedLines(
   companyId: string,
-  limit = 500,
+  onProgress?: (loaded: number) => void,
 ): Promise<UnassignedLine[]> {
-  // Get invoice line IDs already assigned
-  const { data: assigned } = await supabase
-    .from('invoice_line_articles')
-    .select('invoice_line_id')
-    .eq('company_id', companyId)
+  // Step 1: Get all already-assigned invoice_line_ids (paginated)
+  const assignedIds = new Set<string>()
+  const BATCH = 1000
+  let assignedPage = 0
+  while (true) {
+    const { data } = await supabase
+      .from('invoice_line_articles')
+      .select('invoice_line_id')
+      .eq('company_id', companyId)
+      .range(assignedPage * BATCH, (assignedPage + 1) * BATCH - 1)
+    if (!data || data.length === 0) break
+    for (const row of data) assignedIds.add(row.invoice_line_id)
+    if (data.length < BATCH) break
+    assignedPage++
+  }
 
-  const assignedIds = new Set((assigned || []).map(a => a.invoice_line_id))
+  // Step 2: Load ALL invoice lines with invoice context (paginated, NO direction filter)
+  let allLines: any[] = []
+  let page = 0
+  while (true) {
+    const from = page * BATCH
+    const to = from + BATCH - 1
+    const { data, error } = await supabase
+      .from('invoice_lines')
+      .select(`
+        id, invoice_id, line_number, description, quantity, unit_price, total_price, vat_rate, article_code,
+        invoice:invoices!inner(number, date, direction, company_id, counterparty)
+      `)
+      .eq('invoice.company_id', companyId)
+      .order('invoice_id', { ascending: false })
+      .range(from, to)
 
-  // Load invoice lines with invoice context
-  const { data: lines, error } = await supabase
-    .from('invoice_lines')
-    .select(`
-      id, invoice_id, line_number, description, quantity, unit_price, total_price, vat_rate, article_code,
-      invoice:invoices!inner(number, date, direction, company_id, counterparty)
-    `)
-    .eq('invoice.company_id', companyId)
-    .order('invoice_id', { ascending: false })
-    .limit(2000)
+    if (error) throw error
+    if (!data || data.length === 0) break
+    allLines = allLines.concat(data)
+    onProgress?.(allLines.length)
+    if (data.length < BATCH) break
+    page++
+  }
 
-  if (error) throw error
-
-  const unassigned = (lines || [])
+  // Step 3: Filter out already-assigned and map to UnassignedLine
+  return allLines
     .filter((l: any) => !assignedIds.has(l.id))
     .map((l: any) => ({
       id: l.id,
@@ -426,8 +404,6 @@ export async function loadUnassignedLines(
           : null,
       invoice_direction: l.invoice?.direction || null,
     }))
-
-  return unassigned.slice(0, limit)
 }
 
 export interface AssignLineData {
@@ -477,55 +453,74 @@ export async function removeLineAssignment(invoiceLineId: string): Promise<void>
 
 /* ─── Feedback loop (rules) ──────────────────── */
 
+/**
+ * Record feedback for an article assignment.
+ *
+ * Behavior:
+ * - ACCEPTED: find existing rule matching ≥50% of keywords → update hit_count++,
+ *   confidence += 0.05. If no rule found, create a new learned rule.
+ * - REJECTED: find existing rule → reject_count++, confidence -= 0.15.
+ *   Delete rule if confidence drops below 0.20.
+ *
+ * Pattern matching: a rule "matches" if ≥50% of its stored keywords
+ * overlap with the description's keywords (case-insensitive).
+ */
 export async function recordAssignmentFeedback(
   companyId: string,
   articleId: string,
   description: string,
   accepted: boolean,
 ): Promise<void> {
-  // Build a pattern from the description keywords
-  const keywords = description
+  // Build keywords from the description
+  const descKeywords = description
     .toUpperCase()
     .split(/[\s\-–,;.()\/]+/)
     .filter(w => w.length >= 3)
     .slice(0, 8)
 
-  if (keywords.length === 0) return
+  if (descKeywords.length === 0) return
 
-  const patternFilter = { description_contains: keywords }
-
-  // Check if a rule already exists for this article + similar pattern
+  // Load existing rules for this article
   const { data: existing } = await supabase
     .from('article_assignment_rules')
-    .select('id, hit_count, reject_count, confidence')
+    .select('id, pattern, hit_count, reject_count, confidence')
     .eq('company_id', companyId)
     .eq('article_id', articleId)
-    .limit(10)
 
-  // Simple matching: find rule with overlapping keywords
-  const matchingRule = (existing || []).find((r: any) => {
-    // Can't easily compare JSONB patterns client-side, so just check first match
-    return true // Take the first rule for this article
-  })
+  // Find rule with highest keyword overlap (≥50% of rule's keywords must be in description)
+  let bestRule: any = null
+  let bestOverlap = 0
 
-  if (matchingRule && existing && existing.length > 0) {
-    const rule = existing[0] as any
+  for (const rule of existing || []) {
+    const ruleKeywords: string[] = (rule.pattern as any)?.description_contains || []
+    if (ruleKeywords.length === 0) continue
+
+    const overlap = ruleKeywords.filter(kw => descKeywords.includes(kw.toUpperCase())).length
+    const overlapRatio = overlap / ruleKeywords.length
+
+    if (overlapRatio >= 0.5 && overlap > bestOverlap) {
+      bestRule = rule
+      bestOverlap = overlap
+    }
+  }
+
+  if (bestRule) {
     if (accepted) {
       await supabase
         .from('article_assignment_rules')
         .update({
-          hit_count: (rule.hit_count || 0) + 1,
-          confidence: Math.min(0.98, (rule.confidence || 0.6) + 0.05),
+          hit_count: (bestRule.hit_count || 0) + 1,
+          confidence: Math.min(0.98, (bestRule.confidence || 0.6) + 0.05),
           last_used_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         })
-        .eq('id', rule.id)
+        .eq('id', bestRule.id)
     } else {
-      const newRejectCount = (rule.reject_count || 0) + 1
-      const newConfidence = Math.max(0, (rule.confidence || 0.6) - 0.15)
+      const newRejectCount = (bestRule.reject_count || 0) + 1
+      const newConfidence = Math.max(0, (bestRule.confidence || 0.6) - 0.15)
       if (newConfidence < 0.20) {
-        // Remove rule if confidence too low
-        await supabase.from('article_assignment_rules').delete().eq('id', rule.id)
+        // Remove rule if confidence drops too low
+        await supabase.from('article_assignment_rules').delete().eq('id', bestRule.id)
       } else {
         await supabase
           .from('article_assignment_rules')
@@ -534,15 +529,15 @@ export async function recordAssignmentFeedback(
             confidence: newConfidence,
             updated_at: new Date().toISOString(),
           })
-          .eq('id', rule.id)
+          .eq('id', bestRule.id)
       }
     }
   } else if (accepted) {
-    // Create new learned rule
+    // No matching rule found — create a new learned rule
     await supabase.from('article_assignment_rules').insert({
       company_id: companyId,
       article_id: articleId,
-      pattern: patternFilter,
+      pattern: { description_contains: descKeywords },
       confidence: 0.6,
       source: 'learned',
     })
