@@ -197,15 +197,58 @@ function extractClientInvoiceRefs(refs: Record<string, unknown> | null, rawText:
   return [...new Set(results)].filter(r => r.length >= 2)
 }
 
-/** Check if an invoice number matches a ref (flexible: contains, numeric-only) */
+/**
+ * STRICT check if an invoice number matches a ref.
+ * Uses the same logic as the edge function's parseInvoiceRef:
+ * - "371/FE/24" matches "371/FE", "371/FE/24", "371/FE/2024"
+ * - "371/FE/24" does NOT match "4371/FE" or "37/FE"
+ * - "309" does NOT match "9" or "1309"
+ */
 function invoiceNumberMatchesRef(invoiceNumber: string, ref: string): boolean {
-  const numLower = invoiceNumber.toLowerCase()
-  const refLower = ref.toLowerCase()
-  if (numLower.includes(refLower) || refLower.includes(numLower)) return true
-  // Numeric-only match
-  const numOnly = ref.replace(/[^0-9]/g, '')
-  if (numOnly.length >= 3 && numLower.includes(numOnly)) return true
-  return false
+  if (!invoiceNumber || !ref) return false
+  const invUp = invoiceNumber.toUpperCase().trim()
+  const refUp = ref.toUpperCase().trim()
+
+  // Parse the ref into structured parts (mirrors edge function parseInvoiceRef)
+  const slashMatch = refUp.match(/^(\d+)\/(FE|PA|NC|NE|FA)\/(\d{2,4})$/i)
+  if (slashMatch) {
+    const num = slashMatch[1]
+    const suffix = slashMatch[2]
+    const yearStr = slashMatch[3]
+    const fullYear = yearStr.length === 2 ? String(2000 + parseInt(yearStr)) : yearStr
+    // Exact matches: "371/FE/24", "371/FE/2024", "371/FE"
+    if (invUp === refUp) return true
+    if (invUp === `${num}/${suffix}/${fullYear}`) return true
+    if (invUp === `${num}/${suffix}`) return true
+    return false
+  }
+
+  const noYearMatch = refUp.match(/^(\d+)\/(FE|PA|NC|NE|FA)$/i)
+  if (noYearMatch) {
+    const num = noYearMatch[1]
+    const suffix = noYearMatch[2]
+    // Exact: "371/FE" or invoice starts with "371/FE/"
+    if (invUp === refUp) return true
+    if (invUp.startsWith(`${num}/${suffix}/`)) return true
+    return false
+  }
+
+  // Pure long numeric (e.g. SDD invoice "5250425719")
+  if (/^\d{6,}$/.test(refUp)) {
+    return invUp === refUp
+  }
+
+  // Short numeric ref (e.g. "309") — only match if invoice number starts with that + separator
+  const refNumOnly = refUp.replace(/[^0-9]/g, '')
+  if (/^\d+$/.test(refUp) && refNumOnly.length >= 3) {
+    // "309" matches "309/FE", "309/FE/25", "309" exactly — but NOT "1309" or "3090"
+    if (invUp === refUp) return true
+    if (invUp.startsWith(refUp + '/')) return true
+    return false
+  }
+
+  // Fallback: exact match only
+  return invUp === refUp
 }
 
 /* ─── main component ─────────────────────────── */
@@ -947,19 +990,29 @@ export default function RiconciliazionePage() {
     const tx = unmatchedTxs.find(t => t.id === selectedTxId)
     if (!tx) return []
 
-    const absAmount = Math.abs(Number(tx.amount))
+    const txAmount = Number(tx.amount)
+    const absAmount = Math.abs(txAmount)
+
+    // Direction filter: amount > 0 (entrata) → fattura attiva (direction='out')
+    //                   amount < 0 (uscita)  → fattura passiva (direction='in')
+    const expectedDirection = txAmount >= 0 ? 'out' : 'in'
 
     // Extract invoice refs for this TX (prioritization)
     const txInvoiceRefs = extractClientInvoiceRefs(tx.extracted_refs, tx.raw_text)
 
-    // Filter installments with remaining amount > 0
+    // Counterparty name for prioritization (normalized lowercase)
+    const txCounterparty = (tx.counterparty_name || '').toLowerCase().trim()
+
+    // Filter installments: remaining > 0 AND matching direction
     let filtered = openInstallments.filter(inst => {
       const remaining = Number(inst.amount_due) - Number(inst.paid_amount)
       if (remaining <= 0) return false
+      // Direction filter: only show invoices matching the expected direction
+      if (inst.direction !== expectedDirection) return false
       return true
     })
 
-    // Enrich with match data: ref match (priority 0) or amount similarity (priority 1)
+    // Enrich with match data: ref match, counterparty match, amount similarity
     let enriched = filtered.map(inst => {
       const remaining = Number(inst.amount_due) - Number(inst.paid_amount)
       const diff = Math.abs(absAmount - remaining)
@@ -973,16 +1026,26 @@ export default function RiconciliazionePage() {
         ? txInvoiceRefs.find(ref => invoiceNumberMatchesRef(inst.invoice_number!, ref)) || null
         : null
 
+      // Counterparty match: same counterparty gets higher priority
+      const instCounterparty = (inst.counterparty_name || '').toLowerCase().trim()
+      const sameCounterparty = txCounterparty.length > 2 && instCounterparty.length > 2 &&
+        (txCounterparty.includes(instCounterparty) || instCounterparty.includes(txCounterparty))
+
+      // Priority: 0 = ref match, 1 = same counterparty, 2 = other
+      const priority = refMatch ? 0 : sameCounterparty ? 1 : 2
+
       return {
         ...inst,
         _diff: diff,
         _ratio: ratio,
-        _priority: refMatch ? 0 : 1,
+        _priority: priority,
         _refMatch: refMatch,
         _matchedRef: matchedRef,
+        _sameCounterparty: sameCounterparty,
       }
     })
-    // Sort: ref-matched first (priority 0), then by amount closeness
+    // Sort: ref-matched first (0), then same counterparty (1), then others (2)
+    // Within each group, sort by amount closeness
     .sort((a, b) => a._priority - b._priority || a._ratio - b._ratio)
 
     // Apply search filter
@@ -1480,11 +1543,12 @@ export default function RiconciliazionePage() {
                   const remaining = Number(inst.amount_due) - Number(inst.paid_amount)
                   const isRefMatch = inst._refMatch === true
                   const matchedRef = inst._matchedRef
+                  const isSameCounterparty = inst._sameCounterparty === true
 
                   return (
                     <div
                       key={inst.id}
-                      className={`px-3 py-2.5 border-b last:border-b-0 hover:bg-gray-50 transition-colors ${isRefMatch ? 'bg-emerald-50/50' : ''}`}
+                      className={`px-3 py-2.5 border-b last:border-b-0 hover:bg-gray-50 transition-colors ${isRefMatch ? 'bg-emerald-50/50' : isSameCounterparty ? 'bg-blue-50/30' : ''}`}
                     >
                       <div className="flex items-center justify-between">
                         <div className="min-w-0">
@@ -1492,6 +1556,11 @@ export default function RiconciliazionePage() {
                             {isRefMatch && (
                               <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded flex items-center gap-0.5">
                                 <span>📌</span> Ref. nel movimento
+                              </span>
+                            )}
+                            {!isRefMatch && isSameCounterparty && (
+                              <span className="text-[10px] font-medium text-blue-700 bg-blue-100 px-1.5 py-0.5 rounded">
+                                Stessa controparte
                               </span>
                             )}
                             <span className="text-xs font-medium text-gray-800">
