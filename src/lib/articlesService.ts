@@ -334,18 +334,22 @@ export async function loadLearnedRules(companyId: string): Promise<LearnedRule[]
 
 export interface ClassificationCounts {
   total: number
-  classified: number
+  classified: number   // verified=true (confirmed assignments)
+  with_match: number   // verified=false (AI suggestions)
   skipped: number
+  to_analyze: number   // total - classified - with_match - skipped
 }
 
 /**
  * Load classification counts for the KPI bar.
  * - total: all invoice lines for this company
- * - classified: lines with an entry in invoice_line_articles
+ * - classified: lines with verified=true in invoice_line_articles (confirmed)
+ * - with_match: lines with verified=false in invoice_line_articles (AI suggestions)
  * - skipped: lines with classification_status = 'skipped'
+ * - to_analyze: derived = total - classified - with_match - skipped
  */
 export async function loadClassificationCounts(companyId: string): Promise<ClassificationCounts> {
-  const [{ count: total }, { count: classified }, { count: skipped }] = await Promise.all([
+  const [{ count: total }, { count: classified }, { count: with_match }, { count: skipped }] = await Promise.all([
     supabase
       .from('invoice_lines')
       .select('id, invoice:invoices!inner(company_id)', { count: 'exact', head: true })
@@ -353,14 +357,24 @@ export async function loadClassificationCounts(companyId: string): Promise<Class
     supabase
       .from('invoice_line_articles')
       .select('id', { count: 'exact', head: true })
-      .eq('company_id', companyId),
+      .eq('company_id', companyId)
+      .eq('verified', true),
+    supabase
+      .from('invoice_line_articles')
+      .select('id', { count: 'exact', head: true })
+      .eq('company_id', companyId)
+      .eq('verified', false),
     supabase
       .from('invoice_lines')
       .select('id, invoice:invoices!inner(company_id)', { count: 'exact', head: true })
       .eq('invoice.company_id', companyId)
       .eq('classification_status', 'skipped'),
   ])
-  return { total: total || 0, classified: classified || 0, skipped: skipped || 0 }
+  const t = total || 0
+  const c = classified || 0
+  const m = with_match || 0
+  const s = skipped || 0
+  return { total: t, classified: c, with_match: m, skipped: s, to_analyze: Math.max(0, t - c - m - s) }
 }
 
 /* ─── Skip (non-classificabile) ──────────────── */
@@ -674,6 +688,281 @@ export async function loadDashboardStats(
   }
 
   return results.sort((a, b) => b.total_revenue - a.total_revenue)
+}
+
+/* ─── Bulk Suggestions (persist AI analysis) ──── */
+
+export interface BulkSuggestion {
+  invoice_line_id: string
+  invoice_id: string
+  article_id: string
+  confidence: number
+}
+
+export interface SavedSuggestion {
+  invoice_line_id: string
+  invoice_id: string
+  article_id: string
+  confidence: number
+  article_code: string
+  article_name: string
+  article_unit: string
+  article_keywords: string[]
+  line_description: string | null
+  line_number: number | null
+  quantity: number | null
+  unit_price: number | null
+  total_price: number | null
+  vat_rate: number | null
+  article_code_xml: string | null
+  invoice_number: string | null
+  invoice_date: string | null
+  counterparty_name: string | null
+  invoice_direction: string | null
+}
+
+/**
+ * Delete all unverified (AI) suggestions for a company.
+ * Called before re-running analysis to clear stale results.
+ */
+export async function deleteBulkSuggestions(companyId: string): Promise<void> {
+  const { error } = await supabase
+    .from('invoice_line_articles')
+    .delete()
+    .eq('company_id', companyId)
+    .eq('verified', false)
+  if (error) throw error
+}
+
+/**
+ * Save bulk AI suggestions to DB.
+ * Uses upsert with ignoreDuplicates to avoid overwriting verified=true records.
+ * Batches by 500 to stay within Supabase limits.
+ */
+export async function saveBulkSuggestions(
+  companyId: string,
+  suggestions: BulkSuggestion[],
+): Promise<void> {
+  if (suggestions.length === 0) return
+  const BATCH = 500
+  for (let i = 0; i < suggestions.length; i += BATCH) {
+    const batch = suggestions.slice(i, i + BATCH).map(s => ({
+      company_id: companyId,
+      invoice_line_id: s.invoice_line_id,
+      invoice_id: s.invoice_id,
+      article_id: s.article_id,
+      assigned_by: 'ai_auto' as const,
+      confidence: s.confidence,
+      verified: false,
+    }))
+    const { error } = await supabase
+      .from('invoice_line_articles')
+      .upsert(batch, { onConflict: 'invoice_line_id', ignoreDuplicates: true })
+    if (error) throw error
+  }
+}
+
+/**
+ * Load saved AI suggestions (verified=false) for a company.
+ * Returns enriched data with article info + invoice line details.
+ * Paginated in batches of 1000.
+ */
+export async function loadSavedSuggestions(companyId: string): Promise<SavedSuggestion[]> {
+  const BATCH = 1000
+  let all: SavedSuggestion[] = []
+  let page = 0
+
+  while (true) {
+    const from = page * BATCH
+    const to = from + BATCH - 1
+    const { data, error } = await supabase
+      .from('invoice_line_articles')
+      .select(`
+        invoice_line_id, invoice_id, article_id, confidence,
+        article:articles!inner(code, name, unit, keywords),
+        line:invoice_lines!inner(description, line_number, quantity, unit_price, total_price, vat_rate, article_code),
+        invoice:invoices!inner(number, date, direction, counterparty)
+      `)
+      .eq('company_id', companyId)
+      .eq('verified', false)
+      .range(from, to)
+
+    if (error) throw error
+    if (!data || data.length === 0) break
+
+    for (const row of data as any[]) {
+      all.push({
+        invoice_line_id: row.invoice_line_id,
+        invoice_id: row.invoice_id,
+        article_id: row.article_id,
+        confidence: row.confidence,
+        article_code: row.article?.code || '',
+        article_name: row.article?.name || '',
+        article_unit: row.article?.unit || 't',
+        article_keywords: row.article?.keywords || [],
+        line_description: row.line?.description || null,
+        line_number: row.line?.line_number ?? null,
+        quantity: row.line?.quantity ?? null,
+        unit_price: row.line?.unit_price ?? null,
+        total_price: row.line?.total_price ?? null,
+        vat_rate: row.line?.vat_rate ?? null,
+        article_code_xml: row.line?.article_code || null,
+        invoice_number: row.invoice?.number || null,
+        invoice_date: row.invoice?.date || null,
+        counterparty_name:
+          row.invoice?.counterparty && typeof row.invoice.counterparty === 'object'
+            ? (row.invoice.counterparty as any).denom || null
+            : null,
+        invoice_direction: row.invoice?.direction || null,
+      })
+    }
+
+    if (data.length < BATCH) break
+    page++
+  }
+
+  return all
+}
+
+/* ─── Classified + Skipped views ─────────────── */
+
+export interface ClassifiedLine {
+  invoice_line_id: string
+  invoice_id: string
+  article_id: string
+  article_code: string
+  article_name: string
+  confidence: number | null
+  assigned_by: string
+  line_description: string | null
+  quantity: number | null
+  total_price: number | null
+  invoice_number: string | null
+  invoice_date: string | null
+  counterparty_name: string | null
+}
+
+export interface SkippedLine {
+  id: string            // invoice_line.id
+  invoice_id: string
+  line_description: string | null
+  quantity: number | null
+  total_price: number | null
+  invoice_number: string | null
+  invoice_date: string | null
+  counterparty_name: string | null
+}
+
+/**
+ * Load all confirmed (verified=true) line-article assignments.
+ */
+export async function loadClassifiedLines(companyId: string): Promise<ClassifiedLine[]> {
+  const BATCH = 1000
+  let all: ClassifiedLine[] = []
+  let page = 0
+
+  while (true) {
+    const from = page * BATCH
+    const to = from + BATCH - 1
+    const { data, error } = await supabase
+      .from('invoice_line_articles')
+      .select(`
+        invoice_line_id, invoice_id, article_id, confidence, assigned_by,
+        article:articles!inner(code, name),
+        line:invoice_lines!inner(description, quantity, total_price),
+        invoice:invoices!inner(number, date, counterparty)
+      `)
+      .eq('company_id', companyId)
+      .eq('verified', true)
+      .range(from, to)
+
+    if (error) throw error
+    if (!data || data.length === 0) break
+
+    for (const row of data as any[]) {
+      all.push({
+        invoice_line_id: row.invoice_line_id,
+        invoice_id: row.invoice_id,
+        article_id: row.article_id,
+        article_code: row.article?.code || '',
+        article_name: row.article?.name || '',
+        confidence: row.confidence,
+        assigned_by: row.assigned_by,
+        line_description: row.line?.description || null,
+        quantity: row.line?.quantity ?? null,
+        total_price: row.line?.total_price ?? null,
+        invoice_number: row.invoice?.number || null,
+        invoice_date: row.invoice?.date || null,
+        counterparty_name:
+          row.invoice?.counterparty && typeof row.invoice.counterparty === 'object'
+            ? (row.invoice.counterparty as any).denom || null
+            : null,
+      })
+    }
+
+    if (data.length < BATCH) break
+    page++
+  }
+
+  return all
+}
+
+/**
+ * Load all skipped (classification_status='skipped') invoice lines.
+ */
+export async function loadSkippedLines(companyId: string): Promise<SkippedLine[]> {
+  const BATCH = 1000
+  let all: SkippedLine[] = []
+  let page = 0
+
+  while (true) {
+    const from = page * BATCH
+    const to = from + BATCH - 1
+    const { data, error } = await supabase
+      .from('invoice_lines')
+      .select(`
+        id, invoice_id, description, quantity, total_price,
+        invoice:invoices!inner(number, date, company_id, counterparty)
+      `)
+      .eq('invoice.company_id', companyId)
+      .eq('classification_status', 'skipped')
+      .range(from, to)
+
+    if (error) throw error
+    if (!data || data.length === 0) break
+
+    for (const row of data as any[]) {
+      all.push({
+        id: row.id,
+        invoice_id: row.invoice_id,
+        line_description: row.description || null,
+        quantity: row.quantity ?? null,
+        total_price: row.total_price ?? null,
+        invoice_number: row.invoice?.number || null,
+        invoice_date: row.invoice?.date || null,
+        counterparty_name:
+          row.invoice?.counterparty && typeof row.invoice.counterparty === 'object'
+            ? (row.invoice.counterparty as any).denom || null
+            : null,
+      })
+    }
+
+    if (data.length < BATCH) break
+    page++
+  }
+
+  return all
+}
+
+/**
+ * Unskip a previously skipped line (set back to 'pending').
+ */
+export async function unskipLine(lineId: string): Promise<void> {
+  const { error } = await supabase
+    .from('invoice_lines')
+    .update({ classification_status: 'pending' } as any)
+    .eq('id', lineId)
+  if (error) throw error
 }
 
 /* ─── Categories helper ──────────────────────── */

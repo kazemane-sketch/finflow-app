@@ -12,9 +12,12 @@ import {
   loadCategories, assignArticleToLine, loadLearnedRules,
   removeLineAssignment, recordAssignmentFeedback,
   loadClassificationCounts, markLineSkipped, markLinesSkippedBulk,
+  deleteBulkSuggestions, saveBulkSuggestions, loadSavedSuggestions,
+  loadClassifiedLines, loadSkippedLines, unskipLine,
   type Article, type ArticleCreate, type ArticleStats, type ArticleLineRow,
   type UnassignedLine, type MatchResult, type DashboardArticleRow,
-  type ClassificationCounts,
+  type ClassificationCounts, type BulkSuggestion,
+  type ClassifiedLine, type SkippedLine,
 } from '@/lib/articlesService'
 import {
   matchWithLearnedRules, extractLocation, suggestKeywords,
@@ -120,11 +123,19 @@ export default function ArticoliPage() {
   const [filterUnmatchCounterparty, setFilterUnmatchCounterparty] = useState('')
 
   // ─ Classification KPI counts
-  const [kpiCounts, setKpiCounts] = useState<ClassificationCounts>({ total: 0, classified: 0, skipped: 0 })
+  const [kpiCounts, setKpiCounts] = useState<ClassificationCounts>({ total: 0, classified: 0, with_match: 0, skipped: 0, to_analyze: 0 })
 
   // ─ Skip loading state
   const [skippingIds, setSkippingIds] = useState<Set<string>>(new Set())
   const [bulkSkipping, setBulkSkipping] = useState(false)
+
+  // ─ KPI clickable views
+  type ActiveKpi = 'all' | 'with_match' | 'classified' | 'skipped' | 'to_analyze'
+  const [activeKpi, setActiveKpi] = useState<ActiveKpi>('all')
+  const [classifiedLines, setClassifiedLines] = useState<ClassifiedLine[]>([])
+  const [skippedLines, setSkippedLines] = useState<SkippedLine[]>([])
+  const [classifiedLoading, setClassifiedLoading] = useState(false)
+  const [skippedLoading, setSkippedLoading] = useState(false)
 
   // ─ Article override (clickable badge → change suggested article)
   const [articleOverrides, setArticleOverrides] = useState<Map<string, Article>>(new Map())
@@ -283,28 +294,71 @@ export default function ArticoliPage() {
     setFilterUnmatchText('')
     setFilterUnmatchCounterparty('')
     try {
-      // Load articles, rules, counts, and ALL unassigned lines (paginated, no limit)
-      const [arts, rules, counts] = await Promise.all([
+      // Step 1: Clear old AI suggestions
+      setAnalyzeProgress('Pulizia vecchi suggerimenti...')
+      await deleteBulkSuggestions(companyId)
+
+      // Step 2: Load articles, rules and ALL unassigned lines (paginated, no limit)
+      const [arts, rules] = await Promise.all([
         loadArticles(companyId, { activeOnly: true }),
         loadLearnedRules(companyId),
-        loadClassificationCounts(companyId),
       ])
-      setKpiCounts(counts)
+      setArticles(arts)
       setAnalyzeProgress('Caricamento righe fattura...')
       const lines = await loadUnassignedLines(companyId, (loaded) => {
         setAnalyzeProgress(`Caricate ${loaded} righe...`)
       })
       setUnassignedLines(lines)
 
-      // Run matching for each line: learned rules first, then keyword fallback
+      // Step 3: Run matching for each line: learned rules first, then keyword fallback
       setAnalyzeProgress(`Matching ${lines.length} righe...`)
       const results = new Map<string, MatchResult>()
+      const bulkToSave: BulkSuggestion[] = []
+
+      // Diagnostics (STEP 4)
+      let ruleMatches = 0, keywordMatches = 0
+      const activeRules = rules.filter(r => r.confidence > 0.5)
+      console.log(`[ArticoliPage] Analisi: ${lines.length} righe, ${arts.length} articoli, ${rules.length} regole (${activeRules.length} con confidence > 0.5)`)
+      if (activeRules.length > 0) {
+        console.log('[ArticoliPage] Top 5 regole:', activeRules.slice(0, 5).map(r => ({
+          article_id: r.article_id,
+          confidence: r.confidence,
+          keywords: (r.pattern as any)?.description_contains || [],
+          hits: r.hit_count,
+        })))
+      }
+
       for (const line of lines) {
         if (!line.description) continue
         const match = matchWithLearnedRules(line.description, arts, rules)
-        if (match) results.set(line.id, match)
+        if (match) {
+          results.set(line.id, match)
+          bulkToSave.push({
+            invoice_line_id: line.id,
+            invoice_id: line.invoice_id,
+            article_id: match.article.id,
+            confidence: match.confidence,
+          })
+          // Diagnostics: count rule vs keyword matches
+          if (match.confidence >= 50 && match.matchedKeywords.length === 0) ruleMatches++
+          else keywordMatches++
+        }
       }
+
+      console.log(`[ArticoliPage] Risultati: ${results.size} match (${ruleMatches} via regole, ${keywordMatches} via keywords)`)
+
+      // Step 4: Save suggestions to DB
+      if (bulkToSave.length > 0) {
+        setAnalyzeProgress(`Salvataggio ${bulkToSave.length} suggerimenti...`)
+        await saveBulkSuggestions(companyId, bulkToSave)
+      }
+
       setMatchResults(results)
+
+      // Step 5: Refresh KPI counts from DB
+      const counts = await loadClassificationCounts(companyId)
+      setKpiCounts(counts)
+
       toast.success(`Analizzate ${lines.length} righe, ${results.size} con match`)
     } catch (err: any) {
       toast.error(`Errore analisi: ${err.message}`)
@@ -347,7 +401,11 @@ export default function ArticoliPage() {
       matchResults.delete(line.id)
       setMatchResults(new Map(matchResults))
       setArticleOverrides(prev => { const next = new Map(prev); next.delete(line.id); return next })
-      setKpiCounts(prev => ({ ...prev, classified: prev.classified + 1 }))
+      setKpiCounts(prev => ({
+        ...prev,
+        classified: prev.classified + 1,
+        with_match: Math.max(0, prev.with_match - 1),
+      }))
       toast.success(`Assegnato a ${finalArticle.code}`)
     } catch (err: any) {
       toast.error(`Errore: ${err.message}`)
@@ -397,6 +455,73 @@ export default function ArticoliPage() {
     }
     setDashboardLoading(false)
   }, [companyId, dashYear])
+
+  // Auto-load KPI counts + saved suggestions when assignment tab opens
+  useEffect(() => {
+    if (activeTab !== 'assignment' || !companyId) return
+    let cancelled = false
+
+    ;(async () => {
+      try {
+        // Load KPI counts
+        const counts = await loadClassificationCounts(companyId)
+        if (cancelled) return
+        setKpiCounts(counts)
+
+        // If we already have match results in memory (just ran analysis), skip loading from DB
+        if (matchResults.size > 0) return
+
+        // Load saved suggestions from DB
+        const [saved, arts] = await Promise.all([
+          loadSavedSuggestions(companyId),
+          loadArticles(companyId, { activeOnly: true }),
+        ])
+        if (cancelled || saved.length === 0) {
+          if (!cancelled) setArticles(arts)
+          return
+        }
+        setArticles(arts)
+
+        // Convert SavedSuggestion[] → UnassignedLine[] + Map<string, MatchResult>
+        const lines: UnassignedLine[] = []
+        const results = new Map<string, MatchResult>()
+        for (const s of saved) {
+          lines.push({
+            id: s.invoice_line_id,
+            invoice_id: s.invoice_id,
+            line_number: s.line_number,
+            description: s.line_description,
+            quantity: s.quantity,
+            unit_price: s.unit_price,
+            total_price: s.total_price,
+            vat_rate: s.vat_rate,
+            article_code: s.article_code_xml,
+            invoice_number: s.invoice_number,
+            invoice_date: s.invoice_date,
+            counterparty_name: s.counterparty_name,
+            invoice_direction: s.invoice_direction,
+          })
+          const artObj = arts.find(a => a.id === s.article_id)
+          if (artObj) {
+            results.set(s.invoice_line_id, {
+              article: artObj,
+              confidence: s.confidence,
+              matchedKeywords: [],
+              totalKeywords: artObj.keywords.length,
+            })
+          }
+        }
+        if (!cancelled) {
+          setUnassignedLines(lines)
+          setMatchResults(results)
+        }
+      } catch (err) {
+        console.error('Auto-load suggestions error:', err)
+      }
+    })()
+
+    return () => { cancelled = true }
+  }, [activeTab, companyId]) // intentionally omit matchResults to avoid re-runs
 
   useEffect(() => {
     if (activeTab === 'dashboard') loadDashboard()
@@ -536,7 +661,11 @@ export default function ArticoliPage() {
       setUnassignedLines(prev => prev.filter(l => l.id !== lineId))
       matchResults.delete(lineId)
       setMatchResults(new Map(matchResults))
-      setKpiCounts(prev => ({ ...prev, skipped: prev.skipped + 1 }))
+      setKpiCounts(prev => ({
+        ...prev,
+        skipped: prev.skipped + 1,
+        to_analyze: Math.max(0, prev.to_analyze - 1),
+      }))
     } catch (err: any) {
       toast.error(`Errore: ${err.message}`)
     }
@@ -552,13 +681,70 @@ export default function ArticoliPage() {
       await markLinesSkippedBulk(ids)
       const idsSet = new Set(ids)
       setUnassignedLines(prev => prev.filter(l => !idsSet.has(l.id)))
-      setKpiCounts(prev => ({ ...prev, skipped: prev.skipped + ids.length }))
+      setKpiCounts(prev => ({
+        ...prev,
+        skipped: prev.skipped + ids.length,
+        to_analyze: Math.max(0, prev.to_analyze - ids.length),
+      }))
       toast.success(`${ids.length} righe marcate come non classificabili`)
     } catch (err: any) {
       toast.error(`Errore: ${err.message}`)
     }
     setBulkSkipping(false)
   }, [filteredUnmatchedLines])
+
+  // ─── KPI click: load classified/skipped data ─
+  const handleKpiClick = useCallback(async (kpi: ActiveKpi) => {
+    setActiveKpi(kpi)
+    if (kpi === 'classified' && companyId && classifiedLines.length === 0) {
+      setClassifiedLoading(true)
+      try {
+        const lines = await loadClassifiedLines(companyId)
+        setClassifiedLines(lines)
+      } catch (err) { console.error('Load classified error:', err) }
+      setClassifiedLoading(false)
+    }
+    if (kpi === 'skipped' && companyId && skippedLines.length === 0) {
+      setSkippedLoading(true)
+      try {
+        const lines = await loadSkippedLines(companyId)
+        setSkippedLines(lines)
+      } catch (err) { console.error('Load skipped error:', err) }
+      setSkippedLoading(false)
+    }
+  }, [companyId, classifiedLines.length, skippedLines.length])
+
+  // ─── Remove a confirmed classification ────────
+  const handleRemoveClassification = useCallback(async (invoiceLineId: string) => {
+    try {
+      await removeLineAssignment(invoiceLineId)
+      setClassifiedLines(prev => prev.filter(l => l.invoice_line_id !== invoiceLineId))
+      setKpiCounts(prev => ({
+        ...prev,
+        classified: Math.max(0, prev.classified - 1),
+        to_analyze: prev.to_analyze + 1,
+      }))
+      toast.success('Assegnazione rimossa')
+    } catch (err: any) {
+      toast.error(`Errore: ${err.message}`)
+    }
+  }, [])
+
+  // ─── Unskip a skipped line ────────────────────
+  const handleUnskipLine = useCallback(async (lineId: string) => {
+    try {
+      await unskipLine(lineId)
+      setSkippedLines(prev => prev.filter(l => l.id !== lineId))
+      setKpiCounts(prev => ({
+        ...prev,
+        skipped: Math.max(0, prev.skipped - 1),
+        to_analyze: prev.to_analyze + 1,
+      }))
+      toast.success('Riga ripristinata')
+    } catch (err: any) {
+      toast.error(`Errore: ${err.message}`)
+    }
+  }, [])
 
   // ─── Inline article change (clickable badge) ─
   const changeLineArticle = useCallback((lineId: string, newArticle: Article) => {
@@ -1036,7 +1222,7 @@ export default function ArticoliPage() {
             </Button>
           </div>
 
-          {unassignedLines.length === 0 && !analyzing ? (
+          {unassignedLines.length === 0 && !analyzing && kpiCounts.total === 0 ? (
             <Card>
               <CardContent className="py-12 text-center">
                 <Tag className="h-10 w-10 text-gray-300 mx-auto mb-3" />
@@ -1049,31 +1235,138 @@ export default function ArticoliPage() {
               {/* ── KPI Bar ── */}
               {kpiCounts.total > 0 && (
                 <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-                  <div className="bg-gray-50 border rounded-lg px-3 py-2">
+                  <button onClick={() => handleKpiClick('all')}
+                    className={`bg-gray-50 border rounded-lg px-3 py-2 text-left transition-all cursor-pointer hover:shadow-sm ${activeKpi === 'all' ? 'ring-2 ring-gray-400' : ''}`}>
                     <p className="text-[9px] text-gray-400 uppercase font-medium">Totale righe</p>
                     <p className="text-sm font-bold text-gray-800">{kpiCounts.total.toLocaleString('it-IT')}</p>
-                  </div>
-                  <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                  </button>
+                  <button onClick={() => handleKpiClick('with_match')}
+                    className={`bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 text-left transition-all cursor-pointer hover:shadow-sm ${activeKpi === 'with_match' ? 'ring-2 ring-emerald-400' : ''}`}>
                     <p className="text-[9px] text-emerald-600 uppercase font-medium">Con match</p>
-                    <p className="text-sm font-bold text-emerald-700">{matchedLines.length.toLocaleString('it-IT')}</p>
-                  </div>
-                  <div className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2">
+                    <p className="text-sm font-bold text-emerald-700">{kpiCounts.with_match.toLocaleString('it-IT')}</p>
+                  </button>
+                  <button onClick={() => handleKpiClick('classified')}
+                    className={`bg-purple-50 border border-purple-200 rounded-lg px-3 py-2 text-left transition-all cursor-pointer hover:shadow-sm ${activeKpi === 'classified' ? 'ring-2 ring-purple-400' : ''}`}>
                     <p className="text-[9px] text-purple-600 uppercase font-medium">Classificate</p>
                     <p className="text-sm font-bold text-purple-700">{kpiCounts.classified.toLocaleString('it-IT')}</p>
-                  </div>
-                  <div className="bg-orange-50 border border-orange-200 rounded-lg px-3 py-2">
+                  </button>
+                  <button onClick={() => handleKpiClick('skipped')}
+                    className={`bg-orange-50 border border-orange-200 rounded-lg px-3 py-2 text-left transition-all cursor-pointer hover:shadow-sm ${activeKpi === 'skipped' ? 'ring-2 ring-orange-400' : ''}`}>
                     <p className="text-[9px] text-orange-600 uppercase font-medium">Non classificabili</p>
                     <p className="text-sm font-bold text-orange-700">{kpiCounts.skipped.toLocaleString('it-IT')}</p>
-                  </div>
-                  <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">
+                  </button>
+                  <button onClick={() => handleKpiClick('to_analyze')}
+                    className={`bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 text-left transition-all cursor-pointer hover:shadow-sm ${activeKpi === 'to_analyze' ? 'ring-2 ring-blue-400' : ''}`}>
                     <p className="text-[9px] text-blue-600 uppercase font-medium">Da analizzare</p>
-                    <p className="text-sm font-bold text-blue-700">{unmatchedLines.length.toLocaleString('it-IT')}</p>
-                  </div>
+                    <p className="text-sm font-bold text-blue-700">{kpiCounts.to_analyze.toLocaleString('it-IT')}</p>
+                  </button>
                 </div>
               )}
 
+              {/* ════ Classified Lines Section (KPI click) ════ */}
+              {(activeKpi === 'classified' || activeKpi === 'all') && activeKpi === 'classified' && (
+                <Card>
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-sm flex items-center gap-2">
+                      <CheckCircle2 className="h-4 w-4 text-purple-500" />
+                      Righe classificate ({classifiedLines.length})
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="p-0">
+                    {classifiedLoading ? (
+                      <div className="flex items-center justify-center py-8">
+                        <Loader2 className="h-5 w-5 animate-spin text-purple-500" />
+                        <span className="ml-2 text-sm text-gray-500">Caricamento...</span>
+                      </div>
+                    ) : classifiedLines.length === 0 ? (
+                      <p className="px-4 py-6 text-sm text-gray-400 text-center">Nessuna riga classificata</p>
+                    ) : (
+                      <div className="max-h-[50vh] overflow-y-auto divide-y">
+                        {classifiedLines.slice(0, 200).map(line => (
+                          <div key={line.invoice_line_id} className="px-4 py-2.5 hover:bg-gray-50/50 flex items-start gap-3">
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] font-mono font-bold text-purple-700 bg-purple-50 px-1.5 py-0.5 rounded">{line.article_code}</span>
+                                <span className="text-[10px] text-gray-500">{line.article_name}</span>
+                                <span className="text-[9px] text-gray-400 bg-gray-100 px-1 py-0.5 rounded">{line.assigned_by === 'manual' ? 'manuale' : line.assigned_by === 'ai_confirmed' ? 'AI confermata' : 'AI'}</span>
+                              </div>
+                              <p className="text-[11px] text-gray-700 mt-1 line-clamp-1">{line.line_description || '—'}</p>
+                              <div className="flex items-center gap-3 mt-0.5 text-[10px] text-gray-400">
+                                <span>Fatt. {line.invoice_number || '—'}</span>
+                                <span>{fmtDate(line.invoice_date)}</span>
+                                <span>{line.counterparty_name || '—'}</span>
+                                {line.total_price != null && <span className="font-semibold text-gray-600">{fmtEur(line.total_price)}</span>}
+                              </div>
+                            </div>
+                            <button
+                              onClick={() => handleRemoveClassification(line.invoice_line_id)}
+                              className="p-1 rounded text-red-400 hover:bg-red-50 hover:text-red-600 transition-colors shrink-0"
+                              title="Rimuovi assegnazione"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                        {classifiedLines.length > 200 && (
+                          <p className="px-4 py-2 text-[10px] text-gray-400">...e altre {classifiedLines.length - 200} righe</p>
+                        )}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              )}
+
+              {/* ════ Skipped Lines Section (KPI click) ════ */}
+              {activeKpi === 'skipped' && (
+                <Card>
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-sm flex items-center gap-2">
+                      <Ban className="h-4 w-4 text-orange-500" />
+                      Righe non classificabili ({skippedLines.length})
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="p-0">
+                    {skippedLoading ? (
+                      <div className="flex items-center justify-center py-8">
+                        <Loader2 className="h-5 w-5 animate-spin text-orange-500" />
+                        <span className="ml-2 text-sm text-gray-500">Caricamento...</span>
+                      </div>
+                    ) : skippedLines.length === 0 ? (
+                      <p className="px-4 py-6 text-sm text-gray-400 text-center">Nessuna riga skipped</p>
+                    ) : (
+                      <div className="max-h-[50vh] overflow-y-auto divide-y">
+                        {skippedLines.slice(0, 200).map(line => (
+                          <div key={line.id} className="px-4 py-2.5 hover:bg-gray-50/50 flex items-start gap-3">
+                            <div className="min-w-0 flex-1">
+                              <p className="text-[11px] text-gray-700 line-clamp-1">{line.line_description || '(vuoto)'}</p>
+                              <div className="flex items-center gap-3 mt-0.5 text-[10px] text-gray-400">
+                                <span>Fatt. {line.invoice_number || '—'}</span>
+                                <span>{fmtDate(line.invoice_date)}</span>
+                                <span>{line.counterparty_name || '—'}</span>
+                                {line.total_price != null && <span className="font-semibold text-gray-600">{fmtEur(line.total_price)}</span>}
+                              </div>
+                            </div>
+                            <Button
+                              onClick={() => handleUnskipLine(line.id)}
+                              size="sm"
+                              variant="outline"
+                              className="h-6 text-[10px] text-blue-600 border-blue-300 hover:bg-blue-50 shrink-0"
+                            >
+                              <RefreshCw className="h-3 w-3 mr-1" /> Ripristina
+                            </Button>
+                          </div>
+                        ))}
+                        {skippedLines.length > 200 && (
+                          <p className="px-4 py-2 text-[10px] text-gray-400">...e altre {skippedLines.length - 200} righe</p>
+                        )}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              )}
+
               {/* ════ Matched Lines Section ════ */}
-              {matchedLines.length > 0 && (
+              {(activeKpi === 'with_match' || activeKpi === 'all' || activeKpi === 'to_analyze') && matchedLines.length > 0 && (
                 <Card>
                   <CardHeader className="pb-2">
                     <CardTitle className="text-sm flex items-center gap-2">
@@ -1269,7 +1562,7 @@ export default function ArticoliPage() {
               )}
 
               {/* ════ Unmatched Lines Section ════ */}
-              {unmatchedLines.length > 0 && (
+              {(activeKpi === 'to_analyze' || activeKpi === 'all' || activeKpi === 'with_match') && unmatchedLines.length > 0 && (
                 <Card>
                   <CardHeader className="pb-2">
                     <CardTitle className="text-sm flex items-center gap-2 text-gray-500">

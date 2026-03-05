@@ -6,7 +6,7 @@ import { useNavigate } from 'react-router-dom'
  * Red for score ≥ 85%, amber for 50-84%.
  * Clicking navigates to reconciliation page with the tx pre-selected.
  */
-export function ReconciliationDot({ score, txId }: { score: number; txId?: string }) {
+export function ReconciliationDot({ score, txId, invoiceId }: { score: number; txId?: string; invoiceId?: string }) {
   const navigate = useNavigate()
   const color = score >= 85 ? 'bg-red-500' : score >= 50 ? 'bg-amber-500' : 'bg-gray-400'
   const title = score >= 85
@@ -17,7 +17,10 @@ export function ReconciliationDot({ score, txId }: { score: number; txId?: strin
     <button
       onClick={e => {
         e.stopPropagation()
-        navigate(txId ? `/riconciliazione?tab=suggestions&tx=${txId}` : '/riconciliazione?tab=suggestions')
+        const params = new URLSearchParams({ tab: 'suggestions' })
+        if (txId) params.set('tx', txId)
+        if (invoiceId) params.set('invoice', invoiceId)
+        navigate(`/riconciliazione?${params.toString()}`)
       }}
       title={title}
       className="inline-flex items-center justify-center"

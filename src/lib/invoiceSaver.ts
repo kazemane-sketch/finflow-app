@@ -397,6 +397,103 @@ export async function loadInvoices(
   return { data: enriched, count: totalCount };
 }
 
+/* ─── Classification metadata for invoice list icons ──── */
+
+export interface InvoiceClassificationMeta {
+  line_count: number
+  assigned_count: number    // verified=true article assignments
+  has_category: boolean
+  has_account: boolean
+  has_cost_center: boolean
+}
+
+/**
+ * Load lightweight classification metadata for a batch of invoices.
+ * Used to show 📦🏷️🏗️📒 icons in the sidebar invoice list.
+ * Runs 4 parallel queries per batch of 100 IDs.
+ */
+export async function loadInvoiceClassificationMeta(
+  companyId: string,
+  invoiceIds: string[],
+): Promise<Map<string, InvoiceClassificationMeta>> {
+  if (invoiceIds.length === 0) return new Map()
+
+  const result = new Map<string, InvoiceClassificationMeta>()
+  const BATCH = 100
+
+  for (let i = 0; i < invoiceIds.length; i += BATCH) {
+    const batchIds = invoiceIds.slice(i, i + BATCH)
+
+    const [linesRes, assignedRes, classifRes, projRes] = await Promise.all([
+      // 1. Line count per invoice
+      supabase
+        .from('invoice_lines')
+        .select('invoice_id')
+        .in('invoice_id', batchIds),
+      // 2. Assigned (verified=true) count per invoice
+      supabase
+        .from('invoice_line_articles')
+        .select('invoice_id')
+        .eq('company_id', companyId)
+        .eq('verified', true)
+        .in('invoice_id', batchIds),
+      // 3. Invoice classifications (category + account)
+      supabase
+        .from('invoice_classifications')
+        .select('invoice_id, category_id, account_id')
+        .in('invoice_id', batchIds),
+      // 4. Invoice projects (cost centers)
+      supabase
+        .from('invoice_projects')
+        .select('invoice_id')
+        .in('invoice_id', batchIds),
+    ])
+
+    // Count lines per invoice
+    const lineCounts = new Map<string, number>()
+    for (const row of (linesRes.data || [])) {
+      lineCounts.set(row.invoice_id, (lineCounts.get(row.invoice_id) || 0) + 1)
+    }
+
+    // Count assigned per invoice
+    const assignedCounts = new Map<string, number>()
+    for (const row of (assignedRes.data || [])) {
+      assignedCounts.set(row.invoice_id, (assignedCounts.get(row.invoice_id) || 0) + 1)
+    }
+
+    // Category/account per invoice
+    const classifMap = new Map<string, { has_category: boolean; has_account: boolean }>()
+    for (const row of (classifRes.data || []) as any[]) {
+      classifMap.set(row.invoice_id, {
+        has_category: !!row.category_id,
+        has_account: !!row.account_id,
+      })
+    }
+
+    // Cost center per invoice
+    const projSet = new Set<string>()
+    for (const row of (projRes.data || [])) {
+      projSet.add(row.invoice_id)
+    }
+
+    // Merge for each invoice in this batch
+    for (const id of batchIds) {
+      const lc = lineCounts.get(id) || 0
+      const ac = assignedCounts.get(id) || 0
+      const cf = classifMap.get(id)
+      result.set(id, {
+        line_count: lc,
+        assigned_count: ac,
+        has_category: cf?.has_category || false,
+        has_account: cf?.has_account || false,
+        has_cost_center: projSet.has(id),
+      })
+    }
+  }
+
+  return result
+}
+
 /** Load invoice stats (counts by status) — lightweight HEAD queries */
 export async function loadInvoiceStats(
   companyId: string,

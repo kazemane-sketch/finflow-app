@@ -7,9 +7,9 @@ import { processInvoiceFile, TIPO, MP, REG, mpLabel, tpLabel } from '@/lib/invoi
 import {
   saveInvoicesToDB, loadInvoices, loadInvoiceDetail, loadInvoiceStats,
   deleteInvoices, updateInvoice, verifyPassword,
-  fetchInvoiceAggregates,
+  fetchInvoiceAggregates, loadInvoiceClassificationMeta,
   type DBInvoice, type DBInvoiceDetail, type InvoiceUpdate, type InvoiceFilters,
-  type InvoiceAggregates,
+  type InvoiceAggregates, type InvoiceClassificationMeta,
 } from '@/lib/invoiceSaver';
 import { listInstallmentsForInvoice, type InvoiceInstallment } from '@/lib/scadenzario';
 import { supabase } from '@/integrations/supabase/client';
@@ -266,16 +266,30 @@ function ImportProgress({ phase, current, total, logs }: { phase: 'reading' | 's
 // ============================================================
 // SIDEBAR CARD
 // ============================================================
-function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, isMatched, suggestionScore }: { inv: DBInvoice; selected: boolean; checked: boolean; selectMode: boolean; onSelect: () => void; onCheck: () => void; isMatched?: boolean; suggestionScore?: number }) {
+function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, isMatched, suggestionScore, meta }: { inv: DBInvoice; selected: boolean; checked: boolean; selectMode: boolean; onSelect: () => void; onCheck: () => void; isMatched?: boolean; suggestionScore?: number; meta?: InvoiceClassificationMeta }) {
   const nc = inv.doc_type === 'TD04' || inv.doc_type === 'TD05';
   const cp = (inv.counterparty || {}) as any;
   const displayName = cp?.denom || inv.source_filename || 'Sconosciuto';
+  // Classification icons: only show if at least one is active
+  const hasAnyClassif = meta && (meta.assigned_count > 0 || meta.has_category || meta.has_cost_center || meta.has_account);
   return (
     <div className={`flex items-start gap-2 px-3 py-2.5 cursor-pointer border-b border-gray-100 transition-all ${checked ? 'bg-blue-50 border-l-4 border-l-blue-500' : selected ? 'bg-sky-50 border-l-4 border-l-sky-500' : 'border-l-4 border-l-transparent hover:bg-gray-50'}`}>
       {selectMode && <input type="checkbox" checked={checked} onChange={onCheck} className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />}
       <div className="flex-1 min-w-0" onClick={onSelect}>
         <div className="flex justify-between items-center"><span className="text-xs font-semibold text-gray-800 truncate max-w-[55%]">{displayName}</span><span className={`text-xs font-bold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(inv.total_amount)}</span></div>
-        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className="flex items-center gap-1">{isMatched && <ReconciledIcon size={12} />}{!isMatched && suggestionScore != null && <ReconciliationDot score={suggestionScore} />}{nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}<span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></span></div>
+        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className="flex items-center gap-1">{isMatched && <ReconciledIcon size={12} />}{!isMatched && suggestionScore != null && <ReconciliationDot score={suggestionScore} invoiceId={inv.id} />}{nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}<span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></span></div>
+        {hasAnyClassif && (
+          <div className="flex items-center gap-1.5 mt-1">
+            {meta!.assigned_count > 0 && (
+              <span className={`text-[10px] ${meta!.assigned_count >= meta!.line_count ? 'text-emerald-600' : 'text-amber-500'}`} title={`Articoli: ${meta!.assigned_count}/${meta!.line_count}`}>
+                📦
+              </span>
+            )}
+            {meta!.has_category && <span className="text-[10px] text-emerald-600" title="Categoria assegnata">🏷️</span>}
+            {meta!.has_cost_center && <span className="text-[10px] text-emerald-600" title="Centro di costo">🏗️</span>}
+            {meta!.has_account && <span className="text-[10px] text-emerald-600" title="Piano dei conti">📒</span>}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -458,31 +472,52 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       // Load existing assignments for this invoice
       const { data: assignments } = await supabase
         .from('invoice_line_articles')
-        .select('invoice_line_id, article_id, assigned_by, verified, location, article:articles!inner(code, name)')
+        .select('invoice_line_id, article_id, assigned_by, verified, location, confidence, article:articles!inner(id, code, name, unit, keywords)')
         .eq('invoice_id', invoice.id);
 
       if (cancelled) return;
       const map: Record<string, LineArticleInfo> = {};
+      const dbSuggestions: Record<string, MatchResult> = {};
+
       for (const a of (assignments || [])) {
         const art = a.article as any;
-        map[a.invoice_line_id] = {
-          article_id: a.article_id, code: art?.code || '', name: art?.name || '',
-          assigned_by: a.assigned_by, verified: a.verified, location: a.location,
-        };
+        if (a.verified) {
+          // Confirmed assignment → green badge
+          map[a.invoice_line_id] = {
+            article_id: a.article_id, code: art?.code || '', name: art?.name || '',
+            assigned_by: a.assigned_by, verified: a.verified, location: a.location,
+          };
+        } else {
+          // AI suggestion from DB → orange badge
+          const fullArt = arts.find(ar => ar.id === a.article_id);
+          if (fullArt) {
+            dbSuggestions[a.invoice_line_id] = {
+              article: fullArt,
+              confidence: Number(a.confidence) || 50,
+              matchedKeywords: [],
+              totalKeywords: fullArt.keywords.length,
+            };
+          }
+        }
       }
       setLineArticleMap(map);
 
-      // Compute AI suggestions for unassigned lines (learned rules first, then keyword fallback)
+      // Compute AI suggestions for lines with NO DB record at all
+      // (runtime matching — learned rules first, then keyword fallback)
       if (detail?.invoice_lines && arts.length > 0) {
-        const suggestions: Record<string, MatchResult> = {};
+        const runtimeSuggestions: Record<string, MatchResult> = {};
         for (const line of detail.invoice_lines) {
-          if (map[line.id]) continue; // already assigned
+          if (map[line.id]) continue;           // already confirmed
+          if (dbSuggestions[line.id]) continue;  // already has DB suggestion
           const match = matchWithLearnedRules(line.description, arts, rules);
           if (match && match.confidence >= 70) {
-            suggestions[line.id] = match;
+            runtimeSuggestions[line.id] = match;
           }
         }
-        setAiSuggestions(suggestions);
+        // Merge: DB suggestions take priority, then runtime
+        setAiSuggestions({ ...runtimeSuggestions, ...dbSuggestions });
+      } else {
+        setAiSuggestions(dbSuggestions);
       }
     })();
 
@@ -1390,6 +1425,9 @@ export default function FatturePage() {
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
 
+  // ── Classification metadata for sidebar icons ──
+  const [classifMeta, setClassifMeta] = useState<Map<string, InvoiceClassificationMeta>>(new Map());
+
   // ── AI search (BancaPage-style: filter + analysis modes) ──
   const [aiResult, setAiResult] = useState<InvoiceAiResult | null>(null);
   const [aiSearching, setAiSearching] = useState(false);
@@ -1507,6 +1545,17 @@ export default function FatturePage() {
   }, [allLoaded, loadingMore, loadingList]);
 
   useEffect(() => { if (invoices.length > 0) loadExtractionStats(); }, [invoices.length, loadExtractionStats]);
+
+  // Load classification metadata for sidebar icons
+  useEffect(() => {
+    if (!companyId || invoices.length === 0) return;
+    let cancelled = false;
+    const ids = invoices.map(inv => inv.id);
+    loadInvoiceClassificationMeta(companyId, ids)
+      .then(meta => { if (!cancelled) setClassifMeta(meta); })
+      .catch(err => console.error('Classification meta error:', err));
+    return () => { cancelled = true; };
+  }, [companyId, invoices]);
 
   useEffect(() => {
     if (!selectedId || !companyId) { setDetail(null); setInstallments([]); return; }
@@ -1800,7 +1849,7 @@ export default function FatturePage() {
             {loadingList || companyLoading ? <div className="text-center py-8 text-gray-400 text-sm">Caricamento...</div>
               : invoices.length === 0 ? <div className="text-center py-8 text-gray-400 text-sm">Nessun risultato</div>
               : <>
-                {invoices.map(inv => <InvoiceCard key={inv.id} inv={inv} selected={selectedId === inv.id} checked={checked.has(inv.id)} selectMode={selectMode} onSelect={() => setSelectedId(inv.id)} onCheck={() => toggleCheck(inv.id)} isMatched={matchedInvoiceIds.has(inv.id)} suggestionScore={invoiceScores.get(inv.id)} />)}
+                {invoices.map(inv => <InvoiceCard key={inv.id} inv={inv} selected={selectedId === inv.id} checked={checked.has(inv.id)} selectMode={selectMode} onSelect={() => setSelectedId(inv.id)} onCheck={() => toggleCheck(inv.id)} isMatched={matchedInvoiceIds.has(inv.id)} suggestionScore={invoiceScores.get(inv.id)} meta={classifMeta.get(inv.id)} />)}
                 {!allLoaded && <div ref={bottomRef} className="py-4 text-center text-xs text-gray-400">{loadingMore ? 'Caricamento...' : ''}</div>}
               </>}
           </div>
