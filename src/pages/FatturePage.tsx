@@ -22,6 +22,10 @@ import {
   startExtraction, loadExtractionStats as loadExtStats,
   type ExtractionState,
 } from '@/lib/extractionStore';
+import {
+  loadArticles, matchLineToArticle, extractLocation, assignArticleToLine, removeLineAssignment,
+  type Article, type MatchResult,
+} from '@/lib/articlesService';
 
 // ============================================================
 // LOOKUPS
@@ -266,6 +270,95 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, is
 }
 
 // ============================================================
+// ARTICLE ASSIGNMENT — inline dropdown on invoice lines
+// ============================================================
+interface LineArticleInfo {
+  article_id: string; code: string; name: string;
+  assigned_by: string; verified: boolean; location: string | null;
+}
+
+function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove }: {
+  articles: Article[]; current: LineArticleInfo | null;
+  suggestion: MatchResult | null;
+  onAssign: (articleId: string) => void; onRemove: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  const filtered = articles.filter(a => {
+    if (!search) return true;
+    const q = search.toLowerCase();
+    return a.code.toLowerCase().includes(q) || a.name.toLowerCase().includes(q);
+  });
+
+  const isSuggested = suggestion && suggestion.confidence >= 70 && !current;
+
+  return (
+    <div ref={ref} className="relative inline-block print:hidden">
+      {current ? (
+        <button onClick={() => setOpen(!open)}
+          className="px-1.5 py-0.5 text-[9px] font-bold rounded bg-green-100 text-green-800 border border-green-300 hover:bg-green-200 transition-colors cursor-pointer whitespace-nowrap">
+          {current.code}
+        </button>
+      ) : isSuggested ? (
+        <button onClick={() => setOpen(!open)}
+          className="px-1.5 py-0.5 text-[9px] font-medium rounded bg-orange-50 text-orange-700 border border-orange-300 hover:bg-orange-100 transition-colors cursor-pointer whitespace-nowrap flex items-center gap-0.5">
+          <span>⚡</span><span>{suggestion!.article.code}</span>
+        </button>
+      ) : (
+        <button onClick={() => setOpen(!open)}
+          className="px-1.5 py-0.5 text-[9px] text-gray-400 rounded border border-dashed border-gray-300 hover:border-gray-400 hover:text-gray-600 transition-colors cursor-pointer whitespace-nowrap">
+          + Art.
+        </button>
+      )}
+
+      {open && (
+        <div className="absolute right-0 top-full mt-1 w-64 bg-white border border-gray-200 rounded-lg shadow-xl z-50 overflow-hidden">
+          <div className="p-1.5 border-b">
+            <input autoFocus value={search} onChange={e => setSearch(e.target.value)}
+              className="w-full px-2 py-1 text-[11px] border border-gray-200 rounded focus:ring-1 focus:ring-sky-400 outline-none" placeholder="Cerca articolo..." />
+          </div>
+          <div className="max-h-48 overflow-y-auto">
+            {current && (
+              <button onClick={() => { onRemove(); setOpen(false); setSearch(''); }}
+                className="w-full text-left px-2.5 py-1.5 text-[11px] text-red-600 hover:bg-red-50 border-b border-gray-100">
+                ✕ Rimuovi assegnazione
+              </button>
+            )}
+            {isSuggested && !search && (
+              <button onClick={() => { onAssign(suggestion!.article.id); setOpen(false); setSearch(''); }}
+                className="w-full text-left px-2.5 py-1.5 text-[11px] bg-orange-50 text-orange-800 hover:bg-orange-100 border-b border-gray-100 flex items-center gap-1.5">
+                <span>⚡</span>
+                <span className="font-semibold">{suggestion!.article.code}</span>
+                <span className="text-gray-500">— {suggestion!.article.name}</span>
+                <span className="ml-auto text-[9px] text-orange-600">{Math.round(suggestion!.confidence)}%</span>
+              </button>
+            )}
+            {filtered.map(a => (
+              <button key={a.id}
+                onClick={() => { onAssign(a.id); setOpen(false); setSearch(''); }}
+                className={`w-full text-left px-2.5 py-1.5 text-[11px] hover:bg-sky-50 border-b border-gray-50 flex items-center gap-1.5 ${current?.article_id === a.id ? 'bg-sky-50 font-semibold' : ''}`}>
+                <span className="font-mono text-sky-700 font-semibold text-[10px] min-w-[52px]">{a.code}</span>
+                <span className="text-gray-700 truncate">{a.name}</span>
+              </button>
+            ))}
+            {filtered.length === 0 && <div className="px-2.5 py-2 text-[11px] text-gray-400 text-center">Nessun articolo trovato</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
 // FULL INVOICE DETAIL — matches artifact output
 // ============================================================
 function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, onDelete, onReload, onOpenCounterparty, onOpenScadenzario }: {
@@ -274,9 +367,95 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   onOpenCounterparty: (mode: 'verify' | 'edit') => void;
   onOpenScadenzario: () => void;
 }) {
+  const { company } = useCompany();
   const [editing, setEditing] = useState(false);
   const [showXml, setShowXml] = useState(false);
   const [parsed, setParsed] = useState<any>(null);
+
+  // ─── Article assignment state ───
+  const [articles, setArticles] = useState<Article[]>([]);
+  const [lineArticleMap, setLineArticleMap] = useState<Record<string, LineArticleInfo>>({});
+  const [aiSuggestions, setAiSuggestions] = useState<Record<string, MatchResult>>({});
+
+  // Load articles + existing assignments when invoice changes
+  useEffect(() => {
+    const companyId = company?.id;
+    if (!companyId || !invoice?.id) { setArticles([]); setLineArticleMap({}); setAiSuggestions({}); return; }
+    let cancelled = false;
+
+    (async () => {
+      // Load articles for this company
+      const arts = await loadArticles(companyId, { activeOnly: true });
+      if (cancelled) return;
+      setArticles(arts);
+
+      // Load existing assignments for this invoice
+      const { data: assignments } = await supabase
+        .from('invoice_line_articles')
+        .select('invoice_line_id, article_id, assigned_by, verified, location, article:articles!inner(code, name)')
+        .eq('invoice_id', invoice.id);
+
+      if (cancelled) return;
+      const map: Record<string, LineArticleInfo> = {};
+      for (const a of (assignments || [])) {
+        const art = a.article as any;
+        map[a.invoice_line_id] = {
+          article_id: a.article_id, code: art?.code || '', name: art?.name || '',
+          assigned_by: a.assigned_by, verified: a.verified, location: a.location,
+        };
+      }
+      setLineArticleMap(map);
+
+      // Compute AI suggestions for unassigned lines
+      if (detail?.invoice_lines && arts.length > 0) {
+        const suggestions: Record<string, MatchResult> = {};
+        for (const line of detail.invoice_lines) {
+          if (map[line.id]) continue; // already assigned
+          const match = matchLineToArticle(line.description, arts);
+          if (match && match.confidence >= 70) {
+            suggestions[line.id] = match;
+          }
+        }
+        setAiSuggestions(suggestions);
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [company?.id, invoice?.id, detail?.invoice_lines]);
+
+  const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }) => {
+    const companyId = company?.id;
+    if (!companyId || !invoice?.id) return;
+    const location = extractLocation(lineDesc);
+
+    try {
+      // upsert handles both INSERT and UPDATE via onConflict: 'invoice_line_id'
+      await assignArticleToLine(companyId, lineId, invoice.id, articleId, lineData, 'manual', undefined, location);
+
+      // Update local state
+      const art = articles.find(a => a.id === articleId);
+      setLineArticleMap(prev => ({
+        ...prev,
+        [lineId]: {
+          article_id: articleId, code: art?.code || '', name: art?.name || '',
+          assigned_by: 'manual', verified: true, location,
+        },
+      }));
+      // Remove AI suggestion if any
+      setAiSuggestions(prev => { const n = { ...prev }; delete n[lineId]; return n; });
+    } catch (err: any) {
+      console.error('Article assign error:', err);
+    }
+  }, [company?.id, invoice?.id, articles]);
+
+  const handleRemoveArticle = useCallback(async (lineId: string) => {
+    try {
+      await removeLineAssignment(lineId);
+      setLineArticleMap(prev => { const n = { ...prev }; delete n[lineId]; return n; });
+    } catch (err: any) {
+      console.error('Article remove error:', err);
+    }
+  }, []);
 
   useEffect(() => {
     if (detail?.raw_xml) {
@@ -483,9 +662,14 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               <th className="text-right px-1.5 py-1.5 text-sky-700 font-bold text-[10px]">Prezzo Unit.</th>
               <th className="text-right px-1.5 py-1.5 text-sky-700 font-bold text-[10px]">IVA %</th>
               <th className="text-right px-1.5 py-1.5 text-sky-700 font-bold text-[10px]">Totale</th>
+              {articles.length > 0 && <th className="text-right px-1.5 py-1.5 text-sky-700 font-bold text-[10px] print:hidden">Articolo</th>}
             </tr></thead>
             <tbody>
-              {(b?.linee || []).map((l: any, i: number) => (
+              {(b?.linee || []).map((l: any, i: number) => {
+                // Match XML line to DB invoice_lines by line_number for article assignment
+                const dbLine = detail?.invoice_lines?.find(dl => dl.line_number === parseInt(l.numero || String(i + 1)));
+                const lineId = dbLine?.id;
+                return (
                 <tr key={i} className="border-b border-gray-100">
                   {b?.linee?.some((x: any) => x.codiceArticolo) && <td className="text-left px-1.5 py-1 text-gray-400">{l.codiceArticolo || '—'}</td>}
                   <td className="text-left px-1.5 py-1">{l.descrizione}</td>
@@ -493,8 +677,21 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                   <td className="text-right px-1.5 py-1">{fmtNum(safeFloat(l.prezzoUnitario))}</td>
                   <td className="text-right px-1.5 py-1">{fmtNum(safeFloat(l.aliquotaIVA))}%</td>
                   <td className="text-right px-1.5 py-1 font-bold">{fmtNum(safeFloat(l.prezzoTotale))}</td>
+                  {articles.length > 0 && <td className="text-right px-1.5 py-1 print:hidden">
+                    {lineId && <ArticleDropdown
+                      articles={articles}
+                      current={lineArticleMap[lineId] || null}
+                      suggestion={aiSuggestions[lineId] || null}
+                      onAssign={(artId) => handleAssignArticle(lineId, artId, l.descrizione || '', {
+                        quantity: safeFloat(l.quantita) || 1, unit_price: safeFloat(l.prezzoUnitario),
+                        total_price: safeFloat(l.prezzoTotale), vat_rate: safeFloat(l.aliquotaIVA),
+                      })}
+                      onRemove={() => handleRemoveArticle(lineId)}
+                    />}
+                  </td>}
                 </tr>
-              ))}
+                );
+              })}
               {/* Fallback: DB line items when XML not parsed */}
               {!b?.linee?.length && detail?.invoice_lines?.map((l, i) => (
                 <tr key={i} className="border-b border-gray-100">
@@ -503,6 +700,18 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                   <td className="text-right px-1.5 py-1">{fmtNum(l.unit_price)}</td>
                   <td className="text-right px-1.5 py-1">{fmtNum(l.vat_rate)}%</td>
                   <td className="text-right px-1.5 py-1 font-bold">{fmtNum(l.total_price)}</td>
+                  {articles.length > 0 && <td className="text-right px-1.5 py-1 print:hidden">
+                    <ArticleDropdown
+                      articles={articles}
+                      current={lineArticleMap[l.id] || null}
+                      suggestion={aiSuggestions[l.id] || null}
+                      onAssign={(artId) => handleAssignArticle(l.id, artId, l.description, {
+                        quantity: l.quantity, unit_price: l.unit_price,
+                        total_price: l.total_price, vat_rate: l.vat_rate,
+                      })}
+                      onRemove={() => handleRemoveArticle(l.id)}
+                    />
+                  </td>}
                 </tr>
               ))}
             </tbody>
