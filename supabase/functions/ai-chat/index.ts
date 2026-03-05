@@ -9,7 +9,7 @@ const corsHeaders = {
 
 const SONNET_MODEL = "claude-sonnet-4-6";
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
-const MAX_TOOL_ROUNDS = 5;
+const MAX_TOOL_ROUNDS = 10;
 const MAX_CHAT_HISTORY = 20;
 
 /* ─── helpers ──────────────────────────────── */
@@ -200,6 +200,53 @@ const tools = [
         limit: { type: "number", description: "Numero max di risultati (default 5, max 20)" },
       },
       required: ["query"],
+    },
+  },
+  {
+    name: "get_invoices_with_lines",
+    description:
+      "Ritorna fatture CON le righe dettaglio (descrizione, quantità, prezzo unitario, totale) in un'unica query. Usa questo al posto di get_invoices + get_invoice_detail quando devi analizzare articoli, quantità o tonnellate di molte fatture. Max 50 fatture per chiamata.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        counterparty: { type: "string", description: "Nome controparte (ILIKE)" },
+        direction: { type: "string", enum: ["in", "out"], description: "out = attive (emesse/vendita), in = passive (ricevute/acquisto)" },
+        date_from: { type: "string", description: "Data inizio YYYY-MM-DD" },
+        date_to: { type: "string", description: "Data fine YYYY-MM-DD" },
+        line_description: { type: "string", description: "Filtra righe che contengono questa parola (ILIKE)" },
+        limit: { type: "number", description: "Default 50, max 50" },
+      },
+    },
+  },
+  {
+    name: "aggregate_invoice_lines",
+    description:
+      "Calcola totali aggregati delle righe fattura: somma quantità, somma importi, prezzo medio, conteggio. Raggruppa per descrizione prodotto o per mese. Usa questo per domande tipo 'quante tonnellate di calcare nel 2025', 'fatturato mensile per Buzzi', 'prezzo medio calcare'. NON usare get_invoices_with_lines per fare somme — usa questo.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        counterparty: { type: "string", description: "Nome controparte (ILIKE)" },
+        direction: { type: "string", enum: ["in", "out"], description: "out = attive (emesse/vendita), in = passive (ricevute/acquisto)" },
+        date_from: { type: "string", description: "Data inizio YYYY-MM-DD" },
+        date_to: { type: "string", description: "Data fine YYYY-MM-DD" },
+        line_description: { type: "string", description: "Filtra righe che contengono questa parola (ILIKE)" },
+        group_by: { type: "string", enum: ["product", "month", "counterparty", "none"], description: "Raggruppa per: product (descrizione riga), month (mese fattura), counterparty, none (totale unico). Default: product" },
+      },
+    },
+  },
+  {
+    name: "get_distinct_line_descriptions",
+    description:
+      "Ritorna le descrizioni DISTINTE delle righe fattura con conteggio e totali. Usa per esplorare quali prodotti/servizi esistono per una controparte, tipo 'che articoli fatturiamo a Buzzi?', 'che servizi acquistiamo?'. Ritorna una riga per ogni descrizione unica.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        counterparty: { type: "string", description: "Nome controparte (ILIKE)" },
+        direction: { type: "string", enum: ["in", "out"], description: "out = attive (emesse/vendita), in = passive (ricevute/acquisto)" },
+        date_from: { type: "string", description: "Data inizio YYYY-MM-DD" },
+        date_to: { type: "string", description: "Data fine YYYY-MM-DD" },
+        limit: { type: "number", description: "Default 50" },
+      },
     },
   },
 ];
@@ -783,6 +830,200 @@ async function handleSearchKnowledgeBase(sql: SqlClient, companyId: string, args
   };
 }
 
+async function handleGetInvoicesWithLines(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const conditions = ["i.company_id = $1"];
+  const params: unknown[] = [companyId];
+  let idx = 2;
+
+  if (args.counterparty) {
+    conditions.push(`i.counterparty->>'denom' ILIKE '%' || $${idx} || '%'`);
+    params.push(args.counterparty); idx++;
+  }
+  if (args.direction) {
+    conditions.push(`i.direction = $${idx}`);
+    params.push(args.direction); idx++;
+  }
+  if (args.date_from) {
+    conditions.push(`i.date >= $${idx}::date`);
+    params.push(args.date_from); idx++;
+  }
+  if (args.date_to) {
+    conditions.push(`i.date <= $${idx}::date`);
+    params.push(args.date_to); idx++;
+  }
+  if (args.line_description) {
+    conditions.push(`EXISTS (SELECT 1 FROM invoice_lines il2 WHERE il2.invoice_id = i.id AND il2.description ILIKE '%' || $${idx} || '%')`);
+    params.push(args.line_description); idx++;
+  }
+
+  const limit = Math.min(Number(args.limit) || 50, 50);
+  params.push(limit);
+
+  return await sql.unsafe(
+    `SELECT i.id, i.number, i.date, i.total_amount, i.direction,
+            i.counterparty->>'denom' as counterparty_name,
+            json_agg(json_build_object(
+              'description', il.description,
+              'quantity', il.quantity,
+              'unit_price', il.unit_price,
+              'total_price', il.total_price,
+              'vat_rate', il.vat_rate,
+              'line_number', il.line_number
+            ) ORDER BY il.line_number) as lines
+     FROM invoices i
+     LEFT JOIN invoice_lines il ON il.invoice_id = i.id
+     WHERE ${conditions.join(" AND ")}
+     GROUP BY i.id
+     ORDER BY i.date DESC
+     LIMIT $${idx}`,
+    params,
+  );
+}
+
+async function handleAggregateInvoiceLines(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const conditions = ["i.company_id = $1"];
+  const params: unknown[] = [companyId];
+  let idx = 2;
+
+  if (args.counterparty) {
+    conditions.push(`i.counterparty->>'denom' ILIKE '%' || $${idx} || '%'`);
+    params.push(args.counterparty); idx++;
+  }
+  if (args.direction) {
+    conditions.push(`i.direction = $${idx}`);
+    params.push(args.direction); idx++;
+  }
+  if (args.date_from) {
+    conditions.push(`i.date >= $${idx}::date`);
+    params.push(args.date_from); idx++;
+  }
+  if (args.date_to) {
+    conditions.push(`i.date <= $${idx}::date`);
+    params.push(args.date_to); idx++;
+  }
+  if (args.line_description) {
+    conditions.push(`il.description ILIKE '%' || $${idx} || '%'`);
+    params.push(args.line_description); idx++;
+  }
+
+  const where = conditions.join(" AND ");
+  const groupBy = String(args.group_by || "product");
+
+  if (groupBy === "month") {
+    return await sql.unsafe(
+      `SELECT TO_CHAR(i.date, 'YYYY-MM') as gruppo,
+              COUNT(*) as n_righe,
+              SUM(il.quantity) as totale_quantita,
+              SUM(il.total_price) as totale_importo,
+              CASE WHEN SUM(il.quantity) > 0 THEN SUM(il.total_price) / SUM(il.quantity) ELSE 0 END as prezzo_medio
+       FROM invoice_lines il
+       JOIN invoices i ON i.id = il.invoice_id
+       WHERE ${where}
+       GROUP BY TO_CHAR(i.date, 'YYYY-MM')
+       ORDER BY gruppo`,
+      params,
+    );
+  }
+
+  if (groupBy === "counterparty") {
+    return await sql.unsafe(
+      `SELECT i.counterparty->>'denom' as gruppo,
+              COUNT(*) as n_righe,
+              COUNT(DISTINCT i.id) as n_fatture,
+              SUM(il.quantity) as totale_quantita,
+              SUM(il.total_price) as totale_importo,
+              CASE WHEN SUM(il.quantity) > 0 THEN SUM(il.total_price) / SUM(il.quantity) ELSE 0 END as prezzo_medio
+       FROM invoice_lines il
+       JOIN invoices i ON i.id = il.invoice_id
+       WHERE ${where}
+       GROUP BY i.counterparty->>'denom'
+       ORDER BY totale_importo DESC`,
+      params,
+    );
+  }
+
+  if (groupBy === "none") {
+    return await sql.unsafe(
+      `SELECT 'TOTALE' as gruppo,
+              COUNT(*) as n_righe,
+              COUNT(DISTINCT i.id) as n_fatture,
+              SUM(il.quantity) as totale_quantita,
+              SUM(il.total_price) as totale_importo,
+              CASE WHEN SUM(il.quantity) > 0 THEN SUM(il.total_price) / SUM(il.quantity) ELSE 0 END as prezzo_medio,
+              MIN(i.date) as data_prima,
+              MAX(i.date) as data_ultima
+       FROM invoice_lines il
+       JOIN invoices i ON i.id = il.invoice_id
+       WHERE ${where}`,
+      params,
+    );
+  }
+
+  // Default: group by product (description)
+  return await sql.unsafe(
+    `SELECT il.description as gruppo,
+            COUNT(*) as n_righe,
+            COUNT(DISTINCT i.id) as n_fatture,
+            SUM(il.quantity) as totale_quantita,
+            SUM(il.total_price) as totale_importo,
+            CASE WHEN SUM(il.quantity) > 0 THEN SUM(il.total_price) / SUM(il.quantity) ELSE 0 END as prezzo_medio,
+            MIN(i.date) as data_prima,
+            MAX(i.date) as data_ultima
+     FROM invoice_lines il
+     JOIN invoices i ON i.id = il.invoice_id
+     WHERE ${where}
+     GROUP BY il.description
+     ORDER BY totale_importo DESC`,
+    params,
+  );
+}
+
+async function handleGetDistinctLineDescriptions(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const conditions = ["i.company_id = $1"];
+  const params: unknown[] = [companyId];
+  let idx = 2;
+
+  if (args.counterparty) {
+    conditions.push(`i.counterparty->>'denom' ILIKE '%' || $${idx} || '%'`);
+    params.push(args.counterparty); idx++;
+  }
+  if (args.direction) {
+    conditions.push(`i.direction = $${idx}`);
+    params.push(args.direction); idx++;
+  }
+  if (args.date_from) {
+    conditions.push(`i.date >= $${idx}::date`);
+    params.push(args.date_from); idx++;
+  }
+  if (args.date_to) {
+    conditions.push(`i.date <= $${idx}::date`);
+    params.push(args.date_to); idx++;
+  }
+
+  const limit = Math.min(Number(args.limit) || 50, 100);
+  params.push(limit);
+
+  return await sql.unsafe(
+    `SELECT il.description,
+            COUNT(*) as n_occorrenze,
+            COUNT(DISTINCT i.id) as n_fatture,
+            SUM(il.quantity) as totale_quantita,
+            SUM(il.total_price) as totale_importo,
+            CASE WHEN SUM(il.quantity) > 0
+              THEN SUM(il.total_price) / SUM(il.quantity)
+              ELSE 0 END as prezzo_medio,
+            MIN(i.date) as prima_fattura,
+            MAX(i.date) as ultima_fattura
+     FROM invoice_lines il
+     JOIN invoices i ON i.id = il.invoice_id
+     WHERE ${conditions.join(" AND ")}
+     GROUP BY il.description
+     ORDER BY totale_importo DESC
+     LIMIT $${idx}`,
+    params,
+  );
+}
+
 async function executeToolHandler(
   sql: SqlClient,
   companyId: string,
@@ -814,6 +1055,12 @@ async function executeToolHandler(
       return handleSuggestReconciliation(sql, companyId, toolInput);
     case "search_knowledge_base":
       return handleSearchKnowledgeBase(sql, companyId, toolInput);
+    case "get_invoices_with_lines":
+      return handleGetInvoicesWithLines(sql, companyId, toolInput);
+    case "aggregate_invoice_lines":
+      return handleAggregateInvoiceLines(sql, companyId, toolInput);
+    case "get_distinct_line_descriptions":
+      return handleGetDistinctLineDescriptions(sql, companyId, toolInput);
     default:
       return { error: `Tool sconosciuto: ${toolName}` };
   }
@@ -836,6 +1083,18 @@ STRATEGIA DI RICERCA FATTURE — IMPORTANTE:
 - Esempi di quando usare search_invoices: "fatture con calcare", "fatture pietrisco", "forniture cemento", "fattura con CIG...", "chi ha fatturato per trasporti", "fatture relative a manutenzione"
 - Per dettaglio singola fattura con extracted_summary AI: usa get_invoice_detail
 - Se search_invoices ritorna 0 risultati, prova con parole chiave diverse o più corte (es. "calcar" invece di "calcare", "pietr" invece di "pietrisco")
+
+STRUMENTI PER ANALISI RIGHE FATTURA — REGOLE CRITICHE:
+- Per SOMME e AGGREGATI (tonnellate totali, fatturato totale, prezzo medio, andamento mensile): usa SEMPRE aggregate_invoice_lines. Questo esegue una query SQL aggregata diretta — NON caricare tutte le fatture per poi sommare.
+- Per ESPLORARE quali prodotti/servizi esistono per una controparte o periodo: usa get_distinct_line_descriptions. Ritorna una riga per descrizione unica con conteggi e totali.
+- Per ANALISI DETTAGLIATA delle righe di molte fatture (es. "mostrami le ultime 20 fatture con le righe"): usa get_invoices_with_lines. Carica fino a 50 fatture con le righe in una singola query.
+- NON chiamare MAI get_invoice_detail in loop per più di 3 fatture. Usa get_invoices_with_lines al suo posto.
+- Esempi:
+  * "quante tonnellate di calcare nel 2025?" → aggregate_invoice_lines(line_description="calcare", date_from="2025-01-01", date_to="2025-12-31", group_by="none")
+  * "fatturato mensile per Buzzi" → aggregate_invoice_lines(counterparty="Buzzi", group_by="month")
+  * "prezzo medio calcare per Buzzi" → aggregate_invoice_lines(counterparty="Buzzi", line_description="calcare", group_by="none")
+  * "che prodotti fatturiamo a Buzzi?" → get_distinct_line_descriptions(counterparty="Buzzi", direction="out")
+  * "mostra le ultime fatture con righe per trasporto" → get_invoices_with_lines(line_description="trasporto")
 
 CONTROPARTI: get_counterparties supporta ordinamento per fatturato, credito o debito (order_by). Usa role per filtrare clienti/fornitori. Supporta date_from/date_to per statistiche nel periodo.
 
