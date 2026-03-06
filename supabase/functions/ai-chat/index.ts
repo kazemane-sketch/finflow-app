@@ -9,7 +9,7 @@ const corsHeaders = {
 
 const SONNET_MODEL = "claude-sonnet-4-6";
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
-const THINKING_MODEL = "claude-sonnet-4-5-20250514";
+const THINKING_MODEL = "claude-sonnet-4-6";
 const MAX_TOOL_ROUNDS = 10;
 const MAX_CHAT_HISTORY = 20;
 

@@ -280,7 +280,7 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, is
       {selectMode && <input type="checkbox" checked={checked} onChange={onCheck} className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />}
       <div className="flex-1 min-w-0" onClick={onSelect}>
         <div className="flex justify-between items-center"><span className="text-xs font-semibold text-gray-800 truncate max-w-[55%]">{displayName}</span><span className={`text-xs font-bold ${nc ? 'text-red-600' : 'text-green-700'}`}>{fmtEur(inv.total_amount)}</span></div>
-        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className="flex items-center gap-1">{isMatched && <ReconciledIcon size={12} />}{!isMatched && suggestionScore != null && <ReconciliationDot score={suggestionScore} invoiceId={inv.id} />}{nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}<span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></span></div>
+        <div className="flex justify-between items-center mt-0.5"><span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span><span className="flex items-center gap-1">{inv.classification_status === 'ai_suggested' && <span className="text-[10px] text-amber-500" title="Classificazione AI da rivedere">⚡</span>}{isMatched && <ReconciledIcon size={12} />}{!isMatched && suggestionScore != null && <ReconciliationDot score={suggestionScore} invoiceId={inv.id} />}{nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}<span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span></span></div>
         {hasAnyClassif && (
           <div className="flex items-center gap-1.5 mt-1">
             {meta!.assigned_count > 0 && (
@@ -723,6 +723,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setSelAccountId(classif?.account_id || null);
       setAiClassifResult(null);
       setAiClassifStatus('idle');
+      // Reload sidebar so ⚡ disappears (saveInvoiceClassification already set classification_status='confirmed')
+      onReload();
     } catch (e: any) { console.error('Confirm AI classification error:', e); }
   }, [invoice?.id, company?.id, aiClassifResult]);
 
@@ -1683,6 +1685,7 @@ export default function FatturePage() {
   const queryDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [serverStats, setServerStats] = useState<{ total: number; daPagare: number; scadute: number; pagate: number } | null>(null);
   const [tabCounts, setTabCounts] = useState<{ in: number; out: number }>({ in: 0, out: 0 });
+  const [aiSuggestedCount, setAiSuggestedCount] = useState(0);
   const [importing, setImporting] = useState(false);
   const [importPhase, setImportPhase] = useState<'reading' | 'saving' | 'done'>('reading');
   const [importCurrent, setImportCurrent] = useState(0);
@@ -1691,6 +1694,7 @@ export default function FatturePage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'overdue' | 'paid'>('all');
+  const [aiSuggestedFilter, setAiSuggestedFilter] = useState(false);
   const [directionFilter, setDirectionFilter] = useState<'all' | 'in' | 'out'>('in');
   const [selectMode, setSelectMode] = useState(false);
   const [checked, setChecked] = useState<Set<string>>(new Set());
@@ -1767,6 +1771,8 @@ export default function FatturePage() {
         batches.push(ids.slice(i, i + BATCH_SIZE));
       }
 
+      const classifiedIds: string[] = [];
+
       for (let i = 0; i < batches.length; i += PARALLEL) {
         if (signal.aborted) return;
         const parallelBatches = batches.slice(i, i + PARALLEL);
@@ -1785,23 +1791,31 @@ export default function FatturePage() {
               });
               if (!res.ok) {
                 console.error(`Batch classification error: HTTP ${res.status}`);
-                return { success: 0, failed: batch.length };
+                return { success: 0, failed: batch.length, ids: [] as string[] };
               }
               const data = await res.json();
-              return { success: data.results?.length || 0, failed: data.stats?.failed || 0 };
+              const okIds = (data.results || []).map((r: any) => r.invoice_id).filter(Boolean);
+              return { success: data.results?.length || 0, failed: data.stats?.failed || 0, ids: okIds as string[] };
             } catch (fetchErr: any) {
               if (fetchErr?.name === 'AbortError') throw fetchErr;
               console.error('Batch fetch error:', fetchErr);
-              return { success: 0, failed: batch.length };
+              return { success: 0, failed: batch.length, ids: [] as string[] };
             }
           }),
         );
         for (const r of results) {
           successCount += r.success;
           failedCount += r.failed;
+          classifiedIds.push(...r.ids);
         }
         const processed = Math.min((i + PARALLEL) * BATCH_SIZE, ids.length);
         updateProgress(processed, ids.length);
+      }
+
+      // Mark classified invoices as ai_suggested (bulk, 200 per call to stay within PostgREST limits)
+      for (let i = 0; i < classifiedIds.length; i += 200) {
+        const chunk = classifiedIds.slice(i, i + 200);
+        await supabase.from('invoices').update({ classification_status: 'ai_suggested' } as any).in('id', chunk);
       }
 
       if (failedCount > 0 && successCount === 0) {
@@ -1859,7 +1873,7 @@ export default function FatturePage() {
   }, [query]);
 
   const resetAllFilters = useCallback(() => {
-    setDateFrom(''); setDateTo(''); setStatusFilter('all');
+    setDateFrom(''); setDateTo(''); setStatusFilter('all'); setAiSuggestedFilter(false);
     setAmountMin(undefined); setAmountMax(undefined); setCounterpartyPattern(undefined);
   }, []);
 
@@ -1873,7 +1887,8 @@ export default function FatturePage() {
     amountMin,
     amountMax,
     counterpartyPattern,
-  }), [directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.candidateIds, amountMin, amountMax, counterpartyPattern]);
+    classificationStatus: aiSuggestedFilter ? 'ai_suggested' : undefined,
+  }), [directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.candidateIds, amountMin, amountMax, counterpartyPattern, aiSuggestedFilter]);
 
   const reload = useCallback(async (reset = true) => {
     if (!companyId) return;
@@ -1892,13 +1907,15 @@ export default function FatturePage() {
         setInvoices(result.data);
         // Load stats + tab counts in parallel (pass all filter fields including amount/counterparty)
         const statsFilters = { direction: filters.direction, dateFrom: filters.dateFrom, dateTo: filters.dateTo, query: filters.query, amountMin: filters.amountMin, amountMax: filters.amountMax, counterpartyPattern: filters.counterpartyPattern };
-        const [stats, inStats, outStats] = await Promise.all([
+        const [stats, inStats, outStats, aiSugCount] = await Promise.all([
           loadInvoiceStats(companyId, statsFilters),
           loadInvoiceStats(companyId, { ...statsFilters, direction: 'in' }),
           loadInvoiceStats(companyId, { ...statsFilters, direction: 'out' }),
+          supabase.from('invoices').select('id', { count: 'exact', head: true }).eq('company_id', companyId).eq('direction', filters.direction === 'all' ? directionFilter : filters.direction!).eq('classification_status', 'ai_suggested').then(r => r.count ?? 0),
         ]);
         setServerStats(stats);
         setTabCounts({ in: inStats.total, out: outStats.total });
+        setAiSuggestedCount(aiSugCount as number);
       } else {
         setInvoices(prev => [...prev, ...result.data]);
       }
@@ -1915,7 +1932,7 @@ export default function FatturePage() {
     setPage(0); setAllLoaded(false); setInvoices([]); setTotalCount(0);
     reload(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [companyId, directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.candidateIds?.join(','), amountMin, amountMax, counterpartyPattern, reloadTrigger]);
+  }, [companyId, directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.candidateIds?.join(','), amountMin, amountMax, counterpartyPattern, aiSuggestedFilter, reloadTrigger]);
 
   // Load next page
   useEffect(() => { if (page > 0) reload(false); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [page]);
@@ -2260,6 +2277,9 @@ export default function FatturePage() {
               {(['all', 'pending', 'overdue', 'paid'] as const).map(s => (
                 <button key={s} onClick={() => setStatusFilter(s)} className={`flex-1 py-1 text-[10px] font-semibold rounded ${statusFilter === s ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>{s === 'all' ? 'Tutte' : STATUS_LABELS[s]}</button>
               ))}
+              {aiSuggestedCount > 0 && (
+                <button onClick={() => setAiSuggestedFilter(f => !f)} className={`py-1 px-2 text-[10px] font-semibold rounded whitespace-nowrap ${aiSuggestedFilter ? 'bg-amber-100 text-amber-700 border border-amber-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>⚡ {aiSuggestedCount}</button>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <button onClick={() => { setSelectMode(!selectMode); if (selectMode) setChecked(new Set()); }} className={`px-2 py-1 text-[10px] font-semibold rounded ${selectMode ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>{selectMode ? '✕ Esci Selezione' : '☐ Seleziona'}</button>

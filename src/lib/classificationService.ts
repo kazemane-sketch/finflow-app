@@ -368,6 +368,9 @@ export async function saveInvoiceClassification(
     }, { onConflict: 'invoice_id' });
   if (error) throw error;
 
+  // Mark invoice classification as confirmed (removes ⚡ AI suggestion indicator)
+  await supabase.from('invoices').update({ classification_status: 'confirmed' } as any).eq('id', invoiceId);
+
   // RAG: create learning example for the classification (fire-and-forget)
   try {
     const { data: inv } = await supabase.from('invoices')
