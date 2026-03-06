@@ -1707,6 +1707,7 @@ export default function FatturePage() {
   // ── Batch AI Classification ──
   const [batchClassifRunning, setBatchClassifRunning] = useState(false);
   const [batchClassifProgress, setBatchClassifProgress] = useState({ done: 0, total: 0 });
+  const [reloadTrigger, setReloadTrigger] = useState(0);
 
   const runBatchAiClassification = useCallback(async () => {
     const companyId = company?.id;
@@ -1724,22 +1725,46 @@ export default function FatturePage() {
       setBatchClassifProgress({ done: 0, total: ids.length });
 
       const token = await getValidAccessToken();
+      let successCount = 0;
+      let failedCount = 0;
       // Process in batches of 10
       for (let i = 0; i < ids.length; i += 10) {
         const batch = ids.slice(i, i + 10);
-        await fetch(`${SUPABASE_URL}/functions/v1/classification-ai-suggest`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`,
-            'apikey': SUPABASE_ANON_KEY,
-          },
-          body: JSON.stringify({ company_id: companyId, invoice_ids: batch }),
-        });
+        try {
+          const res = await fetch(`${SUPABASE_URL}/functions/v1/classification-ai-suggest`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`,
+              'apikey': SUPABASE_ANON_KEY,
+            },
+            body: JSON.stringify({ company_id: companyId, invoice_ids: batch }),
+          });
+          if (!res.ok) {
+            console.error(`Batch classification error: HTTP ${res.status}`);
+            failedCount += batch.length;
+          } else {
+            const data = await res.json();
+            successCount += (data.results?.length || 0);
+            failedCount += (data.stats?.failed || 0);
+          }
+        } catch (fetchErr) {
+          console.error('Batch fetch error:', fetchErr);
+          failedCount += batch.length;
+        }
         setBatchClassifProgress({ done: Math.min(i + 10, ids.length), total: ids.length });
       }
+      // Show result feedback
+      if (failedCount > 0 && successCount === 0) {
+        alert(`Classificazione fallita per tutte le ${ids.length} fatture. Verifica i log.`);
+      } else if (failedCount > 0) {
+        alert(`Classificate ${successCount} fatture. ${failedCount} errori.`);
+      }
+      // Trigger invoice list reload to reflect updated classification icons
+      setReloadTrigger(t => t + 1);
     } catch (e: any) {
       console.error('Batch AI classification error:', e);
+      alert('Errore durante la classificazione batch. Riprova.');
     }
     setBatchClassifRunning(false);
   }, [company?.id, directionFilter]);
@@ -1834,7 +1859,7 @@ export default function FatturePage() {
     setPage(0); setAllLoaded(false); setInvoices([]); setTotalCount(0);
     reload(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [companyId, directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.candidateIds?.join(','), amountMin, amountMax, counterpartyPattern]);
+  }, [companyId, directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.candidateIds?.join(','), amountMin, amountMax, counterpartyPattern, reloadTrigger]);
 
   // Load next page
   useEffect(() => { if (page > 0) reload(false); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [page]);
@@ -2058,14 +2083,15 @@ export default function FatturePage() {
           <button
             onClick={runExtraction}
             disabled={extractionRunning || (extractionStats?.pending === 0)}
-            className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-purple-700 bg-purple-50 border border-purple-200 rounded-lg hover:bg-purple-100 disabled:opacity-50"
+            title="Estrae dettagli strutturati dalle fatture XML tramite AI"
+            className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-sky-700 bg-sky-50 border border-sky-200 rounded-lg hover:bg-sky-100 disabled:opacity-50"
           >
             {extractionRunning ? (
               <>⏳ Estrazione: {extractionProgress?.processed ?? 0}/{extractionProgress?.total ?? '?'}</>
             ) : extractionStats?.pending === 0 ? (
-              <>✅ AI: {extractionStats?.ready ?? 0}/{extractionStats?.total ?? 0} pronti</>
+              <>📋 Estratte: {extractionStats?.ready ?? 0}/{extractionStats?.total ?? 0}</>
             ) : (
-              <>✨ Estrai dettagli AI{extractionStats ? ` (${extractionStats.pending} pending)` : ''}</>
+              <>📋 Estrai dettagli{extractionStats ? ` (${extractionStats.pending})` : ''}</>
             )}
           </button>
         )}
@@ -2073,11 +2099,12 @@ export default function FatturePage() {
           <button
             onClick={runBatchAiClassification}
             disabled={batchClassifRunning}
+            title="Classifica automaticamente categoria, conto e CdC per le fatture non classificate"
             className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-purple-700 bg-purple-50 border border-purple-200 rounded-lg hover:bg-purple-100 disabled:opacity-50"
           >
             {batchClassifRunning
               ? <>⏳ Classifica: {batchClassifProgress.done}/{batchClassifProgress.total}</>
-              : <>&#x2728; Classifica AI</>
+              : <>🏷️ Classifica AI</>
             }
           </button>
         )}
