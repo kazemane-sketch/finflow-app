@@ -73,10 +73,10 @@ export default function AiChatWidget() {
   // Don't render on /ai page (after all hooks!)
   if (location.pathname === '/ai') return null
 
-  // Page context from current location + selected entity
+  // Page context from current location + selected entity (include UUID so AI can call tools)
   const pageLabel = PAGE_LABELS[location.pathname] || location.pathname
   const pageContext = pageEntity
-    ? `${pageLabel}. L'utente sta guardando: ${pageEntity.summary}`
+    ? `${pageLabel}. L'utente sta guardando: ${pageEntity.summary}. ${pageEntity.type}_id (database UUID) = "${pageEntity.id}" — usa questo ID per chiamare i tool come get_invoice_detail o get_transaction_detail.`
     : pageLabel
 
   /* ── auto-resize textarea ─────────────── */

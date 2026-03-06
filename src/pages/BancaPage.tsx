@@ -1480,6 +1480,7 @@ export default function BancaPage() {
         : '';
       setPageEntity({
         type: 'transaction',
+        id: selectedTx.id,
         summary: `Movimento bancario del ${selectedTx.date || 'N/D'} — ${selectedTx.counterparty_name || selectedTx.description?.slice(0, 50) || 'N/D'} — ${amt}${dir ? ` (${dir})` : ''}`,
       });
     } else {

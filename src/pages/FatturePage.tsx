@@ -2081,7 +2081,8 @@ export default function FatturePage() {
       const dir = selectedInvoice.direction === 'out' ? 'attiva/vendita' : 'passiva/acquisto';
       setPageEntity({
         type: 'invoice',
-        summary: `Fattura ${selectedInvoice.number} del ${fmtDate(selectedInvoice.date)} — ${cpName} — ${fmtEur(selectedInvoice.total_amount)} (${dir})`,
+        id: selectedInvoice.id,
+        summary: `Fattura N.${selectedInvoice.number} del ${fmtDate(selectedInvoice.date)} — ${cpName} — ${fmtEur(selectedInvoice.total_amount)} (${dir})`,
       });
     } else {
       setPageEntity(null);

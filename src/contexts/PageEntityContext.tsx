@@ -20,6 +20,7 @@ import {
 
 export interface PageEntityInfo {
   type: 'invoice' | 'transaction' | 'counterparty' | 'article' | 'installment'
+  id: string      // Database UUID — so the AI can call tools like get_invoice_detail(id)
   summary: string // Human-readable summary for AI context (e.g. "Fattura 001/2024 — CAVECO SRL — €1,234.56")
 }
 
