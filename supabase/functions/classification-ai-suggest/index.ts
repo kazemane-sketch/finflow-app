@@ -9,7 +9,7 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const HAIKU_MODEL = "claude-3-5-haiku-20241022";
+const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const MAX_INVOICES = 50;
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_DIMS = 3072;
@@ -263,6 +263,12 @@ async function ragClassifyLines(
 
 /* ─── Step 2: AI classification via Haiku ─── */
 
+interface AiClassifyResult {
+  results: Map<string, LineResult>;
+  haiku_called: boolean;
+  haiku_error: string | null;
+}
+
 async function aiClassify(
   unmatchedLines: InvoiceLine[],
   context: {
@@ -272,29 +278,37 @@ async function aiClassify(
     projects: ProjectRow[];
     invoiceDirection: string;
     counterpartyName: string;
+    counterpartyAddress: string;
     confirmedExamples: ConfirmedExample[];
   },
-): Promise<Map<string, LineResult>> {
+): Promise<AiClassifyResult> {
   const results = new Map<string, LineResult>();
-  if (unmatchedLines.length === 0) return results;
+  if (unmatchedLines.length === 0) return { results, haiku_called: false, haiku_error: null };
 
-  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
+  const apiKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
   if (!apiKey) {
-    console.warn("ANTHROPIC_API_KEY not set, skipping AI classification");
-    return results;
+    console.error("[classification-ai-suggest] ANTHROPIC_API_KEY NOT SET — Haiku cannot be called!");
+    return { results, haiku_called: false, haiku_error: "ANTHROPIC_API_KEY non configurata" };
   }
 
-  // Build few-shot examples section (only if we have confirmed examples)
-  const examplesSection = context.confirmedExamples.length > 0
-    ? `\nESEMPI DI CLASSIFICAZIONI GIA CONFERMATE (impara da questi pattern):
-${context.confirmedExamples.map((ex, i) => {
-  const parts: string[] = [];
-  if (ex.category_name) parts.push(`Cat: ${ex.category_name}`);
-  if (ex.account_code && ex.account_name) parts.push(`Conto: ${ex.account_code} ${ex.account_name}`);
-  return `${i + 1}. "${ex.description}" → ${parts.join(", ") || "N.D."}`;
-}).join("\n")}
-`
-    : "";
+  // Build few-shot examples section (optional — Haiku is called regardless)
+  let examplesSection: string;
+  if (context.confirmedExamples.length > 0) {
+    const exLines = context.confirmedExamples.map((ex, i) => {
+      const parts: string[] = [];
+      if (ex.category_name) parts.push(`Cat: ${ex.category_name}`);
+      if (ex.account_code && ex.account_name) parts.push(`Conto: ${ex.account_code} ${ex.account_name}`);
+      return `${i + 1}. "${ex.description}" → ${parts.join(", ") || "N.D."}`;
+    }).join("\n");
+    examplesSection = `\nESEMPI DI CLASSIFICAZIONI GIA CONFERMATE (impara da questi pattern):\n${exLines}\n`;
+  } else {
+    examplesSection = `\nNessun esempio storico disponibile. Ragiona dal contesto della fattura: nome fornitore, descrizione righe, sede, settore merceologico.\n`;
+  }
+
+  // Build counterparty info (name + address for geographic context)
+  const counterpartyInfo = context.counterpartyAddress
+    ? `${context.counterpartyName || "N.D."} — Sede: ${context.counterpartyAddress}`
+    : context.counterpartyName || "N.D.";
 
   const prompt = `Sei un contabile italiano esperto. Classifica le seguenti righe fattura.
 
@@ -305,13 +319,13 @@ CATEGORIE DISPONIBILI:
 ${context.categories.map((c) => `- ${c.id}: ${c.name} (${c.type})`).join("\n")}
 
 PIANO DEI CONTI:
-${context.accounts.slice(0, 60).map((a) => `- ${a.id}: ${a.code} ${a.name} (${a.section})`).join("\n")}
+${context.accounts.slice(0, 80).map((a) => `- ${a.id}: ${a.code} ${a.name} (${a.section})`).join("\n")}
 
 CENTRI DI COSTO:
 ${context.projects.map((p) => `- ${p.id}: ${p.code} ${p.name}`).join("\n")}
 ${examplesSection}
 FATTURA: ${context.invoiceDirection === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
-CONTROPARTE: ${context.counterpartyName || "N.D."}
+CONTROPARTE: ${counterpartyInfo}
 
 RIGHE DA CLASSIFICARE:
 ${unmatchedLines.map((l, i) => `${i + 1}. [line_id: ${l.id}] "${l.description}" qty=${l.quantity} total=${l.total_price}`).join("\n")}
@@ -330,15 +344,18 @@ Per ogni riga, rispondi SOLO con un array JSON valido (senza markdown o commenti
 ]
 
 REGOLE:
-- Se la fattura e PASSIVA (acquisto): usa categorie tipo "expense" e conti 60xxx
+- Se la fattura e PASSIVA (acquisto): usa categorie tipo "expense" e conti 60xxx-69xxx
 - Se la fattura e ATTIVA (vendita): usa categorie tipo "revenue" e conti 70xxx
 - Assegna article_id SOLO se trovi un articolo molto pertinente, altrimenti null
-- Assegna category_id e account_id anche senza articolo
+- Assegna SEMPRE category_id e account_id (deduci dal nome fornitore, descrizione riga, sede)
 - Se una riga e simile a un esempio confermato, usa la stessa classificazione (alta confidence)
+- Usa il nome/settore del fornitore per capire la categoria (es: ristorante → mensa/ristorazione)
+- Usa la sede del fornitore per scegliere il centro di costo geografico piu vicino
 - confidence 0-100: piu alto = piu sicuro
 - Rispondi SOLO con l'array JSON, niente altro`;
 
   try {
+    console.log(`[classification-ai-suggest] Calling Haiku for ${unmatchedLines.length} lines (${context.confirmedExamples.length} examples)`);
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -355,12 +372,13 @@ REGOLE:
 
     if (!response.ok) {
       const errText = await response.text();
-      console.error("Haiku API error:", response.status, errText);
-      return results;
+      console.error("[classification-ai-suggest] Haiku API error:", response.status, errText);
+      return { results, haiku_called: true, haiku_error: `Haiku HTTP ${response.status}: ${errText.slice(0, 200)}` };
     }
 
     const data = await response.json();
     const text = data?.content?.[0]?.text || "";
+    console.log(`[classification-ai-suggest] Haiku response length: ${text.length} chars`);
 
     // Parse JSON from response (handle potential markdown wrapping)
     let parsed: any[];
@@ -368,8 +386,12 @@ REGOLE:
       const jsonMatch = text.match(/\[[\s\S]*\]/);
       parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
     } catch (e) {
-      console.error("Failed to parse Haiku response:", e, text.slice(0, 500));
-      return results;
+      console.error("[classification-ai-suggest] Failed to parse Haiku response:", e, text.slice(0, 500));
+      return { results, haiku_called: true, haiku_error: `Parse error: ${text.slice(0, 200)}` };
+    }
+
+    if (parsed.length === 0) {
+      console.warn("[classification-ai-suggest] Haiku returned empty array");
     }
 
     for (const item of parsed) {
@@ -385,11 +407,13 @@ REGOLE:
         reasoning: item.reasoning || null,
       });
     }
-  } catch (e) {
-    console.error("AI classification error:", e);
-  }
 
-  return results;
+    return { results, haiku_called: true, haiku_error: null };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[classification-ai-suggest] AI classification error:", msg);
+    return { results, haiku_called: true, haiku_error: msg };
+  }
 }
 
 /* ─── Step 3: Compose invoice-level from line results ─── */
@@ -561,8 +585,11 @@ Deno.serve(async (req) => {
 
     const results: InvoiceResult[] = [];
     let totalDeterministic = 0;
+    let totalRag = 0;
     let totalAi = 0;
     let totalFailed = 0;
+    let haikuCalled = false;
+    let haikuError: string | null = null;
 
     for (const invoiceId of invoiceIds) {
       try {
@@ -571,10 +598,16 @@ Deno.serve(async (req) => {
           SELECT id, direction, counterparty
           FROM invoices
           WHERE id = ${invoiceId} AND company_id = ${companyId}`;
-        if (!invoiceRow) { totalFailed++; continue; }
+        if (!invoiceRow) {
+          console.warn(`[classification-ai-suggest] Invoice ${invoiceId} not found`);
+          totalFailed++; continue;
+        }
 
-        const counterpartyName = (invoiceRow.counterparty as any)?.denom || "";
-        const counterpartyPiva = (invoiceRow.counterparty as any)?.piva || null;
+        const cp = invoiceRow.counterparty as any;
+        const counterpartyName = cp?.denom || "";
+        const counterpartyPiva = cp?.piva || null;
+        // Build address for geographic context — sede is a single string like "VIA X, CAP CITTA (PROV)"
+        const counterpartyAddress = cp?.sede || "";
 
         // Load lines
         const lines = await sql<InvoiceLine[]>`
@@ -584,81 +617,98 @@ Deno.serve(async (req) => {
           WHERE invoice_id = ${invoiceId}
           ORDER BY line_number`;
 
-        if (lines.length === 0) { totalFailed++; continue; }
+        if (lines.length === 0) {
+          console.warn(`[classification-ai-suggest] Invoice ${invoiceId} has 0 lines`);
+          totalFailed++; continue;
+        }
+
+        console.log(`[classification-ai-suggest] Invoice ${invoiceId}: ${lines.length} lines, counterparty=${counterpartyName}, piva=${counterpartyPiva}`);
 
         // Step 1: Deterministic
         const detResults = await deterministicMatch(sql, companyId, lines, counterpartyPiva, articles, rules);
         totalDeterministic += detResults.size;
 
         // Step 1.5: RAG for unmatched lines (Gemini embedding → search learning_examples)
-        let afterDetLines = lines.filter((l) => !detResults.has(l.id) && !l.category_id && !l.account_id);
+        const afterDetLines = lines.filter((l) => !detResults.has(l.id) && !l.category_id && !l.account_id);
         const geminiKey = (Deno.env.get("GEMINI_API_KEY") || "").trim();
         let ragResults = new Map<string, LineResult>();
         if (geminiKey && afterDetLines.length > 0) {
           try {
             ragResults = await ragClassifyLines(sql, companyId, afterDetLines, counterpartyName, geminiKey);
-            totalDeterministic += ragResults.size; // RAG counts as deterministic
+            totalRag += ragResults.size;
             console.log(`[classification-ai-suggest] RAG resolved ${ragResults.size}/${afterDetLines.length} lines for invoice ${invoiceId}`);
           } catch (err) {
             console.warn("[classification-ai-suggest] RAG phase error:", err);
           }
         }
 
-        // Step 2: AI for still-unmatched — load confirmed examples for few-shot learning
+        // Step 2: AI for still-unmatched — ALWAYS call Haiku if there are unmatched lines
         const unmatchedLines = afterDetLines.filter((l) => !ragResults.has(l.id));
+        console.log(`[classification-ai-suggest] After det+RAG: ${detResults.size} det, ${ragResults.size} rag, ${unmatchedLines.length} unmatched → calling Haiku`);
 
         // Load confirmed classification examples (same counterparty first, then general)
+        // These are OPTIONAL — Haiku is called regardless of whether examples exist
         let confirmedExamples: ConfirmedExample[] = [];
         if (unmatchedLines.length > 0) {
-          // First: examples from same counterparty (most relevant)
-          const cpExamples = counterpartyPiva ? await sql<ConfirmedExample[]>`
-            SELECT DISTINCT ON (il.description)
-              il.description, cat.name as category_name, coa.code as account_code, coa.name as account_name
-            FROM invoice_lines il
-            JOIN invoices i ON i.id = il.invoice_id
-            LEFT JOIN categories cat ON cat.id = il.category_id
-            LEFT JOIN chart_of_accounts coa ON coa.id = il.account_id
-            WHERE i.company_id = ${companyId}
-              AND i.id != ${invoiceId}
-              AND (il.category_id IS NOT NULL OR il.account_id IS NOT NULL)
-              AND i.counterparty->>'piva' ILIKE ${"%" + counterpartyPiva + "%"}
-              AND il.description IS NOT NULL AND length(il.description) > 3
-            ORDER BY il.description, i.date DESC
-            LIMIT 30` : [];
+          try {
+            // First: examples from same counterparty (most relevant)
+            const cpExamples = counterpartyPiva ? await sql<ConfirmedExample[]>`
+              SELECT DISTINCT ON (il.description)
+                il.description, cat.name as category_name, coa.code as account_code, coa.name as account_name
+              FROM invoice_lines il
+              JOIN invoices i ON i.id = il.invoice_id
+              LEFT JOIN categories cat ON cat.id = il.category_id
+              LEFT JOIN chart_of_accounts coa ON coa.id = il.account_id
+              WHERE i.company_id = ${companyId}
+                AND i.id != ${invoiceId}
+                AND (il.category_id IS NOT NULL OR il.account_id IS NOT NULL)
+                AND i.counterparty->>'piva' ILIKE ${"%" + counterpartyPiva + "%"}
+                AND il.description IS NOT NULL AND length(il.description) > 3
+              ORDER BY il.description, i.date DESC
+              LIMIT 30` : [];
 
-          // Then: general examples from other counterparties (fill up to 50)
-          const remaining = 50 - cpExamples.length;
-          const generalExamples = remaining > 0 ? await sql<ConfirmedExample[]>`
-            SELECT DISTINCT ON (il.description)
-              il.description, cat.name as category_name, coa.code as account_code, coa.name as account_name
-            FROM invoice_lines il
-            JOIN invoices i ON i.id = il.invoice_id
-            LEFT JOIN categories cat ON cat.id = il.category_id
-            LEFT JOIN chart_of_accounts coa ON coa.id = il.account_id
-            WHERE i.company_id = ${companyId}
-              AND i.id != ${invoiceId}
-              AND (il.category_id IS NOT NULL OR il.account_id IS NOT NULL)
-              AND il.description IS NOT NULL AND length(il.description) > 3
-              ${counterpartyPiva ? sql`AND (i.counterparty->>'piva' IS NULL OR i.counterparty->>'piva' NOT ILIKE ${"%" + counterpartyPiva + "%"})` : sql``}
-            ORDER BY il.description, i.date DESC
-            LIMIT ${remaining}` : [];
+            // Then: general examples from other counterparties (fill up to 50)
+            const remaining = 50 - cpExamples.length;
+            const generalExamples = remaining > 0 ? await sql<ConfirmedExample[]>`
+              SELECT DISTINCT ON (il.description)
+                il.description, cat.name as category_name, coa.code as account_code, coa.name as account_name
+              FROM invoice_lines il
+              JOIN invoices i ON i.id = il.invoice_id
+              LEFT JOIN categories cat ON cat.id = il.category_id
+              LEFT JOIN chart_of_accounts coa ON coa.id = il.account_id
+              WHERE i.company_id = ${companyId}
+                AND i.id != ${invoiceId}
+                AND (il.category_id IS NOT NULL OR il.account_id IS NOT NULL)
+                AND il.description IS NOT NULL AND length(il.description) > 3
+                ${counterpartyPiva ? sql`AND (i.counterparty->>'piva' IS NULL OR i.counterparty->>'piva' NOT ILIKE ${"%" + counterpartyPiva + "%"})` : sql``}
+              ORDER BY il.description, i.date DESC
+              LIMIT ${remaining}` : [];
 
-          confirmedExamples = [...cpExamples, ...generalExamples];
+            confirmedExamples = [...cpExamples, ...generalExamples];
+            console.log(`[classification-ai-suggest] Loaded ${confirmedExamples.length} confirmed examples (${cpExamples.length} cp, ${generalExamples.length} general)`);
+          } catch (err) {
+            // Even if examples loading fails, we STILL call Haiku
+            console.warn("[classification-ai-suggest] Error loading confirmed examples (continuing without them):", err);
+          }
         }
 
-        const aiResults = await aiClassify(unmatchedLines, {
+        // ALWAYS call Haiku for unmatched lines, regardless of examples count
+        const aiResult = await aiClassify(unmatchedLines, {
           articles, categories, accounts, projects,
           invoiceDirection: invoiceRow.direction,
           counterpartyName,
+          counterpartyAddress,
           confirmedExamples,
         });
-        totalAi += aiResults.size;
+        totalAi += aiResult.results.size;
+        if (aiResult.haiku_called) haikuCalled = true;
+        if (aiResult.haiku_error) haikuError = aiResult.haiku_error;
 
         // Merge all line results (deterministic + RAG + AI)
         const allLineResults: LineResult[] = [
           ...detResults.values(),
           ...ragResults.values(),
-          ...aiResults.values(),
+          ...aiResult.results.values(),
         ];
 
         // Step 3: Compose invoice-level
@@ -674,7 +724,8 @@ Deno.serve(async (req) => {
         await persistResults(sql, companyId, invoiceId, result);
         results.push(result);
       } catch (e) {
-        console.error(`Error classifying invoice ${invoiceId}:`, e);
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`[classification-ai-suggest] Error classifying invoice ${invoiceId}:`, msg);
         totalFailed++;
       }
     }
@@ -684,8 +735,11 @@ Deno.serve(async (req) => {
       stats: {
         total: invoiceIds.length,
         deterministic: totalDeterministic,
+        rag: totalRag,
         ai: totalAi,
         failed: totalFailed,
+        haiku_called: haikuCalled,
+        haiku_error: haikuError,
       },
     });
   } catch (e: any) {
