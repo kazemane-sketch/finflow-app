@@ -533,6 +533,30 @@ export async function removeLineAssignment(invoiceLineId: string): Promise<void>
 
 /* ─── Feedback loop (rules) ──────────────────── */
 
+/** Stop words to exclude from keyword extraction (Italian prepositions, articles, etc.) */
+const STOP_WORDS = new Set([
+  'DI','IN','DA','DEL','DELLA','DELLE','DEGLI','AL','ALLA','ALLE',
+  'IL','LA','LE','LO','GLI','UN','UNA','PER','CON','SU','TRA','FRA',
+  'VIA','INF','SUP','PRESSO','NELLA','NELLE','NEL','SONO','COME','CHE',
+  'NON','KM','NR','CEP','ORD','ORDINE',
+])
+
+/**
+ * Extract significant keywords from a description.
+ * Filters out stop words, short words (≤3 chars), and pure numbers.
+ * Returns max 5 uppercase keywords.
+ */
+export function extractSignificantKeywords(description: string): string[] {
+  return description
+    .toUpperCase()
+    .replace(/['']/g, ' ')
+    .split(/[\s.,\-–()/]+/)
+    .filter(w => w.length > 3)
+    .filter(w => !STOP_WORDS.has(w))
+    .filter(w => !/^\d+$/.test(w))
+    .slice(0, 5)
+}
+
 /**
  * Record feedback for an article assignment.
  *
@@ -551,12 +575,8 @@ export async function recordAssignmentFeedback(
   description: string,
   accepted: boolean,
 ): Promise<void> {
-  // Build keywords from the description
-  const descKeywords = description
-    .toUpperCase()
-    .split(/[\s\-–,;.()\/]+/)
-    .filter(w => w.length >= 3)
-    .slice(0, 8)
+  // Build significant keywords from description (filter out stop words, short words, numbers)
+  const descKeywords = extractSignificantKeywords(description)
 
   if (descKeywords.length === 0) return
 

@@ -90,12 +90,13 @@ export function matchWithLearnedRules(
     const ruleKeywords = rule.pattern?.description_contains || []
     if (ruleKeywords.length === 0) continue
 
-    // All keywords in the rule must be present in the description
+    // At least 70% of keywords must match (not 100%)
     const matched = ruleKeywords.filter(kw => desc.includes(kw.toUpperCase()))
-    if (matched.length < ruleKeywords.length) continue
+    const matchRatio = matched.length / ruleKeywords.length
+    if (matchRatio < 0.7) continue
 
-    // Rule matches — use the stored rule confidence
-    const ruleConf = rule.confidence * 100 // normalize 0-1 → 0-100
+    // Rule matches — scale confidence by match ratio
+    const ruleConf = rule.confidence * matchRatio * 100 // normalize 0-1 → 0-100, scaled by match %
     if (ruleConf > bestRuleConf) {
       const article = articles.find(a => a.id === rule.article_id)
       if (article && article.active) {

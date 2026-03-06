@@ -116,8 +116,10 @@ async function deterministicMatch(
     for (const rule of rules) {
       const keywords: string[] = rule.pattern?.description_contains || [];
       if (keywords.length === 0) continue;
-      const allMatch = keywords.every((kw) => desc.includes(kw.toUpperCase()));
-      if (!allMatch) continue;
+      // At least 70% of keywords must match (not 100%)
+      const matchedKws = keywords.filter((kw) => desc.includes(kw.toUpperCase()));
+      const matchRatio = matchedKws.length / keywords.length;
+      if (matchRatio < 0.7) continue;
 
       const article = articles.find((a) => a.id === rule.article_id);
       if (!article) continue;
@@ -134,8 +136,8 @@ async function deterministicMatch(
         account_id: hist?.account_id || null,
         project_allocations: [],
         match_type: "deterministic",
-        confidence: Math.min(Number(rule.confidence) * 100, 98),
-        reasoning: `Regola: keywords [${keywords.join(", ")}] → ${article.code} ${article.name}`,
+        confidence: Math.min(Number(rule.confidence) * matchRatio * 100, 98),
+        reasoning: `Regola: keywords [${matchedKws.join(", ")}] (${Math.round(matchRatio * 100)}% match) → ${article.code} ${article.name}`,
       });
       matched = true;
       break;
