@@ -422,9 +422,10 @@ function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove }: 
 // ============================================================
 // FULL INVOICE DETAIL — matches artifact output
 // ============================================================
-function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, onDelete, onReload, onOpenCounterparty, onOpenScadenzario }: {
+function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, onDelete, onReload, onPatchInvoice, onOpenCounterparty, onOpenScadenzario }: {
   invoice: DBInvoice; detail: DBInvoiceDetail | null; installments: InvoiceInstallment[]; loadingDetail: boolean;
   onEdit: (u: InvoiceUpdate) => Promise<void>; onDelete: () => void; onReload: () => void;
+  onPatchInvoice: (invoiceId: string, patch: Partial<DBInvoice>) => void;
   onOpenCounterparty: (mode: 'verify' | 'edit') => void;
   onOpenScadenzario: () => void;
 }) {
@@ -746,10 +747,10 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setSelAccountId(classif?.account_id || null);
       setAiClassifResult(null);
       setAiClassifStatus('idle');
-      // Reload sidebar so ⚡ disappears (saveInvoiceClassification already set classification_status='confirmed')
-      onReload();
+      // Patch invoice in sidebar so ⚡ disappears (no full reload → preserves selection + scroll)
+      onPatchInvoice(invoice.id, { classification_status: 'confirmed' } as Partial<DBInvoice>);
     } catch (e: any) { console.error('Confirm AI classification error:', e); }
-  }, [invoice?.id, company?.id, aiClassifResult]);
+  }, [invoice?.id, company?.id, aiClassifResult, onPatchInvoice]);
 
   // Reject AI suggestion — delete classification + reset status to 'none'
   const handleRejectAiClassification = useCallback(async () => {
@@ -762,9 +763,10 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setSelAccountId(null);
       setCdcRows([]);
       setClassifDirty(false);
-      onReload();
+      // Patch invoice in sidebar (no full reload → preserves selection + scroll)
+      onPatchInvoice(invoice.id, { classification_status: 'none' } as Partial<DBInvoice>);
     } catch (e: any) { console.error('Reject AI classification error:', e); }
-  }, [invoice?.id]);
+  }, [invoice?.id, onPatchInvoice]);
 
   // Confirm existing AI-suggested classification (from banner, not from inline AI trigger)
   const handleConfirmExistingClassification = useCallback(async () => {
@@ -775,9 +777,10 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       await supabase.from('invoices').update({ classification_status: 'confirmed' } as any).eq('id', invoice.id);
       const classif = await loadInvoiceClassification(invoice.id);
       setClassification(classif);
-      onReload();
+      // Patch invoice in sidebar (no full reload → preserves selection + scroll)
+      onPatchInvoice(invoice.id, { classification_status: 'confirmed' } as Partial<DBInvoice>);
     } catch (e: any) { console.error('Confirm existing classification error:', e); }
-  }, [invoice?.id, company?.id]);
+  }, [invoice?.id, company?.id, onPatchInvoice]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }) => {
     const companyId = company?.id;
@@ -2190,6 +2193,15 @@ export default function FatturePage() {
 
   const handleEdit = useCallback(async (u: InvoiceUpdate) => { if (!selectedId) return; await updateInvoice(selectedId, u); await reload(true); }, [selectedId, reload]);
 
+  // Lightweight patch: update a single invoice in-place without full reload (preserves selection + scroll)
+  const patchInvoice = useCallback((invoiceId: string, patch: Partial<DBInvoice>) => {
+    setInvoices(prev => prev.map(inv => inv.id === invoiceId ? { ...inv, ...patch } : inv));
+    // If classification_status changed away from ai_suggested, decrement count
+    if (patch.classification_status && patch.classification_status !== 'ai_suggested') {
+      setAiSuggestedCount(prev => Math.max(0, prev - 1));
+    }
+  }, []);
+
   // Filters are now server-side — `invoices` already contains filtered results
 
   const toggleCheck = (id: string) => setChecked(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
@@ -2393,6 +2405,7 @@ export default function FatturePage() {
             onEdit={handleEdit}
             onDelete={() => setDeleteModal({ open: true, ids: [selectedInvoice.id] })}
             onReload={reload}
+            onPatchInvoice={patchInvoice}
             onOpenCounterparty={(mode) => {
               if (selectedInvoice.counterparty_id) {
                 navigate(`/controparti?counterpartyId=${selectedInvoice.counterparty_id}&mode=${mode}`);
