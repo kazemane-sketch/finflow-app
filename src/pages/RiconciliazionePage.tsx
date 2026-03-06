@@ -1172,6 +1172,16 @@ export default function RiconciliazionePage() {
     return map
   }, [reconciledRows])
 
+  // ─── selected TX partial info (for residual banner) ───
+  const selectedTxPartialInfo = useMemo(() => {
+    if (!selectedTxId) return null
+    const selTx = unmatchedTxs.find(t => t.id === selectedTxId)
+    if (!selTx || selTx.reconciliation_status !== 'partial') return null
+    const netAmt = Math.abs(Number(selTx.amount)) - Math.abs(Number(selTx.commission_amount || 0))
+    const reconciled = Number(selTx.reconciled_amount || 0)
+    return { netAmt, reconciled, residual: netAmt - reconciled }
+  }, [selectedTxId, unmatchedTxs])
+
   // ─── AI search for candidates ────────────
   const handleCandidateAISearch = useCallback(async () => {
     if (!candidateSearch.trim() || !companyId) return
@@ -1800,22 +1810,16 @@ export default function RiconciliazionePage() {
                 )}
               </div>
 
-              {selectedTxId && (() => {
-                const selTx = unmatchedTxs.find(t => t.id === selectedTxId)
-                const selIsPartial = selTx?.reconciliation_status === 'partial'
-                const selNetAmt = selTx ? Math.abs(Number(selTx.amount)) - Math.abs(Number(selTx.commission_amount || 0)) : 0
-                const selReconciled = Number(selTx?.reconciled_amount || 0)
-                const selResidual = selNetAmt - selReconciled
-                return <>
-                {selIsPartial && (
-                  <div className="px-3 py-2 border-b bg-amber-50">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[10px] font-medium text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded-full">Parziale</span>
-                      <span className="text-xs text-amber-800">Residuo da abbinare: <span className="font-bold">{fmtEur(selResidual)}</span></span>
-                      <span className="text-[10px] text-amber-600 ml-auto">Riconciliato: {fmtEur(selReconciled)} di {fmtEur(selNetAmt)}</span>
-                    </div>
+              {selectedTxPartialInfo && (
+                <div className="px-3 py-2 border-b bg-amber-50">
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-medium text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded-full">Parziale</span>
+                    <span className="text-xs text-amber-800">Residuo da abbinare: <span className="font-bold">{fmtEur(selectedTxPartialInfo.residual)}</span></span>
+                    <span className="text-[10px] text-amber-600 ml-auto">Riconciliato: {fmtEur(selectedTxPartialInfo.reconciled)} di {fmtEur(selectedTxPartialInfo.netAmt)}</span>
                   </div>
-                )}
+                </div>
+              )}
+              {selectedTxId && (
                 <div className="px-3 py-2 border-b space-y-1.5">
                   <div className="flex items-center gap-1.5">
                     <div className="relative flex-1">
@@ -1857,8 +1861,7 @@ export default function RiconciliazionePage() {
                     </div>
                   ) : null)}
                 </div>
-              </>
-              })()}
+              )}
 
               <div className="flex-1 overflow-y-auto">
                 {!selectedTxId ? (
