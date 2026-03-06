@@ -702,13 +702,19 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     }
   }, [invoice?.id, company?.id, selCategoryId, selAccountId]);
 
-  // Confirm AI suggestion — set verified=true on invoice_classifications
+  // Confirm AI suggestion — set verified=true on invoice_classifications + line-level records
   const handleConfirmAiClassification = useCallback(async () => {
     if (!invoice?.id || !company?.id || !aiClassifResult) return;
     try {
       const il = aiClassifResult.invoice_level;
-      // Save invoice-level as confirmed
+      // Save invoice-level as confirmed (verified=true)
       await saveInvoiceClassification(company.id, invoice.id, il.category_id, il.account_id);
+      // Also confirm AI-suggested line-level article assignments (so deterministic matching learns from them)
+      await supabase
+        .from('invoice_line_articles')
+        .update({ verified: true, assigned_by: 'manual' } as any)
+        .eq('invoice_id', invoice.id)
+        .eq('verified', false);
       const classif = await loadInvoiceClassification(invoice.id);
       setClassification(classif);
       setSelCategoryId(classif?.category_id || null);

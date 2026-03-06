@@ -51,6 +51,7 @@ interface RuleRow {
 interface CategoryRow { id: string; name: string; type: string; }
 interface AccountRow { id: string; code: string; name: string; section: string; }
 interface ProjectRow { id: string; code: string; name: string; }
+interface ConfirmedExample { description: string; category_name: string | null; account_code: string | null; account_name: string | null; }
 
 interface LineResult {
   invoice_line_id: string;
@@ -97,7 +98,8 @@ async function deterministicMatch(
           AND ila.verified = true
           AND (il.category_id IS NOT NULL OR il.account_id IS NOT NULL)
         GROUP BY ila.article_id, il.category_id, il.account_id
-        ORDER BY cnt DESC`
+        ORDER BY cnt DESC
+        LIMIT 100`
     : [];
 
   const results = new Map<string, LineResult>();
@@ -189,6 +191,7 @@ async function aiClassify(
     projects: ProjectRow[];
     invoiceDirection: string;
     counterpartyName: string;
+    confirmedExamples: ConfirmedExample[];
   },
 ): Promise<Map<string, LineResult>> {
   const results = new Map<string, LineResult>();
@@ -199,6 +202,18 @@ async function aiClassify(
     console.warn("ANTHROPIC_API_KEY not set, skipping AI classification");
     return results;
   }
+
+  // Build few-shot examples section (only if we have confirmed examples)
+  const examplesSection = context.confirmedExamples.length > 0
+    ? `\nESEMPI DI CLASSIFICAZIONI GIA CONFERMATE (impara da questi pattern):
+${context.confirmedExamples.map((ex, i) => {
+  const parts: string[] = [];
+  if (ex.category_name) parts.push(`Cat: ${ex.category_name}`);
+  if (ex.account_code && ex.account_name) parts.push(`Conto: ${ex.account_code} ${ex.account_name}`);
+  return `${i + 1}. "${ex.description}" → ${parts.join(", ") || "N.D."}`;
+}).join("\n")}
+`
+    : "";
 
   const prompt = `Sei un contabile italiano esperto. Classifica le seguenti righe fattura.
 
@@ -213,7 +228,7 @@ ${context.accounts.slice(0, 60).map((a) => `- ${a.id}: ${a.code} ${a.name} (${a.
 
 CENTRI DI COSTO:
 ${context.projects.map((p) => `- ${p.id}: ${p.code} ${p.name}`).join("\n")}
-
+${examplesSection}
 FATTURA: ${context.invoiceDirection === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
 CONTROPARTE: ${context.counterpartyName || "N.D."}
 
@@ -238,6 +253,7 @@ REGOLE:
 - Se la fattura e ATTIVA (vendita): usa categorie tipo "revenue" e conti 70xxx
 - Assegna article_id SOLO se trovi un articolo molto pertinente, altrimenti null
 - Assegna category_id e account_id anche senza articolo
+- Se una riga e simile a un esempio confermato, usa la stessa classificazione (alta confidence)
 - confidence 0-100: piu alto = piu sicuro
 - Rispondi SOLO con l'array JSON, niente altro`;
 
@@ -493,12 +509,53 @@ Deno.serve(async (req) => {
         const detResults = await deterministicMatch(sql, companyId, lines, counterpartyPiva, articles, rules);
         totalDeterministic += detResults.size;
 
-        // Step 2: AI for unmatched
+        // Step 2: AI for unmatched — load confirmed examples for few-shot learning
         const unmatchedLines = lines.filter((l) => !detResults.has(l.id) && !l.category_id && !l.account_id);
+
+        // Load confirmed classification examples (same counterparty first, then general)
+        let confirmedExamples: ConfirmedExample[] = [];
+        if (unmatchedLines.length > 0) {
+          // First: examples from same counterparty (most relevant)
+          const cpExamples = counterpartyPiva ? await sql<ConfirmedExample[]>`
+            SELECT DISTINCT ON (il.description)
+              il.description, cat.name as category_name, coa.code as account_code, coa.name as account_name
+            FROM invoice_lines il
+            JOIN invoices i ON i.id = il.invoice_id
+            LEFT JOIN categories cat ON cat.id = il.category_id
+            LEFT JOIN chart_of_accounts coa ON coa.id = il.account_id
+            WHERE i.company_id = ${companyId}
+              AND i.id != ${invoiceId}
+              AND (il.category_id IS NOT NULL OR il.account_id IS NOT NULL)
+              AND i.counterparty->>'piva' ILIKE ${"%" + counterpartyPiva + "%"}
+              AND il.description IS NOT NULL AND length(il.description) > 3
+            ORDER BY il.description, i.date DESC
+            LIMIT 30` : [];
+
+          // Then: general examples from other counterparties (fill up to 50)
+          const remaining = 50 - cpExamples.length;
+          const generalExamples = remaining > 0 ? await sql<ConfirmedExample[]>`
+            SELECT DISTINCT ON (il.description)
+              il.description, cat.name as category_name, coa.code as account_code, coa.name as account_name
+            FROM invoice_lines il
+            JOIN invoices i ON i.id = il.invoice_id
+            LEFT JOIN categories cat ON cat.id = il.category_id
+            LEFT JOIN chart_of_accounts coa ON coa.id = il.account_id
+            WHERE i.company_id = ${companyId}
+              AND i.id != ${invoiceId}
+              AND (il.category_id IS NOT NULL OR il.account_id IS NOT NULL)
+              AND il.description IS NOT NULL AND length(il.description) > 3
+              ${counterpartyPiva ? sql`AND (i.counterparty->>'piva' IS NULL OR i.counterparty->>'piva' NOT ILIKE ${"%" + counterpartyPiva + "%"})` : sql``}
+            ORDER BY il.description, i.date DESC
+            LIMIT ${remaining}` : [];
+
+          confirmedExamples = [...cpExamples, ...generalExamples];
+        }
+
         const aiResults = await aiClassify(unmatchedLines, {
           articles, categories, accounts, projects,
           invoiceDirection: invoiceRow.direction,
           counterpartyName,
+          confirmedExamples,
         });
         totalAi += aiResults.size;
 
