@@ -10,7 +10,7 @@ import {
   loadArticles, createArticle, updateArticle, deleteArticle,
   loadArticleStats, loadArticleLines, loadUnassignedLines, loadDashboardStats,
   loadCategories, assignArticleToLine, loadLearnedRules,
-  removeLineAssignment, recordAssignmentFeedback,
+  removeLineAssignment, recordAssignmentFeedback, batchRecordFeedback,
   loadClassificationCounts, markLineSkipped, markLinesSkippedBulk,
   deleteBulkSuggestions, saveBulkSuggestions, loadSavedSuggestions,
   loadClassifiedLines, loadSkippedLines, unskipLine,
@@ -109,6 +109,7 @@ export default function ArticoliPage() {
   const [unassignedLines, setUnassignedLines] = useState<UnassignedLine[]>([])
   const [matchResults, setMatchResults] = useState<Map<string, MatchResult>>(new Map())
   const [assignmentLoading, setAssignmentLoading] = useState(false)
+  const [bulkProgress, setBulkProgress] = useState<string | null>(null)
   const [analyzing, setAnalyzing] = useState(false)
   const [analyzeProgress, setAnalyzeProgress] = useState('')
   const [confirmingLineId, setConfirmingLineId] = useState<string | null>(null)
@@ -613,44 +614,82 @@ export default function ArticoliPage() {
     return filtered
   }, [unmatchedLines, filterUnmatchText, filterUnmatchCounterparty])
 
-  // ─── Assignment: confirm all FILTERED visible lines (with override support) ─
+  // ─── Assignment: confirm all FILTERED visible lines (BATCHED for performance) ─
   const confirmAllFiltered = useCallback(async () => {
     if (!companyId) return
     setAssignmentLoading(true)
-    let ok = 0, fail = 0
-    for (const line of filteredMatchedLines) {
-      const match = matchResults.get(line.id)
-      if (!match) continue
-      try {
+    const total = filteredMatchedLines.length
+
+    try {
+      // ── Phase 1: Build bulk upsert rows for invoice_line_articles ──
+      setBulkProgress(`Preparando ${total} righe...`)
+      const upsertRows: any[] = []
+      const feedbacks: { articleId: string; description: string; accepted: boolean }[] = []
+
+      for (const line of filteredMatchedLines) {
+        const match = matchResults.get(line.id)
+        if (!match) continue
         const override = articleOverrides.get(line.id)
         const finalArticle = override || match.article
         const wasChanged = !!(override && override.id !== match.article.id)
 
-        const location = extractLocation(line.description || '')
-        await assignArticleToLine(
-          companyId, line.id, line.invoice_id, finalArticle.id,
-          { quantity: line.quantity, unit_price: line.unit_price, total_price: line.total_price, vat_rate: line.vat_rate },
-          wasChanged ? 'manual' : 'ai_confirmed',
-          wasChanged ? undefined : match.confidence,
-          location,
-        )
+        upsertRows.push({
+          company_id: companyId,
+          invoice_line_id: line.id,
+          invoice_id: line.invoice_id,
+          article_id: finalArticle.id,
+          quantity: line.quantity ?? null,
+          unit_price: line.unit_price ?? null,
+          total_price: line.total_price ?? null,
+          vat_rate: line.vat_rate ?? null,
+          assigned_by: wasChanged ? 'manual' : 'ai_confirmed',
+          confidence: wasChanged ? null : match.confidence ?? null,
+          verified: true,
+          location: extractLocation(line.description || '') ?? null,
+        })
 
+        // Collect feedback items (reject old + accept new if overridden)
         if (wasChanged) {
-          await recordAssignmentFeedback(companyId, match.article.id, line.description || '', false)
-          await recordAssignmentFeedback(companyId, finalArticle.id, line.description || '', true)
+          feedbacks.push({ articleId: match.article.id, description: line.description || '', accepted: false })
+          feedbacks.push({ articleId: finalArticle.id, description: line.description || '', accepted: true })
         } else {
-          await recordAssignmentFeedback(companyId, match.article.id, line.description || '', true)
+          feedbacks.push({ articleId: match.article.id, description: line.description || '', accepted: true })
         }
-        ok++
-      } catch {
-        fail++
       }
+
+      // ── Phase 2: Bulk upsert (batch 200 at a time) ──
+      setBulkProgress(`Salvando ${upsertRows.length} assegnamenti...`)
+      let ok = 0, fail = 0
+      for (let i = 0; i < upsertRows.length; i += 200) {
+        const batch = upsertRows.slice(i, i + 200)
+        const { error } = await supabase
+          .from('invoice_line_articles')
+          .upsert(batch, { onConflict: 'invoice_line_id' })
+        if (error) {
+          console.error('Bulk upsert batch error:', error)
+          fail += batch.length
+        } else {
+          ok += batch.length
+        }
+        setBulkProgress(`Salvando: ${Math.min(i + 200, upsertRows.length)}/${upsertRows.length}...`)
+      }
+
+      // ── Phase 3: Batch feedback (update rules) ──
+      setBulkProgress(`Aggiornando regole apprese...`)
+      await batchRecordFeedback(companyId, feedbacks)
+
+      // ── Done ──
+      setBulkProgress(null)
+      toast.success(`Confermati ${ok} assegnamenti${fail ? `, ${fail} errori` : ''}`)
+      await analyzeUnassigned()
+      setArticleOverrides(new Map())
+    } catch (err: any) {
+      console.error('Bulk confirm error:', err)
+      toast.error(`Errore conferma bulk: ${err.message || 'sconosciuto'}`)
+      setBulkProgress(null)
+    } finally {
+      setAssignmentLoading(false)
     }
-    toast.success(`Confermati ${ok} assegnamenti${fail ? `, ${fail} errori` : ''}`)
-    // Refresh
-    await analyzeUnassigned()
-    setArticleOverrides(new Map())
-    setAssignmentLoading(false)
   }, [companyId, filteredMatchedLines, matchResults, articleOverrides, analyzeUnassigned])
 
   // ─── Skip: single line ────────────────────────
@@ -1424,7 +1463,7 @@ export default function ArticoliPage() {
                         className="bg-emerald-600 hover:bg-emerald-700 h-7 text-xs"
                       >
                         {assignmentLoading ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : <Check className="h-3 w-3 mr-1" />}
-                        Conferma {filteredMatchedLines.length === matchedLines.length ? 'tutti' : `${filteredMatchedLines.length} filtrati`}
+                        {bulkProgress || (filteredMatchedLines.length === matchedLines.length ? `Conferma tutti` : `Conferma ${filteredMatchedLines.length} filtrati`)}
                       </Button>
                     </div>
                   </div>

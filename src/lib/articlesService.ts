@@ -644,6 +644,124 @@ export async function recordAssignmentFeedback(
   }
 }
 
+/* ─── Batch feedback (bulk confirm perf optimization) ─── */
+
+interface FeedbackItem {
+  articleId: string
+  description: string
+  accepted: boolean
+}
+
+/**
+ * Batch version of recordAssignmentFeedback.
+ * Instead of N × (SELECT + UPDATE) per line, does:
+ *   1× SELECT all rules → in-memory matching → M updates + K inserts
+ *
+ * For 137 lines matching ~10 rules: 1 SELECT + ~10 UPDATE + 1 INSERT = ~12 DB calls
+ * vs 137 SELECT + 137 UPDATE = 274 DB calls.
+ */
+export async function batchRecordFeedback(
+  companyId: string,
+  feedbacks: FeedbackItem[],
+): Promise<void> {
+  if (feedbacks.length === 0) return
+
+  // 1. Load ALL rules for this company once
+  const { data: allRules } = await supabase
+    .from('article_assignment_rules')
+    .select('id, article_id, pattern, hit_count, reject_count, confidence')
+    .eq('company_id', companyId)
+
+  const rules = allRules || []
+
+  // 2. In-memory: accumulate deltas per rule + collect new rules
+  const ruleDelta = new Map<string, { hits: number; rejects: number; currentHits: number; currentRejects: number; currentConf: number }>()
+  // Track new rules needed: key = articleId|kw_key
+  const newRuleMap = new Map<string, { articleId: string; keywords: string[]; hits: number }>()
+
+  for (const fb of feedbacks) {
+    const descKeywords = extractSignificantKeywords(fb.description)
+    if (descKeywords.length === 0) continue
+
+    // Find matching rule for this article
+    const articleRules = rules.filter(r => r.article_id === fb.articleId)
+    let bestRule: typeof rules[0] | null = null
+    let bestOverlap = 0
+
+    for (const rule of articleRules) {
+      const ruleKeywords: string[] = (rule.pattern as any)?.description_contains || []
+      if (ruleKeywords.length === 0) continue
+      const overlap = ruleKeywords.filter(kw => descKeywords.includes(kw.toUpperCase())).length
+      const overlapRatio = overlap / ruleKeywords.length
+      if (overlapRatio >= 0.5 && overlap > bestOverlap) {
+        bestRule = rule
+        bestOverlap = overlap
+      }
+    }
+
+    if (bestRule) {
+      const existing = ruleDelta.get(bestRule.id) || {
+        hits: 0, rejects: 0,
+        currentHits: bestRule.hit_count || 0,
+        currentRejects: bestRule.reject_count || 0,
+        currentConf: bestRule.confidence || 0.6,
+      }
+      if (fb.accepted) existing.hits++
+      else existing.rejects++
+      ruleDelta.set(bestRule.id, existing)
+    } else if (fb.accepted) {
+      // No rule found → accumulate for new rule creation
+      const kwKey = `${fb.articleId}|${descKeywords.join('|')}`
+      const existing = newRuleMap.get(kwKey)
+      if (existing) {
+        existing.hits++
+      } else {
+        newRuleMap.set(kwKey, { articleId: fb.articleId, keywords: descKeywords, hits: 1 })
+      }
+    }
+  }
+
+  // 3. Batch updates: one UPDATE per modified rule
+  const updatePromises: PromiseLike<any>[] = []
+  for (const [ruleId, delta] of ruleDelta) {
+    const newHits = delta.currentHits + delta.hits
+    const newRejects = delta.currentRejects + delta.rejects
+    const confChange = (delta.hits * 0.05) - (delta.rejects * 0.15)
+    const newConf = Math.max(0, Math.min(0.98, delta.currentConf + confChange))
+
+    if (newConf < 0.20) {
+      updatePromises.push(
+        supabase.from('article_assignment_rules').delete().eq('id', ruleId).then()
+      )
+    } else {
+      updatePromises.push(
+        supabase.from('article_assignment_rules').update({
+          hit_count: newHits,
+          reject_count: newRejects,
+          confidence: newConf,
+          last_used_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }).eq('id', ruleId).then()
+      )
+    }
+  }
+  // Run rule updates in parallel (typically ~10 rules)
+  if (updatePromises.length > 0) await Promise.all(updatePromises)
+
+  // 4. Bulk insert new rules
+  const newRules = [...newRuleMap.values()].map(nr => ({
+    company_id: companyId,
+    article_id: nr.articleId,
+    pattern: { description_contains: nr.keywords },
+    confidence: Math.min(0.6 + (nr.hits - 1) * 0.05, 0.95),
+    source: 'learned',
+    hit_count: nr.hits,
+  }))
+  if (newRules.length > 0) {
+    await supabase.from('article_assignment_rules').insert(newRules)
+  }
+}
+
 /* ─── Dashboard Stats ────────────────────────── */
 
 export async function loadDashboardStats(
