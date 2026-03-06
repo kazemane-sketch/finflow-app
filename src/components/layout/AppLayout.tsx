@@ -124,24 +124,25 @@ export default function AppLayout() {
           <span className="font-bold">FinFlow</span>
         </header>
 
-        <main className="flex-1 overflow-y-auto">
-          {/* Global navigation arrows */}
-          <div className="sticky top-0 z-10 flex items-center gap-1 px-4 py-1.5 bg-white/80 backdrop-blur-sm border-b border-gray-100">
-            <button
-              onClick={() => navigate(-1)}
-              className="p-1 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
-              title="Indietro"
-            >
-              <ChevronLeft className="h-4 w-4" />
-            </button>
-            <button
-              onClick={() => navigate(1)}
-              className="p-1 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
-              title="Avanti"
-            >
-              <ChevronRight className="h-4 w-4" />
-            </button>
-          </div>
+        {/* Global navigation arrows — outside scroll container so h-full pages work */}
+        <div className="shrink-0 flex items-center gap-1 px-4 py-1.5 bg-white/80 border-b border-gray-100">
+          <button
+            onClick={() => navigate(-1)}
+            className="p-1 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
+            title="Indietro"
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+          <button
+            onClick={() => navigate(1)}
+            className="p-1 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
+            title="Avanti"
+          >
+            <ChevronRight className="h-4 w-4" />
+          </button>
+        </div>
+
+        <main className="flex-1 overflow-y-auto min-h-0">
           <Outlet />
         </main>
       </div>

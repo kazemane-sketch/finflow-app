@@ -17,6 +17,7 @@ import { getValidAccessToken } from '@/lib/getValidAccessToken';
 import { useCompany } from '@/hooks/useCompany';
 import { fmtNum, fmtEur, fmtDate } from '@/lib/utils';
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges';
+import { usePageEntity } from '@/contexts/PageEntityContext';
 import { ReconciledIcon, ReconciliationDot } from '@/components/ReconciliationIndicators';
 import { triggerAutoReconciliation } from '@/lib/reconciliationTrigger';
 import {
@@ -504,6 +505,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               confidence: Number(a.confidence) || 50,
               matchedKeywords: [],
               totalKeywords: fullArt.keywords.length,
+              source: 'deterministic',
             };
           }
         }
@@ -1662,6 +1664,7 @@ export default function FatturePage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const companyId = company?.id || null;
   const { matchedInvoiceIds, invoiceScores, refresh: refreshBadges } = useReconciliationBadges();
+  const { setEntity: setPageEntity } = usePageEntity();
   const [invoices, setInvoices] = useState<DBInvoice[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<DBInvoiceDetail | null>(null);
@@ -2070,6 +2073,21 @@ export default function FatturePage() {
   // (handles deep-link case where invoice isn't in the visible page of results)
   const selectedInvoice = invoices.find(i => i.id === selectedId) ?? (selectedId && detail ? detail : null);
   const allFilteredChecked = invoices.length > 0 && invoices.every(i => checked.has(i.id));
+
+  // ── Expose selected invoice to AI widget ──
+  useEffect(() => {
+    if (selectedInvoice) {
+      const cpName = (selectedInvoice.counterparty as any)?.denom || 'N/D';
+      const dir = selectedInvoice.direction === 'out' ? 'attiva/vendita' : 'passiva/acquisto';
+      setPageEntity({
+        type: 'invoice',
+        summary: `Fattura ${selectedInvoice.number} del ${fmtDate(selectedInvoice.date)} — ${cpName} — ${fmtEur(selectedInvoice.total_amount)} (${dir})`,
+      });
+    } else {
+      setPageEntity(null);
+    }
+    return () => setPageEntity(null);
+  }, [selectedId, detail?.id, setPageEntity]);
 
   return (
     <div className="h-full flex flex-col bg-gray-50">

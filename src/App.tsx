@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from 'react-router-dom'
 import { useAuth } from '@/hooks/useAuth'
 import { Toaster } from '@/components/ui/toaster'
 import { AiChatProvider } from '@/contexts/AiChatContext'
+import { PageEntityProvider } from '@/contexts/PageEntityContext'
 import AppLayout from '@/components/layout/AppLayout'
 import AuthPage from '@/pages/AuthPage'
 import DashboardPage from '@/pages/DashboardPage'
@@ -45,7 +46,9 @@ export default function App() {
         <Route element={
           <ProtectedRoute>
             <AiChatProvider>
-              <AppLayout />
+              <PageEntityProvider>
+                <AppLayout />
+              </PageEntityProvider>
             </AiChatProvider>
           </ProtectedRoute>
         }>

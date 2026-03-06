@@ -312,7 +312,7 @@ export default function AiChatPage() {
 
   // ─── render ────────────────────────────
   return (
-    <div className="flex h-full">
+    <div className="flex h-full min-h-0">
       {/* ──── Chat sidebar ──── */}
       <div className="w-72 border-r bg-slate-50/50 flex flex-col shrink-0 hidden md:flex">
         <div className="p-3">
@@ -497,7 +497,7 @@ export default function AiChatPage() {
       </div>
 
       {/* ──── Chat area ──── */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 min-h-0">
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-4 py-6 space-y-4">
           {/* Empty state with suggestions */}

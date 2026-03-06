@@ -28,6 +28,7 @@ import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
 import { getValidAccessToken, type AccessTokenError } from '@/lib/getValidAccessToken'
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges'
 import { ReconciliationDot } from '@/components/ReconciliationIndicators'
+import { usePageEntity } from '@/contexts/PageEntityContext'
 
 import BankTxDetail, {
   txTypeLabel as _txTypeLabel,
@@ -700,6 +701,7 @@ export default function BancaPage() {
   const { company } = useCompany()
   const companyId = company?.id || null
   const { txScores, refresh: refreshBadges } = useReconciliationBadges()
+  const { setEntity: setPageEntity } = usePageEntity()
   const [searchParams, setSearchParams] = useSearchParams()
 
   const [transactions, setTransactions] = useState<any[]>([])
@@ -1468,6 +1470,23 @@ export default function BancaPage() {
     else setSelectedIds(new Set(transactions.map(t => t.id)))
   }
   const allChecked = transactions.length > 0 && transactions.every(t => selectedIds.has(t.id))
+
+  // ── Expose selected transaction to AI widget ──
+  useEffect(() => {
+    if (selectedTx) {
+      const dir = selectedTx.direction === 'in' ? 'entrata' : selectedTx.direction === 'out' ? 'uscita' : '';
+      const amt = typeof selectedTx.amount === 'number'
+        ? new Intl.NumberFormat('it-IT', { style: 'currency', currency: 'EUR' }).format(selectedTx.amount)
+        : '';
+      setPageEntity({
+        type: 'transaction',
+        summary: `Movimento bancario del ${selectedTx.date || 'N/D'} — ${selectedTx.counterparty_name || selectedTx.description?.slice(0, 50) || 'N/D'} — ${amt}${dir ? ` (${dir})` : ''}`,
+      });
+    } else {
+      setPageEntity(null);
+    }
+    return () => setPageEntity(null);
+  }, [selectedTx?.id, setPageEntity]);
 
   return (
     <div className="flex h-full overflow-hidden">

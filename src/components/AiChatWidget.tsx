@@ -1,12 +1,13 @@
 import { useState, useRef, useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import {
-  Sparkles, Send, Loader2, X, Maximize2, Minus,
+  Sparkles, Send, Loader2, X, Maximize2, Minus, FileText,
   Zap, Brain, Search, ChevronDown, ChevronRight,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAiChat, type ToolCallDisplay } from '@/contexts/AiChatContext'
+import { usePageEntity } from '@/contexts/PageEntityContext'
 
 /* ─── page label map ──────────────────────── */
 
@@ -53,6 +54,7 @@ export default function AiChatWidget() {
     modelPreference, setModelPreference,
     sendMessage, startNewChat,
   } = useAiChat()
+  const { entity: pageEntity } = usePageEntity()
 
   const [open, setOpen] = useState(false)
   const [input, setInput] = useState('')
@@ -63,8 +65,11 @@ export default function AiChatWidget() {
   // Don't render on /ai page
   if (location.pathname === '/ai') return null
 
-  // Page context from current location
-  const pageContext = PAGE_LABELS[location.pathname] || location.pathname
+  // Page context from current location + selected entity
+  const pageLabel = PAGE_LABELS[location.pathname] || location.pathname
+  const pageContext = pageEntity
+    ? `${pageLabel}. L'utente sta guardando: ${pageEntity.summary}`
+    : pageLabel
 
   /* ── scroll to bottom on new messages ──── */
   useEffect(() => {
@@ -150,6 +155,14 @@ export default function AiChatWidget() {
           <X className="h-3.5 w-3.5" />
         </button>
       </div>
+
+      {/* ── Entity context indicator ──── */}
+      {pageEntity && (
+        <div className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-50 border-b border-purple-100 text-[10px] text-purple-700 shrink-0">
+          <FileText className="h-3 w-3 shrink-0" />
+          <span className="truncate">{pageEntity.summary}</span>
+        </div>
+      )}
 
       {/* ── Messages ───────────────────── */}
       <div className="flex-1 overflow-y-auto px-3 py-3 space-y-3">

@@ -18,9 +18,11 @@ import {
   type UnassignedLine, type MatchResult, type DashboardArticleRow,
   type ClassificationCounts, type BulkSuggestion,
   type ClassifiedLine, type SkippedLine,
+  callArticleAiMatch, type AiMatchRequest,
 } from '@/lib/articlesService'
 import {
-  matchWithLearnedRules, extractLocation, suggestKeywords,
+  matchWithLearnedRules, matchWithLearnedRulesAll, needsAiMatching,
+  extractLocation, suggestKeywords,
 } from '@/lib/articleMatching'
 import { supabase } from '@/integrations/supabase/client'
 import { fmtDate, fmtEur, fmtNum } from '@/lib/utils'
@@ -28,7 +30,7 @@ import { toast } from 'sonner'
 import {
   Package, Plus, Search, Loader2, Trash2, Save, X, Check,
   XCircle, RefreshCw, Zap, BarChart3, Tag, ChevronRight,
-  CheckCircle2, AlertTriangle, Sparkles, Filter, Eye, Ban,
+  CheckCircle2, AlertTriangle, Sparkles, Filter, Eye, Ban, Brain,
 } from 'lucide-react'
 import {
   ResponsiveContainer, BarChart, CartesianGrid, XAxis, YAxis,
@@ -284,7 +286,7 @@ export default function ArticoliPage() {
     }
   }, [draft.name, draft.keywords])
 
-  // ─── Assignment tab: analyze ALL lines ──────
+  // ─── Assignment tab: analyze ALL lines (2-phase: deterministic + AI) ──────
   const analyzeUnassigned = useCallback(async () => {
     if (!companyId) return
     setAnalyzing(true)
@@ -311,44 +313,98 @@ export default function ArticoliPage() {
       })
       setUnassignedLines(lines)
 
-      // Step 3: Run matching for each line: learned rules first, then keyword fallback
-      setAnalyzeProgress(`Matching ${lines.length} righe...`)
+      // ── Phase 1: Deterministic matching ──────────
+      setAnalyzeProgress(`Fase 1: Matching deterministico ${lines.length} righe...`)
       const results = new Map<string, MatchResult>()
       const bulkToSave: BulkSuggestion[] = []
+      const aiCandidates: UnassignedLine[] = []
 
-      // Diagnostics (STEP 4)
-      let ruleMatches = 0, keywordMatches = 0
+      let detMatches = 0
       const activeRules = rules.filter(r => r.confidence > 0.5)
       console.log(`[ArticoliPage] Analisi: ${lines.length} righe, ${arts.length} articoli, ${rules.length} regole (${activeRules.length} con confidence > 0.5)`)
-      if (activeRules.length > 0) {
-        console.log('[ArticoliPage] Top 5 regole:', activeRules.slice(0, 5).map(r => ({
-          article_id: r.article_id,
-          confidence: r.confidence,
-          keywords: (r.pattern as any)?.description_contains || [],
-          hits: r.hit_count,
-        })))
-      }
 
       for (const line of lines) {
         if (!line.description) continue
-        const match = matchWithLearnedRules(line.description, arts, rules)
-        if (match) {
-          results.set(line.id, match)
+
+        // Get ALL candidate matches for ambiguity detection
+        const allMatches = matchWithLearnedRulesAll(line.description, arts, rules)
+
+        if (needsAiMatching(allMatches)) {
+          // Ambiguous or no match → send to AI
+          aiCandidates.push(line)
+        } else if (allMatches.length > 0) {
+          // Clear deterministic match → use top-1
+          const bestMatch = allMatches[0]
+          results.set(line.id, bestMatch)
           bulkToSave.push({
             invoice_line_id: line.id,
             invoice_id: line.invoice_id,
-            article_id: match.article.id,
-            confidence: match.confidence,
+            article_id: bestMatch.article.id,
+            confidence: bestMatch.confidence,
           })
-          // Diagnostics: count rule vs keyword matches
-          if (match.confidence >= 50 && match.matchedKeywords.length === 0) ruleMatches++
-          else keywordMatches++
+          detMatches++
         }
       }
 
-      console.log(`[ArticoliPage] Risultati: ${results.size} match (${ruleMatches} via regole, ${keywordMatches} via keywords)`)
+      console.log(`[ArticoliPage] Fase 1: ${detMatches} match deterministici, ${aiCandidates.length} righe ambigue per AI`)
 
-      // Step 4: Save suggestions to DB
+      // ── Phase 2: AI Haiku for ambiguous lines ────
+      let aiMatched = 0
+      if (aiCandidates.length > 0) {
+        const AI_BATCH = 20
+        for (let i = 0; i < aiCandidates.length; i += AI_BATCH) {
+          const batch = aiCandidates.slice(i, i + AI_BATCH)
+          setAnalyzeProgress(`Fase 2: Analisi AI ${Math.min(i + AI_BATCH, aiCandidates.length)}/${aiCandidates.length} righe ambigue...`)
+
+          try {
+            const aiResults = await callArticleAiMatch(
+              companyId,
+              batch.map(l => ({
+                line_id: l.id,
+                description: l.description || '',
+                quantity: l.quantity,
+                unit_price: l.unit_price,
+                total_price: l.total_price,
+                invoice_number: l.invoice_number,
+                counterparty_name: l.counterparty_name,
+              })),
+            )
+
+            for (const aiResult of aiResults) {
+              if (!aiResult.article_id) continue
+              const article = arts.find(a => a.id === aiResult.article_id)
+              if (!article) continue
+
+              results.set(aiResult.line_id, {
+                article,
+                confidence: aiResult.confidence,
+                matchedKeywords: [],
+                totalKeywords: article.keywords?.length || 0,
+                source: 'ai',
+                reasoning: aiResult.reasoning,
+              })
+
+              const candidateLine = aiCandidates.find(l => l.id === aiResult.line_id)
+              if (candidateLine) {
+                bulkToSave.push({
+                  invoice_line_id: aiResult.line_id,
+                  invoice_id: candidateLine.invoice_id,
+                  article_id: article.id,
+                  confidence: aiResult.confidence,
+                })
+              }
+              aiMatched++
+            }
+          } catch (err) {
+            console.error(`[ArticoliPage] AI batch error (${i}-${i + AI_BATCH}):`, err)
+            // Continue with next batch
+          }
+        }
+      }
+
+      console.log(`[ArticoliPage] Fase 2: ${aiMatched} match AI su ${aiCandidates.length} righe ambigue`)
+
+      // Step 3: Save suggestions to DB
       if (bulkToSave.length > 0) {
         setAnalyzeProgress(`Salvataggio ${bulkToSave.length} suggerimenti...`)
         await saveBulkSuggestions(companyId, bulkToSave)
@@ -356,11 +412,11 @@ export default function ArticoliPage() {
 
       setMatchResults(results)
 
-      // Step 5: Refresh KPI counts from DB
+      // Step 4: Refresh KPI counts from DB
       const counts = await loadClassificationCounts(companyId)
       setKpiCounts(counts)
 
-      toast.success(`Analizzate ${lines.length} righe, ${results.size} con match`)
+      toast.success(`Analizzate ${lines.length} righe: ${detMatches} deterministici, ${aiMatched} AI`)
     } catch (err: any) {
       toast.error(`Errore analisi: ${err.message}`)
     }
@@ -509,6 +565,7 @@ export default function ArticoliPage() {
               confidence: s.confidence,
               matchedKeywords: [],
               totalKeywords: artObj.keywords.length,
+              source: 'deterministic',
             })
           }
         }
@@ -1485,11 +1542,14 @@ export default function ArticoliPage() {
                             <div className="flex items-start justify-between gap-2">
                               <div className="min-w-0 flex-1">
                                 <div className="flex items-center gap-2 flex-wrap">
-                                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                                    match.confidence >= 90 ? 'bg-emerald-100 text-emerald-700'
-                                    : match.confidence >= 75 ? 'bg-blue-100 text-blue-700'
-                                    : 'bg-amber-100 text-amber-700'
+                                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full inline-flex items-center gap-0.5 ${
+                                    match.source === 'ai'
+                                      ? 'bg-purple-100 text-purple-700'
+                                      : match.confidence >= 90 ? 'bg-emerald-100 text-emerald-700'
+                                      : match.confidence >= 75 ? 'bg-blue-100 text-blue-700'
+                                      : 'bg-amber-100 text-amber-700'
                                   }`}>
+                                    {match.source === 'ai' && <Brain className="h-3 w-3" />}
                                     {Math.round(match.confidence)}%
                                   </span>
                                   {/* Clickable article badge with inline dropdown */}
@@ -1567,11 +1627,24 @@ export default function ArticoliPage() {
                                   {line.quantity != null && <span className="font-mono">{fmtNum(line.quantity)} {UNIT_SHORT[displayArticle.unit] || displayArticle.unit}</span>}
                                   {line.total_price != null && <span className="font-semibold text-gray-600">{fmtEur(line.total_price)}</span>}
                                 </div>
-                                <div className="flex items-center gap-1 mt-1">
-                                  <span className="text-[9px] text-gray-400">Keywords:</span>
-                                  {match.matchedKeywords.map(kw => (
-                                    <span key={kw} className="text-[9px] text-emerald-600 bg-emerald-50 px-1 py-0.5 rounded">{kw}</span>
-                                  ))}
+                                <div className="flex items-center gap-1 mt-1 flex-wrap">
+                                  {match.source === 'ai' ? (
+                                    <>
+                                      <span className="text-[9px] text-purple-500 font-medium inline-flex items-center gap-0.5"><Brain className="h-2.5 w-2.5" /> Analisi AI</span>
+                                      {match.reasoning && (
+                                        <span className="text-[9px] text-gray-400 italic" title={match.reasoning}>
+                                          — {match.reasoning.length > 80 ? match.reasoning.slice(0, 80) + '...' : match.reasoning}
+                                        </span>
+                                      )}
+                                    </>
+                                  ) : (
+                                    <>
+                                      <span className="text-[9px] text-gray-400">Keywords:</span>
+                                      {match.matchedKeywords.map(kw => (
+                                        <span key={kw} className="text-[9px] text-emerald-600 bg-emerald-50 px-1 py-0.5 rounded">{kw}</span>
+                                      ))}
+                                    </>
+                                  )}
                                 </div>
                               </div>
                               <div className="flex items-center gap-1 shrink-0">

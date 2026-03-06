@@ -6,12 +6,14 @@
  * extractLocation, suggestKeywords) live in articleMatching.ts.
  * They are re-exported here for backward compatibility.
  */
-import { supabase } from '@/integrations/supabase/client'
+import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 
 // Re-export matching functions from the shared utility
 export {
   matchLineToArticle,
   matchWithLearnedRules,
+  matchWithLearnedRulesAll,
+  needsAiMatching,
   extractLocation,
   suggestKeywords,
   type LearnedRule,
@@ -88,6 +90,8 @@ export interface MatchResult {
   confidence: number
   matchedKeywords: string[]
   totalKeywords: number
+  source: 'deterministic' | 'ai'
+  reasoning?: string
 }
 
 export interface UnassignedLine {
@@ -1101,6 +1105,54 @@ export async function unskipLine(lineId: string): Promise<void> {
     .update({ classification_status: 'pending' } as any)
     .eq('id', lineId)
   if (error) throw error
+}
+
+/* ─── Categories helper ──────────────────────── */
+
+/* ─── AI Article Matching (Haiku Level 2) ────── */
+
+export interface AiMatchRequest {
+  line_id: string
+  description: string
+  quantity: number | null
+  unit_price: number | null
+  total_price: number | null
+  invoice_number: string | null
+  counterparty_name: string | null
+}
+
+export interface AiMatchResult {
+  line_id: string
+  article_id: string | null
+  article_code: string | null
+  confidence: number
+  reasoning: string
+}
+
+/**
+ * Call the article-ai-match edge function for ambiguous lines.
+ * Max 20 lines per call. Returns AI classification results.
+ */
+export async function callArticleAiMatch(
+  companyId: string,
+  lines: AiMatchRequest[],
+): Promise<AiMatchResult[]> {
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/article-ai-match`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify({ company_id: companyId, lines }),
+  })
+
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.error || `HTTP ${res.status}`)
+  }
+
+  const data = await res.json()
+  return data.results || []
 }
 
 /* ─── Categories helper ──────────────────────── */
