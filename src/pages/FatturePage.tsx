@@ -20,10 +20,10 @@ import { useReconciliationBadges } from '@/hooks/useReconciliationBadges';
 import { usePageEntity } from '@/contexts/PageEntityContext';
 import { ReconciledIcon, ReconciliationDot } from '@/components/ReconciliationIndicators';
 import { triggerAutoReconciliation } from '@/lib/reconciliationTrigger';
+import { useAIJob } from '@/hooks/useAIJob';
 import {
   subscribeExtraction, getExtractionState,
-  startExtraction, loadExtractionStats as loadExtStats,
-  type ExtractionState,
+  loadExtractionStats as loadExtStats,
 } from '@/lib/extractionStore';
 import {
   loadArticles, assignArticleToLine, removeLineAssignment, recordAssignmentFeedback, loadLearnedRules,
@@ -1714,30 +1714,30 @@ export default function FatturePage() {
   const [counterpartyPattern, setCounterpartyPattern] = useState<string | undefined>(undefined);
 
   // ── Batch AI Classification ──
-  const [batchClassifRunning, setBatchClassifRunning] = useState(false);
-  const [batchClassifProgress, setBatchClassifProgress] = useState({ done: 0, total: 0 });
+  const { isRunning: batchClassifRunning, progress: batchClassifJobProgress, startOrStop: classifStartOrStop } = useAIJob('fatture-classify', 'Classificazione Fatture AI');
   const [reloadTrigger, setReloadTrigger] = useState(0);
 
-  const runBatchAiClassification = useCallback(async () => {
+  const runBatchAiClassification = useCallback(() => {
     const companyId = company?.id;
     if (!companyId) return;
-    setBatchClassifRunning(true);
-    try {
-      // Find unclassified invoice IDs: get all invoices, then exclude those with existing classifications
+    classifStartOrStop(async (signal, updateProgress) => {
+      // Find unclassified invoice IDs
       const [{ data: allInvIds }, { data: classifiedIds }] = await Promise.all([
         supabase.from('invoices').select('id').eq('company_id', companyId).eq('direction', directionFilter).limit(200),
         supabase.from('invoice_classifications').select('invoice_id').eq('company_id', companyId),
       ]);
+      if (signal.aborted) return;
       const classifiedSet = new Set((classifiedIds || []).map((r: any) => r.invoice_id));
       const ids = (allInvIds || []).map((r: any) => r.id).filter((id: string) => !classifiedSet.has(id)).slice(0, 50);
-      if (ids.length === 0) { setBatchClassifRunning(false); return; }
-      setBatchClassifProgress({ done: 0, total: ids.length });
+      if (ids.length === 0) return;
 
+      updateProgress(0, ids.length);
       const token = await getValidAccessToken();
       let successCount = 0;
       let failedCount = 0;
-      // Process in batches of 10
+
       for (let i = 0; i < ids.length; i += 10) {
+        if (signal.aborted) return;
         const batch = ids.slice(i, i + 10);
         try {
           const res = await fetch(`${SUPABASE_URL}/functions/v1/classification-ai-suggest`, {
@@ -1748,6 +1748,7 @@ export default function FatturePage() {
               'apikey': SUPABASE_ANON_KEY,
             },
             body: JSON.stringify({ company_id: companyId, invoice_ids: batch }),
+            signal,
           });
           if (!res.ok) {
             console.error(`Batch classification error: HTTP ${res.status}`);
@@ -1757,47 +1758,55 @@ export default function FatturePage() {
             successCount += (data.results?.length || 0);
             failedCount += (data.stats?.failed || 0);
           }
-        } catch (fetchErr) {
+        } catch (fetchErr: any) {
+          if (fetchErr?.name === 'AbortError') return;
           console.error('Batch fetch error:', fetchErr);
           failedCount += batch.length;
         }
-        setBatchClassifProgress({ done: Math.min(i + 10, ids.length), total: ids.length });
+        updateProgress(Math.min(i + 10, ids.length), ids.length);
       }
-      // Show result feedback
+
       if (failedCount > 0 && successCount === 0) {
-        alert(`Classificazione fallita per tutte le ${ids.length} fatture. Verifica i log.`);
+        throw new Error(`Classificazione fallita per tutte le ${ids.length} fatture`);
       } else if (failedCount > 0) {
-        alert(`Classificate ${successCount} fatture. ${failedCount} errori.`);
+        console.warn(`Classificate ${successCount} fatture. ${failedCount} errori.`);
       }
-      // Trigger invoice list reload to reflect updated classification icons
       setReloadTrigger(t => t + 1);
-    } catch (e: any) {
-      console.error('Batch AI classification error:', e);
-      alert('Errore durante la classificazione batch. Riprova.');
-    }
-    setBatchClassifRunning(false);
-  }, [company?.id, directionFilter]);
+    });
+  }, [company?.id, directionFilter, classifStartOrStop]);
 
-  // ── Invoice extraction summary (AI) — lives in module-level store so it survives navigation ──
+  // ── Invoice extraction summary (AI) — now uses global AI job system ──
+  const { isRunning: extractionRunning, progress: extractionJobProgress, startOrStop: extractionStartOrStop } = useAIJob('fatture-extract', 'Estrazione Dettagli Fatture');
   const ext = useSyncExternalStore(subscribeExtraction, getExtractionState);
-  const extractionRunning = ext.running;
-  const extractionProgress = ext.running ? { processed: ext.processed, total: ext.total } : null;
   const extractionStats = ext.stats;
-
-  // Show error alert once when extraction fails
-  const lastExtError = useRef<string | null>(null);
-  useEffect(() => {
-    if (ext.error && ext.error !== lastExtError.current) {
-      lastExtError.current = ext.error;
-      alert(`Errore estrazione: ${ext.error}`);
-    }
-    if (!ext.error) lastExtError.current = null;
-  }, [ext.error]);
 
   const runExtraction = useCallback(() => {
     if (!companyId) return;
-    startExtraction(companyId, invoices.length);
-  }, [companyId, invoices.length]);
+    extractionStartOrStop(async (signal, updateProgress) => {
+      let totalProcessed = 0;
+      const token = await getValidAccessToken();
+      while (!signal.aborted) {
+        const res = await fetch(`${SUPABASE_URL}/functions/v1/invoice-extract-summary`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'apikey': SUPABASE_ANON_KEY,
+            'Authorization': `Bearer ${token}`,
+          },
+          body: JSON.stringify({ company_id: companyId, batch_size: 50 }),
+          signal,
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        totalProcessed += (data.processed || 0);
+        const totalRemaining = totalProcessed + (data.total_pending || 0);
+        updateProgress(totalProcessed, totalRemaining);
+        if ((data.total_pending || 0) <= 0) break;
+      }
+      // Refresh stats after completion
+      loadExtStats(companyId, invoices.length);
+    });
+  }, [companyId, invoices.length, extractionStartOrStop]);
 
   const loadExtractionStats = useCallback(() => {
     if (!companyId) return;
@@ -2107,12 +2116,16 @@ export default function FatturePage() {
         {invoices.length > 0 && (
           <button
             onClick={runExtraction}
-            disabled={extractionRunning || (extractionStats?.pending === 0)}
-            title="Estrae dettagli strutturati dalle fatture XML tramite AI"
-            className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-sky-700 bg-sky-50 border border-sky-200 rounded-lg hover:bg-sky-100 disabled:opacity-50"
+            disabled={!extractionRunning && extractionStats?.pending === 0}
+            title={extractionRunning ? 'Ferma estrazione' : 'Estrae dettagli strutturati dalle fatture XML tramite AI'}
+            className={`inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
+              extractionRunning
+                ? 'text-red-700 bg-red-50 border border-red-200 hover:bg-red-100'
+                : 'text-sky-700 bg-sky-50 border border-sky-200 hover:bg-sky-100 disabled:opacity-50'
+            }`}
           >
             {extractionRunning ? (
-              <>⏳ Estrazione: {extractionProgress?.processed ?? 0}/{extractionProgress?.total ?? '?'}</>
+              <>⏹ Stop ({extractionJobProgress.pct}%)</>
             ) : extractionStats?.pending === 0 ? (
               <>📋 Estratte: {extractionStats?.ready ?? 0}/{extractionStats?.total ?? 0}</>
             ) : (
@@ -2123,12 +2136,15 @@ export default function FatturePage() {
         {invoices.length > 0 && (
           <button
             onClick={runBatchAiClassification}
-            disabled={batchClassifRunning}
-            title="Classifica automaticamente categoria, conto e CdC per le fatture non classificate"
-            className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-purple-700 bg-purple-50 border border-purple-200 rounded-lg hover:bg-purple-100 disabled:opacity-50"
+            title={batchClassifRunning ? 'Ferma classificazione' : 'Classifica automaticamente categoria, conto e CdC per le fatture non classificate'}
+            className={`inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors ${
+              batchClassifRunning
+                ? 'text-red-700 bg-red-50 border border-red-200 hover:bg-red-100'
+                : 'text-purple-700 bg-purple-50 border border-purple-200 hover:bg-purple-100'
+            }`}
           >
             {batchClassifRunning
-              ? <>⏳ Classifica: {batchClassifProgress.done}/{batchClassifProgress.total}</>
+              ? <>⏹ Stop ({batchClassifJobProgress.pct}%)</>
               : <>🏷️ Classifica AI</>
             }
           </button>

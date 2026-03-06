@@ -16,6 +16,7 @@ import { mpLabel, tpLabel } from '@/lib/invoiceParser'
 import BankTxDetail, { txTypeLabel, txTypeBadge, txDirection } from '@/components/BankTxDetail'
 import { askInvoiceAiSearch, type InvoiceAiResult } from '@/lib/invoiceAiSearch'
 import { createReconciliationExample } from '@/lib/learningService'
+import { useAIJob } from '@/hooks/useAIJob'
 
 /* ─── types ──────────────────────────────────── */
 
@@ -279,7 +280,7 @@ export default function RiconciliazionePage() {
 
   // UI state
   const [loading, setLoading] = useState(true)
-  const [generating, setGenerating] = useState(false)
+  const { isRunning: generating, startOrStop: reconStartOrStop } = useAIJob('riconciliazione-auto', 'Riconciliazione Automatica')
   const [confirmingId, setConfirmingId] = useState<string | null>(null)
   const [rejectingId, setRejectingId] = useState<string | null>(null)
   const [bulkConfirming, setBulkConfirming] = useState(false)
@@ -485,11 +486,11 @@ export default function RiconciliazionePage() {
   }, [detailPopup])
 
   // ─── generate suggestions ──────────────────
-  const generateSuggestions = useCallback(async () => {
-    if (!companyId || generating) return
-    setGenerating(true)
-    try {
+  const generateSuggestions = useCallback(() => {
+    if (!companyId) return
+    reconStartOrStop(async (signal) => {
       const token = await getValidAccessToken()
+      if (signal.aborted) return
       const res = await fetch(`${SUPABASE_URL}/functions/v1/reconciliation-generate`, {
         method: 'POST',
         headers: {
@@ -498,18 +499,15 @@ export default function RiconciliazionePage() {
           'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({ company_id: companyId, batch_size: 100 }),
+        signal,
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
 
       toast.success(`${data.new_suggestions} nuovi suggerimenti generati (${data.processed} movimenti analizzati)`)
       await Promise.all([loadKpis(), loadSuggestions()])
-    } catch (err: unknown) {
-      const msg = errMsg(err)
-      toast.error(`Errore generazione: ${msg}`)
-    }
-    setGenerating(false)
-  }, [companyId, generating, loadKpis, loadSuggestions])
+    })
+  }, [companyId, reconStartOrStop, loadKpis, loadSuggestions])
 
   // ─── auto-close remainder (shared helper) ───
   const autoCloseRemainder = useCallback(async (txId: string, amount: number, reason: string) => {
@@ -1352,11 +1350,14 @@ export default function RiconciliazionePage() {
         </div>
         <button
           onClick={generateSuggestions}
-          disabled={generating}
-          className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-50 transition-colors"
+          className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
+            generating
+              ? 'bg-red-600 text-white hover:bg-red-700'
+              : 'bg-purple-600 text-white hover:bg-purple-700'
+          }`}
         >
           {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-          {generating ? 'Analisi in corso...' : 'Genera suggerimenti'}
+          {generating ? '⏹ Stop' : 'Genera suggerimenti'}
         </button>
       </div>
 

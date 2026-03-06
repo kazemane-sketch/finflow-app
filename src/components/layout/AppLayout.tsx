@@ -23,6 +23,7 @@ import {
 import { useState, useEffect } from 'react'
 import { supabase } from '@/integrations/supabase/client'
 import AiChatWidget from '@/components/AiChatWidget'
+import AIJobIndicator from '@/components/AIJobIndicator'
 
 const nav = [
   { to: '/ai', icon: Sparkles, label: 'Assistente AI', className: 'text-purple-600' },
@@ -102,6 +103,9 @@ export default function AppLayout() {
             </NavLink>
           ))}
         </nav>
+
+        {/* AI Job Indicator */}
+        <AIJobIndicator />
 
         <Separator />
 

@@ -27,6 +27,7 @@ import {
 import { supabase } from '@/integrations/supabase/client'
 import { fmtDate, fmtEur, fmtNum } from '@/lib/utils'
 import { toast } from 'sonner'
+import { useAIJob } from '@/hooks/useAIJob'
 import {
   Package, Plus, Search, Loader2, Trash2, Save, X, Check,
   XCircle, RefreshCw, Zap, BarChart3, Tag, ChevronRight,
@@ -112,8 +113,7 @@ export default function ArticoliPage() {
   const [matchResults, setMatchResults] = useState<Map<string, MatchResult>>(new Map())
   const [assignmentLoading, setAssignmentLoading] = useState(false)
   const [bulkProgress, setBulkProgress] = useState<string | null>(null)
-  const [analyzing, setAnalyzing] = useState(false)
-  const [analyzeProgress, setAnalyzeProgress] = useState('')
+  const { isRunning: analyzing, progress: analyzeJobProgress, startOrStop: analyzeStartOrStop } = useAIJob('articoli-classify', 'Classificazione Articoli')
   const [confirmingLineId, setConfirmingLineId] = useState<string | null>(null)
   const [invoicePopup, setInvoicePopup] = useState<string | null>(null) // invoice_id for popup
 
@@ -287,34 +287,31 @@ export default function ArticoliPage() {
   }, [draft.name, draft.keywords])
 
   // ─── Assignment tab: analyze ALL lines (2-phase: deterministic + AI) ──────
-  const analyzeUnassigned = useCallback(async () => {
+  const analyzeUnassigned = useCallback(() => {
     if (!companyId) return
-    setAnalyzing(true)
-    setAnalyzeProgress('Caricamento righe...')
-    // Reset filters on new analysis
-    setFilterMatchArticle('')
-    setFilterMatchConfidence('')
-    setFilterUnmatchText('')
-    setFilterUnmatchCounterparty('')
-    try {
+    analyzeStartOrStop(async (signal, updateProgress) => {
+      // Reset filters on new analysis
+      setFilterMatchArticle('')
+      setFilterMatchConfidence('')
+      setFilterUnmatchText('')
+      setFilterUnmatchCounterparty('')
+
       // Step 1: Clear old AI suggestions
-      setAnalyzeProgress('Pulizia vecchi suggerimenti...')
       await deleteBulkSuggestions(companyId)
+      if (signal.aborted) return
 
       // Step 2: Load articles, rules and ALL unassigned lines (paginated, no limit)
       const [arts, rules] = await Promise.all([
         loadArticles(companyId, { activeOnly: true }),
         loadLearnedRules(companyId),
       ])
+      if (signal.aborted) return
       setArticles(arts)
-      setAnalyzeProgress('Caricamento righe fattura...')
-      const lines = await loadUnassignedLines(companyId, (loaded) => {
-        setAnalyzeProgress(`Caricate ${loaded} righe...`)
-      })
+      const lines = await loadUnassignedLines(companyId, () => {})
+      if (signal.aborted) return
       setUnassignedLines(lines)
 
       // ── Phase 1: Deterministic matching ──────────
-      setAnalyzeProgress(`Fase 1: Matching deterministico ${lines.length} righe...`)
       const results = new Map<string, MatchResult>()
       const bulkToSave: BulkSuggestion[] = []
       const aiCandidates: UnassignedLine[] = []
@@ -327,15 +324,12 @@ export default function ArticoliPage() {
       for (const line of lines) {
         if (!line.description) { noMatchCount++; continue }
 
-        // Get ALL candidate matches for ambiguity detection
         const allMatches = matchWithLearnedRulesAll(line.description, arts, rules)
         const decision = needsAiMatching(allMatches)
 
         if (decision === 'ai') {
-          // Truly ambiguous (2+ candidates close in confidence) → send to Haiku
           aiCandidates.push(line)
         } else if (decision === 'deterministic' && allMatches.length > 0) {
-          // Clear deterministic match → use top-1
           const bestMatch = allMatches[0]
           results.set(line.id, bestMatch)
           bulkToSave.push({
@@ -346,25 +340,22 @@ export default function ArticoliPage() {
           })
           detMatches++
         } else {
-          // 'no_match': no article candidates → leave as unmatched (don't waste Haiku)
           noMatchCount++
         }
       }
 
-      setAnalyzeProgress(
-        `Fase 1 completata: ${detMatches} match ✅ | ${aiCandidates.length} ambigue 🧠 | ${noMatchCount} senza match`
-      )
       console.log(`[ArticoliPage] Fase 1: ${detMatches} deterministici, ${aiCandidates.length} ambigue per AI, ${noMatchCount} senza match`)
+
+      // Update progress: Phase 1 done, set total = detMatches + aiCandidates for Phase 2
+      updateProgress(detMatches, detMatches + aiCandidates.length)
 
       // ── Phase 2: AI Haiku ONLY for truly ambiguous lines ────
       let aiMatched = 0
       if (aiCandidates.length > 0) {
         const AI_BATCH = 20
         for (let i = 0; i < aiCandidates.length; i += AI_BATCH) {
+          if (signal.aborted) return
           const batch = aiCandidates.slice(i, i + AI_BATCH)
-          setAnalyzeProgress(
-            `Fase 2: Analisi AI ${Math.min(i + AI_BATCH, aiCandidates.length)}/${aiCandidates.length} righe ambigue 🧠`
-          )
 
           try {
             const aiResults = await callArticleAiMatch(
@@ -407,8 +398,9 @@ export default function ArticoliPage() {
             }
           } catch (err) {
             console.error(`[ArticoliPage] AI batch error (${i}-${i + AI_BATCH}):`, err)
-            // Continue with next batch
           }
+
+          updateProgress(detMatches + Math.min(i + AI_BATCH, aiCandidates.length), detMatches + aiCandidates.length)
         }
       }
 
@@ -416,7 +408,6 @@ export default function ArticoliPage() {
 
       // Step 3: Save suggestions to DB
       if (bulkToSave.length > 0) {
-        setAnalyzeProgress(`Salvataggio ${bulkToSave.length} suggerimenti...`)
         await saveBulkSuggestions(companyId, bulkToSave)
       }
 
@@ -430,12 +421,8 @@ export default function ArticoliPage() {
       toast.success(
         `Risultato: ${detMatches} deterministici + ${aiMatched} AI = ${totalMatched} con match | ${noMatchCount} senza match`,
       )
-    } catch (err: any) {
-      toast.error(`Errore analisi: ${err.message}`)
-    }
-    setAnalyzeProgress('')
-    setAnalyzing(false)
-  }, [companyId])
+    })
+  }, [companyId, analyzeStartOrStop])
 
   // ─── Assignment: confirm single (with override support) ──
   const confirmAssignment = useCallback(async (line: UnassignedLine, match: MatchResult) => {
@@ -1323,11 +1310,12 @@ export default function ArticoliPage() {
             </div>
             <Button
               onClick={analyzeUnassigned}
-              disabled={analyzing}
-              className="bg-purple-600 hover:bg-purple-700"
+              className={analyzing ? 'bg-red-600 hover:bg-red-700' : 'bg-purple-600 hover:bg-purple-700'}
             >
               {analyzing ? <Loader2 className="h-4 w-4 animate-spin mr-1.5" /> : <Sparkles className="h-4 w-4 mr-1.5" />}
-              {analyzing ? (analyzeProgress || 'Analisi in corso...') : 'Analizza tutte le righe'}
+              {analyzing
+                ? `⏹ Stop${analyzeJobProgress.total > 0 ? ` (${analyzeJobProgress.pct}%)` : ''}`
+                : 'Analizza tutte le righe'}
             </Button>
           </div>
 

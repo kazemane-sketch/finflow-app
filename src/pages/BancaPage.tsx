@@ -29,6 +29,7 @@ import { getValidAccessToken, type AccessTokenError } from '@/lib/getValidAccess
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges'
 import { ReconciliationDot } from '@/components/ReconciliationIndicators'
 import { usePageEntity } from '@/contexts/PageEntityContext'
+import { useAIJob } from '@/hooks/useAIJob'
 
 import BankTxDetail, {
   txTypeLabel as _txTypeLabel,
@@ -756,9 +757,8 @@ export default function BancaPage() {
     parseResult: BankParseResult; filename: string;
   } | null>(null)
 
-  // Extraction refs
-  const [extractionRunning, setExtractionRunning] = useState(false)
-  const [extractionProgress, setExtractionProgress] = useState<{ processed: number; total: number } | null>(null)
+  // Extraction refs — now tracked by global AI job system
+  const { isRunning: extractionRunning, progress: extractionJobProgress, startOrStop: extractionStartOrStop } = useAIJob('banca-extract-refs', 'Estrazione Riferimenti Banca')
 
   // Import
   const [importing, setImporting] = useState(false)
@@ -793,35 +793,33 @@ export default function BancaPage() {
     }
   }, [companyId])
 
-  const runExtraction = useCallback(async () => {
-    if (!companyId || extractionRunning) return
-    setExtractionRunning(true)
-    setExtractionProgress({ processed: 0, total: 0 })
-    let totalProcessed = 0
-    try {
-      while (true) {
+  const runExtraction = useCallback(() => {
+    if (!companyId) return
+    extractionStartOrStop(async (signal, updateProgress) => {
+      let totalProcessed = 0
+      while (!signal.aborted) {
         const res = await fetch(`${SUPABASE_URL}/functions/v1/bank-extract-refs`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
           body: JSON.stringify({ company_id: companyId, batch_size: 50 }),
+          signal,
         })
         const data = await res.json()
         if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
         // First response with nothing pending — already fully extracted
         if (totalProcessed === 0 && (data.processed || 0) === 0 && (data.total_pending || 0) <= 0) {
-          alert('Tutti i riferimenti sono già stati estratti.')
+          setToast({ message: 'Tutti i riferimenti sono già stati estratti.', type: 'info' })
           break
         }
         totalProcessed += (data.processed || 0)
-        setExtractionProgress({ processed: totalProcessed, total: totalProcessed + (data.total_pending || 0) })
+        const totalRemaining = totalProcessed + (data.total_pending || 0)
+        updateProgress(totalProcessed, totalRemaining)
         if ((data.total_pending || 0) <= 0) break
       }
-    } catch (e: any) {
-      console.error('[Extraction]', e)
-      alert('Errore estrazione: ' + e.message)
-    }
-    setExtractionRunning(false)
-  }, [companyId, extractionRunning])
+      // Refresh embedding health after completion
+      refreshEmbeddingHealth()
+    })
+  }, [companyId, extractionStartOrStop, refreshEmbeddingHealth])
 
   // Auto-dismiss toast
   useEffect(() => {
@@ -1737,11 +1735,14 @@ export default function BancaPage() {
               {transactions.length > 0 && (
                 <button
                   onClick={runExtraction}
-                  disabled={extractionRunning}
-                  className="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium text-purple-700 bg-purple-50 border border-purple-200 rounded hover:bg-purple-100 disabled:opacity-50"
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded transition-colors ${
+                    extractionRunning
+                      ? 'text-red-700 bg-red-50 border border-red-200 hover:bg-red-100'
+                      : 'text-purple-700 bg-purple-50 border border-purple-200 hover:bg-purple-100'
+                  }`}
                 >
                   {extractionRunning ? (
-                    <><RefreshCw className="h-3 w-3 animate-spin" /> Estrazione: {extractionProgress?.processed ?? 0}/{extractionProgress?.total ?? '?'}</>
+                    <><RefreshCw className="h-3 w-3 animate-spin" /> ⏹ Stop ({extractionJobProgress.pct}%)</>
                   ) : (
                     <><Sparkles className="h-3 w-3" /> Estrai riferimenti AI</>
                   )}
