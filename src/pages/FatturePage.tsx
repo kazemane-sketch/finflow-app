@@ -1879,7 +1879,7 @@ export default function FatturePage() {
 
   const buildFilters = useCallback((): InvoiceFilters => ({
     direction: directionFilter,
-    status: statusFilter,
+    status: aiSuggestedFilter ? 'all' : statusFilter,
     dateFrom: dateFrom || undefined,
     dateTo: dateTo || undefined,
     query: debouncedQuery || undefined,
@@ -1911,7 +1911,7 @@ export default function FatturePage() {
           loadInvoiceStats(companyId, statsFilters),
           loadInvoiceStats(companyId, { ...statsFilters, direction: 'in' }),
           loadInvoiceStats(companyId, { ...statsFilters, direction: 'out' }),
-          supabase.from('invoices').select('id', { count: 'exact', head: true }).eq('company_id', companyId).eq('direction', filters.direction === 'all' ? directionFilter : filters.direction!).eq('classification_status', 'ai_suggested').then(r => r.count ?? 0),
+          (() => { let q = supabase.from('invoices').select('id', { count: 'exact', head: true }).eq('company_id', companyId).eq('classification_status', 'ai_suggested'); if (directionFilter !== 'all') q = q.eq('direction', directionFilter); return q.then(r => r.count ?? 0); })(),
         ]);
         setServerStats(stats);
         setTabCounts({ in: inStats.total, out: outStats.total });
@@ -2275,12 +2275,22 @@ export default function FatturePage() {
             {/* Status filter */}
             <div className="flex gap-1">
               {(['all', 'pending', 'overdue', 'paid'] as const).map(s => (
-                <button key={s} onClick={() => setStatusFilter(s)} className={`flex-1 py-1 text-[10px] font-semibold rounded ${statusFilter === s ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>{s === 'all' ? 'Tutte' : STATUS_LABELS[s]}</button>
+                <button key={s} onClick={() => { setStatusFilter(s); setAiSuggestedFilter(false); }} className={`flex-1 py-1 text-[10px] font-semibold rounded ${statusFilter === s && !aiSuggestedFilter ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>{s === 'all' ? 'Tutte' : STATUS_LABELS[s]}</button>
               ))}
-              {aiSuggestedCount > 0 && (
-                <button onClick={() => setAiSuggestedFilter(f => !f)} className={`py-1 px-2 text-[10px] font-semibold rounded whitespace-nowrap ${aiSuggestedFilter ? 'bg-amber-100 text-amber-700 border border-amber-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>⚡ {aiSuggestedCount}</button>
-              )}
             </div>
+            {/* AI classification filter */}
+            {aiSuggestedCount > 0 && (
+              <button
+                onClick={() => { setAiSuggestedFilter(f => !f); setStatusFilter('all'); }}
+                className={`w-full py-1.5 text-[11px] font-semibold rounded-md transition-colors ${
+                  aiSuggestedFilter
+                    ? 'bg-amber-100 text-amber-700 border border-amber-300'
+                    : 'bg-amber-50 text-amber-600 border border-amber-200 hover:bg-amber-100'
+                }`}
+              >
+                ⚡ Da Confermare ({aiSuggestedCount})
+              </button>
+            )}
             <div className="flex items-center gap-2">
               <button onClick={() => { setSelectMode(!selectMode); if (selectMode) setChecked(new Set()); }} className={`px-2 py-1 text-[10px] font-semibold rounded ${selectMode ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>{selectMode ? '✕ Esci Selezione' : '☐ Seleziona'}</button>
               {selectMode && <>
