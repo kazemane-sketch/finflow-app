@@ -290,6 +290,7 @@ export default function RiconciliazionePage() {
     searchParams.get('tx') || null
   )
   const [assistedSearch, setAssistedSearch] = useState('')
+  const [assistedPartialOnly, setAssistedPartialOnly] = useState(false)
   const [candidateSearch, setCandidateSearch] = useState('')
   const [candidateAiResult, setCandidateAiResult] = useState<InvoiceAiResult | null>(null)
   const [candidateAiSearching, setCandidateAiSearching] = useState(false)
@@ -1096,7 +1097,15 @@ export default function RiconciliazionePage() {
   const handlePostReconAction = useCallback(async (action: 'commission' | 'abbuono' | 'skip') => {
     if (!postReconDialog) return
     if (action === 'skip') {
+      const txId = postReconDialog.txId
       setPostReconDialog(null)
+      // Navigate to assisted tab and pre-select the partial TX for further matching
+      await Promise.all([loadKpis(), loadSuggestions(), loadUnmatched(), loadOpenInstallments()])
+      setActiveTab('assisted')
+      setSelectedTxId(txId)
+      setCandidateAiResult(null)
+      setCandidateAiInstallments([])
+      setCandidateSearch('')
       return
     }
 
@@ -1115,7 +1124,7 @@ export default function RiconciliazionePage() {
     } catch (err: unknown) {
       toast.error(`Errore chiusura residuo: ${errMsg(err)}`)
     }
-  }, [postReconDialog, autoCloseRemainder, loadKpis, loadSuggestions, loadUnmatched])
+  }, [postReconDialog, autoCloseRemainder, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments])
 
   // ─── tab change handler ────────────────────
   const handleTabChange = (tab: string) => {
@@ -1129,15 +1138,39 @@ export default function RiconciliazionePage() {
   }
 
   // ─── filtered unmatched for assisted tab ───
+  const partialCount = useMemo(() => unmatchedTxs.filter(tx => tx.reconciliation_status === 'partial').length, [unmatchedTxs])
   const filteredUnmatched = useMemo(() => {
-    if (!assistedSearch.trim()) return unmatchedTxs
-    const q = assistedSearch.toLowerCase()
-    return unmatchedTxs.filter(tx =>
-      (tx.counterparty_name || '').toLowerCase().includes(q) ||
-      (tx.description || '').toLowerCase().includes(q) ||
-      String(tx.amount).includes(q)
-    )
-  }, [unmatchedTxs, assistedSearch])
+    let list = unmatchedTxs
+    if (assistedPartialOnly) {
+      list = list.filter(tx => tx.reconciliation_status === 'partial')
+    }
+    if (assistedSearch.trim()) {
+      const q = assistedSearch.toLowerCase()
+      list = list.filter(tx =>
+        (tx.counterparty_name || '').toLowerCase().includes(q) ||
+        (tx.description || '').toLowerCase().includes(q) ||
+        String(tx.amount).includes(q)
+      )
+    }
+    return list
+  }, [unmatchedTxs, assistedSearch, assistedPartialOnly])
+
+  // Lookup: bank_transaction_id → reconciliation info (for showing partial match history)
+  const txReconHistory = useMemo(() => {
+    const map = new Map<string, { invoiceNumber: string | null; amount: number; date: string }[]>()
+    for (const r of reconciledRows) {
+      const txId = r.bank_transaction_id
+      if (!map.has(txId)) map.set(txId, [])
+      const cp = (r.invoice as any)?.counterparty
+      const invNum = (r.invoice as any)?.number || null
+      map.get(txId)!.push({
+        invoiceNumber: invNum,
+        amount: Number(r.reconciled_amount || 0),
+        date: r.confirmed_at || r.created_at,
+      })
+    }
+    return map
+  }, [reconciledRows])
 
   // ─── AI search for candidates ────────────
   const handleCandidateAISearch = useCallback(async () => {
@@ -1656,16 +1689,30 @@ export default function RiconciliazionePage() {
                 <span className="text-sm font-semibold text-gray-700">Movimenti bancari</span>
                 <span className="text-[10px] text-gray-400 ml-auto">{filteredUnmatched.length}</span>
               </div>
-              <div className="px-3 py-2 border-b">
-                <div className="relative">
-                  <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
-                  <input
-                    type="text"
-                    value={assistedSearch}
-                    onChange={e => setAssistedSearch(e.target.value)}
-                    placeholder="Cerca controparte, descrizione..."
-                    className="w-full pl-8 pr-3 py-1.5 text-xs border rounded-md focus:outline-none focus:ring-1 focus:ring-purple-400"
-                  />
+              <div className="px-3 py-2 border-b space-y-1.5">
+                <div className="flex items-center gap-1.5">
+                  <div className="relative flex-1">
+                    <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
+                    <input
+                      type="text"
+                      value={assistedSearch}
+                      onChange={e => setAssistedSearch(e.target.value)}
+                      placeholder="Cerca controparte, descrizione..."
+                      className="w-full pl-8 pr-3 py-1.5 text-xs border rounded-md focus:outline-none focus:ring-1 focus:ring-purple-400"
+                    />
+                  </div>
+                  {partialCount > 0 && (
+                    <button
+                      onClick={() => setAssistedPartialOnly(f => !f)}
+                      className={`px-2 py-1.5 text-[10px] font-semibold rounded-md border whitespace-nowrap transition-colors ${
+                        assistedPartialOnly
+                          ? 'bg-orange-100 text-orange-700 border-orange-300'
+                          : 'bg-white text-gray-500 border-gray-200 hover:bg-gray-50'
+                      }`}
+                    >
+                      Parziali ({partialCount})
+                    </button>
+                  )}
                 </div>
               </div>
               <div className="flex-1 overflow-y-auto">
@@ -1724,9 +1771,16 @@ export default function RiconciliazionePage() {
                         )}
                       </div>
                       {isPartial && (
-                        <p className="text-[10px] text-orange-600 mt-0.5 pl-3.5">
-                          Disponibile: {fmtEur(txAvailable)} (di {fmtEur(netAmt)})
-                        </p>
+                        <div className="mt-0.5 pl-3.5">
+                          <p className="text-[10px] text-orange-600">
+                            Residuo: {fmtEur(txAvailable)} — Riconciliato: {fmtEur(txReconciledAmt)} di {fmtEur(netAmt)}
+                          </p>
+                          {txReconHistory.get(tx.id)?.map((h, hi) => (
+                            <p key={hi} className="text-[9px] text-gray-400">
+                              {h.invoiceNumber ? `Fatt. ${h.invoiceNumber}` : 'Abbinato'}: {fmtEur(h.amount)} — {fmtDate(h.date)}
+                            </p>
+                          ))}
+                        </div>
                       )}
                     </button>
                   )
@@ -1746,7 +1800,22 @@ export default function RiconciliazionePage() {
                 )}
               </div>
 
-              {selectedTxId && (
+              {selectedTxId && (() => {
+                const selTx = unmatchedTxs.find(t => t.id === selectedTxId)
+                const selIsPartial = selTx?.reconciliation_status === 'partial'
+                const selNetAmt = selTx ? Math.abs(Number(selTx.amount)) - Math.abs(Number(selTx.commission_amount || 0)) : 0
+                const selReconciled = Number(selTx?.reconciled_amount || 0)
+                const selResidual = selNetAmt - selReconciled
+                return <>
+                {selIsPartial && (
+                  <div className="px-3 py-2 border-b bg-amber-50">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-medium text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded-full">Parziale</span>
+                      <span className="text-xs text-amber-800">Residuo da abbinare: <span className="font-bold">{fmtEur(selResidual)}</span></span>
+                      <span className="text-[10px] text-amber-600 ml-auto">Riconciliato: {fmtEur(selReconciled)} di {fmtEur(selNetAmt)}</span>
+                    </div>
+                  </div>
+                )}
                 <div className="px-3 py-2 border-b space-y-1.5">
                   <div className="flex items-center gap-1.5">
                     <div className="relative flex-1">
@@ -1788,7 +1857,8 @@ export default function RiconciliazionePage() {
                     </div>
                   ) : null)}
                 </div>
-              )}
+              </>
+              })()}
 
               <div className="flex-1 overflow-y-auto">
                 {!selectedTxId ? (
