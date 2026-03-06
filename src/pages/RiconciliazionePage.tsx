@@ -291,6 +291,7 @@ export default function RiconciliazionePage() {
   )
   const [assistedSearch, setAssistedSearch] = useState('')
   const [assistedPartialOnly, setAssistedPartialOnly] = useState(false)
+  const [assistedSortByReconDate, setAssistedSortByReconDate] = useState<'asc' | 'desc' | null>(null)
   const [candidateSearch, setCandidateSearch] = useState('')
   const [candidateAiResult, setCandidateAiResult] = useState<InvoiceAiResult | null>(null)
   const [candidateAiSearching, setCandidateAiSearching] = useState(false)
@@ -315,6 +316,14 @@ export default function RiconciliazionePage() {
   const [closingReason, setClosingReason] = useState('commissione_bancaria')
   const [closingAmount, setClosingAmount] = useState('')
   const [closingInProgress, setClosingInProgress] = useState(false)
+
+  // Residual management dialog (from Riconciliati tab)
+  const [residualDialog, setResidualDialog] = useState<{
+    reconRow: ReconciledRow
+    remainder: number
+    txId: string
+    txDirection: string | null
+  } | null>(null)
 
   // Post-reconciliation dialog (remainder after matching)
   const [postReconDialog, setPostReconDialog] = useState<{
@@ -967,20 +976,37 @@ export default function RiconciliazionePage() {
         .eq('id', recon.id)
       if (e1) throw e1
 
-      // 4. Reverse bank transaction reconciled_amount
-      // First fetch current reconciled_amount to decrement
-      const { data: txData } = await supabase
-        .from('bank_transactions')
-        .select('reconciled_amount, amount')
-        .eq('id', recon.bank_transaction_id)
-        .single()
-      const newTxReconciled = Math.max(0, Number(txData?.reconciled_amount || 0) - reversalAmount)
-      const newTxStatus = newTxReconciled < 0.01 ? 'unmatched' : 'partial'
-      const { error: e2 } = await supabase
-        .from('bank_transactions')
-        .update({ reconciled_amount: newTxReconciled, reconciliation_status: newTxStatus })
-        .eq('id', recon.bank_transaction_id)
-      if (e2) throw e2
+      // 4. Smart reset: recalculate bank TX from remaining reconciliations + adjustments
+      const { count: remainingReconCount } = await supabase
+        .from('reconciliations')
+        .select('*', { count: 'exact', head: true })
+        .eq('bank_transaction_id', recon.bank_transaction_id)
+
+      if ((remainingReconCount ?? 0) === 0) {
+        // No reconciliations remain → full reset (also clears lingering auto-close adjustments)
+        const { error: e2 } = await supabase
+          .from('bank_transactions')
+          .update({ reconciled_amount: 0, reconciliation_status: 'unmatched' })
+          .eq('id', recon.bank_transaction_id)
+        if (e2) throw e2
+      } else {
+        // Some reconciliations remain → recalculate from actual data
+        const [{ data: remainingRecons }, { data: adjLogs }, { data: txData }] = await Promise.all([
+          supabase.from('reconciliations').select('reconciled_amount').eq('bank_transaction_id', recon.bank_transaction_id),
+          supabase.from('reconciliation_log').select('adjustment_amount').eq('bank_transaction_id', recon.bank_transaction_id).eq('accepted', true).not('adjustment_amount', 'is', null),
+          supabase.from('bank_transactions').select('amount, commission_amount').eq('id', recon.bank_transaction_id).single(),
+        ])
+        const reconSum = (remainingRecons || []).reduce((s, r) => s + Number(r.reconciled_amount || 0), 0)
+        const adjSum = (adjLogs || []).reduce((s, a) => s + Number(a.adjustment_amount || 0), 0)
+        const newReconciled = Math.max(0, reconSum + adjSum)
+        const txNet = txData ? Math.abs(Number(txData.amount)) - Math.abs(Number(txData.commission_amount || 0)) : 0
+        const newStatus = newReconciled >= txNet - 0.01 ? 'matched' : newReconciled > 0.01 ? 'partial' : 'unmatched'
+        const { error: e2 } = await supabase
+          .from('bank_transactions')
+          .update({ reconciled_amount: newReconciled, reconciliation_status: newStatus })
+          .eq('id', recon.bank_transaction_id)
+        if (e2) throw e2
+      }
 
       // 5. Reverse installment paid_amount
       const resolvedInstId = reconInstallmentId
@@ -1137,6 +1163,22 @@ export default function RiconciliazionePage() {
     })
   }
 
+  // Lookup: bank_transaction_id → reconciliation info (for showing partial match history)
+  const txReconHistory = useMemo(() => {
+    const map = new Map<string, { invoiceNumber: string | null; amount: number; date: string }[]>()
+    for (const r of reconciledRows) {
+      const txId = r.bank_transaction_id
+      if (!map.has(txId)) map.set(txId, [])
+      const invNum = (r.invoice as any)?.number || null
+      map.get(txId)!.push({
+        invoiceNumber: invNum,
+        amount: Number(r.reconciled_amount || 0),
+        date: r.confirmed_at || r.created_at,
+      })
+    }
+    return map
+  }, [reconciledRows])
+
   // ─── filtered unmatched for assisted tab ───
   const partialCount = useMemo(() => unmatchedTxs.filter(tx => tx.reconciliation_status === 'partial').length, [unmatchedTxs])
   const filteredUnmatched = useMemo(() => {
@@ -1152,25 +1194,23 @@ export default function RiconciliazionePage() {
         String(tx.amount).includes(q)
       )
     }
-    return list
-  }, [unmatchedTxs, assistedSearch, assistedPartialOnly])
-
-  // Lookup: bank_transaction_id → reconciliation info (for showing partial match history)
-  const txReconHistory = useMemo(() => {
-    const map = new Map<string, { invoiceNumber: string | null; amount: number; date: string }[]>()
-    for (const r of reconciledRows) {
-      const txId = r.bank_transaction_id
-      if (!map.has(txId)) map.set(txId, [])
-      const cp = (r.invoice as any)?.counterparty
-      const invNum = (r.invoice as any)?.number || null
-      map.get(txId)!.push({
-        invoiceNumber: invNum,
-        amount: Number(r.reconciled_amount || 0),
-        date: r.confirmed_at || r.created_at,
+    // Sort by last reconciliation date when active
+    if (assistedSortByReconDate && txReconHistory.size > 0) {
+      list = [...list].sort((a, b) => {
+        const aHistory = txReconHistory.get(a.id)
+        const bHistory = txReconHistory.get(b.id)
+        const aDate = aHistory?.reduce((latest, h) => h.date > latest ? h.date : latest, '') || ''
+        const bDate = bHistory?.reduce((latest, h) => h.date > latest ? h.date : latest, '') || ''
+        if (!aDate && !bDate) return 0
+        if (!aDate) return 1
+        if (!bDate) return -1
+        return assistedSortByReconDate === 'asc' ? aDate.localeCompare(bDate) : bDate.localeCompare(aDate)
       })
     }
-    return map
-  }, [reconciledRows])
+    return list
+  }, [unmatchedTxs, assistedSearch, assistedPartialOnly, assistedSortByReconDate, txReconHistory])
+
+
 
   // ─── selected TX partial info (for residual banner) ───
   const selectedTxPartialInfo = useMemo(() => {
@@ -1723,6 +1763,19 @@ export default function RiconciliazionePage() {
                       Parziali ({partialCount})
                     </button>
                   )}
+                  {assistedPartialOnly && partialCount > 0 && (
+                    <button
+                      onClick={() => setAssistedSortByReconDate(prev => prev === null ? 'asc' : prev === 'asc' ? 'desc' : null)}
+                      className={`px-2 py-1.5 text-[10px] font-semibold rounded-md border whitespace-nowrap transition-colors ${
+                        assistedSortByReconDate
+                          ? 'bg-blue-100 text-blue-700 border-blue-300'
+                          : 'bg-white text-gray-500 border-gray-200 hover:bg-gray-50'
+                      }`}
+                      title={assistedSortByReconDate === 'asc' ? 'Meno recente prima' : assistedSortByReconDate === 'desc' ? 'Più recente prima' : 'Ordina per data riconciliazione'}
+                    >
+                      {assistedSortByReconDate === 'asc' ? '↑' : assistedSortByReconDate === 'desc' ? '↓' : '⇅'} Data ric.
+                    </button>
+                  )}
                 </div>
               </div>
               <div className="flex-1 overflow-y-auto">
@@ -2080,8 +2133,17 @@ export default function RiconciliazionePage() {
                           {/* Difference column */}
                           <div className="text-right">
                             {txHasRemainder ? (
-                              <div>
-                                <span className={`text-xs font-bold ${
+                              <button
+                                onClick={() => setResidualDialog({
+                                  reconRow: r,
+                                  remainder: txRemainder,
+                                  txId: r.bank_transaction_id,
+                                  txDirection: txDir,
+                                })}
+                                className="text-right group"
+                                title="Gestisci residuo"
+                              >
+                                <span className={`text-xs font-bold group-hover:underline ${
                                   txRemainder < 5 ? 'text-emerald-600' :
                                   txRemainder <= 50 ? 'text-orange-600' :
                                   'text-red-600'
@@ -2089,7 +2151,7 @@ export default function RiconciliazionePage() {
                                   {fmtEur(txRemainder)}
                                 </span>
                                 <p className="text-[9px] text-gray-400">residuo</p>
-                              </div>
+                              </button>
                             ) : (
                               <span className="text-[10px] text-emerald-500 font-medium">✓</span>
                             )}
@@ -2219,6 +2281,27 @@ export default function RiconciliazionePage() {
           dialog={postReconDialog}
           onClose={() => setPostReconDialog(null)}
           onAction={handlePostReconAction}
+        />
+      )}
+
+      {/* ──── Residual management dialog (from Riconciliati tab) ──── */}
+      {residualDialog && (
+        <ResidualManagementDialog
+          dialog={residualDialog}
+          openInstallments={openInstallments}
+          onClose={() => setResidualDialog(null)}
+          onCloseDifference={(reconRow, amount, reason) => {
+            closeDifference(reconRow, amount, reason)
+            setResidualDialog(null)
+          }}
+          onNavigateToAssisted={(txId) => {
+            setResidualDialog(null)
+            setActiveTab('assisted')
+            setSelectedTxId(txId)
+            setCandidateAiResult(null)
+            setCandidateAiInstallments([])
+            setCandidateSearch('')
+          }}
         />
       )}
 
@@ -2790,6 +2873,175 @@ function PostReconciliationDialog({ dialog, onClose, onAction }: {
             </button>
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+/* ─── Residual management dialog (from Riconciliati tab) ─── */
+
+function ResidualManagementDialog({
+  dialog,
+  openInstallments,
+  onClose,
+  onCloseDifference,
+  onNavigateToAssisted,
+}: {
+  dialog: { reconRow: ReconciledRow; remainder: number; txId: string; txDirection: string | null }
+  openInstallments: OpenInstallment[]
+  onClose: () => void
+  onCloseDifference: (reconRow: ReconciledRow, amount: number, reason: string) => void
+  onNavigateToAssisted: (txId: string) => void
+}) {
+  const [mode, setMode] = useState<'match' | 'commission' | 'abbuono'>('match')
+  const [search, setSearch] = useState('')
+
+  const expectedInvDirection = dialog.txDirection === 'in' ? 'out' : 'in'
+  const tx = dialog.reconRow.bank_transaction
+  const inv = dialog.reconRow.invoice
+
+  const candidates = useMemo(() => {
+    let filtered = openInstallments
+      .filter(inst => {
+        const remaining = Number(inst.amount_due) - Number(inst.paid_amount)
+        return remaining > 0 && inst.direction === expectedInvDirection
+      })
+      .map(inst => {
+        const remaining = Number(inst.amount_due) - Number(inst.paid_amount)
+        return { ...inst, _remaining: remaining, _diff: Math.abs(dialog.remainder - remaining) }
+      })
+      .sort((a, b) => a._diff - b._diff)
+
+    if (search.trim()) {
+      const q = search.toLowerCase()
+      filtered = filtered.filter(inst =>
+        (inst.counterparty_name || '').toLowerCase().includes(q) ||
+        (inst.invoice_number || '').toLowerCase().includes(q)
+      )
+    }
+    return filtered.slice(0, 30)
+  }, [openInstallments, dialog.remainder, expectedInvDirection, search])
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg max-h-[80vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        {/* Header */}
+        <div className="px-5 py-4 border-b bg-amber-50/80">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-bold text-gray-800">Gestisci residuo</h3>
+              <p className="text-xs text-gray-500 mt-0.5">
+                {tx?.counterparty_name || 'Movimento'} &mdash; {inv?.number ? `Fatt. ${inv.number}` : 'Fattura'}
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <span className="text-lg font-bold text-amber-700">{fmtEur(dialog.remainder)}</span>
+              <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600"><X className="h-4 w-4" /></button>
+            </div>
+          </div>
+        </div>
+
+        {/* Mode selector */}
+        <div className="flex border-b">
+          {([
+            { key: 'match' as const, label: 'Abbina a fattura', icon: Link2 },
+            { key: 'commission' as const, label: 'Commissione', icon: CircleDollarSign },
+            { key: 'abbuono' as const, label: 'Abbuono', icon: Ban },
+          ]).map(m => (
+            <button
+              key={m.key}
+              onClick={() => setMode(m.key)}
+              className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2.5 text-[11px] font-semibold border-b-2 transition-colors ${
+                mode === m.key
+                  ? 'border-amber-500 text-amber-700 bg-amber-50/50'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+              }`}
+            >
+              <m.icon className="h-3.5 w-3.5" />
+              {m.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto">
+          {mode === 'match' && (
+            <div>
+              <div className="px-4 py-2.5 border-b">
+                <div className="relative">
+                  <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-gray-400" />
+                  <input
+                    type="text"
+                    value={search}
+                    onChange={e => setSearch(e.target.value)}
+                    placeholder="Cerca controparte, numero fattura..."
+                    className="w-full pl-8 pr-3 py-1.5 text-xs border rounded-md focus:outline-none focus:ring-1 focus:ring-amber-400"
+                  />
+                </div>
+              </div>
+              {candidates.length === 0 ? (
+                <div className="text-center py-8 text-xs text-gray-400">Nessun candidato trovato</div>
+              ) : (
+                <div className="divide-y">
+                  {candidates.map(inst => {
+                    const diffPct = dialog.remainder > 0 ? (inst._diff / dialog.remainder) * 100 : 100
+                    return (
+                      <div key={inst.id} className="px-4 py-2.5 flex items-center gap-3 hover:bg-gray-50 transition-colors">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-medium text-gray-800 truncate">{inst.counterparty_name || 'N.D.'}</p>
+                          <div className="flex items-center gap-2 mt-0.5">
+                            {inst.invoice_number && <span className="text-[10px] text-blue-600 font-medium">#{inst.invoice_number}</span>}
+                            <span className="text-[10px] text-gray-400">Scad. {fmtDate(inst.due_date)}</span>
+                          </div>
+                        </div>
+                        <div className="text-right shrink-0">
+                          <p className="text-xs font-bold text-gray-700">{fmtEur(inst._remaining)}</p>
+                          <p className={`text-[9px] ${diffPct < 5 ? 'text-emerald-600' : diffPct < 15 ? 'text-orange-500' : 'text-gray-400'}`}>
+                            {diffPct < 1 ? 'Coincide' : `Diff: ${fmtEur(inst._diff)}`}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => onNavigateToAssisted(dialog.txId)}
+                          className="px-2.5 py-1 text-[10px] font-semibold rounded-md bg-purple-600 text-white hover:bg-purple-700 transition-colors shrink-0"
+                        >
+                          Abbina
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {mode === 'commission' && (
+            <div className="px-5 py-8 text-center">
+              <CircleDollarSign className="h-10 w-10 text-orange-400 mx-auto mb-3" />
+              <p className="text-sm text-gray-700 mb-1">Chiudi come <strong>commissione bancaria</strong></p>
+              <p className="text-xs text-gray-400 mb-4">Il residuo di {fmtEur(dialog.remainder)} verrà registrato come costo bancario</p>
+              <button
+                onClick={() => onCloseDifference(dialog.reconRow, dialog.remainder, 'commissione_bancaria')}
+                className="px-4 py-2 text-xs font-semibold rounded-lg bg-orange-600 text-white hover:bg-orange-700 transition-colors"
+              >
+                Conferma commissione
+              </button>
+            </div>
+          )}
+
+          {mode === 'abbuono' && (
+            <div className="px-5 py-8 text-center">
+              <Ban className="h-10 w-10 text-gray-400 mx-auto mb-3" />
+              <p className="text-sm text-gray-700 mb-1">Chiudi come <strong>abbuono</strong></p>
+              <p className="text-xs text-gray-400 mb-4">Il residuo di {fmtEur(dialog.remainder)} verrà chiuso come sconto/abbuono</p>
+              <button
+                onClick={() => onCloseDifference(dialog.reconRow, dialog.remainder, 'abbuono_passivo')}
+                className="px-4 py-2 text-xs font-semibold rounded-lg bg-gray-600 text-white hover:bg-gray-700 transition-colors"
+              >
+                Conferma abbuono
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )
