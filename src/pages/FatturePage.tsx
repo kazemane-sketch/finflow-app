@@ -1721,14 +1721,37 @@ export default function FatturePage() {
     const companyId = company?.id;
     if (!companyId) return;
     classifStartOrStop(async (signal, updateProgress) => {
-      // Find unclassified invoice IDs
-      const [{ data: allInvIds }, { data: classifiedIds }] = await Promise.all([
-        supabase.from('invoices').select('id').eq('company_id', companyId).eq('direction', directionFilter).limit(200),
-        supabase.from('invoice_classifications').select('invoice_id').eq('company_id', companyId),
-      ]);
-      if (signal.aborted) return;
-      const classifiedSet = new Set((classifiedIds || []).map((r: any) => r.invoice_id));
-      const ids = (allInvIds || []).map((r: any) => r.id).filter((id: string) => !classifiedSet.has(id)).slice(0, 50);
+      // Paginated fetch of ALL invoice IDs (Supabase max 1000 per call)
+      const PAGE = 1000;
+      const allInvIds: string[] = [];
+      for (let from = 0; ; from += PAGE) {
+        const { data } = await supabase
+          .from('invoices')
+          .select('id')
+          .eq('company_id', companyId)
+          .eq('direction', directionFilter)
+          .range(from, from + PAGE - 1);
+        if (signal.aborted) return;
+        if (!data || data.length === 0) break;
+        for (const r of data) allInvIds.push(r.id);
+        if (data.length < PAGE) break;
+      }
+
+      // Paginated fetch of ALL classified invoice IDs
+      const classifiedSet = new Set<string>();
+      for (let from = 0; ; from += PAGE) {
+        const { data } = await supabase
+          .from('invoice_classifications')
+          .select('invoice_id')
+          .eq('company_id', companyId)
+          .range(from, from + PAGE - 1);
+        if (signal.aborted) return;
+        if (!data || data.length === 0) break;
+        for (const r of data) classifiedSet.add(r.invoice_id);
+        if (data.length < PAGE) break;
+      }
+
+      const ids = allInvIds.filter((id) => !classifiedSet.has(id));
       if (ids.length === 0) return;
 
       updateProgress(0, ids.length);
@@ -1736,34 +1759,49 @@ export default function FatturePage() {
       let successCount = 0;
       let failedCount = 0;
 
-      for (let i = 0; i < ids.length; i += 10) {
+      // Split into batches of 10 IDs per API call, run 5 calls in parallel
+      const BATCH_SIZE = 10;
+      const PARALLEL = 5;
+      const batches: string[][] = [];
+      for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+        batches.push(ids.slice(i, i + BATCH_SIZE));
+      }
+
+      for (let i = 0; i < batches.length; i += PARALLEL) {
         if (signal.aborted) return;
-        const batch = ids.slice(i, i + 10);
-        try {
-          const res = await fetch(`${SUPABASE_URL}/functions/v1/classification-ai-suggest`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${token}`,
-              'apikey': SUPABASE_ANON_KEY,
-            },
-            body: JSON.stringify({ company_id: companyId, invoice_ids: batch }),
-            signal,
-          });
-          if (!res.ok) {
-            console.error(`Batch classification error: HTTP ${res.status}`);
-            failedCount += batch.length;
-          } else {
-            const data = await res.json();
-            successCount += (data.results?.length || 0);
-            failedCount += (data.stats?.failed || 0);
-          }
-        } catch (fetchErr: any) {
-          if (fetchErr?.name === 'AbortError') return;
-          console.error('Batch fetch error:', fetchErr);
-          failedCount += batch.length;
+        const parallelBatches = batches.slice(i, i + PARALLEL);
+        const results = await Promise.all(
+          parallelBatches.map(async (batch) => {
+            try {
+              const res = await fetch(`${SUPABASE_URL}/functions/v1/classification-ai-suggest`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${token}`,
+                  'apikey': SUPABASE_ANON_KEY,
+                },
+                body: JSON.stringify({ company_id: companyId, invoice_ids: batch }),
+                signal,
+              });
+              if (!res.ok) {
+                console.error(`Batch classification error: HTTP ${res.status}`);
+                return { success: 0, failed: batch.length };
+              }
+              const data = await res.json();
+              return { success: data.results?.length || 0, failed: data.stats?.failed || 0 };
+            } catch (fetchErr: any) {
+              if (fetchErr?.name === 'AbortError') throw fetchErr;
+              console.error('Batch fetch error:', fetchErr);
+              return { success: 0, failed: batch.length };
+            }
+          }),
+        );
+        for (const r of results) {
+          successCount += r.success;
+          failedCount += r.failed;
         }
-        updateProgress(Math.min(i + 10, ids.length), ids.length);
+        const processed = Math.min((i + PARALLEL) * BATCH_SIZE, ids.length);
+        updateProgress(processed, ids.length);
       }
 
       if (failedCount > 0 && successCount === 0) {

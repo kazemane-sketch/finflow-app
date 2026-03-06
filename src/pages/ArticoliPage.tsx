@@ -289,37 +289,35 @@ export default function ArticoliPage() {
   // ─── Assignment tab: analyze ALL lines (2-phase: deterministic + AI) ──────
   const analyzeUnassigned = useCallback(() => {
     if (!companyId) return
-    analyzeStartOrStop(async (signal, updateProgress) => {
-      // Reset filters on new analysis
-      setFilterMatchArticle('')
-      setFilterMatchConfidence('')
-      setFilterUnmatchText('')
-      setFilterUnmatchCounterparty('')
+    // Reset filters BEFORE starting the background job (sync, runs immediately)
+    setFilterMatchArticle('')
+    setFilterMatchConfidence('')
+    setFilterUnmatchText('')
+    setFilterUnmatchCounterparty('')
 
+    // Snapshot companyId so the work function is self-contained
+    const cid = companyId
+    analyzeStartOrStop(async (signal, updateProgress) => {
       // Step 1: Clear old AI suggestions
-      await deleteBulkSuggestions(companyId)
+      await deleteBulkSuggestions(cid)
       if (signal.aborted) return
 
       // Step 2: Load articles, rules and ALL unassigned lines (paginated, no limit)
       const [arts, rules] = await Promise.all([
-        loadArticles(companyId, { activeOnly: true }),
-        loadLearnedRules(companyId),
+        loadArticles(cid, { activeOnly: true }),
+        loadLearnedRules(cid),
       ])
       if (signal.aborted) return
-      setArticles(arts)
-      const lines = await loadUnassignedLines(companyId, () => {})
+      const lines = await loadUnassignedLines(cid, () => {})
       if (signal.aborted) return
-      setUnassignedLines(lines)
 
       // ── Phase 1: Deterministic matching ──────────
-      const results = new Map<string, MatchResult>()
       const bulkToSave: BulkSuggestion[] = []
       const aiCandidates: UnassignedLine[] = []
       let noMatchCount = 0
-
       let detMatches = 0
-      const activeRules = rules.filter(r => r.confidence > 0.5)
-      console.log(`[ArticoliPage] Analisi: ${lines.length} righe, ${arts.length} articoli, ${rules.length} regole (${activeRules.length} con confidence > 0.5)`)
+
+      console.log(`[ArticoliPage] Analisi: ${lines.length} righe, ${arts.length} articoli, ${rules.length} regole`)
 
       for (const line of lines) {
         if (!line.description) { noMatchCount++; continue }
@@ -331,7 +329,6 @@ export default function ArticoliPage() {
           aiCandidates.push(line)
         } else if (decision === 'deterministic' && allMatches.length > 0) {
           const bestMatch = allMatches[0]
-          results.set(line.id, bestMatch)
           bulkToSave.push({
             invoice_line_id: line.id,
             invoice_id: line.invoice_id,
@@ -345,45 +342,51 @@ export default function ArticoliPage() {
       }
 
       console.log(`[ArticoliPage] Fase 1: ${detMatches} deterministici, ${aiCandidates.length} ambigue per AI, ${noMatchCount} senza match`)
-
-      // Update progress: Phase 1 done, set total = detMatches + aiCandidates for Phase 2
       updateProgress(detMatches, detMatches + aiCandidates.length)
 
-      // ── Phase 2: AI Haiku ONLY for truly ambiguous lines ────
+      // ── Phase 2: AI Haiku ONLY for truly ambiguous lines (5 parallel calls) ────
       let aiMatched = 0
       if (aiCandidates.length > 0) {
         const AI_BATCH = 20
+        const PARALLEL = 5
+
+        // Pre-split into batches
+        const aiBatches: UnassignedLine[][] = []
         for (let i = 0; i < aiCandidates.length; i += AI_BATCH) {
+          aiBatches.push(aiCandidates.slice(i, i + AI_BATCH))
+        }
+
+        for (let i = 0; i < aiBatches.length; i += PARALLEL) {
           if (signal.aborted) return
-          const batch = aiCandidates.slice(i, i + AI_BATCH)
+          const parallelBatches = aiBatches.slice(i, i + PARALLEL)
 
-          try {
-            const aiResults = await callArticleAiMatch(
-              companyId,
-              batch.map(l => ({
-                line_id: l.id,
-                description: l.description || '',
-                quantity: l.quantity,
-                unit_price: l.unit_price,
-                total_price: l.total_price,
-                invoice_number: l.invoice_number,
-                counterparty_name: l.counterparty_name,
-              })),
-            )
+          const allResults = await Promise.all(
+            parallelBatches.map(async (batch) => {
+              try {
+                return await callArticleAiMatch(
+                  cid,
+                  batch.map(l => ({
+                    line_id: l.id,
+                    description: l.description || '',
+                    quantity: l.quantity,
+                    unit_price: l.unit_price,
+                    total_price: l.total_price,
+                    invoice_number: l.invoice_number,
+                    counterparty_name: l.counterparty_name,
+                  })),
+                )
+              } catch (err) {
+                console.error(`[ArticoliPage] AI batch error:`, err)
+                return []
+              }
+            }),
+          )
 
+          for (const aiResults of allResults) {
             for (const aiResult of aiResults) {
               if (!aiResult.article_id) continue
               const article = arts.find(a => a.id === aiResult.article_id)
               if (!article) continue
-
-              results.set(aiResult.line_id, {
-                article,
-                confidence: aiResult.confidence,
-                matchedKeywords: [],
-                totalKeywords: article.keywords?.length || 0,
-                source: 'ai',
-                reasoning: aiResult.reasoning,
-              })
 
               const candidateLine = aiCandidates.find(l => l.id === aiResult.line_id)
               if (candidateLine) {
@@ -396,31 +399,23 @@ export default function ArticoliPage() {
               }
               aiMatched++
             }
-          } catch (err) {
-            console.error(`[ArticoliPage] AI batch error (${i}-${i + AI_BATCH}):`, err)
           }
 
-          updateProgress(detMatches + Math.min(i + AI_BATCH, aiCandidates.length), detMatches + aiCandidates.length)
+          const processed = Math.min((i + PARALLEL) * AI_BATCH, aiCandidates.length)
+          updateProgress(detMatches + processed, detMatches + aiCandidates.length)
         }
       }
 
       console.log(`[ArticoliPage] Fase 2: ${aiMatched} match AI su ${aiCandidates.length} righe ambigue`)
 
-      // Step 3: Save suggestions to DB
+      // Step 3: Save all suggestions to DB (this is the durable result)
       if (bulkToSave.length > 0) {
-        await saveBulkSuggestions(companyId, bulkToSave)
+        await saveBulkSuggestions(cid, bulkToSave)
       }
 
-      setMatchResults(results)
-
-      // Step 4: Refresh KPI counts from DB
-      const counts = await loadClassificationCounts(companyId)
-      setKpiCounts(counts)
-
+      // NOTE: No React state setters here — the page will reload data from DB on mount/focus
       const totalMatched = detMatches + aiMatched
-      toast.success(
-        `Risultato: ${detMatches} deterministici + ${aiMatched} AI = ${totalMatched} con match | ${noMatchCount} senza match`,
-      )
+      console.log(`[ArticoliPage] Completato: ${totalMatched} con match, ${noMatchCount} senza match`)
     })
   }, [companyId, analyzeStartOrStop])
 
