@@ -62,7 +62,15 @@ export default function AiChatWidget() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
-  // Don't render on /ai page
+  /* ── scroll to bottom on new messages ──── */
+  // IMPORTANT: all hooks must be BEFORE any conditional return (React Rules of Hooks)
+  useEffect(() => {
+    if (open) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [messages, loading, open])
+
+  // Don't render on /ai page (after all hooks!)
   if (location.pathname === '/ai') return null
 
   // Page context from current location + selected entity
@@ -70,13 +78,6 @@ export default function AiChatWidget() {
   const pageContext = pageEntity
     ? `${pageLabel}. L'utente sta guardando: ${pageEntity.summary}`
     : pageLabel
-
-  /* ── scroll to bottom on new messages ──── */
-  useEffect(() => {
-    if (open) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-    }
-  }, [messages, loading, open])
 
   /* ── auto-resize textarea ─────────────── */
   const handleInputChange = (val: string) => {
