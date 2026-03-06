@@ -1,6 +1,6 @@
 // src/pages/FatturePage.tsx — v5
 // Date filter + AI search (Haiku) + removed Fix Nomi
-import { useState, useCallback, useRef, useEffect, useSyncExternalStore } from 'react';
+import { useState, useCallback, useRef, useEffect, useMemo, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { processInvoiceFile, TIPO, MP, REG, mpLabel, tpLabel } from '@/lib/invoiceParser';
@@ -32,7 +32,7 @@ import {
 import { matchWithLearnedRules, extractLocation } from '@/lib/articleMatching';
 import {
   loadCategories, loadProjects, loadChartOfAccounts,
-  loadInvoiceClassification, saveInvoiceClassification,
+  loadInvoiceClassification, saveInvoiceClassification, deleteInvoiceClassification,
   loadInvoiceProjects, saveInvoiceProjects,
   loadLineClassifications, saveLineCategoryAndAccount,
   loadLineProjects, saveLineProjects,
@@ -617,9 +617,17 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   }, [addCdcId, cdcRows, invoice?.total_amount]);
 
   const handleRemoveCdc = useCallback((projectId: string) => {
-    setCdcRows(prev => prev.filter(r => r.project_id !== projectId));
+    setCdcRows(prev => {
+      const remaining = prev.filter(r => r.project_id !== projectId);
+      // Auto-fill 100% if exactly 1 center remains
+      if (remaining.length === 1) {
+        const total = Math.abs(invoice?.total_amount || 0);
+        return [{ ...remaining[0], percentage: 100, amount: total > 0 ? total : null }];
+      }
+      return remaining;
+    });
     setClassifDirty(true);
-  }, []);
+  }, [invoice?.total_amount]);
 
   const handleCdcPctChange = useCallback((projectId: string, pct: number) => {
     const total = Math.abs(invoice?.total_amount || 0);
@@ -640,6 +648,21 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     ));
     setClassifDirty(true);
   }, [invoice?.total_amount]);
+
+  // CdC validation: allocation must sum to 100% (percentage mode) or exact invoice total (amount mode)
+  const cdcValidation = useMemo(() => {
+    if (cdcRows.length === 0) return { valid: true, message: '' };
+    const invTotal = Math.abs(invoice?.total_amount || 0);
+    const totalPct = Math.round(cdcRows.reduce((s, r) => s + r.percentage, 0) * 100) / 100;
+    const totalAmt = Math.round(cdcRows.reduce((s, r) => s + (r.amount ?? (invTotal > 0 ? invTotal * r.percentage / 100 : 0)), 0) * 100) / 100;
+    if (cdcMode === 'percentage') {
+      const ok = Math.abs(totalPct - 100) < 0.01;
+      return { valid: ok, message: ok ? '' : `La somma delle percentuali deve essere 100% (attuale: ${fmtNum(totalPct)}%)` };
+    } else {
+      const ok = Math.abs(totalAmt - invTotal) < 0.01;
+      return { valid: ok, message: ok ? '' : `La somma degli importi deve essere ${fmtEur(invTotal)} (attuale: ${fmtEur(totalAmt)})` };
+    }
+  }, [cdcRows, cdcMode, invoice?.total_amount]);
 
   // Line-level classification: update category or account for a single line
   const handleLineClassifChange = useCallback(async (lineId: string, field: 'category_id' | 'account_id', value: string | null) => {
@@ -727,6 +750,34 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       onReload();
     } catch (e: any) { console.error('Confirm AI classification error:', e); }
   }, [invoice?.id, company?.id, aiClassifResult]);
+
+  // Reject AI suggestion — delete classification + reset status to 'none'
+  const handleRejectAiClassification = useCallback(async () => {
+    if (!invoice?.id) return;
+    try {
+      await deleteInvoiceClassification(invoice.id);
+      await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
+      setClassification(null);
+      setSelCategoryId(null);
+      setSelAccountId(null);
+      setCdcRows([]);
+      setClassifDirty(false);
+      onReload();
+    } catch (e: any) { console.error('Reject AI classification error:', e); }
+  }, [invoice?.id]);
+
+  // Confirm existing AI-suggested classification (from banner, not from inline AI trigger)
+  const handleConfirmExistingClassification = useCallback(async () => {
+    if (!invoice?.id || !company?.id) return;
+    try {
+      // Just mark as confirmed — the classification data already exists
+      await supabase.from('invoice_classifications').update({ verified: true, assigned_by: 'manual', updated_at: new Date().toISOString() }).eq('invoice_id', invoice.id);
+      await supabase.from('invoices').update({ classification_status: 'confirmed' } as any).eq('id', invoice.id);
+      const classif = await loadInvoiceClassification(invoice.id);
+      setClassification(classif);
+      onReload();
+    } catch (e: any) { console.error('Confirm existing classification error:', e); }
+  }, [invoice?.id, company?.id]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }) => {
     const companyId = company?.id;
@@ -975,6 +1026,21 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       {(allCategories.length > 0 || allAccounts.length > 0 || allProjects.length > 0) && (
         <Sec title="Classificazione fattura">
           <div className="space-y-3 print:hidden">
+            {/* AI Suggestion Banner */}
+            {invoice.classification_status === 'ai_suggested' && (
+              <div className="flex items-center gap-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                <span className="text-amber-500 text-sm flex-shrink-0">⚡</span>
+                <span className="text-xs text-amber-800 flex-1">Classificazione suggerita dall'AI — verifica e conferma</span>
+                <button onClick={handleConfirmExistingClassification}
+                  className="px-2.5 py-1 text-[11px] font-semibold rounded-md bg-emerald-600 text-white hover:bg-emerald-700 transition-colors flex-shrink-0">
+                  ✓ Conferma
+                </button>
+                <button onClick={handleRejectAiClassification}
+                  className="px-2.5 py-1 text-[11px] font-semibold rounded-md bg-red-100 text-red-700 hover:bg-red-200 transition-colors flex-shrink-0">
+                  ✕ Rifiuta
+                </button>
+              </div>
+            )}
             {/* Categoria */}
             {allCategories.length > 0 && (
               <div className="flex items-center gap-3">
@@ -1154,11 +1220,20 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               </div>
             )}
 
+            {/* CdC validation error */}
+            {cdcRows.length > 0 && !cdcValidation.valid && (
+              <div className="flex items-center gap-1.5 px-2 py-1.5 bg-red-50 border border-red-200 rounded-md">
+                <span className="text-red-500 text-xs">⚠</span>
+                <span className="text-[10px] text-red-700">{cdcValidation.message}</span>
+              </div>
+            )}
+
             {/* Save button */}
             {classifDirty && (
               <div className="flex justify-end pt-1">
-                <button onClick={handleSaveClassification} disabled={classifSaving}
-                  className="px-3 py-1.5 text-xs font-semibold text-white bg-sky-600 rounded-md hover:bg-sky-700 disabled:opacity-50 transition-colors">
+                <button onClick={handleSaveClassification} disabled={classifSaving || !cdcValidation.valid}
+                  className="px-3 py-1.5 text-xs font-semibold text-white bg-sky-600 rounded-md hover:bg-sky-700 disabled:opacity-50 transition-colors"
+                  title={!cdcValidation.valid ? cdcValidation.message : ''}>
                   {classifSaving ? 'Salvataggio...' : 'Salva classificazione'}
                 </button>
               </div>
