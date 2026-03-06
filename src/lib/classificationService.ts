@@ -1,6 +1,7 @@
 // src/lib/classificationService.ts — CRUD for Categories, Projects, Chart of Accounts
 // and invoice-level / line-level classification assignments.
 import { supabase } from '@/integrations/supabase/client';
+import { createClassificationExample } from '@/lib/learningService';
 
 // ─── Types ────────────────────────────────────────────────
 
@@ -366,6 +367,29 @@ export async function saveInvoiceClassification(
       updated_at: new Date().toISOString(),
     }, { onConflict: 'invoice_id' });
   if (error) throw error;
+
+  // RAG: create learning example for the classification (fire-and-forget)
+  try {
+    const { data: inv } = await supabase.from('invoices')
+      .select('number, total_amount, counterparty')
+      .eq('id', invoiceId).single()
+    const { data: cat } = categoryId
+      ? await supabase.from('categories').select('name').eq('id', categoryId).single()
+      : { data: null }
+    const { data: acc } = accountId
+      ? await supabase.from('chart_of_accounts').select('code, name').eq('id', accountId).single()
+      : { data: null }
+    if (inv) {
+      const cpName = (inv.counterparty as any)?.denom || null
+      createClassificationExample(
+        companyId, inv.number, cpName, inv.total_amount, null,
+        cat?.name || null, acc?.code || null, acc?.name || null,
+        categoryId, accountId, invoiceId,
+      ).catch(err => console.warn('[saveInvoiceClassification] learning example error:', err))
+    }
+  } catch (err) {
+    console.warn('[saveInvoiceClassification] learning example lookup error:', err)
+  }
 }
 
 export async function deleteInvoiceClassification(invoiceId: string): Promise<void> {

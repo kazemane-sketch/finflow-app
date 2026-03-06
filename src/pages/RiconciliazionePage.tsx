@@ -15,6 +15,7 @@ import { fmtDate, fmtEur } from '@/lib/utils'
 import { mpLabel, tpLabel } from '@/lib/invoiceParser'
 import BankTxDetail, { txTypeLabel, txTypeBadge, txDirection } from '@/components/BankTxDetail'
 import { askInvoiceAiSearch, type InvoiceAiResult } from '@/lib/invoiceAiSearch'
+import { createReconciliationExample } from '@/lib/learningService'
 
 /* ─── types ──────────────────────────────────── */
 
@@ -664,6 +665,18 @@ export default function RiconciliazionePage() {
         match_reason: suggestion.match_reason,
       })
 
+      // 5b. RAG: create learning example (fire-and-forget)
+      if (tx && suggestion.invoice_id) {
+        const inv = suggestion.invoice
+        createReconciliationExample(
+          companyId,
+          tx.description || '', tx.date || '', Number(tx.amount),
+          inv?.number || '', inv?.date || '', Number(inv?.total_amount || 0),
+          tx.id, suggestion.invoice_id, suggestion.installment_id || null,
+          suggestion.match_score,
+        ).catch(err => console.warn('[confirmSuggestion] learning example error:', err))
+      }
+
       // 6. Expire suggestions that are no longer viable
       // If TX fully matched → expire ALL pending suggestions for this TX
       if (txFullyMatched) {
@@ -862,6 +875,14 @@ export default function RiconciliazionePage() {
         match_score: 100,
         match_reason: 'Abbinamento manuale utente',
       })
+
+      // RAG: create learning example for manual match (fire-and-forget)
+      createReconciliationExample(
+        companyId,
+        tx.description || '', tx.date || '', Number(tx.amount),
+        installment.invoice_number || '', '', Number(installment.amount_due),
+        tx.id, installment.invoice_id, installment.id, 100,
+      ).catch(err => console.warn('[manualMatch] learning example error:', err))
 
       // Expire impossible suggestions for this TX or installment
       if (txFullyMatched) {

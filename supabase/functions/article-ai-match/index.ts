@@ -1,4 +1,5 @@
-// article-ai-match — Haiku Level 2 article matching for ambiguous lines
+// article-ai-match — Haiku Level 3 article matching for ambiguous lines
+// Level 2 (RAG): search learning_examples via Gemini embedding before calling Haiku
 // Pattern: same as classification-ai-suggest (postgres npm, CORS, ANTHROPIC_API_KEY)
 import postgres from "npm:postgres@3.4.5";
 
@@ -10,6 +11,10 @@ const corsHeaders = {
 
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const MAX_LINES = 20;
+const EMBEDDING_MODEL = "gemini-embedding-001";
+const EXPECTED_DIMS = 3072;
+const RAG_DIRECT_THRESHOLD = 0.85;  // Use RAG result directly if similarity >= this
+const RAG_CONTEXT_THRESHOLD = 0.70; // Add as extra context if similarity >= this
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -156,6 +161,86 @@ Rispondi SOLO con un array JSON valido, senza markdown e senza backtick:
 [{"line_id": "uuid", "article_code": "CODICE" oppure null, "confidence": 0-100, "reasoning": "breve spiegazione"}]`;
 }
 
+/* ─── Gemini embedding (for RAG Level 2) ── */
+
+function toVectorLiteral(values: number[]): string {
+  return `[${values.map((v) => Number.isFinite(v) ? v.toFixed(8) : "0").join(",")}]`;
+}
+
+async function callGeminiEmbedding(apiKey: string, text: string): Promise<number[]> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${apiKey}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: `models/${EMBEDDING_MODEL}`,
+      content: { parts: [{ text }] },
+      taskType: "RETRIEVAL_QUERY",
+      outputDimensionality: EXPECTED_DIMS,
+    }),
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Gemini error: ${payload?.error?.message || response.status}`);
+
+  const values = payload?.embedding?.values;
+  if (!Array.isArray(values) || values.length !== EXPECTED_DIMS) {
+    throw new Error(`Embedding dims: ${values?.length}, expected ${EXPECTED_DIMS}`);
+  }
+  return values.map((v: unknown) => Number(v));
+}
+
+/* ─── RAG matching (Level 2) ──────────── */
+
+interface RagMatch {
+  line_id: string;
+  article_code: string;
+  confidence: number;
+  reasoning: string;
+}
+
+async function ragMatchLines(
+  sql: SqlClient,
+  companyId: string,
+  lines: InputLine[],
+  geminiKey: string,
+): Promise<Map<string, RagMatch>> {
+  const results = new Map<string, RagMatch>();
+
+  for (const line of lines) {
+    if (!line.description || line.description.length < 5) continue;
+    try {
+      const vec = await callGeminiEmbedding(geminiKey, line.description);
+      const vecLiteral = toVectorLiteral(vec);
+
+      const matches = await sql.unsafe(
+        `SELECT output_label, metadata, (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
+         FROM learning_examples
+         WHERE company_id = $2
+           AND domain = 'article_assignment'
+           AND embedding IS NOT NULL
+         ORDER BY embedding <=> $1::halfvec(3072)
+         LIMIT 3`,
+        [vecLiteral, companyId],
+      );
+
+      if (matches.length > 0 && matches[0].similarity >= RAG_DIRECT_THRESHOLD) {
+        results.set(line.line_id, {
+          line_id: line.line_id,
+          article_code: matches[0].output_label,
+          confidence: Math.round(matches[0].similarity * 100),
+          reasoning: `RAG: esempio confermato simile (${(matches[0].similarity * 100).toFixed(0)}%)`,
+        });
+      }
+    } catch (err) {
+      // Skip RAG for this line — will fall through to Haiku
+      console.warn(`[article-ai-match] RAG error for ${line.line_id}:`, err);
+    }
+  }
+
+  return results;
+}
+
 /* ─── main ─────────────────────────────── */
 
 Deno.serve(async (req: Request) => {
@@ -192,8 +277,42 @@ Deno.serve(async (req: Request) => {
       return json({ error: "Nessun articolo trovato per questa azienda" }, 400);
     }
 
-    // Build prompt and call Haiku
-    const prompt = buildPrompt(articles, examples, lines);
+    // Build article code → id map for resolution
+    const codeToId = new Map(articles.map(a => [a.code, a.id]));
+
+    // ─── RAG Level 2: Gemini embedding → search learning_examples ───
+    const geminiKey = (Deno.env.get("GEMINI_API_KEY") || "").trim();
+    let ragResults = new Map<string, RagMatch>();
+    if (geminiKey) {
+      try {
+        ragResults = await ragMatchLines(sql, companyId, lines, geminiKey);
+        console.log(`[article-ai-match] RAG resolved ${ragResults.size}/${lines.length} lines`);
+      } catch (err) {
+        console.warn("[article-ai-match] RAG phase error (continuing to Haiku):", err);
+      }
+    }
+
+    // Filter out RAG-resolved lines before sending to Haiku
+    const unmatchedLines = lines.filter(l => !ragResults.has(l.line_id));
+
+    // If ALL lines resolved by RAG → skip Haiku entirely (cost = 0)
+    if (unmatchedLines.length === 0) {
+      const results = [...ragResults.values()].map(r => ({
+        line_id: r.line_id,
+        article_id: r.article_code ? (codeToId.get(r.article_code) || null) : null,
+        article_code: r.article_code || null,
+        confidence: r.confidence,
+        reasoning: r.reasoning,
+      }));
+      const matched = results.filter(r => r.article_id).length;
+      return json({
+        results,
+        stats: { total_lines: lines.length, matched, unmatched: lines.length - matched, rag_resolved: ragResults.size, haiku_called: false },
+      });
+    }
+
+    // ─── Haiku Level 3: call Claude for remaining unmatched lines ───
+    const prompt = buildPrompt(articles, examples, unmatchedLines);
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -232,26 +351,37 @@ Deno.serve(async (req: Request) => {
       return json({ error: "Errore parsing risposta AI" }, 502);
     }
 
-    // Build article code → id map for resolution
-    const codeToId = new Map(articles.map(a => [a.code, a.id]));
+    // Merge RAG results + Haiku results
+    const allResults = [
+      // RAG-resolved lines first
+      ...[...ragResults.values()].map(r => ({
+        line_id: r.line_id,
+        article_id: r.article_code ? (codeToId.get(r.article_code) || null) : null,
+        article_code: r.article_code || null,
+        confidence: r.confidence,
+        reasoning: r.reasoning,
+      })),
+      // Haiku-resolved lines
+      ...aiResults.map(r => ({
+        line_id: r.line_id,
+        article_id: r.article_code ? (codeToId.get(r.article_code) || null) : null,
+        article_code: r.article_code || null,
+        confidence: typeof r.confidence === "number" ? r.confidence : 0,
+        reasoning: String(r.reasoning || ""),
+      })),
+    ];
 
-    // Resolve article_code → article_id
-    const results = aiResults.map(r => ({
-      line_id: r.line_id,
-      article_id: r.article_code ? (codeToId.get(r.article_code) || null) : null,
-      article_code: r.article_code || null,
-      confidence: typeof r.confidence === "number" ? r.confidence : 0,
-      reasoning: String(r.reasoning || ""),
-    }));
-
-    const matched = results.filter(r => r.article_id).length;
+    const matched = allResults.filter(r => r.article_id).length;
 
     return json({
-      results,
+      results: allResults,
       stats: {
         total_lines: lines.length,
         matched,
         unmatched: lines.length - matched,
+        rag_resolved: ragResults.size,
+        haiku_called: true,
+        haiku_lines: unmatchedLines.length,
       },
     });
   } catch (err: unknown) {

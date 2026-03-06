@@ -1,4 +1,5 @@
-// classification-ai-suggest — deterministic + Haiku AI classification for invoices
+// classification-ai-suggest — deterministic + RAG + Haiku AI classification for invoices
+// Level 2 (RAG): search learning_examples via Gemini embedding between deterministic and Haiku
 // Pattern: same as reconciliation-generate (postgres npm, CORS, ANTHROPIC_API_KEY)
 import postgres from "npm:postgres@3.4.5";
 
@@ -10,6 +11,9 @@ const corsHeaders = {
 
 const HAIKU_MODEL = "claude-3-5-haiku-20241022";
 const MAX_INVOICES = 50;
+const EMBEDDING_MODEL = "gemini-embedding-001";
+const EXPECTED_DIMS = 3072;
+const RAG_DIRECT_THRESHOLD = 0.80; // Use RAG result directly if similarity >= this
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -176,6 +180,81 @@ async function deterministicMatch(
         confidence: Math.round(bestScore * 100),
         reasoning: `Keywords [${bestMatched.join(", ")}] → ${bestArticle.code} ${bestArticle.name}`,
       });
+    }
+  }
+
+  return results;
+}
+
+/* ─── Step 1.5: RAG matching via Gemini embeddings ─── */
+
+function toVectorLiteral(values: number[]): string {
+  return `[${values.map((v) => Number.isFinite(v) ? v.toFixed(8) : "0").join(",")}]`;
+}
+
+async function callGeminiEmbedding(apiKey: string, text: string): Promise<number[]> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${apiKey}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: `models/${EMBEDDING_MODEL}`,
+      content: { parts: [{ text }] },
+      taskType: "RETRIEVAL_QUERY",
+      outputDimensionality: EXPECTED_DIMS,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Gemini error: ${payload?.error?.message || response.status}`);
+  const values = payload?.embedding?.values;
+  if (!Array.isArray(values) || values.length !== EXPECTED_DIMS) throw new Error("Bad embedding dims");
+  return values.map((v: unknown) => Number(v));
+}
+
+async function ragClassifyLines(
+  sql: SqlClient,
+  companyId: string,
+  lines: InvoiceLine[],
+  counterpartyName: string,
+  geminiKey: string,
+): Promise<Map<string, LineResult>> {
+  const results = new Map<string, LineResult>();
+
+  for (const line of lines) {
+    const desc = (line.description || "").trim();
+    if (desc.length < 5) continue;
+
+    try {
+      const queryText = `${desc} | ${counterpartyName || "N/D"}`;
+      const vec = await callGeminiEmbedding(geminiKey, queryText);
+      const vecLiteral = toVectorLiteral(vec);
+
+      const matches = await sql.unsafe(
+        `SELECT output_label, metadata, (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
+         FROM learning_examples
+         WHERE company_id = $2
+           AND domain = 'classification'
+           AND embedding IS NOT NULL
+         ORDER BY embedding <=> $1::halfvec(3072)
+         LIMIT 3`,
+        [vecLiteral, companyId],
+      );
+
+      if (matches.length > 0 && matches[0].similarity >= RAG_DIRECT_THRESHOLD) {
+        const meta = matches[0].metadata;
+        results.set(line.id, {
+          invoice_line_id: line.id,
+          article_id: null,
+          category_id: meta?.category_id || null,
+          account_id: meta?.account_id || null,
+          project_allocations: [],
+          match_type: "deterministic", // RAG counts as deterministic-level (free, reliable)
+          confidence: Math.round(matches[0].similarity * 100),
+          reasoning: `RAG: classificazione simile confermata (${(matches[0].similarity * 100).toFixed(0)}%)`,
+        });
+      }
+    } catch (err) {
+      console.warn(`[classification-ai-suggest] RAG error for line ${line.id}:`, err);
     }
   }
 
@@ -511,8 +590,22 @@ Deno.serve(async (req) => {
         const detResults = await deterministicMatch(sql, companyId, lines, counterpartyPiva, articles, rules);
         totalDeterministic += detResults.size;
 
-        // Step 2: AI for unmatched — load confirmed examples for few-shot learning
-        const unmatchedLines = lines.filter((l) => !detResults.has(l.id) && !l.category_id && !l.account_id);
+        // Step 1.5: RAG for unmatched lines (Gemini embedding → search learning_examples)
+        let afterDetLines = lines.filter((l) => !detResults.has(l.id) && !l.category_id && !l.account_id);
+        const geminiKey = (Deno.env.get("GEMINI_API_KEY") || "").trim();
+        let ragResults = new Map<string, LineResult>();
+        if (geminiKey && afterDetLines.length > 0) {
+          try {
+            ragResults = await ragClassifyLines(sql, companyId, afterDetLines, counterpartyName, geminiKey);
+            totalDeterministic += ragResults.size; // RAG counts as deterministic
+            console.log(`[classification-ai-suggest] RAG resolved ${ragResults.size}/${afterDetLines.length} lines for invoice ${invoiceId}`);
+          } catch (err) {
+            console.warn("[classification-ai-suggest] RAG phase error:", err);
+          }
+        }
+
+        // Step 2: AI for still-unmatched — load confirmed examples for few-shot learning
+        const unmatchedLines = afterDetLines.filter((l) => !ragResults.has(l.id));
 
         // Load confirmed classification examples (same counterparty first, then general)
         let confirmedExamples: ConfirmedExample[] = [];
@@ -561,9 +654,10 @@ Deno.serve(async (req) => {
         });
         totalAi += aiResults.size;
 
-        // Merge all line results
+        // Merge all line results (deterministic + RAG + AI)
         const allLineResults: LineResult[] = [
           ...detResults.values(),
+          ...ragResults.values(),
           ...aiResults.values(),
         ];
 

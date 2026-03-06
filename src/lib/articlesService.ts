@@ -7,6 +7,7 @@
  * They are re-exported here for backward compatibility.
  */
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
+import { createArticleExample } from '@/lib/learningService'
 
 // Re-export matching functions from the shared utility
 export {
@@ -646,6 +647,17 @@ export async function recordAssignmentFeedback(
       source: 'learned',
     })
   }
+
+  // RAG: create learning example for accepted assignments (fire-and-forget)
+  if (accepted) {
+    const { data: artData } = await supabase
+      .from('articles').select('code, name').eq('id', articleId).single()
+    if (artData) {
+      createArticleExample(companyId, description, null, null,
+        artData.code, artData.name, articleId, null,
+      ).catch(err => console.warn('[recordAssignmentFeedback] learning example error:', err))
+    }
+  }
 }
 
 /* ─── Batch feedback (bulk confirm perf optimization) ─── */
@@ -763,6 +775,27 @@ export async function batchRecordFeedback(
   }))
   if (newRules.length > 0) {
     await supabase.from('article_assignment_rules').insert(newRules)
+  }
+
+  // RAG: create learning examples for all accepted feedbacks (fire-and-forget)
+  const acceptedFbs = feedbacks.filter(fb => fb.accepted)
+  if (acceptedFbs.length > 0) {
+    try {
+      const articleIds = [...new Set(acceptedFbs.map(fb => fb.articleId))]
+      const { data: arts } = await supabase
+        .from('articles').select('id, code, name').in('id', articleIds)
+      const artMap = new Map((arts || []).map(a => [a.id, a]))
+
+      for (const fb of acceptedFbs) {
+        const art = artMap.get(fb.articleId)
+        if (!art) continue
+        createArticleExample(companyId, fb.description, null, null,
+          art.code, art.name, fb.articleId, null,
+        ).catch(() => { /* silent */ })
+      }
+    } catch (err) {
+      console.warn('[batchRecordFeedback] learning examples error:', err)
+    }
   }
 }
 

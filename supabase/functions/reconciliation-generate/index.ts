@@ -7,6 +7,9 @@ const corsHeaders = {
 };
 
 const MAX_BATCH = 100;
+const EMBEDDING_MODEL = "gemini-embedding-001";
+const EXPECTED_DIMS = 3072;
+const RAG_BOOST_THRESHOLD = 0.80;
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -572,6 +575,84 @@ function dedup(suggestions: Suggestion[], maxResults: number): Suggestion[] {
     .slice(0, maxResults);
 }
 
+/* ─── RAG score boost for ambiguous suggestions ── */
+
+function toVectorLiteral(values: number[]): string {
+  return `[${values.map((v) => Number.isFinite(v) ? v.toFixed(8) : "0").join(",")}]`;
+}
+
+async function callGeminiEmbedding(apiKey: string, text: string): Promise<number[]> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${apiKey}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: `models/${EMBEDDING_MODEL}`,
+      content: { parts: [{ text }] },
+      taskType: "RETRIEVAL_QUERY",
+      outputDimensionality: EXPECTED_DIMS,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Gemini error: ${payload?.error?.message || response.status}`);
+  const values = payload?.embedding?.values;
+  if (!Array.isArray(values) || values.length !== EXPECTED_DIMS) throw new Error("Bad embedding dims");
+  return values.map((v: unknown) => Number(v));
+}
+
+async function ragBoostSuggestions(
+  sql: SqlClient,
+  companyId: string,
+  tx: TxRow,
+  suggestions: Suggestion[],
+  geminiKey: string,
+): Promise<Suggestion[]> {
+  if (suggestions.length === 0 || !geminiKey) return suggestions;
+
+  // Only boost ambiguous suggestions (score 60-85)
+  const toBoost = suggestions.filter(s => s.match_score >= 60 && s.match_score <= 85);
+  if (toBoost.length === 0) return suggestions;
+
+  try {
+    // Embed the transaction description
+    const txText = `TX: ${tx.counterparty_name || ''} ${tx.date || ''} ${Math.abs(Number(tx.amount))} EUR`;
+    const vec = await callGeminiEmbedding(geminiKey, txText);
+    const vecLiteral = toVectorLiteral(vec);
+
+    const matches = await sql.unsafe(
+      `SELECT output_label, metadata, (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
+       FROM learning_examples
+       WHERE company_id = $2
+         AND domain = 'reconciliation'
+         AND embedding IS NOT NULL
+       ORDER BY embedding <=> $1::halfvec(3072)
+       LIMIT 5`,
+      [vecLiteral, companyId],
+    );
+
+    if (matches.length > 0) {
+      for (const s of suggestions) {
+        for (const m of matches) {
+          if (m.similarity >= RAG_BOOST_THRESHOLD && m.metadata?.invoice_id === s.invoice_id) {
+            s.match_score = Math.min(98, s.match_score + 10);
+            s.match_reason += ` + RAG confermato (${(m.similarity * 100).toFixed(0)}%)`;
+            s.suggestion_data = {
+              ...(s.suggestion_data || {}),
+              rag_boost: true,
+              rag_similarity: Number(m.similarity.toFixed(3)),
+            };
+            break; // Only boost once per suggestion
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[reconciliation-generate] RAG boost error:", err);
+  }
+
+  return suggestions;
+}
+
 /* ─── main generator per transaction ──── */
 
 async function generateForTransaction(
@@ -616,7 +697,15 @@ async function generateForTransaction(
   const fallback = await matchByCounterpartyAmount(
     sql, companyId, tx, remainingAmount,
   );
-  return dedup(fallback, 5);
+  const dedupedFallback = dedup(fallback, 5);
+
+  // ── RAG boost: boost ambiguous suggestions with confirmed examples ──
+  const geminiKey = (Deno.env.get("GEMINI_API_KEY") || "").trim();
+  if (geminiKey && dedupedFallback.length > 0) {
+    return await ragBoostSuggestions(sql, companyId, tx, dedupedFallback, geminiKey);
+  }
+
+  return dedupedFallback;
 }
 
 /* ─── main handler ────────────────────── */
