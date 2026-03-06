@@ -318,21 +318,23 @@ export default function ArticoliPage() {
       const results = new Map<string, MatchResult>()
       const bulkToSave: BulkSuggestion[] = []
       const aiCandidates: UnassignedLine[] = []
+      let noMatchCount = 0
 
       let detMatches = 0
       const activeRules = rules.filter(r => r.confidence > 0.5)
       console.log(`[ArticoliPage] Analisi: ${lines.length} righe, ${arts.length} articoli, ${rules.length} regole (${activeRules.length} con confidence > 0.5)`)
 
       for (const line of lines) {
-        if (!line.description) continue
+        if (!line.description) { noMatchCount++; continue }
 
         // Get ALL candidate matches for ambiguity detection
         const allMatches = matchWithLearnedRulesAll(line.description, arts, rules)
+        const decision = needsAiMatching(allMatches)
 
-        if (needsAiMatching(allMatches)) {
-          // Ambiguous or no match → send to AI
+        if (decision === 'ai') {
+          // Truly ambiguous (2+ candidates close in confidence) → send to Haiku
           aiCandidates.push(line)
-        } else if (allMatches.length > 0) {
+        } else if (decision === 'deterministic' && allMatches.length > 0) {
           // Clear deterministic match → use top-1
           const bestMatch = allMatches[0]
           results.set(line.id, bestMatch)
@@ -343,18 +345,26 @@ export default function ArticoliPage() {
             confidence: bestMatch.confidence,
           })
           detMatches++
+        } else {
+          // 'no_match': no article candidates → leave as unmatched (don't waste Haiku)
+          noMatchCount++
         }
       }
 
-      console.log(`[ArticoliPage] Fase 1: ${detMatches} match deterministici, ${aiCandidates.length} righe ambigue per AI`)
+      setAnalyzeProgress(
+        `Fase 1 completata: ${detMatches} match ✅ | ${aiCandidates.length} ambigue 🧠 | ${noMatchCount} senza match`
+      )
+      console.log(`[ArticoliPage] Fase 1: ${detMatches} deterministici, ${aiCandidates.length} ambigue per AI, ${noMatchCount} senza match`)
 
-      // ── Phase 2: AI Haiku for ambiguous lines ────
+      // ── Phase 2: AI Haiku ONLY for truly ambiguous lines ────
       let aiMatched = 0
       if (aiCandidates.length > 0) {
         const AI_BATCH = 20
         for (let i = 0; i < aiCandidates.length; i += AI_BATCH) {
           const batch = aiCandidates.slice(i, i + AI_BATCH)
-          setAnalyzeProgress(`Fase 2: Analisi AI ${Math.min(i + AI_BATCH, aiCandidates.length)}/${aiCandidates.length} righe ambigue...`)
+          setAnalyzeProgress(
+            `Fase 2: Analisi AI ${Math.min(i + AI_BATCH, aiCandidates.length)}/${aiCandidates.length} righe ambigue 🧠`
+          )
 
           try {
             const aiResults = await callArticleAiMatch(
@@ -416,7 +426,10 @@ export default function ArticoliPage() {
       const counts = await loadClassificationCounts(companyId)
       setKpiCounts(counts)
 
-      toast.success(`Analizzate ${lines.length} righe: ${detMatches} deterministici, ${aiMatched} AI`)
+      const totalMatched = detMatches + aiMatched
+      toast.success(
+        `Risultato: ${detMatches} deterministici + ${aiMatched} AI = ${totalMatched} con match | ${noMatchCount} senza match`,
+      )
     } catch (err: any) {
       toast.error(`Errore analisi: ${err.message}`)
     }

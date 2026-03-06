@@ -5,7 +5,7 @@
  * - matchLineToArticle (keyword-based)
  * - matchWithLearnedRules (rules-first, keyword-fallback)
  * - matchWithLearnedRulesAll (ALL candidates for ambiguity detection)
- * - needsAiMatching (determines if Haiku Level 2 is needed)
+ * - needsAiMatching (3-way: 'deterministic' | 'ai' | 'no_match')
  * - extractLocation
  * - suggestKeywords
  *
@@ -199,41 +199,43 @@ export function matchWithLearnedRulesAll(
 
 /* ─── Ambiguity detection ─────────────────────── */
 
+export type AiMatchDecision = 'deterministic' | 'ai' | 'no_match'
+
 /**
- * Determine if a line needs AI (Haiku Level 2) based on its match candidates.
+ * Determine what to do with a line based on its match candidates.
  *
- * Returns true (needs AI) when:
- * - No matches at all
- * - Best match confidence < 50 (too weak)
- * - Two+ candidates within 30 points of each other (ambiguous)
- * - Single match with confidence ≤ 85 (borderline)
+ * Returns 'no_match' when:
+ * - No candidates at all (Haiku can't invent articles)
+ * - Single match with confidence < 50 (too weak to be useful)
  *
- * Returns false (deterministic is fine) when:
+ * Returns 'ai' (send to Haiku) when:
+ * - Two+ candidates within 30 points of each other (truly ambiguous)
+ *
+ * Returns 'deterministic' when:
  * - Single match with confidence > 85 (clear winner)
  * - Top match is 30+ points ahead of runner-up (decisive lead)
+ * - Any other case where deterministic is good enough
  */
-export function needsAiMatching(allMatches: MatchResult[]): boolean {
-  if (allMatches.length === 0) return true
+export function needsAiMatching(allMatches: MatchResult[]): AiMatchDecision {
+  // Zero candidates → no article exists for this line, don't waste Haiku
+  if (allMatches.length === 0) return 'no_match'
 
   const top1 = allMatches[0].confidence
 
-  // Single match with confidence > 85 → deterministic
-  if (allMatches.length === 1 && top1 > 85) return false
+  // Single match with high confidence → clear deterministic winner
+  if (allMatches.length === 1 && top1 > 85) return 'deterministic'
 
-  // Best match too weak → AI
-  if (top1 < 50) return true
-
-  // Two+ matches: check if gap is decisive
+  // Two+ matches: check if gap is too close (truly ambiguous → AI)
   if (allMatches.length >= 2) {
     const top2 = allMatches[1].confidence
-    if (top1 - top2 < 30) return true // too close → AI
+    if (top1 - top2 < 30) return 'ai' // two candidates too close → Haiku decides
   }
 
-  // Single match with moderate confidence → AI
-  if (allMatches.length === 1 && top1 <= 85) return true
+  // Single match with very low confidence → not useful
+  if (top1 < 50 && allMatches.length === 1) return 'no_match'
 
-  // Decisive lead with strong top match → deterministic
-  return false
+  // Everything else: use the top deterministic match
+  return 'deterministic'
 }
 
 /* ─── Location extraction ────────────────────── */

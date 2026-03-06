@@ -18,6 +18,7 @@ export {
   extractLocation,
   suggestKeywords,
   type LearnedRule,
+  type AiMatchDecision,
 } from '@/lib/articleMatching'
 
 /* ─── types ──────────────────────────────────── */
