@@ -2,11 +2,13 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useCompany } from '@/hooks/useCompany'
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 import { getValidAccessToken } from '@/lib/getValidAccessToken'
+import { useAiChat } from '@/contexts/AiChatContext'
 import {
   Send, Plus, MessageSquare, Search, Sparkles,
   BarChart3, FileText, Landmark, Link2, ChevronDown, ChevronRight,
   Loader2, MoreHorizontal, Trash2, Pencil, Check, X,
   Upload, BookOpen, AlertCircle,
+  Zap, Brain,
 } from 'lucide-react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import ReactMarkdown from 'react-markdown'
@@ -19,20 +21,6 @@ interface Chat {
   title: string
   updated_at: string
   message_count: number
-}
-
-interface Message {
-  id: string
-  role: 'user' | 'assistant' | 'tool'
-  content: string
-  tool_name?: string
-  created_at: string
-}
-
-interface ToolCallDisplay {
-  name: string
-  args: Record<string, unknown>
-  result_count: number
 }
 
 interface KbDocument {
@@ -59,6 +47,12 @@ const TOOL_LABELS: Record<string, string> = {
   get_company_stats: 'Statistiche azienda',
   suggest_reconciliation: 'Suggerimento riconciliazione',
   search_knowledge_base: 'Ricerca knowledge base',
+  get_chart_of_accounts: 'Piano dei conti',
+  get_categories: 'Categorie',
+  get_cost_centers: 'Centri di costo',
+  get_articles: 'Articoli',
+  get_company_settings: 'Impostazioni azienda',
+  get_reconciliation_stats: 'Statistiche riconciliazione',
 }
 
 /* ─── relative time helper ────────────────── */
@@ -90,17 +84,21 @@ export default function AiChatPage() {
   const { company } = useCompany()
   const companyId = company?.id
 
-  // Chat list
+  // ── Shared context state ──
+  const {
+    messages, setMessages,
+    chatId, setChatId,
+    loading,
+    toolCalls, setToolCalls,
+    modelPreference, setModelPreference,
+    sendMessage: ctxSendMessage,
+    startNewChat: ctxStartNewChat,
+    chatVersion,
+  } = useAiChat()
+
+  // ── Local state (sidebar, KB, rename/delete) ──
   const [chats, setChats] = useState<Chat[]>([])
-  const [selectedChatId, setSelectedChatId] = useState<string | null>(null)
-
-  // Messages
-  const [messages, setMessages] = useState<Message[]>([])
-  const [toolCalls, setToolCalls] = useState<ToolCallDisplay[]>([])
-
-  // Input
   const [input, setInput] = useState('')
-  const [loading, setLoading] = useState(false)
 
   // Chat management: rename + delete
   const [renamingId, setRenamingId] = useState<string | null>(null)
@@ -133,6 +131,11 @@ export default function AiChatPage() {
 
   useEffect(() => { loadChats() }, [loadChats])
 
+  // Reload chat list when context sends a message (chatVersion bumped)
+  useEffect(() => {
+    if (chatVersion > 0) loadChats()
+  }, [chatVersion, loadChats])
+
   // ─── load kb documents ───────────────────
   const loadKbDocs = useCallback(async () => {
     if (!companyId) return
@@ -155,21 +158,19 @@ export default function AiChatPage() {
     return () => clearInterval(interval)
   }, [kbDocs, loadKbDocs])
 
-  // ─── load messages for selected chat ────
-  const loadMessages = useCallback(async (chatId: string) => {
+  // ─── load messages for selected chat (sidebar click) ────
+  const selectChat = useCallback(async (chatIdToLoad: string) => {
+    setChatId(chatIdToLoad)
+    setToolCalls([])
+    setRenamingId(null)
     const { data } = await supabase
       .from('ai_messages')
       .select('id, role, content, tool_name, created_at')
-      .eq('chat_id', chatId)
+      .eq('chat_id', chatIdToLoad)
       .order('created_at', { ascending: true })
       .limit(100)
-    if (data) setMessages(data.filter(m => m.role === 'user' || m.role === 'assistant') as Message[])
-  }, [])
-
-  useEffect(() => {
-    if (selectedChatId) loadMessages(selectedChatId)
-    else setMessages([])
-  }, [selectedChatId, loadMessages])
+    if (data) setMessages(data.filter(m => m.role === 'user' || m.role === 'assistant'))
+  }, [setChatId, setMessages, setToolCalls])
 
   // ─── scroll to bottom ──────────────────
   useEffect(() => {
@@ -187,9 +188,7 @@ export default function AiChatPage() {
 
   // ─── new chat ──────────────────────────
   const startNewChat = () => {
-    setSelectedChatId(null)
-    setMessages([])
-    setToolCalls([])
+    ctxStartNewChat()
     setInput('')
   }
 
@@ -197,7 +196,6 @@ export default function AiChatPage() {
   const startRename = (chat: Chat) => {
     setRenamingId(chat.id)
     setRenameValue(chat.title)
-    // Focus input after React renders it
     setTimeout(() => renameInputRef.current?.select(), 50)
   }
 
@@ -225,10 +223,8 @@ export default function AiChatPage() {
       .eq('id', deletingId)
     if (!error) {
       setChats(prev => prev.filter(c => c.id !== deletingId))
-      if (selectedChatId === deletingId) {
-        setSelectedChatId(null)
-        setMessages([])
-        setToolCalls([])
+      if (chatId === deletingId) {
+        ctxStartNewChat()
       }
     }
     setDeleteLoading(false)
@@ -253,7 +249,6 @@ export default function AiChatPage() {
     try {
       const token = await getValidAccessToken()
 
-      // 1. Create db record
       const { data: doc, error: dbErr } = await supabase
         .from('kb_documents')
         .insert({
@@ -268,20 +263,17 @@ export default function AiChatPage() {
         .single()
       if (dbErr || !doc) throw new Error(dbErr?.message || 'Errore creazione record')
 
-      // 2. Upload file to storage
       const storagePath = `${companyId}/${doc.id}/${file.name}`
       const { error: uploadErr } = await supabase.storage
         .from('kb-documents')
         .upload(storagePath, file)
       if (uploadErr) throw new Error(uploadErr.message)
 
-      // 3. Update record with storage path + status → processing
       await supabase
         .from('kb_documents')
         .update({ storage_path: storagePath, status: 'processing' })
         .eq('id', doc.id)
 
-      // 4. Trigger processing edge function
       fetch(`${SUPABASE_URL}/functions/v1/kb-process-document`, {
         method: 'POST',
         headers: {
@@ -290,7 +282,7 @@ export default function AiChatPage() {
           'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({ document_id: doc.id, company_id: companyId }),
-      }).catch(() => {}) // fire-and-forget
+      }).catch(() => {})
 
       void loadKbDocs()
     } catch (err: unknown) {
@@ -302,87 +294,20 @@ export default function AiChatPage() {
   const deleteKbDoc = async (docId: string) => {
     const doc = kbDocs.find(d => d.id === docId)
     if (!doc) return
-    // Delete storage file
     if (doc.file_name && companyId) {
       await supabase.storage.from('kb-documents').remove([`${companyId}/${docId}/${doc.file_name}`])
     }
-    // Delete db record (cascades to chunks)
     await supabase.from('kb_documents').delete().eq('id', docId)
     setKbDocs(prev => prev.filter(d => d.id !== docId))
   }
 
-  // ─── send message ──────────────────────
-  const sendMessage = async (text?: string) => {
+  // ─── send message (wraps context) ──────
+  const handleSend = async (text?: string) => {
     const msg = (text || input).trim()
-    if (!msg || loading || !companyId) return
-
+    if (!msg || loading) return
     setInput('')
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
-
-    // Optimistic UI
-    const tempUserMsg: Message = {
-      id: `temp-${Date.now()}`,
-      role: 'user',
-      content: msg,
-      created_at: new Date().toISOString(),
-    }
-    setMessages(prev => [...prev, tempUserMsg])
-    setToolCalls([])
-    setLoading(true)
-
-    try {
-      const token = await getValidAccessToken()
-
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/ai-chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'apikey': SUPABASE_ANON_KEY,
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          mode: 'chat',
-          company_id: companyId,
-          chat_id: selectedChatId,
-          message: msg,
-        }),
-      })
-
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
-
-      // Update chat ID if new
-      if (!selectedChatId && data.chat_id) {
-        setSelectedChatId(data.chat_id)
-      }
-
-      // Add assistant message
-      const assistantMsg: Message = {
-        id: `resp-${Date.now()}`,
-        role: 'assistant',
-        content: data.message?.content || 'Nessuna risposta.',
-        created_at: new Date().toISOString(),
-      }
-      setMessages(prev => [...prev, assistantMsg])
-
-      // Tool calls display
-      if (data.tool_calls?.length) {
-        setToolCalls(data.tool_calls)
-      }
-
-      // Refresh chat list
-      void loadChats()
-    } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : String(err)
-      const errorMsg: Message = {
-        id: `err-${Date.now()}`,
-        role: 'assistant',
-        content: `Errore: ${errMsg}`,
-        created_at: new Date().toISOString(),
-      }
-      setMessages(prev => [...prev, errorMsg])
-    }
-    setLoading(false)
+    await ctxSendMessage(msg) // no page context on /ai since it's the dedicated page
   }
 
   // ─── render ────────────────────────────
@@ -405,14 +330,13 @@ export default function AiChatPage() {
             <div
               key={chat.id}
               className={`group relative flex items-center rounded-md text-sm transition-colors ${
-                selectedChatId === chat.id
+                chatId === chat.id
                   ? 'bg-purple-100 text-purple-900'
                   : 'text-slate-600 hover:bg-slate-100'
               }`}
             >
-              {/* Main clickable area */}
               <button
-                onClick={() => { setSelectedChatId(chat.id); setToolCalls([]); setRenamingId(null) }}
+                onClick={() => selectChat(chat.id)}
                 className="flex-1 text-left px-3 py-2 min-w-0"
               >
                 <div className="flex items-center gap-2">
@@ -448,7 +372,6 @@ export default function AiChatPage() {
                 )}
               </button>
 
-              {/* Three-dot dropdown menu */}
               {renamingId !== chat.id && (
                 <DropdownMenu.Root>
                   <DropdownMenu.Trigger asChild>
@@ -509,7 +432,6 @@ export default function AiChatPage() {
 
           {kbExpanded && (
             <div className="px-2 pb-2 space-y-1">
-              {/* Upload button */}
               <button
                 onClick={() => fileInputRef.current?.click()}
                 disabled={kbUploading}
@@ -533,7 +455,6 @@ export default function AiChatPage() {
                 }}
               />
 
-              {/* Document list */}
               {kbDocs.map(doc => (
                 <div key={doc.id} className="group flex items-center gap-2 px-2 py-1.5 rounded-md text-xs hover:bg-slate-100 transition-colors">
                   <FileText className="h-3 w-3 shrink-0 text-slate-400" />
@@ -595,7 +516,7 @@ export default function AiChatPage() {
                 {SUGGESTIONS.map((s, i) => (
                   <button
                     key={i}
-                    onClick={() => sendMessage(s.text)}
+                    onClick={() => handleSend(s.text)}
                     className="flex items-center gap-3 p-3 rounded-xl border border-slate-200 bg-white hover:border-purple-300 hover:shadow-sm transition-all text-left"
                   >
                     <div className={`p-2 rounded-lg ${s.color}`}>
@@ -611,7 +532,6 @@ export default function AiChatPage() {
           {/* Messages list */}
           {messages.map((msg, idx) => (
             <div key={msg.id}>
-              {/* Tool calls chip between user and assistant */}
               {msg.role === 'assistant' && idx > 0 && toolCalls.length > 0 && messages[idx - 1]?.role === 'user' && (
                 <ToolCallsChip calls={toolCalls} />
               )}
@@ -641,7 +561,11 @@ export default function AiChatPage() {
             <div className="flex justify-start">
               <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-2xl rounded-bl-md px-4 py-2.5 text-sm text-slate-500 shadow-sm">
                 <Loader2 className="h-4 w-4 animate-spin text-purple-500" />
-                FinFlow AI sta analizzando...
+                {modelPreference === 'thinking' ? (
+                  <span>Ragionando...</span>
+                ) : (
+                  <span>FinFlow AI sta analizzando...</span>
+                )}
               </div>
             </div>
           )}
@@ -651,6 +575,44 @@ export default function AiChatPage() {
 
         {/* Input area */}
         <div className="border-t bg-white px-4 py-3">
+          {/* Model toggle */}
+          <div className="max-w-3xl mx-auto flex items-center justify-center gap-2 mb-2">
+            <button
+              onClick={() => setModelPreference('fast')}
+              className={`flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                modelPreference === 'fast'
+                  ? 'bg-amber-100 text-amber-700'
+                  : 'text-slate-400 hover:text-slate-600'
+              }`}
+            >
+              <Zap className="h-3.5 w-3.5" />
+              Fast
+            </button>
+            <div
+              onClick={() => setModelPreference(modelPreference === 'fast' ? 'thinking' : 'fast')}
+              className="relative w-9 h-5 bg-slate-200 rounded-full cursor-pointer transition-colors"
+            >
+              <div
+                className={`absolute top-0.5 w-4 h-4 rounded-full transition-all ${
+                  modelPreference === 'thinking'
+                    ? 'left-[20px] bg-purple-600'
+                    : 'left-0.5 bg-amber-500'
+                }`}
+              />
+            </div>
+            <button
+              onClick={() => setModelPreference('thinking')}
+              className={`flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                modelPreference === 'thinking'
+                  ? 'bg-purple-100 text-purple-700'
+                  : 'text-slate-400 hover:text-slate-600'
+              }`}
+            >
+              <Brain className="h-3.5 w-3.5" />
+              Thinking
+            </button>
+          </div>
+
           <div className="max-w-3xl mx-auto flex items-end gap-2">
             <textarea
               ref={textareaRef}
@@ -659,7 +621,7 @@ export default function AiChatPage() {
               onKeyDown={e => {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault()
-                  sendMessage()
+                  handleSend()
                 }
               }}
               placeholder="Chiedi qualcosa sui tuoi dati..."
@@ -668,7 +630,7 @@ export default function AiChatPage() {
               className="flex-1 resize-none rounded-xl border border-slate-200 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-purple-400 focus:border-transparent disabled:opacity-50 bg-slate-50"
             />
             <button
-              onClick={() => sendMessage()}
+              onClick={() => handleSend()}
               disabled={!input.trim() || loading}
               className="shrink-0 p-2.5 rounded-xl bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
@@ -712,7 +674,7 @@ export default function AiChatPage() {
 
 /* ─── Tool calls chip ─────────────────────── */
 
-function ToolCallsChip({ calls }: { calls: ToolCallDisplay[] }) {
+function ToolCallsChip({ calls }: { calls: { name: string; args: Record<string, unknown>; result_count: number }[] }) {
   const [expanded, setExpanded] = useState(false)
 
   return (

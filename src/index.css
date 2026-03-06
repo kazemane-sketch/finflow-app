@@ -38,3 +38,12 @@
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground)); }
+
+/* AI widget soft pulse animation */
+@keyframes pulse-soft {
+  0%, 100% { box-shadow: 0 4px 14px rgba(139, 92, 246, 0.3); }
+  50% { box-shadow: 0 4px 20px rgba(139, 92, 246, 0.5); }
+}
+.animate-pulse-soft {
+  animation: pulse-soft 3s ease-in-out infinite;
+}

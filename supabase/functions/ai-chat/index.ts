@@ -9,6 +9,7 @@ const corsHeaders = {
 
 const SONNET_MODEL = "claude-sonnet-4-6";
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
+const THINKING_MODEL = "claude-sonnet-4-5-20250514";
 const MAX_TOOL_ROUNDS = 10;
 const MAX_CHAT_HISTORY = 20;
 
@@ -279,6 +280,86 @@ const tools = [
         },
       },
       required: ["invoice_ids"],
+    },
+  },
+  {
+    name: "get_chart_of_accounts",
+    description:
+      "Ritorna il piano dei conti dell'azienda. Struttura gerarchica con codice, nome, sezione. Usa per domande tipo 'dove metto una spesa ristorante?', 'qual e il conto per il gasolio?', 'mostrami il piano dei conti'.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        section: {
+          type: "string",
+          enum: ["revenue", "cost_production", "cost_personnel", "depreciation", "other_costs", "financial", "extraordinary", "all"],
+          description: "Filtra per sezione. Default: all",
+        },
+        search: { type: "string", description: "Ricerca nel nome o codice del conto (ILIKE)" },
+      },
+    },
+  },
+  {
+    name: "get_categories",
+    description:
+      "Ritorna le categorie dell'azienda (ricavi e costi). Usa per domande su come categorizzare spese/ricavi.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        type: {
+          type: "string",
+          enum: ["revenue", "expense", "both", "all"],
+          description: "Filtra per tipo. Default: all",
+        },
+      },
+    },
+  },
+  {
+    name: "get_cost_centers",
+    description:
+      "Ritorna i centri di costo (progetti) dell'azienda con struttura gerarchica a 2 livelli. Livello 1 = sedi operative, Livello 2 = attivita.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        parent_code: { type: "string", description: "Filtra per centro padre (es. 'BRE' per sotto-centri Brescia)" },
+        status: {
+          type: "string",
+          enum: ["active", "completed", "suspended", "all"],
+          description: "Default: active",
+        },
+      },
+    },
+  },
+  {
+    name: "get_articles",
+    description:
+      "Ritorna gli articoli/prodotti dell'azienda con keywords e statistiche (assegnamenti, tonnellate, fatturato). Usa per domande su prodotti, tonnellate, prezzi medi.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        search: { type: "string", description: "Ricerca nel nome o codice articolo" },
+        category: { type: "string", description: "Filtra per categoria articolo" },
+      },
+    },
+  },
+  {
+    name: "get_company_settings",
+    description:
+      "Ritorna le impostazioni dell'azienda: nome, P.IVA, conti bancari, DSO/PSO default. Usa per domande su configurazione aziendale.",
+    input_schema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "get_reconciliation_stats",
+    description:
+      "Statistiche riconciliazione: quanti movimenti riconciliati, parziali, da riconciliare, suggerimenti pendenti.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        date_from: { type: "string", description: "Data inizio (YYYY-MM-DD)" },
+        date_to: { type: "string", description: "Data fine (YYYY-MM-DD)" },
+      },
     },
   },
 ];
@@ -1219,6 +1300,84 @@ async function handleClassifyInvoice(sql: SqlClient, companyId: string, args: Re
   }
 }
 
+/* ─── new handlers: chart of accounts, categories, cost centers, articles, settings, reconciliation ─── */
+
+async function handleGetChartOfAccounts(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const section = String(args.section || "all");
+  const search = args.search ? String(args.search) : null;
+  const rows = await sql`
+    SELECT code, name, section, parent_code, level, is_header
+    FROM chart_of_accounts
+    WHERE company_id = ${companyId} AND active = true
+      AND (${section} = 'all' OR section = ${section})
+      AND (${search}::text IS NULL OR name ILIKE ${"%" + (search || "") + "%"} OR code ILIKE ${"%" + (search || "") + "%"})
+    ORDER BY sort_order, code
+    LIMIT 200`;
+  return rows;
+}
+
+async function handleGetCategories(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const catType = String(args.type || "all");
+  const rows = await sql`
+    SELECT name, type, color, description
+    FROM categories
+    WHERE company_id = ${companyId} AND active = true
+      AND (${catType} = 'all' OR type = ${catType} OR type = 'both')
+    ORDER BY sort_order, name`;
+  return rows;
+}
+
+async function handleGetCostCenters(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const parentCode = args.parent_code ? String(args.parent_code) : null;
+  const status = String(args.status || "active");
+  const rows = await sql`
+    SELECT p.code, p.name, p.color, p.status, p.description,
+           parent.code as parent_code, parent.name as parent_name
+    FROM projects p
+    LEFT JOIN projects parent ON parent.id = p.parent_id
+    WHERE p.company_id = ${companyId}
+      AND (${status} = 'all' OR p.status = ${status})
+      AND (${parentCode}::text IS NULL OR parent.code = ${parentCode} OR p.code = ${parentCode})
+    ORDER BY COALESCE(parent.code, p.code), p.code`;
+  return rows;
+}
+
+async function handleGetArticles(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const search = args.search ? String(args.search) : null;
+  const category = args.category ? String(args.category) : null;
+  const rows = await sql`
+    SELECT a.code, a.name, a.description, a.unit, a.category, a.direction, a.keywords,
+           (SELECT count(*) FROM invoice_line_articles ila WHERE ila.article_id = a.id AND ila.verified = true)::int as assigned_count,
+           (SELECT coalesce(sum(ila.quantity), 0) FROM invoice_line_articles ila WHERE ila.article_id = a.id AND ila.verified = true)::float as total_quantity,
+           (SELECT coalesce(sum(ila.total_price), 0) FROM invoice_line_articles ila WHERE ila.article_id = a.id AND ila.verified = true)::float as total_revenue
+    FROM articles a
+    WHERE a.company_id = ${companyId} AND a.active = true
+      AND (${search}::text IS NULL OR a.name ILIKE ${"%" + (search || "") + "%"} OR a.code ILIKE ${"%" + (search || "") + "%"})
+      AND (${category}::text IS NULL OR a.category = ${category})
+    ORDER BY a.code`;
+  return rows;
+}
+
+async function handleGetCompanySettings(sql: SqlClient, companyId: string, _args: Record<string, unknown>) {
+  const [company] = await sql`
+    SELECT c.name, c.piva, c.cf, c.city, c.default_dso, c.default_pso,
+           (SELECT json_agg(json_build_object('name', ba.name, 'iban', ba.iban, 'opening_balance', ba.opening_balance))
+            FROM bank_accounts ba WHERE ba.company_id = c.id) as bank_accounts
+    FROM companies c
+    WHERE c.id = ${companyId}`;
+  return company || { error: "Azienda non trovata" };
+}
+
+async function handleGetReconciliationStats(sql: SqlClient, companyId: string, _args: Record<string, unknown>) {
+  const [stats] = await sql`
+    SELECT
+      (SELECT count(*) FROM bank_transactions WHERE company_id = ${companyId} AND reconciliation_status = 'matched')::int as riconciliati,
+      (SELECT count(*) FROM bank_transactions WHERE company_id = ${companyId} AND reconciliation_status = 'partial')::int as parziali,
+      (SELECT count(*) FROM bank_transactions WHERE company_id = ${companyId} AND reconciliation_status = 'unmatched')::int as da_riconciliare,
+      (SELECT count(*) FROM reconciliation_suggestions WHERE company_id = ${companyId} AND status = 'pending')::int as suggerimenti_pendenti`;
+  return stats;
+}
+
 async function executeToolHandler(
   sql: SqlClient,
   companyId: string,
@@ -1260,6 +1419,18 @@ async function executeToolHandler(
       return handleGetClassificationStats(sql, companyId, toolInput);
     case "classify_invoice":
       return handleClassifyInvoice(sql, companyId, toolInput);
+    case "get_chart_of_accounts":
+      return handleGetChartOfAccounts(sql, companyId, toolInput);
+    case "get_categories":
+      return handleGetCategories(sql, companyId, toolInput);
+    case "get_cost_centers":
+      return handleGetCostCenters(sql, companyId, toolInput);
+    case "get_articles":
+      return handleGetArticles(sql, companyId, toolInput);
+    case "get_company_settings":
+      return handleGetCompanySettings(sql, companyId, toolInput);
+    case "get_reconciliation_stats":
+      return handleGetReconciliationStats(sql, companyId, toolInput);
     default:
       return { error: `Tool sconosciuto: ${toolName}` };
   }
@@ -1269,7 +1440,21 @@ async function executeToolHandler(
 
 const SYSTEM_PROMPT = `Sei l'assistente AI di FinFlow, un gestionale finanziario per PMI italiane. Rispondi in italiano, in modo pratico e preciso.
 
-Hai accesso ai dati dell'azienda tramite le seguenti funzioni. Quando l'utente chiede informazioni, usa le funzioni per recuperare dati reali. Non inventare mai dati. Per importi usa il formato italiano (1.234,56 €). Quando analizzi movimenti bancari, presta particolare attenzione al campo raw_text e extracted_refs per trovare riferimenti a fatture, mandati, contratti, rate.
+Hai accesso COMPLETO a tutti i dati dell'azienda:
+- Fatture (attive e passive) con righe, rate, articoli assegnati
+- Movimenti bancari con raw_text e riferimenti estratti
+- Controparti con statistiche finanziarie
+- Piano dei conti dell'azienda (usa get_chart_of_accounts)
+- Categorie di costo/ricavo (usa get_categories)
+- Centri di costo con struttura gerarchica (usa get_cost_centers)
+- Articoli/prodotti con tonnellate e fatturato (usa get_articles)
+- Impostazioni aziendali e conti bancari (usa get_company_settings)
+- Statistiche riconciliazione (usa get_reconciliation_stats)
+- Classificazioni e suggerimenti AI
+
+Quando l'utente chiede dove classificare una spesa, consulta il piano dei conti e le categorie DELL'AZIENDA, non rispondere in modo generico. Usa get_chart_of_accounts per trovare il conto giusto.
+
+Quando l'utente chiede informazioni, usa le funzioni per recuperare dati reali. Non inventare mai dati. Per importi usa il formato italiano (1.234,56 €). Quando analizzi movimenti bancari, presta particolare attenzione al campo raw_text e extracted_refs per trovare riferimenti a fatture, mandati, contratti, rate.
 
 CONVENZIONE DIRECTION (MOLTO IMPORTANTE):
 - direction='out' = Fattura ATTIVA (emessa da noi, vendita) → denaro IN ENTRATA. Nel campo direction dei risultati, "out" significa fattura attiva/emessa.
@@ -1495,6 +1680,9 @@ Deno.serve(async (req) => {
     const userMessage = String(body.message || "").trim();
     if (!userMessage) return json({ error: "Messaggio vuoto" }, 400);
 
+    const modelPreference = String(body.model_preference || "fast");
+    const chatModel = modelPreference === "thinking" ? THINKING_MODEL : HAIKU_MODEL;
+
     let chatId = body.chat_id ? String(body.chat_id) : null;
     let isNewChat = false;
 
@@ -1531,8 +1719,8 @@ Deno.serve(async (req) => {
     }
     claudeMessages.push({ role: "user", content: userMessage });
 
-    // Run AI
-    const result = await runAiChat(claudeMessages, sql, companyId, SONNET_MODEL);
+    // Run AI (model based on user preference: fast=haiku, thinking=sonnet)
+    const result = await runAiChat(claudeMessages, sql, companyId, chatModel);
 
     // Save messages
     await sql`
@@ -1551,7 +1739,7 @@ Deno.serve(async (req) => {
     // Save assistant response
     await sql`
       INSERT INTO ai_messages (chat_id, role, content, tokens_used, model)
-      VALUES (${chatId}, 'assistant', ${result.content}, ${result.tokensUsed}, ${SONNET_MODEL})
+      VALUES (${chatId}, 'assistant', ${result.content}, ${result.tokensUsed}, ${chatModel})
     `;
 
     // Update chat metadata

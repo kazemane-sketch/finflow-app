@@ -1,6 +1,7 @@
 import { Routes, Route, Navigate } from 'react-router-dom'
 import { useAuth } from '@/hooks/useAuth'
 import { Toaster } from '@/components/ui/toaster'
+import { AiChatProvider } from '@/contexts/AiChatContext'
 import AppLayout from '@/components/layout/AppLayout'
 import AuthPage from '@/pages/AuthPage'
 import DashboardPage from '@/pages/DashboardPage'
@@ -43,7 +44,9 @@ export default function App() {
         } />
         <Route element={
           <ProtectedRoute>
-            <AppLayout />
+            <AiChatProvider>
+              <AppLayout />
+            </AiChatProvider>
           </ProtectedRoute>
         }>
           <Route path="/ai" element={<AiChatPage />} />
