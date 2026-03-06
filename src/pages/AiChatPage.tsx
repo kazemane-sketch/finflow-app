@@ -34,6 +34,29 @@ interface KbDocument {
   created_at: string
 }
 
+/* ─── thinking accordion ─────────────────── */
+
+function ThinkingAccordion({ thinking }: { thinking: string }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="mb-2">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-1 text-[11px] text-purple-600 hover:text-purple-800 font-medium transition-colors"
+      >
+        {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        <Brain className="h-3 w-3" />
+        {open ? 'Nascondi ragionamento' : 'Mostra ragionamento'}
+      </button>
+      {open && (
+        <div className="mt-1.5 pl-3 border-l-2 border-purple-200 text-[11px] text-slate-500 whitespace-pre-wrap max-h-60 overflow-y-auto">
+          {thinking}
+        </div>
+      )}
+    </div>
+  )
+}
+
 /* ─── tool label map ──────────────────────── */
 
 const TOOL_LABELS: Record<string, string> = {
@@ -543,11 +566,14 @@ export default function AiChatPage() {
                     : 'bg-white border border-slate-200 text-slate-800 rounded-bl-md shadow-sm'
                 }`}>
                   {msg.role === 'assistant' ? (
-                    <div className="prose prose-sm prose-slate max-w-none [&_table]:text-xs [&_th]:px-2 [&_td]:px-2 [&_th]:py-1 [&_td]:py-1">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {msg.content}
-                      </ReactMarkdown>
-                    </div>
+                    <>
+                      {msg.thinking && <ThinkingAccordion thinking={msg.thinking} />}
+                      <div className="prose prose-sm prose-slate max-w-none [&_table]:text-xs [&_th]:px-2 [&_td]:px-2 [&_th]:py-1 [&_td]:py-1">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {msg.content}
+                        </ReactMarkdown>
+                      </div>
+                    </>
                   ) : (
                     <span className="whitespace-pre-wrap">{msg.content}</span>
                   )}

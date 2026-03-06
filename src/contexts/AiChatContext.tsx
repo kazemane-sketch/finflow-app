@@ -15,6 +15,7 @@ export interface ChatMessage {
   id: string
   role: 'user' | 'assistant' | 'tool'
   content: string
+  thinking?: string | null
   tool_name?: string
   created_at: string
 }
@@ -120,11 +121,12 @@ export function AiChatProvider({ children }: { children: ReactNode }) {
           setChatId(data.chat_id)
         }
 
-        // Add assistant message
+        // Add assistant message (with thinking content if present)
         const assistantMsg: ChatMessage = {
           id: `resp-${Date.now()}`,
           role: 'assistant',
           content: data.message?.content || 'Nessuna risposta.',
+          thinking: data.message?.thinking || null,
           created_at: new Date().toISOString(),
         }
         setMessages(prev => [...prev, assistantMsg])

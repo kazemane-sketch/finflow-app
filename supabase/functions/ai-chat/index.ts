@@ -1506,12 +1506,43 @@ async function runAiChat(
   sql: SqlClient,
   companyId: string,
   model: string,
-): Promise<{ content: string; toolCalls: ToolCallInfo[]; tokensUsed: number }> {
+  thinkingEnabled = false,
+): Promise<{ content: string; thinking?: string; toolCalls: ToolCallInfo[]; tokensUsed: number }> {
   let currentMessages = [...messages];
   const allToolCalls: ToolCallInfo[] = [];
   let totalTokens = 0;
+  let thinkingText = "";
 
   const anthropicKey = Deno.env.get("ANTHROPIC_API_KEY")!;
+
+  // Build request body differently for thinking vs normal mode
+  function buildRequestBody() {
+    if (thinkingEnabled) {
+      // Extended Thinking: no system top-level, no temperature, thinking budget
+      // Prepend system prompt as first user message context
+      const thinkingMessages = [...currentMessages];
+      if (thinkingMessages.length > 0 && thinkingMessages[0].role === "user") {
+        thinkingMessages[0] = {
+          role: "user",
+          content: `[Contesto sistema]\n${SYSTEM_PROMPT}\n\n[Domanda utente]\n${thinkingMessages[0].content}`,
+        };
+      }
+      return {
+        model,
+        max_tokens: 16000,
+        thinking: { type: "enabled", budget_tokens: 10000 },
+        messages: thinkingMessages,
+        tools,
+      };
+    }
+    return {
+      model,
+      max_tokens: 4096,
+      system: SYSTEM_PROMPT,
+      messages: currentMessages,
+      tools,
+    };
+  }
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -1521,13 +1552,7 @@ async function runAiChat(
         "x-api-key": anthropicKey,
         "anthropic-version": "2023-06-01",
       },
-      body: JSON.stringify({
-        model,
-        max_tokens: 4096,
-        system: SYSTEM_PROMPT,
-        messages: currentMessages,
-        tools,
-      }),
+      body: JSON.stringify(buildRequestBody()),
     });
 
     if (!response.ok) {
@@ -1537,6 +1562,14 @@ async function runAiChat(
 
     const data = await response.json();
     totalTokens += (data.usage?.input_tokens || 0) + (data.usage?.output_tokens || 0);
+
+    // Collect thinking blocks (Extended Thinking mode)
+    const thinkingBlocks = (data.content || []).filter(
+      (b: { type: string }) => b.type === "thinking",
+    );
+    for (const tb of thinkingBlocks) {
+      if (tb.thinking) thinkingText += (thinkingText ? "\n\n" : "") + tb.thinking;
+    }
 
     const toolUseBlocks = (data.content || []).filter(
       (b: { type: string }) => b.type === "tool_use",
@@ -1548,6 +1581,7 @@ async function runAiChat(
       );
       return {
         content: textBlock?.text || "Non ho trovato una risposta.",
+        thinking: thinkingText || undefined,
         toolCalls: allToolCalls,
         tokensUsed: totalTokens,
       };
@@ -1719,8 +1753,9 @@ Deno.serve(async (req) => {
     }
     claudeMessages.push({ role: "user", content: userMessage });
 
-    // Run AI (model based on user preference: fast=haiku, thinking=sonnet)
-    const result = await runAiChat(claudeMessages, sql, companyId, chatModel);
+    // Run AI (model based on user preference: fast=haiku, thinking=sonnet with extended thinking)
+    const isThinking = modelPreference === "thinking";
+    const result = await runAiChat(claudeMessages, sql, companyId, chatModel, isThinking);
 
     // Save messages
     await sql`
@@ -1759,7 +1794,7 @@ Deno.serve(async (req) => {
 
     return json({
       chat_id: chatId,
-      message: { role: "assistant", content: result.content },
+      message: { role: "assistant", content: result.content, thinking: result.thinking || null },
       tool_calls: result.toolCalls.map((tc) => ({
         name: tc.name,
         args: tc.args,
