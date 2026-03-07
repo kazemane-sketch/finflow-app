@@ -41,6 +41,7 @@ import {
   type InvoiceClassification, type InvoiceProjectAssignment,
   type LineClassification, type LineProjectAssignment,
 } from '@/lib/classificationService';
+import { createRuleFromConfirmation, findMatchingRules } from '@/lib/classificationRulesService';
 
 // ============================================================
 // LOOKUPS
@@ -625,9 +626,25 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         amount: ip.amount ?? null,
       })));
       setClassifDirty(false);
+
+      // Create classification rules from confirmed line-level data (fire-and-forget)
+      const cp = (invoice.counterparty || {}) as any;
+      if (detail?.invoice_lines) {
+        for (const line of detail.invoice_lines) {
+          const lc = lineClassifs[line.id];
+          if (lc?.category_id || lc?.account_id) {
+            createRuleFromConfirmation(
+              companyId, cp?.piva || null, cp?.denom || null,
+              line.description, invoice.direction as 'in' | 'out',
+              { category_id: lc.category_id, account_id: lc.account_id,
+                article_id: lineArticleMap[line.id]?.article_id || null },
+            ).catch(err => console.warn('[rules] error:', err));
+          }
+        }
+      }
     } catch (e: any) { console.error('Save classification error:', e); }
     setClassifSaving(false);
-  }, [company?.id, invoice?.id, selCategoryId, selAccountId, cdcRows, cdcMode]);
+  }, [company?.id, invoice?.id, selCategoryId, selAccountId, cdcRows, cdcMode, detail?.invoice_lines, lineClassifs, lineArticleMap, invoice?.counterparty, invoice?.direction]);
 
   // Local CdC row management (no DB calls)
   const handleAddCdc = useCallback(() => {
@@ -714,46 +731,112 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     } catch (e: any) { console.error('Save line classification error:', e); }
   }, [lineClassifs]);
 
-  // AI classification — request suggestion from edge function
+  // AI classification — fast-path rules first, then unified Sonnet classifier
   const handleRequestAiClassification = useCallback(async () => {
     if (!invoice?.id || !company?.id) return;
     setAiClassifStatus('loading');
     try {
-      const token = await getValidAccessToken();
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/classification-ai-suggest`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-          'apikey': SUPABASE_ANON_KEY,
+      const cp = (invoice.counterparty || {}) as any;
+      const lines = detail?.invoice_lines || [];
+
+      // Step 1: Fast-path — check classification rules (instant, 0ms)
+      const ruleSuggestions = await findMatchingRules(
+        company.id, cp?.piva || null, cp?.denom || null,
+        lines.map(l => ({ id: l.id, description: l.description })),
+        invoice.direction as 'in' | 'out',
+      );
+
+      const coveredLineIds = new Set(ruleSuggestions.map(s => s.line_id));
+      const uncoveredLines = lines.filter(l => !coveredLineIds.has(l.id));
+
+      // Step 2: For uncovered lines, call unified classifier (Sonnet)
+      let aiResult: any = null;
+      if (uncoveredLines.length > 0) {
+        const token = await getValidAccessToken();
+        const res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+            'apikey': SUPABASE_ANON_KEY,
+          },
+          body: JSON.stringify({
+            company_id: company.id,
+            invoice_id: invoice.id,
+            lines: uncoveredLines.map(l => ({
+              line_id: l.id,
+              description: l.description,
+              quantity: l.quantity,
+              unit_price: l.unit_price,
+              total_price: l.total_price,
+            })),
+            direction: invoice.direction,
+            counterparty_vat_key: cp?.piva || null,
+            counterparty_name: cp?.denom || null,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Errore AI');
+        aiResult = data;
+      }
+
+      // Merge rule suggestions + AI result into the expected format
+      const mergedLines = [
+        ...ruleSuggestions.map(s => ({
+          invoice_line_id: s.line_id,
+          article_id: s.article_id,
+          category_id: s.category_id,
+          account_id: s.account_id,
+          project_allocations: s.cost_center_allocations || [],
+          match_type: 'rule' as const,
+          confidence: s.confidence,
+          reasoning: 'Regola appresa',
+        })),
+        ...(aiResult?.lines || []).map((lr: any) => ({
+          invoice_line_id: lr.line_id,
+          article_id: lr.article_id || null,
+          category_id: lr.category_id,
+          account_id: lr.account_id,
+          project_allocations: lr.cost_center_allocations || [],
+          match_type: 'ai' as const,
+          confidence: lr.confidence,
+          reasoning: lr.reasoning,
+        })),
+      ];
+
+      const result = {
+        invoice_id: invoice.id,
+        lines: mergedLines,
+        invoice_level: aiResult?.invoice_level || {
+          category_id: ruleSuggestions[0]?.category_id || null,
+          account_id: ruleSuggestions[0]?.account_id || null,
+          project_allocations: [],
+          confidence: ruleSuggestions[0]?.confidence || 0,
+          reasoning: `${ruleSuggestions.length} righe da regole, ${aiResult?.lines?.length || 0} da AI`,
         },
-        body: JSON.stringify({ company_id: company.id, invoice_ids: [invoice.id] }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Errore AI');
-      const result = data.results?.[0] || null;
+      };
+
       setAiClassifResult(result);
       setAiClassifStatus('done');
+
       // Reload classification data to reflect persisted suggestions
-      if (result) {
-        const [classif, lineClf, lineProj] = await Promise.all([
-          loadInvoiceClassification(invoice.id),
-          loadLineClassifications(invoice.id),
-          loadLineProjects(invoice.id),
-        ]);
-        if (classif) {
-          setClassification(classif);
-          setSelCategoryId(classif.category_id || selCategoryId);
-          setSelAccountId(classif.account_id || selAccountId);
-        }
-        setLineClassifs(lineClf);
-        setLineProjects(lineProj);
+      const [classif, lineClf, lineProj] = await Promise.all([
+        loadInvoiceClassification(invoice.id),
+        loadLineClassifications(invoice.id),
+        loadLineProjects(invoice.id),
+      ]);
+      if (classif) {
+        setClassification(classif);
+        setSelCategoryId(classif.category_id || selCategoryId);
+        setSelAccountId(classif.account_id || selAccountId);
       }
+      setLineClassifs(lineClf);
+      setLineProjects(lineProj);
     } catch (e: any) {
       console.error('AI classification error:', e);
       setAiClassifStatus('error');
     }
-  }, [invoice?.id, company?.id, selCategoryId, selAccountId]);
+  }, [invoice?.id, company?.id, invoice?.counterparty, invoice?.direction, detail?.invoice_lines, selCategoryId, selAccountId]);
 
   // Confirm AI suggestion — set verified=true on invoice_classifications + line-level records
   const handleConfirmAiClassification = useCallback(async () => {
@@ -776,8 +859,23 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setAiClassifStatus('idle');
       // Patch invoice in sidebar so ⚡ disappears (no full reload → preserves selection + scroll)
       onPatchInvoice(invoice.id, { classification_status: 'confirmed' } as Partial<DBInvoice>);
+
+      // Create classification rules from AI-confirmed lines (fire-and-forget)
+      const cp = (invoice.counterparty || {}) as any;
+      if (aiClassifResult.lines) {
+        for (const lr of aiClassifResult.lines) {
+          const lineDesc = detail?.invoice_lines?.find(l => l.id === lr.invoice_line_id)?.description;
+          if (lineDesc && (lr.category_id || lr.account_id)) {
+            createRuleFromConfirmation(
+              company.id, cp?.piva || null, cp?.denom || null,
+              lineDesc, invoice.direction as 'in' | 'out',
+              { category_id: lr.category_id, account_id: lr.account_id, article_id: lr.article_id },
+            ).catch(err => console.warn('[rules] error:', err));
+          }
+        }
+      }
     } catch (e: any) { console.error('Confirm AI classification error:', e); }
-  }, [invoice?.id, company?.id, aiClassifResult, onPatchInvoice]);
+  }, [invoice?.id, company?.id, aiClassifResult, onPatchInvoice, detail?.invoice_lines, invoice?.counterparty, invoice?.direction]);
 
   // Reject AI suggestion — delete classification + reset status to 'none'
   const handleRejectAiClassification = useCallback(async () => {
@@ -806,8 +904,24 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setClassification(classif);
       // Patch invoice in sidebar (no full reload → preserves selection + scroll)
       onPatchInvoice(invoice.id, { classification_status: 'confirmed' } as Partial<DBInvoice>);
+
+      // Create classification rules from confirmed line data (fire-and-forget)
+      const cp = (invoice.counterparty || {}) as any;
+      if (detail?.invoice_lines) {
+        for (const line of detail.invoice_lines) {
+          const lc = lineClassifs[line.id];
+          if (lc?.category_id || lc?.account_id) {
+            createRuleFromConfirmation(
+              company.id, cp?.piva || null, cp?.denom || null,
+              line.description, invoice.direction as 'in' | 'out',
+              { category_id: lc.category_id, account_id: lc.account_id,
+                article_id: lineArticleMap[line.id]?.article_id || null },
+            ).catch(err => console.warn('[rules] error:', err));
+          }
+        }
+      }
     } catch (e: any) { console.error('Confirm existing classification error:', e); }
-  }, [invoice?.id, company?.id, onPatchInvoice]);
+  }, [invoice?.id, company?.id, onPatchInvoice, detail?.invoice_lines, lineClassifs, lineArticleMap, invoice?.counterparty, invoice?.direction]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }) => {
     const companyId = company?.id;
@@ -1773,19 +1887,19 @@ export default function FatturePage() {
     const companyId = company?.id;
     if (!companyId) return;
     classifStartOrStop(async (signal, updateProgress) => {
-      // Paginated fetch of ALL invoice IDs (Supabase max 1000 per call)
+      // Paginated fetch of ALL invoice IDs + counterparty data (Supabase max 1000 per call)
       const PAGE = 1000;
-      const allInvIds: string[] = [];
+      const allInvoices: { id: string; counterparty: any; direction: string }[] = [];
       for (let from = 0; ; from += PAGE) {
         const { data } = await supabase
           .from('invoices')
-          .select('id')
+          .select('id, counterparty, direction')
           .eq('company_id', companyId)
           .eq('direction', directionFilter)
           .range(from, from + PAGE - 1);
         if (signal.aborted) return;
         if (!data || data.length === 0) break;
-        for (const r of data) allInvIds.push(r.id);
+        for (const r of data) allInvoices.push(r as any);
         if (data.length < PAGE) break;
       }
 
@@ -1803,71 +1917,123 @@ export default function FatturePage() {
         if (data.length < PAGE) break;
       }
 
-      const ids = allInvIds.filter((id) => !classifiedSet.has(id));
-      if (ids.length === 0) return;
+      const unclassified = allInvoices.filter((inv) => !classifiedSet.has(inv.id));
+      if (unclassified.length === 0) return;
 
-      updateProgress(0, ids.length);
+      updateProgress(0, unclassified.length);
       const token = await getValidAccessToken();
       let successCount = 0;
       let failedCount = 0;
-
-      // Split into batches of 10 IDs per API call, run 5 calls in parallel
-      const BATCH_SIZE = 10;
-      const PARALLEL = 5;
-      const batches: string[][] = [];
-      for (let i = 0; i < ids.length; i += BATCH_SIZE) {
-        batches.push(ids.slice(i, i + BATCH_SIZE));
-      }
-
       const classifiedIds: string[] = [];
 
-      for (let i = 0; i < batches.length; i += PARALLEL) {
+      // Process 3 invoices in parallel
+      const PARALLEL = 3;
+      for (let i = 0; i < unclassified.length; i += PARALLEL) {
         if (signal.aborted) return;
-        const parallelBatches = batches.slice(i, i + PARALLEL);
+        const batch = unclassified.slice(i, i + PARALLEL);
+
         const results = await Promise.all(
-          parallelBatches.map(async (batch) => {
+          batch.map(async (inv) => {
             try {
-              const res = await fetch(`${SUPABASE_URL}/functions/v1/classification-ai-suggest`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${token}`,
-                  'apikey': SUPABASE_ANON_KEY,
-                },
-                body: JSON.stringify({ company_id: companyId, invoice_ids: batch }),
-                signal,
-              });
-              if (!res.ok) {
-                console.error(`Batch classification error: HTTP ${res.status}`);
-                return { success: 0, failed: batch.length, ids: [] as string[] };
+              // Load invoice lines
+              const { data: lines } = await supabase
+                .from('invoice_lines')
+                .select('id, description, quantity, unit_price, total_price')
+                .eq('invoice_id', inv.id)
+                .order('line_number');
+              if (!lines || lines.length === 0) return { ok: false };
+
+              const cp = (inv.counterparty || {}) as any;
+
+              // Step 1: Fast-path rules (instant, no API call)
+              const ruleSuggestions = await findMatchingRules(
+                companyId, cp?.piva || null, cp?.denom || null,
+                lines.map(l => ({ id: l.id, description: l.description })),
+                inv.direction as 'in' | 'out',
+              );
+
+              // Apply rule suggestions to DB (fire-and-forget via supabase)
+              for (const s of ruleSuggestions) {
+                if (s.category_id || s.account_id) {
+                  await supabase.from('invoice_lines').update({
+                    category_id: s.category_id, account_id: s.account_id,
+                    classification_status: 'ai_suggested',
+                  } as any).eq('id', s.line_id).is('category_id', null);
+                }
               }
-              const data = await res.json();
-              const okIds = (data.results || []).map((r: any) => r.invoice_id).filter(Boolean);
-              return { success: data.results?.length || 0, failed: data.stats?.failed || 0, ids: okIds as string[] };
+
+              // Step 2: Uncovered lines → unified classifier
+              const coveredIds = new Set(ruleSuggestions.map(s => s.line_id));
+              const uncoveredLines = lines.filter(l => !coveredIds.has(l.id));
+
+              if (uncoveredLines.length > 0) {
+                const res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`,
+                    'apikey': SUPABASE_ANON_KEY,
+                  },
+                  body: JSON.stringify({
+                    company_id: companyId,
+                    invoice_id: inv.id,
+                    lines: uncoveredLines.map(l => ({
+                      line_id: l.id,
+                      description: l.description,
+                      quantity: l.quantity,
+                      unit_price: l.unit_price,
+                      total_price: l.total_price,
+                    })),
+                    direction: inv.direction,
+                    counterparty_vat_key: cp?.piva || null,
+                    counterparty_name: cp?.denom || null,
+                  }),
+                  signal,
+                });
+                if (!res.ok) {
+                  console.error(`Classification error for ${inv.id}: HTTP ${res.status}`);
+                  return { ok: false };
+                }
+              } else if (ruleSuggestions.length > 0) {
+                // All lines covered by rules — create invoice-level classification from rules
+                const firstRule = ruleSuggestions[0];
+                await supabase.from('invoice_classifications').upsert({
+                  company_id: companyId, invoice_id: inv.id,
+                  category_id: firstRule.category_id, account_id: firstRule.account_id,
+                  assigned_by: 'ai_auto', verified: false,
+                  ai_confidence: firstRule.confidence,
+                  ai_reasoning: `${ruleSuggestions.length} righe da regole apprese`,
+                } as any, { onConflict: 'invoice_id' });
+              }
+
+              return { ok: true };
             } catch (fetchErr: any) {
               if (fetchErr?.name === 'AbortError') throw fetchErr;
-              console.error('Batch fetch error:', fetchErr);
-              return { success: 0, failed: batch.length, ids: [] as string[] };
+              console.error('Batch classification error:', fetchErr);
+              return { ok: false };
             }
           }),
         );
-        for (const r of results) {
-          successCount += r.success;
-          failedCount += r.failed;
-          classifiedIds.push(...r.ids);
+
+        for (let j = 0; j < results.length; j++) {
+          if (results[j].ok) {
+            successCount++;
+            classifiedIds.push(batch[j].id);
+          } else {
+            failedCount++;
+          }
         }
-        const processed = Math.min((i + PARALLEL) * BATCH_SIZE, ids.length);
-        updateProgress(processed, ids.length);
+        updateProgress(Math.min(i + PARALLEL, unclassified.length), unclassified.length);
       }
 
-      // Mark classified invoices as ai_suggested (bulk, 200 per call to stay within PostgREST limits)
+      // Mark classified invoices as ai_suggested (bulk, 200 per call)
       for (let i = 0; i < classifiedIds.length; i += 200) {
         const chunk = classifiedIds.slice(i, i + 200);
         await supabase.from('invoices').update({ classification_status: 'ai_suggested' } as any).in('id', chunk);
       }
 
       if (failedCount > 0 && successCount === 0) {
-        throw new Error(`Classificazione fallita per tutte le ${ids.length} fatture`);
+        throw new Error(`Classificazione fallita per tutte le ${unclassified.length} fatture`);
       } else if (failedCount > 0) {
         console.warn(`Classificate ${successCount} fatture. ${failedCount} errori.`);
       }
