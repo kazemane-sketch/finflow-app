@@ -864,8 +864,12 @@ export default function ContropartiPage() {
 
   const handleBatchEnrich = useCallback(() => {
     if (!companyId) return
-    const targets = counterparties.filter(cp => !cp.enrichment_source && cp.vat_key)
+    const unenriched = counterparties.filter(cp => !cp.enrichment_source && cp.vat_key)
+    const targets = unenriched.length > 0
+      ? unenriched
+      : counterparties.filter(cp => cp.vat_key)
     if (targets.length === 0) return
+    const forceMode = unenriched.length === 0
 
     enrichStartOrStop(async (signal, updateProgress) => {
       const CHUNK = 10
@@ -875,7 +879,7 @@ export default function ContropartiPage() {
         const chunk = targets.slice(i, i + CHUNK)
         const ids = chunk.map(cp => cp.id)
         try {
-          await enrichCounterparties(companyId, ids, false)
+          await enrichCounterparties(companyId, ids, forceMode)
         } catch { /* continue on error */ }
         processed += chunk.length
         updateProgress(processed, targets.length)
@@ -903,24 +907,24 @@ export default function ContropartiPage() {
           <p className="text-muted-foreground text-sm mt-1">Clienti e fornitori da fatture/import manuale con verifica anagrafica</p>
         </div>
         <div className="flex items-center gap-2">
-          {(unenrichedCount > 0 || enrichRunning) && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleBatchEnrich}
-              disabled={loading}
-              className={enrichRunning ? 'text-red-700 border-red-300 hover:bg-red-50' : 'text-violet-700 border-violet-300 hover:bg-violet-50'}
-            >
-              {enrichRunning ? (
-                <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
-              ) : (
-                <Sparkles className="h-3.5 w-3.5 mr-1.5" />
-              )}
-              {enrichRunning
-                ? `Stop (${enrichProgress.pct}%)`
-                : `Arricchisci ATECO (${unenrichedCount})`}
-            </Button>
-          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleBatchEnrich}
+            disabled={loading}
+            className={enrichRunning ? 'text-red-700 border-red-300 hover:bg-red-50' : 'text-violet-700 border-violet-300 hover:bg-violet-50'}
+          >
+            {enrichRunning ? (
+              <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+            ) : (
+              <Sparkles className="h-3.5 w-3.5 mr-1.5" />
+            )}
+            {enrichRunning
+              ? `Stop (${enrichProgress.pct}%)`
+              : unenrichedCount > 0
+                ? `Arricchisci ATECO (${unenrichedCount})`
+                : 'Riarricchisci ATECO'}
+          </Button>
           <Button variant="outline" size="sm" onClick={reloadCounterparties} disabled={loading}>
             <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`} />Aggiorna
           </Button>
