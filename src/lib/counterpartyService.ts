@@ -22,6 +22,12 @@ export interface Counterparty {
   pso_days_override: number | null
   notes: string | null
   auto_created: boolean | null
+  ateco_code: string | null
+  ateco_description: string | null
+  business_sector: string | null
+  business_description: string | null
+  enrichment_source: string | null
+  enriched_at: string | null
   created_at: string
   updated_at: string
 }
@@ -296,6 +302,11 @@ export async function resolveOrCreateCounterpartyFromInvoice(
 
     if (insertErr) throw new Error(insertErr.message)
 
+    // Fire-and-forget ATECO enrichment for new counterparties with P.IVA
+    if (vatKey) {
+      enrichCounterparties(companyId, [inserted.id]).catch(() => {})
+    }
+
     return {
       counterpartyId: inserted.id,
       status: inserted.status as CounterpartyStatus,
@@ -368,7 +379,7 @@ export async function loadCounterparties(
 ): Promise<Counterparty[]> {
   let query = supabase
     .from('counterparties')
-    .select('id, company_id, type, status, name, vat_number, vat_key, fiscal_code, legal_type, classification_source, classification_confidence, address, dso_days_override, pso_days_override, notes, auto_created, created_at, updated_at')
+    .select('id, company_id, type, status, name, vat_number, vat_key, fiscal_code, legal_type, classification_source, classification_confidence, address, dso_days_override, pso_days_override, notes, auto_created, ateco_code, ateco_description, business_sector, business_description, enrichment_source, enriched_at, created_at, updated_at')
     .eq('company_id', companyId)
     .order('name', { ascending: true })
 
@@ -442,7 +453,7 @@ export async function createManualCounterparty(
       auto_created: false,
       verified_at: status === 'verified' ? new Date().toISOString() : null,
     })
-    .select('id, company_id, type, status, name, vat_number, vat_key, fiscal_code, legal_type, classification_source, classification_confidence, address, dso_days_override, pso_days_override, notes, auto_created, created_at, updated_at')
+    .select('id, company_id, type, status, name, vat_number, vat_key, fiscal_code, legal_type, classification_source, classification_confidence, address, dso_days_override, pso_days_override, notes, auto_created, ateco_code, ateco_description, business_sector, business_description, enrichment_source, enriched_at, created_at, updated_at')
     .single()
 
   if (error) throw new Error(error.message)
@@ -812,6 +823,24 @@ export async function loadInstallmentFlowsByCounterparty(
       invoice_number: invoice?.number || null,
     }
   })
+}
+
+export async function enrichCounterparties(
+  companyId: string,
+  counterpartyIds?: string[],
+  force = false,
+): Promise<{ enriched: number; skipped: number; errors: number; details: Array<{ id: string; name: string; ateco_code: string | null; source: string; error: string | null }> }> {
+  const { data, error } = await supabase.functions.invoke('enrich-counterparty', {
+    body: {
+      company_id: companyId,
+      counterparty_ids: counterpartyIds || undefined,
+      mode: counterpartyIds?.length ? 'single' : 'batch',
+      force,
+    },
+  })
+
+  if (error) throw new Error(error.message || 'Errore arricchimento controparti')
+  return data
 }
 
 export async function syncInvoiceCounterpartySnapshots(companyId: string): Promise<void> {

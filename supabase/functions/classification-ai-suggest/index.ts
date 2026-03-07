@@ -279,6 +279,7 @@ async function aiClassify(
     invoiceDirection: string;
     counterpartyName: string;
     counterpartyAddress: string;
+    counterpartyAteco: string;
     confirmedExamples: ConfirmedExample[];
   },
 ): Promise<AiClassifyResult> {
@@ -305,10 +306,10 @@ async function aiClassify(
     examplesSection = `\nNessun esempio storico disponibile. Ragiona dal contesto della fattura: nome fornitore, descrizione righe, sede, settore merceologico.\n`;
   }
 
-  // Build counterparty info (name + address for geographic context)
-  const counterpartyInfo = context.counterpartyAddress
-    ? `${context.counterpartyName || "N.D."} — Sede: ${context.counterpartyAddress}`
-    : context.counterpartyName || "N.D.";
+  // Build counterparty info (name + address + ATECO for context)
+  let counterpartyInfo = context.counterpartyName || "N.D.";
+  if (context.counterpartyAddress) counterpartyInfo += ` — Sede: ${context.counterpartyAddress}`;
+  if (context.counterpartyAteco) counterpartyInfo += ` — ${context.counterpartyAteco}`;
 
   const prompt = `Sei un contabile italiano esperto. Classifica le seguenti righe fattura.
 
@@ -349,7 +350,8 @@ REGOLE:
 - Assegna article_id SOLO se trovi un articolo molto pertinente, altrimenti null
 - Assegna SEMPRE category_id e account_id (deduci dal nome fornitore, descrizione riga, sede)
 - Se una riga e simile a un esempio confermato, usa la stessa classificazione (alta confidence)
-- Usa il nome/settore del fornitore per capire la categoria (es: ristorante → mensa/ristorazione)
+- Se il codice ATECO e disponibile nella controparte, usalo come guida principale per la categoria e il conto contabile
+- Usa il nome/settore/ATECO del fornitore per capire la categoria (es: ATECO 56=ristorazione, 62=IT)
 - Usa la sede del fornitore per scegliere il centro di costo geografico piu vicino
 - confidence 0-100: piu alto = piu sicuro
 - Rispondi SOLO con l'array JSON, niente altro`;
@@ -609,6 +611,25 @@ Deno.serve(async (req) => {
         // Build address for geographic context — sede is a single string like "VIA X, CAP CITTA (PROV)"
         const counterpartyAddress = cp?.sede || "";
 
+        // Lookup ATECO enrichment data from counterparties table
+        let counterpartyAteco = "";
+        if (counterpartyPiva) {
+          const vatKey = counterpartyPiva.toUpperCase().replace(/^IT/i, "").replace(/[^A-Z0-9]/gi, "");
+          if (vatKey) {
+            const [atecoRow] = await sql`
+              SELECT ateco_code, ateco_description, business_sector
+              FROM counterparties
+              WHERE company_id = ${companyId} AND vat_key = ${vatKey} AND ateco_code IS NOT NULL
+              LIMIT 1`;
+            if (atecoRow?.ateco_code) {
+              const parts = [`ATECO ${atecoRow.ateco_code}`];
+              if (atecoRow.ateco_description) parts.push(atecoRow.ateco_description);
+              if (atecoRow.business_sector) parts.push(`Settore: ${atecoRow.business_sector}`);
+              counterpartyAteco = parts.join(" — ");
+            }
+          }
+        }
+
         // Load lines
         const lines = await sql<InvoiceLine[]>`
           SELECT id, invoice_id, description, quantity::float, unit_price::float,
@@ -698,6 +719,7 @@ Deno.serve(async (req) => {
           invoiceDirection: invoiceRow.direction,
           counterpartyName,
           counterpartyAddress,
+          counterpartyAteco,
           confirmedExamples,
         });
         totalAi += aiResult.results.size;

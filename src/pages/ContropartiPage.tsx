@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -11,6 +11,7 @@ import {
   updateCounterparty,
   verifyCounterparty,
   rejectCounterparty,
+  enrichCounterparties,
   loadInvoicesByCounterparty,
   loadInstallmentFlowsByCounterparty,
   buildCounterpartyAnalytics,
@@ -21,6 +22,7 @@ import {
   type CounterpartyRole,
   type CounterpartyStatus,
 } from '@/lib/counterpartyService'
+import { getEnrichmentState, subscribeEnrichment, startEnrichment } from '@/lib/enrichmentStore'
 import { fmtDate, fmtEur } from '@/lib/utils'
 import {
   Users,
@@ -31,6 +33,9 @@ import {
   XCircle,
   Filter,
   RefreshCw,
+  Sparkles,
+  Building2,
+  Loader2,
 } from 'lucide-react'
 import {
   ResponsiveContainer,
@@ -363,6 +368,7 @@ export default function ContropartiPage() {
   const { company } = useCompany()
   const companyId = company?.id || null
   const [searchParams] = useSearchParams()
+  const enrichState = useSyncExternalStore(subscribeEnrichment, getEnrichmentState)
 
   const [counterparties, setCounterparties] = useState<Counterparty[]>([])
   const [loading, setLoading] = useState(false)
@@ -374,8 +380,10 @@ export default function ContropartiPage() {
   const [roleFilter, setRoleFilter] = useState<'all' | CounterpartyRole>('all')
   const [statusFilter, setStatusFilter] = useState<'all' | CounterpartyStatus>('all')
   const [legalTypeFilter, setLegalTypeFilter] = useState<'all' | CounterpartyLegalType>('all')
+  const [sectorFilter, setSectorFilter] = useState<string>('all')
   const [queryInput, setQueryInput] = useState('')
   const [query, setQuery] = useState('')
+  const [enrichingSingle, setEnrichingSingle] = useState(false)
 
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
@@ -483,6 +491,25 @@ export default function ContropartiPage() {
       return next
     })
   }, [searchParams, counterparties])
+
+  const uniqueSectors = useMemo(() => {
+    const sectors = new Set<string>()
+    for (const cp of counterparties) {
+      if (cp.business_sector) sectors.add(cp.business_sector)
+    }
+    return Array.from(sectors).sort()
+  }, [counterparties])
+
+  const filteredCounterparties = useMemo(() => {
+    if (sectorFilter === 'all') return counterparties
+    if (sectorFilter === '__none__') return counterparties.filter((cp) => !cp.business_sector)
+    return counterparties.filter((cp) => cp.business_sector === sectorFilter)
+  }, [counterparties, sectorFilter])
+
+  const unenrichedCount = useMemo(
+    () => counterparties.filter((cp) => !cp.enrichment_source && cp.vat_key).length,
+    [counterparties],
+  )
 
   const focused = useMemo(
     () => counterparties.find((cp) => cp.id === focusedId) || null,
@@ -716,12 +743,12 @@ export default function ContropartiPage() {
   }
 
   const selectAllVisible = () => {
-    setSelectedIds(new Set(counterparties.map((cp) => cp.id)))
+    setSelectedIds(new Set(filteredCounterparties.map((cp) => cp.id)))
   }
 
   const clearSelection = () => setSelectedIds(new Set())
 
-  const allVisibleSelected = counterparties.length > 0 && counterparties.every((cp) => selectedIds.has(cp.id))
+  const allVisibleSelected = filteredCounterparties.length > 0 && filteredCounterparties.every((cp) => selectedIds.has(cp.id))
 
   const onRowClick = (id: string) => {
     toggleSelect(id)
@@ -825,7 +852,32 @@ export default function ContropartiPage() {
     setSaving(false)
   }
 
-  const pendingCount = counterparties.filter((c) => c.status === 'pending').length
+  const pendingCount = filteredCounterparties.filter((c) => c.status === 'pending').length
+
+  const prevEnrichRunning = useRef(enrichState.running)
+  useEffect(() => {
+    if (prevEnrichRunning.current && !enrichState.running) {
+      reloadCounterparties()
+    }
+    prevEnrichRunning.current = enrichState.running
+  }, [enrichState.running, reloadCounterparties])
+
+  const handleBatchEnrich = useCallback(() => {
+    if (!companyId || enrichState.running) return
+    startEnrichment(companyId, unenrichedCount)
+  }, [companyId, enrichState.running, unenrichedCount])
+
+  const handleSingleEnrich = useCallback(async () => {
+    if (!companyId || !focused) return
+    setEnrichingSingle(true)
+    try {
+      await enrichCounterparties(companyId, [focused.id], true)
+      await reloadCounterparties()
+    } catch (e: any) {
+      setError(e.message || 'Errore arricchimento')
+    }
+    setEnrichingSingle(false)
+  }, [companyId, focused, reloadCounterparties])
 
   return (
     <div className="p-6 space-y-5">
@@ -835,6 +887,24 @@ export default function ContropartiPage() {
           <p className="text-muted-foreground text-sm mt-1">Clienti e fornitori da fatture/import manuale con verifica anagrafica</p>
         </div>
         <div className="flex items-center gap-2">
+          {unenrichedCount > 0 && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleBatchEnrich}
+              disabled={enrichState.running || loading}
+              className="text-violet-700 border-violet-300 hover:bg-violet-50"
+            >
+              {enrichState.running ? (
+                <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+              ) : (
+                <Sparkles className="h-3.5 w-3.5 mr-1.5" />
+              )}
+              {enrichState.running
+                ? `Arricchimento ${enrichState.processed}/${enrichState.total}...`
+                : `Arricchisci ATECO (${unenrichedCount})`}
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={reloadCounterparties} disabled={loading}>
             <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${loading ? 'animate-spin' : ''}`} />Aggiorna
           </Button>
@@ -848,6 +918,12 @@ export default function ContropartiPage() {
         <div className="flex items-center gap-2 p-3 rounded-lg border border-amber-200 bg-amber-50 text-amber-800 text-sm">
           <AlertTriangle className="h-4 w-4" />
           {pendingCount} controparti in stato "Da verificare"
+        </div>
+      )}
+
+      {enrichState.error && (
+        <div className="flex items-center gap-2 p-3 rounded-lg border border-red-200 bg-red-50 text-red-700 text-sm">
+          <XCircle className="h-4 w-4" />Errore arricchimento: {enrichState.error}
         </div>
       )}
 
@@ -922,6 +998,23 @@ export default function ContropartiPage() {
                 </select>
               </div>
 
+              {uniqueSectors.length > 0 && (
+                <div className="flex items-center gap-2">
+                  <Building2 className="h-3.5 w-3.5 text-gray-400" />
+                  <select
+                    value={sectorFilter}
+                    onChange={(e) => setSectorFilter(e.target.value)}
+                    className="flex-1 border rounded-md px-2 py-1 text-xs"
+                  >
+                    <option value="all">Tutti i settori</option>
+                    {uniqueSectors.map((s) => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
+                    <option value="__none__">Non arricchite</option>
+                  </select>
+                </div>
+              )}
+
               <div className="text-[11px] text-gray-500">Clic: seleziona/deseleziona. Doppio clic: apre dettaglio.</div>
             </div>
 
@@ -931,7 +1024,7 @@ export default function ContropartiPage() {
                 size="sm"
                 className="h-7 text-xs"
                 onClick={allVisibleSelected ? clearSelection : selectAllVisible}
-                disabled={counterparties.length === 0}
+                disabled={filteredCounterparties.length === 0}
               >
                 {allVisibleSelected ? 'Deseleziona tutti' : 'Seleziona tutti'}
               </Button>
@@ -960,10 +1053,10 @@ export default function ContropartiPage() {
             <div className="flex-1 overflow-y-auto border rounded-lg divide-y">
               {loading ? (
                 <div className="text-center py-8 text-sm text-gray-500">Caricamento...</div>
-              ) : counterparties.length === 0 ? (
+              ) : filteredCounterparties.length === 0 ? (
                 <div className="text-center py-8 text-sm text-gray-500">Nessuna controparte trovata</div>
               ) : (
-                counterparties.map((cp) => {
+                filteredCounterparties.map((cp) => {
                   const selected = selectedIds.has(cp.id)
                   const focusedRow = focusedId === cp.id
                   return (
@@ -988,6 +1081,11 @@ export default function ContropartiPage() {
                             {cp.legal_type && (
                               <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-gray-100 text-gray-700">
                                 {LEGAL_TYPE_LABEL[cp.legal_type]}
+                              </span>
+                            )}
+                            {cp.business_sector && (
+                              <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-violet-100 text-violet-700">
+                                {cp.business_sector}
                               </span>
                             )}
                           </div>
@@ -1088,6 +1186,63 @@ export default function ContropartiPage() {
                       <option value="altro">Altro</option>
                     </select>
                   </div>
+
+                  {focused.ateco_code ? (
+                    <div className="sm:col-span-2 bg-violet-50 border border-violet-200 rounded-lg p-3 space-y-1.5">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold text-violet-800 flex items-center gap-1.5">
+                          <Building2 className="h-3.5 w-3.5" />Dati ATECO
+                        </span>
+                        <button
+                          onClick={handleSingleEnrich}
+                          disabled={enrichingSingle}
+                          className="text-[10px] text-violet-600 hover:text-violet-800 flex items-center gap-1"
+                        >
+                          {enrichingSingle ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+                          Aggiorna
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                        <div>
+                          <span className="text-gray-500">Codice:</span>{' '}
+                          <span className="font-mono font-medium text-violet-900">{focused.ateco_code}</span>
+                        </div>
+                        {focused.business_sector && (
+                          <div>
+                            <span className="text-gray-500">Settore:</span>{' '}
+                            <span className="font-medium text-violet-800">{focused.business_sector}</span>
+                          </div>
+                        )}
+                      </div>
+                      {focused.ateco_description && (
+                        <p className="text-[11px] text-violet-700">{focused.ateco_description}</p>
+                      )}
+                      {focused.business_description && (
+                        <p className="text-[11px] text-gray-600 italic">{focused.business_description}</p>
+                      )}
+                      <p className="text-[10px] text-gray-400">
+                        Fonte: {focused.enrichment_source === 'camerale' ? 'Camera di Commercio' : focused.enrichment_source === 'ai' ? 'AI (inferito)' : focused.enrichment_source || '—'}
+                        {focused.enriched_at && ` — ${fmtDate(focused.enriched_at)}`}
+                      </p>
+                    </div>
+                  ) : focused.vat_key ? (
+                    <div className="sm:col-span-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleSingleEnrich}
+                        disabled={enrichingSingle}
+                        className="text-violet-700 border-violet-300 hover:bg-violet-50"
+                      >
+                        {enrichingSingle ? (
+                          <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+                        ) : (
+                          <Sparkles className="h-3.5 w-3.5 mr-1.5" />
+                        )}
+                        Arricchisci dati ATECO
+                      </Button>
+                    </div>
+                  ) : null}
 
                   <div>
                     <Label className="text-xs">Indirizzo</Label>
