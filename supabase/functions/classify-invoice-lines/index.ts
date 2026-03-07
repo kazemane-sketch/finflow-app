@@ -377,6 +377,7 @@ async function persistResults(
   articles: ArticleRow[],
 ): Promise<void> {
   const codeToId = new Map(articles.map((a) => [a.code, a.id]));
+  let persisted = 0;
 
   for (const lr of lineResults) {
     if (lr.confidence < MIN_CONFIDENCE) continue;
@@ -386,54 +387,77 @@ async function persistResults(
 
     // Save line-level category/account + mark as ai_suggested
     if (lr.category_id || lr.account_id) {
-      await sql`
-        UPDATE invoice_lines
-        SET category_id = COALESCE(${lr.category_id}, category_id),
-            account_id = COALESCE(${lr.account_id}, account_id),
-            classification_status = 'ai_suggested'
-        WHERE id = ${lr.line_id}
-          AND category_id IS NULL AND account_id IS NULL`;
+      try {
+        await sql`
+          UPDATE invoice_lines
+          SET category_id = COALESCE(${lr.category_id}, category_id),
+              account_id = COALESCE(${lr.account_id}, account_id),
+              classification_status = 'ai_suggested'
+          WHERE id = ${lr.line_id}
+            AND category_id IS NULL AND account_id IS NULL`;
+      } catch (e: unknown) {
+        console.error(`[persist] line ${lr.line_id} UPDATE invoice_lines failed:`, (e as Error).message);
+      }
     }
 
     // Save article suggestion as unverified
     if (articleId) {
-      await sql`
-        INSERT INTO invoice_line_articles
-          (company_id, invoice_id, invoice_line_id, article_id, assigned_by, verified, confidence)
-        VALUES (${companyId}, ${invoiceId}, ${lr.line_id}, ${articleId}, 'ai_classification', false, ${lr.confidence})
-        ON CONFLICT (invoice_line_id) DO NOTHING`;
+      try {
+        await sql`
+          INSERT INTO invoice_line_articles
+            (company_id, invoice_id, invoice_line_id, article_id, assigned_by, verified, confidence)
+          VALUES (${companyId}, ${invoiceId}, ${lr.line_id}, ${articleId}, 'ai_classification', false, ${lr.confidence})
+          ON CONFLICT (invoice_line_id) DO NOTHING`;
+      } catch (e: unknown) {
+        console.error(`[persist] line ${lr.line_id} INSERT invoice_line_articles failed:`, (e as Error).message);
+      }
     }
 
     // Save line-level CdC allocations
     for (const pa of lr.cost_center_allocations || []) {
-      await sql`
-        INSERT INTO invoice_line_projects
-          (company_id, invoice_id, invoice_line_id, project_id, percentage, assigned_by)
-        VALUES (${companyId}, ${invoiceId}, ${lr.line_id}, ${pa.project_id}, ${pa.percentage}, 'ai_auto')
-        ON CONFLICT DO NOTHING`;
+      try {
+        await sql`
+          INSERT INTO invoice_line_projects
+            (company_id, invoice_id, invoice_line_id, project_id, percentage, assigned_by)
+          VALUES (${companyId}, ${invoiceId}, ${lr.line_id}, ${pa.project_id}, ${pa.percentage}, 'ai_auto')
+          ON CONFLICT DO NOTHING`;
+      } catch (e: unknown) {
+        console.error(`[persist] line ${lr.line_id} INSERT invoice_line_projects failed:`, (e as Error).message);
+      }
     }
+    persisted++;
   }
+
+  console.log(`[persist] ${persisted} lines persisted`);
 
   // Save invoice-level classification as unverified suggestion
   if (
     invoiceLevel.confidence >= MIN_CONFIDENCE &&
     (invoiceLevel.category_id || invoiceLevel.account_id)
   ) {
-    await sql`
-      INSERT INTO invoice_classifications
-        (company_id, invoice_id, category_id, account_id, assigned_by, verified, ai_confidence, ai_reasoning)
-      VALUES (${companyId}, ${invoiceId}, ${invoiceLevel.category_id}, ${invoiceLevel.account_id},
-              'ai_auto', false, ${invoiceLevel.confidence}, ${invoiceLevel.reasoning})
-      ON CONFLICT (invoice_id) DO NOTHING`;
+    try {
+      await sql`
+        INSERT INTO invoice_classifications
+          (company_id, invoice_id, category_id, account_id, assigned_by, verified, ai_confidence, ai_reasoning)
+        VALUES (${companyId}, ${invoiceId}, ${invoiceLevel.category_id}, ${invoiceLevel.account_id},
+                'ai_auto', false, ${invoiceLevel.confidence}, ${invoiceLevel.reasoning})
+        ON CONFLICT (invoice_id) DO NOTHING`;
+    } catch (e: unknown) {
+      console.error(`[persist] INSERT invoice_classifications failed:`, (e as Error).message);
+    }
   }
 
   // Save invoice-level CdC allocations
   for (const pa of invoiceLevel.project_allocations) {
-    await sql`
-      INSERT INTO invoice_projects
-        (company_id, invoice_id, project_id, percentage, assigned_by)
-      VALUES (${companyId}, ${invoiceId}, ${pa.project_id}, ${pa.percentage}, 'ai_auto')
-      ON CONFLICT DO NOTHING`;
+    try {
+      await sql`
+        INSERT INTO invoice_projects
+          (company_id, invoice_id, project_id, percentage, assigned_by)
+        VALUES (${companyId}, ${invoiceId}, ${pa.project_id}, ${pa.percentage}, 'ai_auto')
+        ON CONFLICT DO NOTHING`;
+    } catch (e: unknown) {
+      console.error(`[persist] INSERT invoice_projects failed:`, (e as Error).message);
+    }
   }
 }
 
@@ -675,12 +699,24 @@ Deno.serve(async (req) => {
       articles,
     );
 
-    // Save keywords on invoice (if any)
-    if (keywords.length > 0) {
-      await sql`
-        UPDATE invoices
-        SET search_keywords = ${JSON.stringify(keywords)}::jsonb
-        WHERE id = ${invoiceId}`;
+    // Mark invoice as ai_suggested + save keywords
+    try {
+      if (keywords.length > 0) {
+        await sql`
+          UPDATE invoices
+          SET classification_status = 'ai_suggested',
+              search_keywords = ${JSON.stringify(keywords)}::jsonb
+          WHERE id = ${invoiceId}
+            AND classification_status != 'confirmed'`;
+      } else {
+        await sql`
+          UPDATE invoices
+          SET classification_status = 'ai_suggested'
+          WHERE id = ${invoiceId}
+            AND classification_status != 'confirmed'`;
+      }
+    } catch (e: unknown) {
+      console.error(`[persist] UPDATE invoices failed:`, (e as Error).message);
     }
 
     // Resolve article codes to IDs for the response
