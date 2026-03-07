@@ -528,12 +528,12 @@ Deno.serve(async (req) => {
       if (vatKey) {
         history = (await sql`
           SELECT il.description, c.name as category_name, a.code as account_code, a.name as account_name,
-                 art.code as article_code, art.name as article_name, il.cost_center_allocations
+                 art.code as article_code, art.name as article_name, null::jsonb as cost_center_allocations
           FROM invoice_lines il
           JOIN invoices i ON il.invoice_id = i.id
           LEFT JOIN categories c ON il.category_id = c.id
           LEFT JOIN chart_of_accounts a ON il.account_id = a.id
-          LEFT JOIN invoice_line_articles ila ON ila.line_id = il.id
+          LEFT JOIN invoice_line_articles ila ON ila.invoice_line_id = il.id
           LEFT JOIN articles art ON ila.article_id = art.id
           WHERE i.company_id = ${companyId}
             AND i.counterparty_id = (
