@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -22,7 +22,7 @@ import {
   type CounterpartyRole,
   type CounterpartyStatus,
 } from '@/lib/counterpartyService'
-import { getEnrichmentState, subscribeEnrichment, startEnrichment } from '@/lib/enrichmentStore'
+import { useAIJob } from '@/hooks/useAIJob'
 import { fmtDate, fmtEur } from '@/lib/utils'
 import {
   Users,
@@ -368,7 +368,7 @@ export default function ContropartiPage() {
   const { company } = useCompany()
   const companyId = company?.id || null
   const [searchParams] = useSearchParams()
-  const enrichState = useSyncExternalStore(subscribeEnrichment, getEnrichmentState)
+  const { isRunning: enrichRunning, progress: enrichProgress, startOrStop: enrichStartOrStop } = useAIJob('controparti-enrich', 'Arricchimento ATECO')
 
   const [counterparties, setCounterparties] = useState<Counterparty[]>([])
   const [loading, setLoading] = useState(false)
@@ -854,18 +854,34 @@ export default function ContropartiPage() {
 
   const pendingCount = filteredCounterparties.filter((c) => c.status === 'pending').length
 
-  const prevEnrichRunning = useRef(enrichState.running)
+  const prevEnrichRunning = useRef(enrichRunning)
   useEffect(() => {
-    if (prevEnrichRunning.current && !enrichState.running) {
+    if (prevEnrichRunning.current && !enrichRunning) {
       reloadCounterparties()
     }
-    prevEnrichRunning.current = enrichState.running
-  }, [enrichState.running, reloadCounterparties])
+    prevEnrichRunning.current = enrichRunning
+  }, [enrichRunning, reloadCounterparties])
 
   const handleBatchEnrich = useCallback(() => {
-    if (!companyId || enrichState.running) return
-    startEnrichment(companyId, unenrichedCount)
-  }, [companyId, enrichState.running, unenrichedCount])
+    if (!companyId) return
+    const targets = counterparties.filter(cp => !cp.enrichment_source && cp.vat_key)
+    if (targets.length === 0) return
+
+    enrichStartOrStop(async (signal, updateProgress) => {
+      const CHUNK = 10
+      let processed = 0
+      for (let i = 0; i < targets.length; i += CHUNK) {
+        if (signal.aborted) return
+        const chunk = targets.slice(i, i + CHUNK)
+        const ids = chunk.map(cp => cp.id)
+        try {
+          await enrichCounterparties(companyId, ids, false)
+        } catch { /* continue on error */ }
+        processed += chunk.length
+        updateProgress(processed, targets.length)
+      }
+    }, targets.length)
+  }, [companyId, counterparties, enrichStartOrStop])
 
   const handleSingleEnrich = useCallback(async () => {
     if (!companyId || !focused) return
@@ -887,21 +903,21 @@ export default function ContropartiPage() {
           <p className="text-muted-foreground text-sm mt-1">Clienti e fornitori da fatture/import manuale con verifica anagrafica</p>
         </div>
         <div className="flex items-center gap-2">
-          {unenrichedCount > 0 && (
+          {(unenrichedCount > 0 || enrichRunning) && (
             <Button
               variant="outline"
               size="sm"
               onClick={handleBatchEnrich}
-              disabled={enrichState.running || loading}
-              className="text-violet-700 border-violet-300 hover:bg-violet-50"
+              disabled={loading}
+              className={enrichRunning ? 'text-red-700 border-red-300 hover:bg-red-50' : 'text-violet-700 border-violet-300 hover:bg-violet-50'}
             >
-              {enrichState.running ? (
+              {enrichRunning ? (
                 <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
               ) : (
                 <Sparkles className="h-3.5 w-3.5 mr-1.5" />
               )}
-              {enrichState.running
-                ? `Arricchimento ${enrichState.processed}/${enrichState.total}...`
+              {enrichRunning
+                ? `Stop (${enrichProgress.pct}%)`
                 : `Arricchisci ATECO (${unenrichedCount})`}
             </Button>
           )}
@@ -918,12 +934,6 @@ export default function ContropartiPage() {
         <div className="flex items-center gap-2 p-3 rounded-lg border border-amber-200 bg-amber-50 text-amber-800 text-sm">
           <AlertTriangle className="h-4 w-4" />
           {pendingCount} controparti in stato "Da verificare"
-        </div>
-      )}
-
-      {enrichState.error && (
-        <div className="flex items-center gap-2 p-3 rounded-lg border border-red-200 bg-red-50 text-red-700 text-sm">
-          <XCircle className="h-4 w-4" />Errore arricchimento: {enrichState.error}
         </div>
       )}
 
