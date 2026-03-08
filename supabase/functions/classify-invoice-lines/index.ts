@@ -163,6 +163,7 @@ function buildPrompt(
   ragExamples: RagExample[],
   direction: string,
   lines: InputLine[],
+  userInstructions: { scope: string; instruction: string }[] = [],
 ): string {
   // Articles section
   const artSection = articles
@@ -242,7 +243,10 @@ CONTROPARTE: ${counterpartyInfo}
 
 ${historySection}
 ${ragSection}
-
+${userInstructions.length > 0 ? `
+REGOLE UTENTE (PRIORITÀ ALTA — applica SEMPRE queste regole dell'utente):
+${userInstructions.map((ui) => `- [${ui.scope}] ${ui.instruction}`).join("\n")}
+` : ""}
 REGOLE:
 * PASSIVA (acquisto/direction=in): categorie "expense", conti di costo (60xxx-69xxx o come nel piano conti)
 * ATTIVA (vendita/direction=out): categorie "revenue", conti di ricavo (70xxx+)
@@ -589,6 +593,22 @@ Deno.serve(async (req) => {
       );
     }
 
+    // ─── Load user instructions ────────────────────────
+    interface UserInstruction { scope: string; instruction: string }
+    let userInstructions: UserInstruction[] = [];
+    try {
+      userInstructions = await sql<UserInstruction[]>`
+        SELECT scope, instruction FROM user_instructions
+        WHERE company_id = ${companyId} AND active = true
+          AND scope IN ('general', 'classification', 'counterparty')
+        ORDER BY scope, created_at`;
+      if (userInstructions.length > 0) {
+        console.log(`[classify-invoice-lines] Loaded ${userInstructions.length} user instructions`);
+      }
+    } catch (err) {
+      console.warn("[classify-invoice-lines] Error loading user instructions:", err);
+    }
+
     // ─── Build prompt and call Sonnet ──────────────────
     const prompt = buildPrompt(
       articles,
@@ -600,6 +620,7 @@ Deno.serve(async (req) => {
       ragExamples,
       direction,
       inputLines,
+      userInstructions,
     );
 
     console.log(

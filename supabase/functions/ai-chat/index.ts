@@ -362,6 +362,40 @@ const tools = [
       },
     },
   },
+  {
+    name: "save_user_instruction",
+    description:
+      "Salva un'istruzione/regola dell'utente per le operazioni AI future (classificazione, riconciliazione, ecc.). Usa quando l'utente dichiara una regola, una convenzione o una preferenza che dovrebbe essere ricordata. Esempi: 'le fatture CREDEMLEASING sono sempre leasing veicoli', 'il trasporto calcare va in B14-FRA', 'i pagamenti F24 non vanno riconciliati'.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        instruction: { type: "string", description: "Il testo dell'istruzione/regola" },
+        scope: {
+          type: "string",
+          enum: ["general", "counterparty", "category", "classification", "reconciliation"],
+          description: "Ambito: general = regola generica, counterparty = specifica per controparte, category = per categoria, classification = per classificazione fatture, reconciliation = per riconciliazione",
+        },
+        scope_ref: { type: "string", description: "UUID opzionale dell'entità correlata (counterparty_id, category_id). Cercalo prima con gli altri tool se necessario." },
+      },
+      required: ["instruction", "scope"],
+    },
+  },
+  {
+    name: "get_user_instructions",
+    description:
+      "Recupera le istruzioni/regole salvate dall'utente. Usa per mostrare all'utente le sue regole attive o per verificare se una regola esiste già prima di salvarne una nuova.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        scope: {
+          type: "string",
+          enum: ["general", "counterparty", "category", "classification", "reconciliation", "all"],
+          description: "Filtra per ambito. 'all' = tutte le istruzioni. Default: all",
+        },
+        scope_ref: { type: "string", description: "UUID opzionale per filtrare per entità specifica" },
+      },
+    },
+  },
 ];
 
 /* ─── tool handlers ───────────────────────── */
@@ -1378,6 +1412,58 @@ async function handleGetReconciliationStats(sql: SqlClient, companyId: string, _
   return stats;
 }
 
+async function handleSaveUserInstruction(
+  sql: SqlClient,
+  companyId: string,
+  args: Record<string, unknown>,
+) {
+  const instruction = String(args.instruction || "").trim();
+  if (!instruction) return { error: "Istruzione vuota" };
+
+  const scope = String(args.scope || "general");
+  const scopeRef = args.scope_ref ? String(args.scope_ref) : null;
+
+  const [row] = await sql`
+    INSERT INTO user_instructions (company_id, scope, scope_ref, instruction, source)
+    VALUES (${companyId}, ${scope}, ${scopeRef}, ${instruction}, 'ai_chat')
+    RETURNING id, scope, instruction`;
+
+  return { saved: true, id: row.id, scope: row.scope, instruction: row.instruction };
+}
+
+async function handleGetUserInstructions(
+  sql: SqlClient,
+  companyId: string,
+  args: Record<string, unknown>,
+) {
+  const scope = String(args.scope || "all");
+  const scopeRef = args.scope_ref ? String(args.scope_ref) : null;
+
+  if (scope === "all" && !scopeRef) {
+    return await sql`
+      SELECT id, scope, scope_ref, instruction, source, created_at
+      FROM user_instructions
+      WHERE company_id = ${companyId} AND active = true
+      ORDER BY scope, created_at`;
+  }
+
+  if (scopeRef) {
+    return await sql`
+      SELECT id, scope, scope_ref, instruction, source, created_at
+      FROM user_instructions
+      WHERE company_id = ${companyId} AND active = true
+        AND (${scope} = 'all' OR scope = ${scope})
+        AND scope_ref = ${scopeRef}::uuid
+      ORDER BY created_at`;
+  }
+
+  return await sql`
+    SELECT id, scope, scope_ref, instruction, source, created_at
+    FROM user_instructions
+    WHERE company_id = ${companyId} AND active = true AND scope = ${scope}
+    ORDER BY created_at`;
+}
+
 async function executeToolHandler(
   sql: SqlClient,
   companyId: string,
@@ -1431,6 +1517,10 @@ async function executeToolHandler(
       return handleGetCompanySettings(sql, companyId, toolInput);
     case "get_reconciliation_stats":
       return handleGetReconciliationStats(sql, companyId, toolInput);
+    case "save_user_instruction":
+      return handleSaveUserInstruction(sql, companyId, toolInput);
+    case "get_user_instructions":
+      return handleGetUserInstructions(sql, companyId, toolInput);
     default:
       return { error: `Tool sconosciuto: ${toolName}` };
   }
@@ -1493,6 +1583,15 @@ CLASSIFICAZIONE FATTURE:
 - get_invoices con filtro category_name o cost_center_code: per trovare fatture classificate con categoria/CdC specifico.
 - get_company_stats include sezione "classificazione" con conteggi fatture classificate/AI/non classificate.
 
+ISTRUZIONI UTENTE (MEMORIA PERSISTENTE):
+- save_user_instruction: quando l'utente dichiara una REGOLA, PREFERENZA o CONVENZIONE che deve essere ricordata per il futuro, salvala automaticamente. Non chiedere conferma, salvala e conferma. Esempi:
+  * "le fatture CREDEMLEASING sono sempre leasing veicoli" → scope: counterparty
+  * "il calcare va classificato come materia prima" → scope: classification
+  * "i pagamenti F24 non vanno riconciliati" → scope: reconciliation
+  * "usa sempre il centro di costo BRE-FRA per il frantoio" → scope: general
+- get_user_instructions: per mostrare le regole salvate o verificare se ne esiste già una simile
+- Le istruzioni salvate vengono automaticamente iniettate nel contesto di tutte le future classificazioni AI e sessioni chat
+
 Quando presenti tabelle o elenchi, usa il formato markdown. Quando menzioni importi, specifica sempre se è un'entrata o un'uscita. Per le date usa il formato italiano (gg/mm/aaaa).`;
 
 interface ToolCallInfo {
@@ -1507,6 +1606,7 @@ async function runAiChat(
   companyId: string,
   model: string,
   thinkingEnabled = false,
+  extraSystemContext = "",
 ): Promise<{ content: string; thinking?: string; toolCalls: ToolCallInfo[]; tokensUsed: number }> {
   let currentMessages = [...messages];
   const allToolCalls: ToolCallInfo[] = [];
@@ -1516,6 +1616,10 @@ async function runAiChat(
   const anthropicKey = Deno.env.get("ANTHROPIC_API_KEY")!;
 
   // Build request body differently for thinking vs normal mode
+  const fullSystemPrompt = extraSystemContext
+    ? `${SYSTEM_PROMPT}\n\n${extraSystemContext}`
+    : SYSTEM_PROMPT;
+
   function buildRequestBody() {
     if (thinkingEnabled) {
       // Extended Thinking: no system top-level, no temperature, thinking budget
@@ -1524,7 +1628,7 @@ async function runAiChat(
       if (thinkingMessages.length > 0 && thinkingMessages[0].role === "user") {
         thinkingMessages[0] = {
           role: "user",
-          content: `[Contesto sistema]\n${SYSTEM_PROMPT}\n\n[Domanda utente]\n${thinkingMessages[0].content}`,
+          content: `[Contesto sistema]\n${fullSystemPrompt}\n\n[Domanda utente]\n${thinkingMessages[0].content}`,
         };
       }
       return {
@@ -1538,7 +1642,7 @@ async function runAiChat(
     return {
       model,
       max_tokens: 4096,
-      system: SYSTEM_PROMPT,
+      system: fullSystemPrompt,
       messages: currentMessages,
       tools,
     };
@@ -1753,9 +1857,23 @@ Deno.serve(async (req) => {
     }
     claudeMessages.push({ role: "user", content: userMessage });
 
+    // Load active user instructions to inject as context
+    const userInstructions = await sql`
+      SELECT scope, instruction FROM user_instructions
+      WHERE company_id = ${companyId} AND active = true
+      ORDER BY scope, created_at`;
+
+    let instructionsContext = "";
+    if (userInstructions.length > 0) {
+      const lines = userInstructions.map(
+        (ui: { scope: string; instruction: string }) => `- [${ui.scope}] ${ui.instruction}`,
+      );
+      instructionsContext = `REGOLE UTENTE SALVATE (applica SEMPRE queste regole nelle analisi e risposte):\n${lines.join("\n")}`;
+    }
+
     // Run AI (model based on user preference: fast=haiku, thinking=sonnet with extended thinking)
     const isThinking = modelPreference === "thinking";
-    const result = await runAiChat(claudeMessages, sql, companyId, chatModel, isThinking);
+    const result = await runAiChat(claudeMessages, sql, companyId, chatModel, isThinking, instructionsContext);
 
     // Save messages
     await sql`

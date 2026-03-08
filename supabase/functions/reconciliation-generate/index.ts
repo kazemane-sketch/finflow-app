@@ -506,6 +506,7 @@ async function matchByCounterpartyAmount(
   const cpWord = tx.counterparty_name.split(/\s+/)[0];
   if (!cpWord || cpWord.length < 3) return [];
 
+  // Miglioria 5: wider tolerance 40%-115% (was ±10%)
   const cpMatches = await sql.unsafe(
     `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
             ii.amount_due, ii.paid_amount, ii.status,
@@ -517,9 +518,9 @@ async function matchByCounterpartyAmount(
        AND inv.direction = $2
        AND ii.status IN ('pending','overdue','partial')
        AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
-       AND abs(ii.amount_due - ii.paid_amount) BETWEEN $4 * 0.90 AND $4 * 1.10
+       AND abs(ii.amount_due - ii.paid_amount) BETWEEN $4 * 0.40 AND $4 * 1.15
      ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $4) ASC
-     LIMIT 5`,
+     LIMIT 10`,
     [companyId, expectedDirection, cpWord, remainingAmount],
   );
 
@@ -534,18 +535,33 @@ async function matchByCounterpartyAmount(
         )
       : 999;
 
-    let score = 65;
-    if (amountRatio < 0.05 && daysDiff < 30) score = 85;
-    else if (amountRatio < 0.05 && daysDiff < 60) score = 80;
+    // Miglioria 5: tiered scoring based on amount difference
+    let score: number;
+    if (amountRatio < 0.02 && daysDiff < 30) score = 85;
+    else if (amountRatio < 0.05 && daysDiff < 30) score = 80;
+    else if (amountRatio < 0.05 && daysDiff < 60) score = 78;
     else if (amountRatio < 0.10 && daysDiff < 30) score = 75;
     else if (amountRatio < 0.10) score = 70;
+    else if (amountRatio < 0.20) score = 60;
+    else score = 50; // 20%-60% diff — still show but low confidence
+
+    // Amount note for large differences (common Italian patterns)
+    let amountNote = "";
+    const pctDiff = ((instRemaining - remainingAmount) / instRemaining) * 100;
+    if (Math.abs(pctDiff - 20) < 3) {
+      amountNote = "Possibile ritenuta d'acconto (20%)";
+    } else if (Math.abs(pctDiff - 4) < 2) {
+      amountNote = "Possibile split payment IVA";
+    } else if (amountRatio > 0.10) {
+      amountNote = `Differenza ${pctDiff > 0 ? "+" : ""}${pctDiff.toFixed(0)}%`;
+    }
 
     suggestions.push({
       bank_transaction_id: tx.id,
       installment_id: m.installment_id,
       invoice_id: m.invoice_id,
       match_score: score,
-      match_reason: `Controparte "${m.counterparty_name}" + importo simile (diff €${amountDiff.toFixed(2)})${daysDiff < 30 ? " + data vicina" : ""}`,
+      match_reason: `Controparte "${m.counterparty_name}" + importo simile (diff €${amountDiff.toFixed(2)})${daysDiff < 30 ? " + data vicina" : ""}${amountNote ? ` — ${amountNote}` : ""}`,
       proposed_by: "deterministic",
       rule_id: null,
       suggestion_data: {
@@ -553,8 +569,96 @@ async function matchByCounterpartyAmount(
         amount_diff: amountDiff,
         days_diff: daysDiff,
         level: "counterparty",
+        ...(amountNote ? { amount_note: amountNote } : {}),
       },
     });
+  }
+
+  return suggestions;
+}
+
+/* ─── Level 1.5: Match by learned rules (Miglioria 3) ─── */
+
+async function matchByRules(
+  sql: SqlClient,
+  companyId: string,
+  tx: TxRow,
+  remainingAmount: number,
+): Promise<Suggestion[]> {
+  const suggestions: Suggestion[] = [];
+  const expectedDirection = getExpectedInvoiceDirection(Number(tx.amount));
+
+  // Find rules matching this transaction pattern
+  const rules = await sql.unsafe(
+    `SELECT id, rule_name, rule_data, confidence
+     FROM reconciliation_rules
+     WHERE company_id = $1 AND confidence > 0.3
+     ORDER BY confidence DESC
+     LIMIT 20`,
+    [companyId],
+  );
+
+  if (rules.length === 0) return [];
+
+  for (const rule of rules) {
+    const rd = rule.rule_data as Record<string, unknown> | null;
+    if (!rd) continue;
+
+    // Check if TX matches the rule pattern
+    const ruleCounterparty = rd.counterparty_pattern as string | null;
+    const ruleType = rd.transaction_type as string | null;
+
+    // Counterparty must match
+    if (ruleCounterparty && !counterpartyMatches(tx.counterparty_name, ruleCounterparty)) continue;
+    // Transaction type must match (if specified)
+    if (ruleType && tx.transaction_type && !tx.transaction_type.toUpperCase().includes(ruleType.toUpperCase())) continue;
+
+    // Find matching invoices
+    const cpWord = (ruleCounterparty || tx.counterparty_name || "").split(/\s+/)[0];
+    if (!cpWord || cpWord.length < 3) continue;
+
+    const ruleMatches = await sql.unsafe(
+      `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
+              ii.amount_due, ii.paid_amount,
+              inv.number as invoice_number,
+              inv.counterparty->>'denom' as counterparty_name
+       FROM invoice_installments ii
+       JOIN invoices inv ON inv.id = ii.invoice_id
+       WHERE ii.company_id = $1
+         AND inv.direction = $2
+         AND ii.status IN ('pending','overdue','partial')
+         AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
+         AND abs(ii.amount_due - ii.paid_amount) BETWEEN $4 * 0.90 AND $4 * 1.10
+       ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $4) ASC
+       LIMIT 3`,
+      [companyId, expectedDirection, cpWord, remainingAmount],
+    );
+
+    for (const m of ruleMatches) {
+      const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
+      if (instRemaining < 0.01) continue;
+      const amountDiff = Math.abs(remainingAmount - instRemaining);
+
+      // Score based on rule confidence (70-90 range)
+      const ruleConf = Number(rule.confidence);
+      const score = Math.round(70 + ruleConf * 20); // 0.3 → 76, 0.6 → 82, 1.0 → 90
+
+      suggestions.push({
+        bank_transaction_id: tx.id,
+        installment_id: m.installment_id,
+        invoice_id: m.invoice_id,
+        match_score: Math.min(score, 90),
+        match_reason: `Regola "${rule.rule_name}" (conf. ${(ruleConf * 100).toFixed(0)}%) → ${m.counterparty_name}`,
+        proposed_by: "rule",
+        rule_id: rule.id,
+        suggestion_data: {
+          rule_name: rule.rule_name,
+          rule_confidence: ruleConf,
+          amount_diff: amountDiff,
+          level: "rule",
+        },
+      });
+    }
   }
 
   return suggestions;
@@ -573,6 +677,108 @@ function dedup(suggestions: Suggestion[], maxResults: number): Suggestion[] {
     })
     .sort((a, b) => b.match_score - a.match_score)
     .slice(0, maxResults);
+}
+
+/* ─── Miglioria 1: Cumulative payments (1 TX → N invoices) ─── */
+
+async function matchCumulativePayment(
+  sql: SqlClient,
+  companyId: string,
+  tx: TxRow,
+  remainingAmount: number,
+): Promise<Suggestion[]> {
+  if (!tx.counterparty_name) return [];
+  const cpWord = tx.counterparty_name.split(/\s+/)[0];
+  if (!cpWord || cpWord.length < 3) return [];
+
+  const expectedDirection = getExpectedInvoiceDirection(Number(tx.amount));
+
+  // Fetch all open installments for this counterparty
+  const openInst = await sql.unsafe(
+    `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
+            ii.amount_due, ii.paid_amount,
+            inv.number as invoice_number,
+            inv.counterparty->>'denom' as counterparty_name,
+            abs(ii.amount_due - ii.paid_amount) as remaining
+     FROM invoice_installments ii
+     JOIN invoices inv ON inv.id = ii.invoice_id
+     WHERE ii.company_id = $1
+       AND inv.direction = $2
+       AND ii.status IN ('pending','overdue','partial')
+       AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
+       AND abs(ii.amount_due - ii.paid_amount) > 0.01
+     ORDER BY ii.due_date ASC
+     LIMIT 10`,
+    [companyId, expectedDirection, cpWord],
+  );
+
+  if (openInst.length < 2) return []; // Need at least 2 invoices for cumulative
+
+  // Try combinations of 2-3 invoices
+  const target = remainingAmount;
+  const tolerance = 0.05; // ±5%
+
+  // Try pairs
+  for (let i = 0; i < openInst.length; i++) {
+    for (let j = i + 1; j < openInst.length; j++) {
+      const sum = Number(openInst[i].remaining) + Number(openInst[j].remaining);
+      const ratio = Math.abs(sum - target) / target;
+      if (ratio <= tolerance) {
+        const groupId = crypto.randomUUID();
+        const score = ratio < 0.02 ? 75 : 65;
+        const items = [openInst[i], openInst[j]];
+        return items.map((m) => ({
+          bank_transaction_id: tx.id,
+          installment_id: m.installment_id,
+          invoice_id: m.invoice_id,
+          match_score: score,
+          match_reason: `Pagamento cumulativo: ${items.map(x => x.invoice_number).join(" + ")} = €${sum.toFixed(2)} (TX €${target.toFixed(2)})`,
+          proposed_by: "deterministic" as const,
+          rule_id: null,
+          suggestion_data: {
+            group_id: groupId,
+            group_total: sum,
+            level: "cumulative",
+            counterparty: m.counterparty_name,
+            amount_diff: Math.abs(sum - target),
+          },
+        }));
+      }
+    }
+  }
+
+  // Try triples (only if pairs didn't match)
+  for (let i = 0; i < Math.min(openInst.length, 6); i++) {
+    for (let j = i + 1; j < Math.min(openInst.length, 7); j++) {
+      for (let k = j + 1; k < Math.min(openInst.length, 8); k++) {
+        const sum = Number(openInst[i].remaining) + Number(openInst[j].remaining) + Number(openInst[k].remaining);
+        const ratio = Math.abs(sum - target) / target;
+        if (ratio <= tolerance) {
+          const groupId = crypto.randomUUID();
+          const score = ratio < 0.02 ? 70 : 60;
+          const items = [openInst[i], openInst[j], openInst[k]];
+          return items.map((m) => ({
+            bank_transaction_id: tx.id,
+            installment_id: m.installment_id,
+            invoice_id: m.invoice_id,
+            match_score: score,
+            match_reason: `Pagamento cumulativo: ${items.map(x => x.invoice_number).join(" + ")} = €${sum.toFixed(2)}`,
+            proposed_by: "deterministic" as const,
+            rule_id: null,
+            suggestion_data: {
+              group_id: groupId,
+              group_total: sum,
+              level: "cumulative",
+              counterparty: m.counterparty_name,
+              amount_diff: Math.abs(sum - target),
+            },
+          }));
+        }
+      }
+    }
+  }
+
+  return [];
 }
 
 /* ─── RAG score boost for ambiguous suggestions ── */
@@ -679,8 +885,14 @@ async function generateForTransaction(
       sql, companyId, tx, invoiceRefs, remainingAmount,
     );
     if (refMatches.length > 0) {
-      return dedup(refMatches, 20);
+      return filterRejected(sql, companyId, dedup(refMatches, 20));
     }
+  }
+
+  // ── Level 1.5: Match by learned rules (Miglioria 3, score 70-90) ──
+  const ruleMatches = await matchByRules(sql, companyId, tx, remainingAmount);
+  if (ruleMatches.length > 0) {
+    return filterRejected(sql, companyId, dedup(ruleMatches, 5));
   }
 
   // ── Level 2: Match by mandate SDD (score 85) ──
@@ -689,23 +901,65 @@ async function generateForTransaction(
       sql, companyId, tx, mandateId, remainingAmount,
     );
     if (mandateMatches.length > 0) {
-      return dedup(mandateMatches, 5);
+      return filterRejected(sql, companyId, dedup(mandateMatches, 5));
     }
   }
 
-  // ── Level 3: Fallback — counterparty + amount (score 65-85) ──
+  // ── Level 3: Fallback — counterparty + amount (score 50-85) ──
   const fallback = await matchByCounterpartyAmount(
     sql, companyId, tx, remainingAmount,
   );
-  const dedupedFallback = dedup(fallback, 5);
+  let results = dedup(fallback, 5);
+
+  // ── Level 3.5: Cumulative payments (Miglioria 1) ──
+  if (results.length === 0) {
+    const cumulative = await matchCumulativePayment(sql, companyId, tx, remainingAmount);
+    if (cumulative.length > 0) {
+      results = cumulative;
+    }
+  }
 
   // ── RAG boost: boost ambiguous suggestions with confirmed examples ──
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") || "").trim();
-  if (geminiKey && dedupedFallback.length > 0) {
-    return await ragBoostSuggestions(sql, companyId, tx, dedupedFallback, geminiKey);
+  if (geminiKey && results.length > 0) {
+    results = await ragBoostSuggestions(sql, companyId, tx, results, geminiKey);
   }
 
-  return dedupedFallback;
+  // ── Miglioria 4: filter previously rejected pairs ──
+  return filterRejected(sql, companyId, results);
+}
+
+/* ─── Miglioria 4: Filter previously rejected pairs ─── */
+
+async function filterRejected(
+  sql: SqlClient,
+  companyId: string,
+  suggestions: Suggestion[],
+): Promise<Suggestion[]> {
+  if (suggestions.length === 0) return [];
+
+  const filtered: Suggestion[] = [];
+  for (const s of suggestions) {
+    if (!s.invoice_id) {
+      filtered.push(s);
+      continue;
+    }
+
+    const [{ cnt }] = await sql.unsafe(
+      `SELECT count(*)::int as cnt
+       FROM reconciliation_log
+       WHERE company_id = $1
+         AND bank_transaction_id = $2
+         AND invoice_id = $3
+         AND accepted = false`,
+      [companyId, s.bank_transaction_id, s.invoice_id],
+    );
+
+    if (cnt === 0) {
+      filtered.push(s);
+    }
+  }
+  return filtered;
 }
 
 /* ─── main handler ────────────────────── */

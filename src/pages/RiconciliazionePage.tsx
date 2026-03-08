@@ -28,6 +28,7 @@ interface SuggestionRow {
   match_score: number
   match_reason: string
   proposed_by: string
+  rule_id: string | null
   suggestion_data: Record<string, unknown> | null
   status: string
   created_at: string
@@ -376,7 +377,7 @@ export default function RiconciliazionePage() {
       .from('reconciliation_suggestions')
       .select(`
         id, bank_transaction_id, installment_id, invoice_id,
-        match_score, match_reason, proposed_by, suggestion_data, status, created_at,
+        match_score, match_reason, proposed_by, rule_id, suggestion_data, status, created_at,
         bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount, reconciled_amount),
         invoice:invoices(id, number, counterparty, total_amount, date),
         installment:invoice_installments(id, installment_no, due_date, amount_due, paid_amount, status, direction)
@@ -685,6 +686,28 @@ export default function RiconciliazionePage() {
         ).catch(err => console.warn('[confirmSuggestion] learning example error:', err))
       }
 
+      // 5c. Miglioria 3: Upsert reconciliation rule from confirmed match
+      if (tx && suggestion.invoice_id && tx.counterparty_name) {
+        const inv = suggestion.invoice
+        const ruleName = `${tx.counterparty_name} → ${inv?.number || 'fattura'}`
+        const ruleData = {
+          counterparty_pattern: tx.counterparty_name,
+          transaction_type: tx.transaction_type || null,
+          amount_range: [Math.abs(Number(tx.amount)) * 0.85, Math.abs(Number(tx.amount)) * 1.15],
+        }
+        supabase.from('reconciliation_rules').upsert({
+          company_id: companyId,
+          rule_name: ruleName.slice(0, 200),
+          rule_type: 'counterparty_amount',
+          pattern: ruleData,
+          action: { match_invoice: true },
+          rule_data: ruleData,
+          confidence: Math.min(1, (suggestion.match_score / 100) * 0.8 + 0.2),
+        }, { onConflict: 'company_id,rule_name' }).then(({ error: ruleErr }) => {
+          if (ruleErr) console.warn('[confirmSuggestion] rule upsert error:', ruleErr)
+        })
+      }
+
       // 6. Expire suggestions that are no longer viable
       // If TX fully matched → expire ALL pending suggestions for this TX
       if (txFullyMatched) {
@@ -757,6 +780,16 @@ export default function RiconciliazionePage() {
         match_score: suggestion.match_score,
         match_reason: suggestion.match_reason,
       })
+
+      // Miglioria 4: degrade rule confidence on reject
+      if (suggestion.rule_id) {
+        supabase.from('reconciliation_rules')
+          .update({ confidence: Math.max(0, (suggestion.match_score / 100) - 0.05), reject_count: 1 })
+          .eq('id', suggestion.rule_id)
+          .then(({ error: ruleErr }) => {
+            if (ruleErr) console.warn('[rejectSuggestion] rule degrade error:', ruleErr)
+          })
+      }
 
       toast.success('Suggerimento rifiutato')
       setSuggestions(prev => prev.filter(s => s.id !== suggestion.id))
@@ -2760,6 +2793,27 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
               )}
             </div>
           </div>
+
+          {/* Amount note (Miglioria 5) */}
+          {typeof suggestion.suggestion_data?.amount_note === 'string' && (
+            <div className="mt-1.5 inline-flex items-center gap-1 text-[10px] bg-amber-50 text-amber-700 border border-amber-200 rounded px-1.5 py-0.5">
+              {suggestion.suggestion_data.amount_note}
+            </div>
+          )}
+
+          {/* Cumulative payment indicator (Miglioria 1) */}
+          {suggestion.suggestion_data?.level === 'cumulative' && (
+            <div className="mt-1 inline-flex items-center gap-1 text-[10px] bg-blue-50 text-blue-700 border border-blue-200 rounded px-1.5 py-0.5">
+              Pagamento cumulativo
+            </div>
+          )}
+
+          {/* Rule-based match indicator (Miglioria 3) */}
+          {suggestion.suggestion_data?.level === 'rule' && (
+            <div className="mt-1 inline-flex items-center gap-1 text-[10px] bg-green-50 text-green-700 border border-green-200 rounded px-1.5 py-0.5">
+              Regola: {String(suggestion.suggestion_data.rule_name ?? 'appresa')}
+            </div>
+          )}
 
           {/* Match reason (expandable) */}
           <button

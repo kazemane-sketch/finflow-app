@@ -6,20 +6,21 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useAuth } from '@/hooks/useAuth'
 import { useCompany } from '@/hooks/useCompany'
-import { Settings, Building2, Landmark, Pencil, Trash2, Plus, X, AlertTriangle, CheckCircle, Tag, FolderKanban, BookOpen } from 'lucide-react'
+import { Settings, Building2, Landmark, Pencil, Trash2, Plus, X, AlertTriangle, CheckCircle, Tag, FolderKanban, BookOpen, Brain, Loader2 } from 'lucide-react'
 import { supabase } from '@/integrations/supabase/client'
 import { saveOpeningBalance } from '@/lib/bankParser'
 import CategoriesTab from '@/components/settings/CategoriesTab'
 import ProjectsTab from '@/components/settings/ProjectsTab'
 import ChartOfAccountsTab from '@/components/settings/ChartOfAccountsTab'
 
-type SettingsTab = 'generale' | 'categorie' | 'progetti' | 'piano-conti'
+type SettingsTab = 'generale' | 'categorie' | 'progetti' | 'piano-conti' | 'istruzioni-ai'
 
 const TABS: { key: SettingsTab; label: string; icon: typeof Settings }[] = [
   { key: 'generale', label: 'Generale', icon: Settings },
   { key: 'categorie', label: 'Categorie', icon: Tag },
   { key: 'progetti', label: 'Centri di Costo', icon: FolderKanban },
   { key: 'piano-conti', label: 'Piano dei Conti', icon: BookOpen },
+  { key: 'istruzioni-ai', label: 'Istruzioni AI', icon: Brain },
 ]
 
 // ============================================================
@@ -142,6 +143,177 @@ function DeleteBankModal({ name, onConfirm, onCancel }: {
         </div>
       </div>
     </div>
+  )
+}
+
+// ============================================================
+// INSTRUCTIONS TAB
+// ============================================================
+const SCOPE_LABELS: Record<string, string> = {
+  general: 'Generale',
+  counterparty: 'Controparte',
+  category: 'Categoria',
+  classification: 'Classificazione',
+  reconciliation: 'Riconciliazione',
+}
+
+const SCOPE_COLORS: Record<string, string> = {
+  general: 'bg-gray-100 text-gray-700',
+  counterparty: 'bg-blue-100 text-blue-700',
+  category: 'bg-green-100 text-green-700',
+  classification: 'bg-purple-100 text-purple-700',
+  reconciliation: 'bg-amber-100 text-amber-700',
+}
+
+function InstructionsTab({ companyId }: { companyId: string }) {
+  const [instructions, setInstructions] = useState<Array<{
+    id: string; scope: string; scope_ref: string | null; instruction: string;
+    source: string; created_at: string; counterparty_name?: string
+  }>>([])
+  const [loading, setLoading] = useState(true)
+  const [newInstruction, setNewInstruction] = useState('')
+  const [newScope, setNewScope] = useState('general')
+
+  const loadInstructions = useCallback(async () => {
+    setLoading(true)
+    try {
+      const { data } = await supabase
+        .from('user_instructions')
+        .select('id, scope, scope_ref, instruction, source, created_at')
+        .eq('company_id', companyId)
+        .eq('active', true)
+        .order('scope')
+        .order('created_at', { ascending: true })
+
+      // Resolve counterparty names for scope_ref
+      const items = data || []
+      const cpRefs = items.filter(i => i.scope === 'counterparty' && i.scope_ref).map(i => i.scope_ref!)
+      let cpNames: Record<string, string> = {}
+      if (cpRefs.length > 0) {
+        const { data: cps } = await supabase
+          .from('counterparties')
+          .select('id, name')
+          .in('id', cpRefs)
+        if (cps) cpNames = Object.fromEntries(cps.map(c => [c.id, c.name]))
+      }
+
+      setInstructions(items.map(i => ({
+        ...i,
+        counterparty_name: i.scope_ref ? cpNames[i.scope_ref] : undefined,
+      })))
+    } catch { /* ignore */ }
+    setLoading(false)
+  }, [companyId])
+
+  useEffect(() => { loadInstructions() }, [loadInstructions])
+
+  const addInstruction = async () => {
+    if (!newInstruction.trim()) return
+    await supabase.from('user_instructions').insert({
+      company_id: companyId,
+      scope: newScope,
+      instruction: newInstruction.trim(),
+      source: 'manual',
+    })
+    setNewInstruction('')
+    loadInstructions()
+  }
+
+  const removeInstruction = async (id: string) => {
+    await supabase.from('user_instructions').update({ active: false }).eq('id', id)
+    loadInstructions()
+  }
+
+  // Group by scope
+  const grouped = instructions.reduce<Record<string, typeof instructions>>((acc, inst) => {
+    const key = inst.scope
+    if (!acc[key]) acc[key] = []
+    acc[key].push(inst)
+    return acc
+  }, {})
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base flex items-center gap-2">
+          <Brain className="h-4 w-4 text-purple-600" />
+          Istruzioni AI
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-xs text-gray-500">
+          Le istruzioni vengono applicate automaticamente a tutte le classificazioni AI e sessioni chat.
+          Puoi salvarle anche dalla chat AI dicendo cose come "ricorda che le fatture X sono sempre Y".
+        </p>
+
+        {/* Add new instruction */}
+        <div className="flex gap-2 items-end">
+          <div className="flex-1">
+            <Label className="text-xs">Nuova istruzione</Label>
+            <Input
+              value={newInstruction}
+              onChange={(e) => setNewInstruction(e.target.value)}
+              placeholder="Es: le fatture CREDEMLEASING sono sempre leasing veicoli"
+              className="mt-1"
+              onKeyDown={(e) => e.key === 'Enter' && addInstruction()}
+            />
+          </div>
+          <select
+            value={newScope}
+            onChange={(e) => setNewScope(e.target.value)}
+            className="h-9 border rounded-md px-2 text-xs"
+          >
+            <option value="general">Generale</option>
+            <option value="classification">Classificazione</option>
+            <option value="reconciliation">Riconciliazione</option>
+          </select>
+          <Button size="sm" onClick={addInstruction} disabled={!newInstruction.trim()}>
+            <Plus className="h-3.5 w-3.5 mr-1" />Aggiungi
+          </Button>
+        </div>
+
+        {loading && (
+          <div className="flex items-center justify-center py-8">
+            <Loader2 className="h-5 w-5 animate-spin text-purple-400" />
+          </div>
+        )}
+
+        {!loading && instructions.length === 0 && (
+          <p className="text-sm text-gray-400 text-center py-6">Nessuna istruzione salvata</p>
+        )}
+
+        {!loading && Object.entries(grouped).map(([scope, items]) => (
+          <div key={scope} className="space-y-1.5">
+            <h3 className="text-xs font-semibold text-gray-600 flex items-center gap-1.5">
+              <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ${SCOPE_COLORS[scope] || SCOPE_COLORS.general}`}>
+                {SCOPE_LABELS[scope] || scope}
+              </span>
+              <span className="text-gray-400">({items.length})</span>
+            </h3>
+            {items.map((inst) => (
+              <div key={inst.id} className="flex items-start gap-2 bg-gray-50 rounded-lg px-3 py-2 group">
+                <span className="flex-1 text-sm text-gray-700">
+                  {inst.instruction}
+                  {inst.counterparty_name && (
+                    <span className="text-xs text-blue-500 ml-1.5">({inst.counterparty_name})</span>
+                  )}
+                </span>
+                <span className="text-[10px] text-gray-400 shrink-0 mt-0.5">
+                  {inst.source === 'ai_chat' ? 'da chat' : 'manuale'}
+                </span>
+                <button
+                  onClick={() => removeInstruction(inst.id)}
+                  className="text-gray-300 hover:text-red-500 shrink-0 mt-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                  title="Rimuovi"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        ))}
+      </CardContent>
+    </Card>
   )
 }
 
@@ -291,7 +463,8 @@ export default function ImpostazioniPage() {
       {activeTab === 'categorie' && companyId && <CategoriesTab companyId={companyId} />}
       {activeTab === 'progetti' && companyId && <ProjectsTab companyId={companyId} />}
       {activeTab === 'piano-conti' && companyId && <ChartOfAccountsTab companyId={companyId} />}
-      {(activeTab === 'categorie' || activeTab === 'progetti' || activeTab === 'piano-conti') && !companyId && (
+      {activeTab === 'istruzioni-ai' && companyId && <InstructionsTab companyId={companyId} />}
+      {(activeTab === 'categorie' || activeTab === 'progetti' || activeTab === 'piano-conti' || activeTab === 'istruzioni-ai') && !companyId && (
         <p className="text-sm text-gray-400 text-center py-8">Importa almeno una fattura per configurare le classificazioni</p>
       )}
 

@@ -24,6 +24,7 @@ import {
 } from '@/lib/counterpartyService'
 import { useAIJob } from '@/hooks/useAIJob'
 import { fmtDate, fmtEur } from '@/lib/utils'
+import { supabase } from '@/integrations/supabase/client'
 import {
   Users,
   Plus,
@@ -36,6 +37,8 @@ import {
   Sparkles,
   Building2,
   Loader2,
+  Brain,
+  Trash2,
 } from 'lucide-react'
 import {
   ResponsiveContainer,
@@ -409,6 +412,11 @@ export default function ContropartiPage() {
   }>>([])
   const [linkedInstallments, setLinkedInstallments] = useState<CounterpartyInstallmentFlowRow[]>([])
 
+  // User instructions for this counterparty
+  const [cpInstructions, setCpInstructions] = useState<Array<{ id: string; instruction: string; created_at: string }>>([])
+  const [newInstruction, setNewInstruction] = useState('')
+  const [instructionsLoading, setInstructionsLoading] = useState(false)
+
   const [draft, setDraft] = useState<{
     name: string
     status: CounterpartyStatus
@@ -587,6 +595,47 @@ export default function ContropartiPage() {
   useEffect(() => {
     reloadLinkedInstallments()
   }, [reloadLinkedInstallments])
+
+  // ─── User instructions for focused counterparty ───
+  const loadCpInstructions = useCallback(async () => {
+    if (!companyId || !focusedId) {
+      setCpInstructions([])
+      return
+    }
+    setInstructionsLoading(true)
+    try {
+      const { data } = await supabase
+        .from('user_instructions')
+        .select('id, instruction, created_at')
+        .eq('company_id', companyId)
+        .eq('scope', 'counterparty')
+        .eq('scope_ref', focusedId)
+        .eq('active', true)
+        .order('created_at', { ascending: true })
+      setCpInstructions(data || [])
+    } catch { /* ignore */ }
+    setInstructionsLoading(false)
+  }, [companyId, focusedId])
+
+  useEffect(() => { loadCpInstructions() }, [loadCpInstructions])
+
+  const addCpInstruction = useCallback(async () => {
+    if (!companyId || !focusedId || !newInstruction.trim()) return
+    await supabase.from('user_instructions').insert({
+      company_id: companyId,
+      scope: 'counterparty',
+      scope_ref: focusedId,
+      instruction: newInstruction.trim(),
+      source: 'manual',
+    })
+    setNewInstruction('')
+    loadCpInstructions()
+  }, [companyId, focusedId, newInstruction, loadCpInstructions])
+
+  const removeCpInstruction = useCallback(async (id: string) => {
+    await supabase.from('user_instructions').update({ active: false }).eq('id', id)
+    loadCpInstructions()
+  }, [loadCpInstructions])
 
   const analyticsSourceRows = useMemo(() => {
     if (analyticsDateMode === 'payment_date') {
@@ -1300,6 +1349,46 @@ export default function ContropartiPage() {
                       onChange={(e) => setDraft((d) => d ? ({ ...d, notes: e.target.value }) : d)}
                       className="w-full mt-1 border rounded-md px-3 py-2 text-sm min-h-[70px]"
                     />
+                  </div>
+                </div>
+
+                {/* ─── Istruzioni AI per controparte ─── */}
+                <div className="border rounded-lg p-3 space-y-2 bg-purple-50/50">
+                  <div className="flex items-center gap-1.5">
+                    <Brain className="h-3.5 w-3.5 text-purple-600" />
+                    <Label className="text-xs font-medium text-purple-700">Istruzioni AI</Label>
+                    {instructionsLoading && <Loader2 className="h-3 w-3 animate-spin text-purple-400" />}
+                  </div>
+                  <p className="text-[10px] text-purple-500 -mt-1">Regole applicate automaticamente a classificazione e chat AI per questa controparte.</p>
+
+                  {cpInstructions.length > 0 && (
+                    <ul className="space-y-1">
+                      {cpInstructions.map((inst) => (
+                        <li key={inst.id} className="flex items-start gap-1.5 text-xs text-gray-700 bg-white rounded px-2 py-1.5">
+                          <span className="flex-1">{inst.instruction}</span>
+                          <button
+                            onClick={() => removeCpInstruction(inst.id)}
+                            className="text-gray-400 hover:text-red-500 shrink-0 mt-0.5"
+                            title="Rimuovi"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+
+                  <div className="flex gap-1.5">
+                    <Input
+                      value={newInstruction}
+                      onChange={(e) => setNewInstruction(e.target.value)}
+                      placeholder="Es: le fatture sono sempre leasing veicoli"
+                      className="text-xs h-7"
+                      onKeyDown={(e) => e.key === 'Enter' && addCpInstruction()}
+                    />
+                    <Button size="sm" variant="outline" className="h-7 px-2 shrink-0" onClick={addCpInstruction} disabled={!newInstruction.trim()}>
+                      <Plus className="h-3 w-3" />
+                    </Button>
                   </div>
                 </div>
 
