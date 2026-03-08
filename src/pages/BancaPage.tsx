@@ -919,11 +919,16 @@ export default function BancaPage() {
   const runAnalyze = useCallback(() => {
     if (!companyId) return
     analyzeStartOrStop(async (signal, updateProgress) => {
+      const accessToken = await getValidAccessToken()
       let totalProcessed = 0
       while (!signal.aborted) {
         const res = await fetch(`${SUPABASE_URL}/functions/v1/analyze-bank-transactions`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
+          headers: {
+            'Content-Type': 'application/json',
+            'apikey': SUPABASE_ANON_KEY,
+            'Authorization': `Bearer ${accessToken}`,
+          },
           body: JSON.stringify({ company_id: companyId, batch_size: 30 }),
           signal,
         })
