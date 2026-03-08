@@ -98,7 +98,19 @@ function triageDeterministic(
   )
     return "giro_conto";
 
-  // Commissioni, spese, interessi bancari
+  // Pagamenti: disposizioni, bonifici (PRIMA delle commissioni!)
+  // "Disposizione di pagamento con commissioni" è un PAGAMENTO, non una commissione
+  if (
+    desc.includes("DISPOSIZIONE DI PAGAMENTO") ||
+    desc.includes("VOSTRA DISPOSIZIONE A FAVORE") ||
+    desc.includes("BONIFICO A FAVORE") ||
+    desc.includes("BONIFICO DISPOSTO") ||
+    desc.includes("VS.DISPOSIZIONE A FAVORE") ||
+    desc.includes("VS DISPOSIZIONE A FAVORE")
+  )
+    return "invoice_payment";
+
+  // Commissioni, spese, interessi bancari (solo se NON è un pagamento — check sopra)
   if (
     desc.includes("COMMISSIONI") ||
     desc.includes("SPESE TENUTA") ||
