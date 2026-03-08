@@ -2069,25 +2069,49 @@ export default function FatturePage() {
     extractionStartOrStop(async (signal, updateProgress) => {
       let totalProcessed = 0;
       const token = await getValidAccessToken();
+      const BATCH = 10;
       while (!signal.aborted) {
-        const res = await fetch(`${SUPABASE_URL}/functions/v1/invoice-extract-summary`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'apikey': SUPABASE_ANON_KEY,
-            'Authorization': `Bearer ${token}`,
-          },
-          body: JSON.stringify({ company_id: companyId, batch_size: 50 }),
-          signal,
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-        totalProcessed += (data.processed || 0);
-        const totalRemaining = totalProcessed + (data.total_pending || 0);
-        updateProgress(totalProcessed, totalRemaining);
-        if ((data.total_pending || 0) <= 0) break;
+        // Fetch batch of unclassified invoices
+        const { data: pending, error: fetchErr } = await supabase
+          .from('invoices')
+          .select('id, counterparty, direction')
+          .eq('company_id', companyId)
+          .or('classification_status.is.null,classification_status.eq.pending')
+          .limit(BATCH);
+        if (fetchErr) throw new Error(fetchErr.message);
+        if (!pending || pending.length === 0) break;
+
+        for (const inv of pending) {
+          if (signal.aborted) break;
+          const { data: lines } = await supabase
+            .from('invoice_lines')
+            .select('id, description, quantity, unit_price, total_price')
+            .eq('invoice_id', inv.id);
+          if (!lines || lines.length === 0) { totalProcessed++; continue; }
+          const cp = inv.counterparty as Record<string, string> | null;
+          await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
+            body: JSON.stringify({
+              company_id: companyId, invoice_id: inv.id,
+              lines: lines.map(l => ({ line_id: l.id, description: l.description || '', quantity: l.quantity, unit_price: l.unit_price, total_price: l.total_price })),
+              direction: inv.direction || 'in', counterparty_name: cp?.denom || '',
+            }),
+            signal,
+          });
+          totalProcessed++;
+          updateProgress(totalProcessed, totalProcessed + Math.max(0, pending.length - 1));
+        }
+
+        // Re-count remaining
+        const { count } = await supabase
+          .from('invoices')
+          .select('id', { count: 'exact', head: true })
+          .eq('company_id', companyId)
+          .or('classification_status.is.null,classification_status.eq.pending');
+        updateProgress(totalProcessed, totalProcessed + (count || 0));
+        if ((count || 0) <= 0) break;
       }
-      // Refresh stats after completion
       loadExtStats(companyId, invoices.length);
     });
   }, [companyId, invoices.length, extractionStartOrStop]);

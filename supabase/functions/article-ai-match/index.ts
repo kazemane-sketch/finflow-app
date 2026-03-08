@@ -1,3 +1,4 @@
+// DEPRECATED: Sostituita da classify-invoice-lines. Non chiamata dal frontend.
 // article-ai-match — Haiku Level 3 article matching for ambiguous lines
 // Level 2 (RAG): search learning_examples via Gemini embedding before calling Haiku
 // Pattern: same as classification-ai-suggest (postgres npm, CORS, ANTHROPIC_API_KEY)

@@ -1,3 +1,4 @@
+// DEPRECATED: Sostituita da classify-invoice-lines. Non chiamata dal frontend.
 import postgres from "npm:postgres@3.4.5";
 
 const corsHeaders = {

@@ -2,22 +2,34 @@
 // Estrazione movimenti bancari da PDF con Gemini + SSE progress.
 // Robustezza: chunk piccoli, retry/backoff, parse JSON tollerante.
 import { PDFDocument } from "npm:pdf-lib";
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+import {
+  corsHeaders,
+  type PostingSide,
+  type Direction,
+  type DirectionSource,
+  type AmountSignExplicit,
+  type DirectionInference,
+  type SideSource,
+  type SemanticKeyword,
+  IN_KEYWORDS,
+  OUT_KEYWORDS,
+  sseData,
+  delay,
+  toNumber,
+  clip,
+  normType,
+  normalizeText,
+  roundConfidence,
+  detectExplicitAmountSign,
+  normalizePostingSide,
+  scoreKeywords,
+  expectedDirectionFromType,
+  tryParseAnyJson,
+} from "../_shared/bank-pdf-common.ts";
 
 const MODEL = Deno.env.get("GEMINI_MODEL") ?? "gemini-2.5-flash";
 const CHUNK_SIZE = Number(Deno.env.get("PDF_CHUNK_PAGES") ?? "1");
 const MAX_OUTPUT_TOKENS = Number(Deno.env.get("GEMINI_MAX_OUTPUT_TOKENS") ?? "32768");
-
-type PostingSide = "dare" | "avere" | "unknown";
-type Direction = "in" | "out";
-type DirectionSource = "side_rule" | "semantic_rule" | "amount_fallback" | "manual";
-type AmountSignExplicit = "minus" | "plus_or_none" | "unknown";
 
 type Tx = {
   date: string;
@@ -48,50 +60,6 @@ type GeminiChunkResult = {
   rawParsedCount: number;
   droppedMissingRequiredCount: number;
 };
-
-type SemanticKeyword = { needle: string; weight: number };
-
-type DirectionInference = {
-  direction: Direction;
-  source: DirectionSource;
-  confidence: number;
-  needsReview: boolean;
-  reason: string;
-};
-
-type SideSource = "explicit" | "inferred" | "unknown";
-
-const OUT_KEYWORDS: SemanticKeyword[] = [
-  { needle: "vostra disposizione a favore", weight: 2.8 },
-  { needle: "bonifico a favore", weight: 2.4 },
-  { needle: "addebito", weight: 2.3 },
-  { needle: "effetti ritirati pagati", weight: 2.7 },
-  { needle: "effetti ritirati", weight: 1.8 },
-  { needle: "f24", weight: 2.4 },
-  { needle: "commissioni", weight: 1.7 },
-  { needle: "commissione", weight: 1.6 },
-  { needle: "rid", weight: 1.8 },
-  { needle: "sdd", weight: 1.8 },
-  { needle: "prelievo", weight: 2.2 },
-  { needle: "pagamento", weight: 1.4 },
-  { needle: "assegno", weight: 1.5 },
-  { needle: "giroconto", weight: 1.2 },
-  { needle: "disposizione filiale disponente", weight: 2.0 },
-];
-
-const IN_KEYWORDS: SemanticKeyword[] = [
-  { needle: "a vostro favore", weight: 2.8 },
-  { needle: "bonifico a vostro favore", weight: 2.8 },
-  { needle: "accredito", weight: 2.2 },
-  { needle: "stipendio", weight: 2.2 },
-  { needle: "interessi a credito", weight: 2.6 },
-  { needle: "interessi creditori", weight: 2.2 },
-  { needle: "incasso", weight: 1.8 },
-  { needle: "versamento", weight: 1.8 },
-  { needle: "rimborso", weight: 1.5 },
-  { needle: "riaccredito", weight: 2.2 },
-  { needle: "saldo a credito", weight: 2.0 },
-];
 
 const PROMPT = `Sei un parser contabile italiano.
 Estrai i movimenti bancari presenti nel PDF (estratto conto MPS o simile).
@@ -131,99 +99,6 @@ Regole importanti:
 - Se posting_side non è determinabile metti "unknown".
 - Se non trovi movimenti, restituisci {"transactions":[]}.`;
 
-function sseData(controller: ReadableStreamDefaultController<Uint8Array>, data: unknown) {
-  const enc = new TextEncoder();
-  controller.enqueue(enc.encode(`data: ${JSON.stringify(data)}\n\n`));
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function toNumber(v: unknown): number | null {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v !== "string") return null;
-  const s = v.trim();
-  if (!s) return null;
-  const normalized = s
-    .replace(/\s/g, "")
-    .replace(/[€]/g, "")
-    .replace(/\.(?=\d{3}(\D|$))/g, "")
-    .replace(",", ".")
-    .replace(/[^0-9+-.]/g, "");
-  const n = Number(normalized);
-  return Number.isFinite(n) ? n : null;
-}
-
-function clip(v: unknown, max: number): string | null {
-  if (typeof v !== "string") return null;
-  const t = v.trim();
-  if (!t) return null;
-  return t.length > max ? t.slice(0, max) : t;
-}
-
-function normType(v: unknown): string {
-  const allowed = new Set([
-    "bonifico_in",
-    "bonifico_out",
-    "riba",
-    "sdd",
-    "pos",
-    "prelievo",
-    "commissione",
-    "stipendio",
-    "f24",
-    "altro",
-  ]);
-  const t = typeof v === "string" ? v.trim().toLowerCase() : "";
-  return allowed.has(t) ? t : "altro";
-}
-
-function normalizeText(v: unknown): string {
-  return String(v ?? "")
-    .toLowerCase()
-    .replace(/[\n\r\t]+/g, " ")
-    .replace(/[^a-z0-9àèéìòù\s./-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function roundConfidence(v: number): number {
-  const bounded = Math.min(1, Math.max(0, v));
-  return Math.round(bounded * 100) / 100;
-}
-
-function detectExplicitAmountSign(amountTextRaw: string | null): AmountSignExplicit {
-  if (!amountTextRaw) return "unknown";
-  const s = amountTextRaw.trim();
-  if (!s) return "unknown";
-  if (/^[\s]*-/.test(s) || /^[\s]*\(/.test(s)) return "minus";
-  return "plus_or_none";
-}
-
-function normalizePostingSide(v: unknown): PostingSide {
-  const s = normalizeText(v);
-  if (!s) return "unknown";
-
-  if (
-    s === "d" ||
-    s === "dare" ||
-    s.includes("mov dare") ||
-    s.includes("movimento dare") ||
-    s.includes("colonna dare")
-  ) return "dare";
-
-  if (
-    s === "a" ||
-    s === "avere" ||
-    s.includes("mov avere") ||
-    s.includes("movimento avere") ||
-    s.includes("colonna avere")
-  ) return "avere";
-
-  return "unknown";
-}
-
 function inferPostingSideFromText(text: string): PostingSide {
   const hasDare = /\bmov\.?\s*dare\b|\bmovimento\s*dare\b|\bdare\b/.test(text);
   const hasAvere = /\bmov\.?\s*avere\b|\bmovimento\s*avere\b|\bavere\b/.test(text);
@@ -239,35 +114,6 @@ function normalizeDirection(v: unknown): Direction | null {
   if (s === "in" || s.includes("entrata") || s.includes("accredito")) return "in";
   if (s === "out" || s.includes("uscita") || s.includes("addebito")) return "out";
   return null;
-}
-
-function expectedDirectionFromType(txType: string): Direction | null {
-  switch (txType) {
-    case "bonifico_in":
-    case "stipendio":
-      return "in";
-    case "bonifico_out":
-    case "sdd":
-    case "pos":
-    case "prelievo":
-    case "commissione":
-    case "f24":
-      return "out";
-    default:
-      return null;
-  }
-}
-
-function scoreKeywords(text: string, rules: SemanticKeyword[]): { score: number; hits: string[] } {
-  let score = 0;
-  const hits: string[] = [];
-  for (const rule of rules) {
-    if (text.includes(rule.needle)) {
-      score += rule.weight;
-      hits.push(rule.needle);
-    }
-  }
-  return { score, hits };
 }
 
 function inferDirectionFromSemantic(text: string, llmDirection: Direction | null): DirectionInference | null {
@@ -450,58 +296,6 @@ function sanitizeTx(x: any): Tx | null {
     direction_needs_review: directionDecision.needsReview,
     direction_reason: clip(directionDecision.reason, 240) || "Direzione determinata automaticamente",
   };
-}
-
-function normalizePayload(payload: any): any[] {
-  if (Array.isArray(payload)) return payload;
-  if (payload && Array.isArray(payload.transactions)) return payload.transactions;
-  if (payload && Array.isArray(payload.movimenti)) return payload.movimenti;
-  if (payload?.data && Array.isArray(payload.data.transactions)) return payload.data.transactions;
-  if (payload?.result && Array.isArray(payload.result.transactions)) return payload.result.transactions;
-  return [];
-}
-
-function tryParseAnyJson(text: string): any[] {
-  const s = text.replace(/```json/gi, "").replace(/```/g, "").trim();
-  if (!s) return [];
-
-  try {
-    return normalizePayload(JSON.parse(s));
-  } catch {
-    // continue
-  }
-
-  const arrayStart = s.indexOf("[");
-  const arrayEnd = s.lastIndexOf("]");
-  if (arrayStart >= 0 && arrayEnd > arrayStart) {
-    try {
-      return normalizePayload(JSON.parse(s.slice(arrayStart, arrayEnd + 1)));
-    } catch {
-      // continue
-    }
-  }
-
-  const objStart = s.indexOf("{");
-  const objEnd = s.lastIndexOf("}");
-  if (objStart >= 0 && objEnd > objStart) {
-    try {
-      return normalizePayload(JSON.parse(s.slice(objStart, objEnd + 1)));
-    } catch {
-      // continue
-    }
-  }
-
-  const lastComplete = s.lastIndexOf("},");
-  if (lastComplete > 0) {
-    const candidate = `${s.slice(0, lastComplete + 1)}]`;
-    try {
-      return normalizePayload(JSON.parse(candidate));
-    } catch {
-      // continue
-    }
-  }
-
-  return [];
 }
 
 async function splitPdfIntoChunks(pdfBase64: string, chunkSize = CHUNK_SIZE): Promise<{ chunks: string[]; totalPages: number }> {

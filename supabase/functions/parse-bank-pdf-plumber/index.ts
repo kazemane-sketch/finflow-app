@@ -1,11 +1,24 @@
 import { PDFDocument } from "npm:pdf-lib";
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+import {
+  corsHeaders,
+  type PostingSide,
+  type Direction,
+  type DirectionSource,
+  type AmountSignExplicit,
+  IN_KEYWORDS,
+  OUT_KEYWORDS,
+  sseData,
+  delay,
+  toNumber,
+  clip,
+  normType,
+  normalizeText,
+  roundConfidence,
+  detectExplicitAmountSign,
+  normalizePostingSide,
+  scoreKeywords,
+  expectedDirectionFromType,
+} from "../_shared/bank-pdf-common.ts";
 
 const CHUNK_SIZE = Number(Deno.env.get("PDF_PLUMBER_CHUNK_PAGES") ?? Deno.env.get("PDF_CHUNK_PAGES") ?? "6");
 const PARSER_TIMEOUT_MS = Number(Deno.env.get("PDF_PARSER_TIMEOUT_MS") ?? "120000");
@@ -15,10 +28,6 @@ const LLM_ENRICH_BATCH_SIZE = 20;
 const DESCRIPTION_CONFIDENCE_THRESHOLD = 0.6;
 const COUNTERPARTY_CONFIDENCE_THRESHOLD = 0.7;
 
-type PostingSide = "dare" | "avere" | "unknown";
-type Direction = "in" | "out";
-type DirectionSource = "side_rule" | "semantic_rule" | "amount_fallback" | "manual";
-type AmountSignExplicit = "minus" | "plus_or_none" | "unknown";
 type CounterpartySource = "regex" | "heuristic" | "llm" | "parser_seed" | "unknown";
 type DescriptionSource = "llm" | "parser_fallback";
 type RawIntegrity = "complete" | "suspect";
@@ -126,31 +135,6 @@ type DirectionDecision = {
   reason: string;
 };
 
-type Keyword = { needle: string; weight: number };
-
-const OUT_KEYWORDS: Keyword[] = [
-  { needle: "vostra disposizione a favore", weight: 2.8 },
-  { needle: "bonifico a favore", weight: 2.4 },
-  { needle: "addebito", weight: 2.3 },
-  { needle: "effetti ritirati", weight: 2.5 },
-  { needle: "f24", weight: 2.4 },
-  { needle: "commissioni", weight: 1.7 },
-  { needle: "rid", weight: 1.8 },
-  { needle: "sdd", weight: 1.8 },
-  { needle: "prelievo", weight: 2.1 },
-  { needle: "pagamento", weight: 1.4 },
-];
-
-const IN_KEYWORDS: Keyword[] = [
-  { needle: "a vostro favore", weight: 2.8 },
-  { needle: "accredito", weight: 2.2 },
-  { needle: "stipendio", weight: 2.2 },
-  { needle: "interessi a credito", weight: 2.6 },
-  { needle: "incasso", weight: 1.8 },
-  { needle: "versamento", weight: 1.7 },
-  { needle: "rimborso", weight: 1.5 },
-];
-
 const INVALID_COUNTERPARTY_VALUES = new Set([
   "",
   "n.d.",
@@ -189,53 +173,8 @@ const COUNTERPARTY_STOP_MARKERS = [
   "caus:",
 ];
 
-function sseData(controller: ReadableStreamDefaultController<Uint8Array>, data: unknown) {
-  const enc = new TextEncoder();
-  controller.enqueue(enc.encode(`data: ${JSON.stringify(data)}\n\n`));
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function round2(v: number): number {
   return Math.round(v * 100) / 100;
-}
-
-function roundConfidence(v: number): number {
-  const bounded = Math.min(1, Math.max(0, v));
-  return round2(bounded);
-}
-
-function toNumber(v: unknown): number | null {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v !== "string") return null;
-  const s = v.trim();
-  if (!s) return null;
-  const normalized = s
-    .replace(/\s/g, "")
-    .replace(/[€]/g, "")
-    .replace(/\.(?=\d{3}(\D|$))/g, "")
-    .replace(",", ".")
-    .replace(/[^0-9+-.]/g, "");
-  const n = Number(normalized);
-  return Number.isFinite(n) ? n : null;
-}
-
-function clip(v: unknown, max: number): string | null {
-  if (typeof v !== "string") return null;
-  const t = v.trim();
-  if (!t) return null;
-  return t.length > max ? t.slice(0, max) : t;
-}
-
-function normalizeText(v: unknown): string {
-  return String(v ?? "")
-    .toLowerCase()
-    .replace(/[\n\r\t]+/g, " ")
-    .replace(/[^a-z0-9àèéìòù\s./-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
 }
 
 function normalizeCounterpartySource(v: unknown): CounterpartySource {
@@ -329,71 +268,9 @@ function counterpartyCanUseLlm(txType: string): boolean {
     txType === "altro";
 }
 
-function detectExplicitAmountSign(amountTextRaw: string | null): AmountSignExplicit {
-  if (!amountTextRaw) return "unknown";
-  const s = amountTextRaw.trim();
-  if (!s) return "unknown";
-  if (/^[\s]*-/.test(s) || /^[\s]*\(/.test(s)) return "minus";
-  return "plus_or_none";
-}
-
-function normalizePostingSide(v: unknown): PostingSide {
-  const s = normalizeText(v);
-  if (!s) return "unknown";
-  if (s === "dare" || s.includes("dare") || s === "d") return "dare";
-  if (s === "avere" || s.includes("avere") || s === "a") return "avere";
-  return "unknown";
-}
-
 function normalizeRawIntegrity(v: unknown): RawIntegrity {
   const s = normalizeText(v);
   return s === "suspect" ? "suspect" : "complete";
-}
-
-function normType(v: unknown): string {
-  const allowed = new Set([
-    "bonifico_in",
-    "bonifico_out",
-    "riba",
-    "sdd",
-    "pos",
-    "prelievo",
-    "commissione",
-    "stipendio",
-    "f24",
-    "altro",
-  ]);
-  const t = typeof v === "string" ? v.trim().toLowerCase() : "";
-  return allowed.has(t) ? t : "altro";
-}
-
-function scoreKeywords(text: string, rules: Keyword[]): { score: number; hits: string[] } {
-  let score = 0;
-  const hits: string[] = [];
-  for (const rule of rules) {
-    if (text.includes(rule.needle)) {
-      score += rule.weight;
-      hits.push(rule.needle);
-    }
-  }
-  return { score, hits };
-}
-
-function expectedDirectionFromType(txType: string): Direction | null {
-  switch (txType) {
-    case "bonifico_in":
-    case "stipendio":
-      return "in";
-    case "bonifico_out":
-    case "sdd":
-    case "pos":
-    case "prelievo":
-    case "commissione":
-    case "f24":
-      return "out";
-    default:
-      return null;
-  }
 }
 
 function inferTypeByText(text: string, direction: Direction): string {

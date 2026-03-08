@@ -373,6 +373,8 @@ export default function ArticoliPage() {
                     total_price: l.total_price,
                     invoice_number: l.invoice_number,
                     counterparty_name: l.counterparty_name,
+                    invoice_id: l.invoice_id,
+                    invoice_direction: l.invoice_direction,
                   })),
                 )
               } catch (err) {

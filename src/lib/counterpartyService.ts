@@ -37,6 +37,7 @@ export interface ResolveCounterpartyInput {
   vat_number?: string | null
   fiscal_code?: string | null
   address?: string | null
+  ateco_code?: string | null
   source_context?: string
 }
 
@@ -162,6 +163,17 @@ function inferLegalTypeByRules(input: ResolveCounterpartyInput): {
     return { legalType: 'altro', confidence: 0.35, source: 'rule' }
   }
 
+  // ATECO-based classification (high confidence from structured data)
+  if (input.ateco_code) {
+    const ateco = input.ateco_code.trim()
+    if (ateco.startsWith('84'))
+      return { legalType: 'pa', confidence: 0.90, source: 'rule' }
+    if (['86.2', '69', '71', '73', '74'].some(p => ateco.startsWith(p)))
+      return { legalType: 'professionista', confidence: 0.85, source: 'rule' }
+    if (vatKey)
+      return { legalType: 'azienda', confidence: 0.82, source: 'rule' }
+  }
+
   if (PA_KEYWORDS.some((k) => name.includes(k))) {
     return { legalType: 'pa', confidence: 0.93, source: 'rule' }
   }
@@ -190,35 +202,8 @@ async function inferLegalTypeWithAiFallback(input: ResolveCounterpartyInput): Pr
   confidence: number
   source: CounterpartyClassificationSource
 }> {
-  const rule = inferLegalTypeByRules(input)
-  if (rule.confidence >= 0.74) return rule
-
-  try {
-    const { data, error } = await supabase.functions.invoke('classify-counterparty', {
-      body: {
-        name: input.name,
-        vat_number: input.vat_number || null,
-        fiscal_code: input.fiscal_code || null,
-        address: input.address || null,
-        source_context: input.source_context || 'invoice_import',
-      },
-    })
-
-    if (error) return rule
-
-    const allowed: CounterpartyLegalType[] = ['azienda', 'pa', 'professionista', 'persona', 'altro']
-    const legalType = allowed.includes(data?.legal_type) ? data.legal_type : rule.legalType
-    const confidence = Math.max(0, Math.min(1, safeNum(data?.confidence, rule.confidence)))
-    const source: CounterpartyClassificationSource = data?.source === 'ai' ? 'ai' : 'rule'
-
-    return {
-      legalType,
-      confidence: Number(confidence.toFixed(2)),
-      source,
-    }
-  } catch {
-    return rule
-  }
+  // Deterministic rules only (ATECO + keywords). AI fallback removed.
+  return inferLegalTypeByRules(input)
 }
 
 export async function resolveOrCreateCounterpartyFromInvoice(

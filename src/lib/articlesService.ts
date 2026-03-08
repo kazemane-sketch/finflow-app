@@ -1153,6 +1153,8 @@ export interface AiMatchRequest {
   total_price: number | null
   invoice_number: string | null
   counterparty_name: string | null
+  invoice_id?: string
+  invoice_direction?: string | null
 }
 
 export interface AiMatchResult {
@@ -1164,29 +1166,65 @@ export interface AiMatchResult {
 }
 
 /**
- * Call the article-ai-match edge function for ambiguous lines.
- * Max 20 lines per call. Returns AI classification results.
+ * AI article matching via classify-invoice-lines edge function.
+ * Groups lines by invoice_id, calls the unified classifier, extracts article assignments.
  */
 export async function callArticleAiMatch(
   companyId: string,
   lines: AiMatchRequest[],
 ): Promise<AiMatchResult[]> {
-  const res = await fetch(`${SUPABASE_URL}/functions/v1/article-ai-match`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      apikey: SUPABASE_ANON_KEY,
-    },
-    body: JSON.stringify({ company_id: companyId, lines }),
-  })
-
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}))
-    throw new Error(data.error || `HTTP ${res.status}`)
+  // Group lines by invoice_id (fall back to first line's invoice_id if missing)
+  const byInvoice = new Map<string, AiMatchRequest[]>()
+  for (const line of lines) {
+    const invId = line.invoice_id || 'unknown'
+    if (!byInvoice.has(invId)) byInvoice.set(invId, [])
+    byInvoice.get(invId)!.push(line)
   }
 
-  const data = await res.json()
-  return data.results || []
+  const allResults: AiMatchResult[] = []
+  const { data: { session } } = await supabase.auth.getSession()
+  const token = session?.access_token || ''
+
+  for (const [invoiceId, invoiceLines] of byInvoice) {
+    if (invoiceId === 'unknown') continue
+    try {
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          company_id: companyId,
+          invoice_id: invoiceId,
+          lines: invoiceLines.map(l => ({
+            line_id: l.line_id,
+            description: l.description,
+            quantity: l.quantity,
+            unit_price: l.unit_price,
+            total_price: l.total_price,
+          })),
+          direction: invoiceLines[0]?.invoice_direction || 'in',
+          counterparty_name: invoiceLines[0]?.counterparty_name || '',
+        }),
+      })
+      if (!res.ok) continue
+      const data = await res.json()
+      for (const lr of data.lines || []) {
+        allResults.push({
+          line_id: lr.line_id,
+          article_id: lr.article_id || null,
+          article_code: lr.article_code || null,
+          confidence: (lr.confidence || 0) / 100, // normalize 0-100 → 0-1
+          reasoning: lr.reasoning || '',
+        })
+      }
+    } catch (err) {
+      console.error(`[callArticleAiMatch] classify-invoice-lines error for invoice ${invoiceId}:`, err)
+    }
+  }
+  return allResults
 }
 
 /* ─── Categories helper ──────────────────────── */

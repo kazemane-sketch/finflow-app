@@ -1,3 +1,4 @@
+// DEPRECATED: Sostituita da classify-invoice-lines. Non chiamata dal frontend.
 // classification-ai-suggest — deterministic + RAG + Haiku AI classification for invoices
 // Level 2 (RAG): search learning_examples via Gemini embedding between deterministic and Haiku
 // Pattern: same as reconciliation-generate (postgres npm, CORS, ANTHROPIC_API_KEY)
