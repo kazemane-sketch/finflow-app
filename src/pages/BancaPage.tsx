@@ -924,7 +924,7 @@ export default function BancaPage() {
         const res = await fetch(`${SUPABASE_URL}/functions/v1/analyze-bank-transactions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
-          body: JSON.stringify({ company_id: companyId, batch_size: 30 }),
+          body: JSON.stringify({ company_id: companyId, batch_size: 15 }),
           signal,
         })
         const data = await res.json()
@@ -935,8 +935,8 @@ export default function BancaPage() {
           break
         }
         totalProcessed += batch
-        updateProgress(totalProcessed, totalProcessed + 30)
-        if (batch < 10) break
+        updateProgress(totalProcessed, totalProcessed + 15)
+        if (batch < 5) break
       }
       loadDataRef.current?.(true)
     })
