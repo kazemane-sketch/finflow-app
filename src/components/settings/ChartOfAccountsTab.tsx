@@ -1,14 +1,20 @@
 // src/components/settings/ChartOfAccountsTab.tsx — Tree CRUD for chart of accounts
+// with onboarding wizard (sector template selection) + PDF import
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Plus, Pencil, Trash2, X, AlertTriangle, ChevronDown, ChevronRight, Download } from 'lucide-react';
+import { Plus, Pencil, Trash2, X, AlertTriangle, ChevronDown, ChevronRight, FileText, Loader2, CheckCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
   loadChartOfAccounts, createChartAccount, updateChartAccount, deleteChartAccount,
-  importDefaultChartOfAccounts, SECTION_LABELS,
+  SECTION_LABELS,
   type ChartAccount, type ChartAccountCreate, type CoaSection,
 } from '@/lib/classificationService';
+import {
+  loadTemplateSectors, applyTemplate,
+  type CoaSector, type SectorMeta,
+} from '@/lib/coaTemplateService';
+import ImportCOADialog from '@/components/settings/ImportCOADialog';
 
 // ─── Tree helpers ─────────────────────────────────────────
 
@@ -17,16 +23,13 @@ interface TreeNode extends ChartAccount {
 }
 
 function buildTree(accounts: ChartAccount[]): TreeNode[] {
-  // Group by section, then nest by parent_code
   const roots: TreeNode[] = [];
   const byCode = new Map<string, TreeNode>();
 
-  // First pass: convert to TreeNode
   for (const acc of accounts) {
     byCode.set(acc.code, { ...acc, children: [] });
   }
 
-  // Second pass: nest children under parents
   for (const acc of accounts) {
     const node = byCode.get(acc.code)!;
     if (acc.parent_code && byCode.has(acc.parent_code)) {
@@ -34,7 +37,6 @@ function buildTree(accounts: ChartAccount[]): TreeNode[] {
     } else if (acc.level === 1) {
       roots.push(node);
     } else {
-      // Orphan level 2/3 accounts — try to find parent by code prefix
       let found = false;
       for (const [code, parent] of byCode) {
         if (code !== acc.code && acc.code.startsWith(code) && parent.level < acc.level) {
@@ -85,7 +87,7 @@ function TreeRow({ node, depth, collapsed, onToggle, onEdit, onDelete }: {
             {isOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
           </button>
         ) : (
-          <span className="w-[18px]" /> // spacer
+          <span className="w-[18px]" />
         )}
         <span className={`font-mono text-[11px] min-w-[60px] ${node.is_header ? 'text-gray-900 font-bold' : 'text-sky-700 font-semibold'}`}>
           {node.code}
@@ -115,6 +117,165 @@ function TreeRow({ node, depth, collapsed, onToggle, onEdit, onDelete }: {
   );
 }
 
+// ─── Setup Wizard ─────────────────────────────────────────
+
+function CoaSetupWizard({ companyId, onComplete }: {
+  companyId: string;
+  onComplete: () => void;
+}) {
+  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [sectors, setSectors] = useState<SectorMeta[]>([]);
+  const [selectedSector, setSelectedSector] = useState<CoaSector | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [applying, setApplying] = useState(false);
+  const [appliedCount, setAppliedCount] = useState(0);
+  const [error, setError] = useState('');
+  const [showImportDialog, setShowImportDialog] = useState(false);
+
+  // Load sector metadata
+  useEffect(() => {
+    loadTemplateSectors()
+      .then(setSectors)
+      .catch(e => console.error('Failed to load sectors:', e))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const handleSelectSector = (sector: CoaSector) => {
+    setSelectedSector(sector);
+    setStep(2);
+  };
+
+  const handleApply = async () => {
+    if (!selectedSector) return;
+    setApplying(true);
+    setError('');
+    try {
+      const count = await applyTemplate(companyId, selectedSector);
+      setAppliedCount(count);
+      setStep(3);
+    } catch (e: any) {
+      setError(e.message || 'Errore durante l\'applicazione del template');
+    }
+    setApplying(false);
+  };
+
+  const selectedMeta = sectors.find(s => s.sector === selectedSector);
+
+  if (loading) {
+    return (
+      <div className="text-center py-8">
+        <Loader2 className="h-6 w-6 text-gray-400 animate-spin mx-auto" />
+        <p className="text-sm text-gray-400 mt-2">Caricamento template...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* ─── Step 1: Sector selection ─── */}
+      {step === 1 && (
+        <div className="space-y-4">
+          <div className="text-center space-y-1">
+            <p className="text-sm font-medium text-gray-900">Seleziona il settore della tua azienda</p>
+            <p className="text-xs text-gray-500">
+              Verrà caricato un piano dei conti standard per il tuo settore
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            {sectors.map(s => (
+              <button
+                key={s.sector}
+                onClick={() => handleSelectSector(s.sector)}
+                className="text-left p-4 border-2 border-gray-200 rounded-xl hover:border-sky-400
+                  hover:bg-sky-50/50 transition-all group cursor-pointer"
+              >
+                <div className="text-2xl mb-2">{s.icon}</div>
+                <p className="text-sm font-semibold text-gray-900 group-hover:text-sky-700">{s.label}</p>
+                <p className="text-xs text-gray-500 mt-0.5">{s.description}</p>
+                <p className="text-[10px] text-gray-400 mt-2">~{s.accountCount} conti</p>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ─── Step 2: Confirm & Apply ─── */}
+      {step === 2 && selectedMeta && (
+        <div className="text-center space-y-4 py-4">
+          <div className="text-3xl">{selectedMeta.icon}</div>
+          <div>
+            <p className="text-sm font-semibold text-gray-900">{selectedMeta.label}</p>
+            <p className="text-xs text-gray-500">{selectedMeta.description}</p>
+          </div>
+          <p className="text-sm text-gray-600">
+            Verranno creati <span className="font-semibold text-sky-700">~{selectedMeta.accountCount} conti</span> nel piano dei conti
+          </p>
+          {error && (
+            <p className="text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">{error}</p>
+          )}
+          <div className="flex justify-center gap-3">
+            <Button variant="outline" size="sm" onClick={() => { setStep(1); setError(''); }}>
+              Indietro
+            </Button>
+            <Button size="sm" onClick={handleApply} disabled={applying}>
+              {applying ? (
+                <><Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />Applicazione...</>
+              ) : (
+                <>Applica template ({selectedMeta.accountCount} conti)</>
+              )}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* ─── Step 3: Success + optional PDF import ─── */}
+      {step === 3 && (
+        <div className="text-center space-y-4 py-4">
+          <CheckCircle className="h-10 w-10 text-emerald-500 mx-auto" />
+          <div>
+            <p className="text-sm font-semibold text-gray-900">
+              Template applicato con successo!
+            </p>
+            <p className="text-xs text-gray-500 mt-1">
+              {appliedCount} conti importati nel piano dei conti
+            </p>
+          </div>
+
+          <div className="bg-gray-50 rounded-xl p-4 space-y-2 max-w-sm mx-auto">
+            <p className="text-xs text-gray-600">
+              Vuoi personalizzare il piano dei conti caricando il bilancio della tua azienda?
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setShowImportDialog(true)}
+              className="w-full"
+            >
+              <FileText className="h-3.5 w-3.5 mr-1.5" />
+              Importa da bilancio PDF
+            </Button>
+          </div>
+
+          <Button size="sm" onClick={onComplete}>
+            Chiudi e visualizza piano dei conti
+          </Button>
+
+          {showImportDialog && (
+            <ImportCOADialog
+              companyId={companyId}
+              existingCodes={new Set()} // will be populated after reload
+              open={showImportDialog}
+              onClose={() => setShowImportDialog(false)}
+              onImported={() => { setShowImportDialog(false); onComplete(); }}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Main Component ───────────────────────────────────────
 
 export default function ChartOfAccountsTab({ companyId }: { companyId: string }) {
@@ -123,7 +284,7 @@ export default function ChartOfAccountsTab({ companyId }: { companyId: string })
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [modal, setModal] = useState<{ acc?: ChartAccount } | null>(null);
   const [delModal, setDelModal] = useState<ChartAccount | null>(null);
-  const [importing, setImporting] = useState(false);
+  const [showImportDialog, setShowImportDialog] = useState(false);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -135,6 +296,11 @@ export default function ChartOfAccountsTab({ companyId }: { companyId: string })
   useEffect(() => { reload(); }, [reload]);
 
   const tree = useMemo(() => buildTree(accounts), [accounts]);
+
+  const existingCodes = useMemo(
+    () => new Set(accounts.map(a => a.code)),
+    [accounts]
+  );
 
   const toggleCollapse = (code: string) => {
     setCollapsed(prev => {
@@ -151,54 +317,60 @@ export default function ChartOfAccountsTab({ companyId }: { companyId: string })
     setDelModal(null);
   };
 
-  const handleImport = async () => {
-    if (!confirm('Importare il piano dei conti default CAVECO? (solo se la tabella e vuota)')) return;
-    setImporting(true);
-    try {
-      const count = await importDefaultChartOfAccounts(companyId);
-      alert(`Importati ${count} conti.`);
-      await reload();
-    } catch (e: any) {
-      alert('Errore: ' + e.message);
-    }
-    setImporting(false);
-  };
+  // Show wizard if the chart is empty (or nearly empty)
+  const showWizard = !loading && accounts.length < 5;
 
   return (
     <div className="space-y-4">
+      {/* Header */}
       <div className="flex items-center justify-between">
         <h2 className="text-base font-semibold text-gray-900">Piano dei Conti</h2>
-        <div className="flex gap-2">
-          {accounts.length === 0 && (
-            <Button size="sm" variant="outline" onClick={handleImport} disabled={importing}>
-              <Download className="h-3.5 w-3.5 mr-1.5" />{importing ? 'Importazione...' : 'Importa default'}
+        {!showWizard && (
+          <div className="flex gap-2">
+            <Button size="sm" variant="outline" onClick={() => setShowImportDialog(true)}>
+              <FileText className="h-3.5 w-3.5 mr-1.5" />Importa da bilancio PDF
             </Button>
-          )}
-          <Button size="sm" variant="outline" onClick={() => setModal({})}>
-            <Plus className="h-3.5 w-3.5 mr-1.5" />Nuovo conto
-          </Button>
-        </div>
+            <Button size="sm" variant="outline" onClick={() => setModal({})}>
+              <Plus className="h-3.5 w-3.5 mr-1.5" />Nuovo conto
+            </Button>
+          </div>
+        )}
       </div>
 
-      {loading ? (
+      {/* Loading */}
+      {loading && (
         <p className="text-sm text-gray-400 text-center py-6">Caricamento...</p>
-      ) : accounts.length === 0 ? (
-        <div className="text-center py-8 space-y-2">
-          <p className="text-sm text-gray-400">Nessun conto configurato</p>
-          <p className="text-xs text-gray-400">Clicca "Importa default" per caricare il piano dei conti CAVECO</p>
-        </div>
-      ) : (
-        <div className="border border-gray-200 rounded-lg overflow-hidden">
-          {tree.map(node => (
-            <TreeRow key={node.id} node={node} depth={0} collapsed={collapsed}
-              onToggle={toggleCollapse} onEdit={acc => setModal({ acc })} onDelete={acc => setDelModal(acc)} />
-          ))}
-        </div>
       )}
 
-      {/* Count */}
-      {accounts.length > 0 && (
-        <p className="text-xs text-gray-400 text-right">{accounts.length} conti totali</p>
+      {/* Wizard (when chart is empty) */}
+      {showWizard && (
+        <CoaSetupWizard companyId={companyId} onComplete={reload} />
+      )}
+
+      {/* Tree view (when chart has accounts) */}
+      {!loading && accounts.length >= 5 && (
+        <>
+          <div className="border border-gray-200 rounded-lg overflow-hidden">
+            {tree.map(node => (
+              <TreeRow key={node.id} node={node} depth={0} collapsed={collapsed}
+                onToggle={toggleCollapse} onEdit={acc => setModal({ acc })} onDelete={acc => setDelModal(acc)} />
+            ))}
+          </div>
+
+          {/* Count */}
+          <p className="text-xs text-gray-400 text-right">{accounts.length} conti totali</p>
+        </>
+      )}
+
+      {/* Import dialog */}
+      {showImportDialog && (
+        <ImportCOADialog
+          companyId={companyId}
+          existingCodes={existingCodes}
+          open={showImportDialog}
+          onClose={() => setShowImportDialog(false)}
+          onImported={() => { setShowImportDialog(false); reload(); }}
+        />
       )}
 
       {/* Create/Edit modal */}
