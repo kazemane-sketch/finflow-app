@@ -7,10 +7,19 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const CONCURRENCY = 3;
 const MAX_BATCH = 100;
-const API_TIMEOUT_MS = 10_000;
+const API_TIMEOUT_MS = 15_000;
+
+const TRUSTED_DOMAINS = [
+  "registroimprese",
+  "visura.pro",
+  "ufficiocamerale",
+  "cameredicommercio",
+  "cciaa",
+  "infocamere",
+  "ateco.infocamere",
+];
 
 /* ─── helpers ──────────────────────────────── */
 
@@ -137,65 +146,101 @@ async function lookupCamerale(
   }
 }
 
-/* ─── AI fallback via Haiku ────────────────── */
+/* ─── Gemini with Google Search grounding ──── */
 
-async function inferAtecoWithAi(
+type GeminiEnrichResult = EnrichResult & {
+  source_url: string | null;
+  confidence: number;
+  grounded: boolean;
+};
+
+function hasTrustedDomain(url: string | null): boolean {
+  if (!url) return false;
+  const lower = url.toLowerCase();
+  return TRUSTED_DOMAINS.some((d) => lower.includes(d));
+}
+
+async function lookupAtecoWithGemini(
   apiKey: string,
   cp: CpRow,
-): Promise<EnrichResult | null> {
-  const prompt = `Sei un esperto di classificazione ATECO italiana (ISTAT 2007).
-Data questa controparte:
-- Nome: ${clip(cp.name, 200)}
-- P.IVA: ${cp.vat_number || "N/D"}
-- Sede: ${clip(cp.address, 200) || "N/D"}
-- Tipo: ${cp.legal_type || "N/D"}
+): Promise<GeminiEnrichResult | null> {
+  const name = clip(cp.name, 200);
+  const vatNumber = cp.vat_number || "N/D";
+  const address = clip(cp.address, 200) || "N/D";
+  const legalType = cp.legal_type || "N/D";
 
-Inferisci il codice ATECO più probabile per questa attività.
+  const prompt = `Cerca sul web il codice ATECO ufficiale (dalla Camera di Commercio o dal Registro Imprese) di questa azienda italiana:
+Nome: ${name}
+Partita IVA: ${vatNumber}
+Sede: ${address}
+Tipo: ${legalType}
 
-REGOLE:
-- Il codice ATECO deve essere nel formato XX.XX.XX (6 cifre con punti)
-- Se non riesci a determinarlo con sicurezza, usa il livello di dettaglio più generico (XX.XX o XX)
-- Per PA, usa 84.xx.xx
-- Per professionisti (avvocati, commercialisti, etc.), usa 69.xx.xx
-- Per studi di ingegneria/architettura, usa 71.xx.xx
-- Rispondi SOLO con JSON valido, senza markdown
-
-Formato risposta:
-{"ateco_code":"XX.XX.XX","ateco_description":"Descrizione attività ATECO","business_description":"Breve descrizione di cosa fa l'azienda","confidence":0.8}`;
+Cerca su siti come registroimprese.it, visura.pro, ufficiocamerale.it, o qualsiasi fonte ufficiale.
+Rispondi SOLO con JSON valido:
+{"ateco_code": "XX.XX.XX", "ateco_description": "descrizione ufficiale", "business_sector": "settore", "business_description": "breve descrizione attività", "source_url": "url dove hai trovato il dato", "confidence": 0.0}
+Se NON trovi il codice ATECO ufficiale sul web, metti confidence < 0.5 e specifica che è inferito.`;
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          tools: [{
+            google_search_retrieval: {
+              dynamic_retrieval_config: {
+                mode: "MODE_DYNAMIC",
+                dynamic_threshold: 0.3,
+              },
+            },
+          }],
+          generationConfig: {
+            temperature: 0,
+            maxOutputTokens: 500,
+            responseMimeType: "application/json",
+            thinkingConfig: { thinkingBudget: 0 },
+          },
+        }),
+        signal: AbortSignal.timeout(API_TIMEOUT_MS),
       },
-      body: JSON.stringify({
-        model: HAIKU_MODEL,
-        max_tokens: 512,
-        messages: [{ role: "user", content: prompt }],
-      }),
-      signal: AbortSignal.timeout(API_TIMEOUT_MS),
-    });
+    );
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      const errBody = await response.text();
+      console.error(`Gemini grounding error ${response.status}:`, errBody.slice(0, 300));
+      return null;
+    }
 
     const data = await response.json();
-    let text = data?.content?.[0]?.type === "text" ? data.content[0].text : "";
-    text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+    const rawText = (data?.candidates?.[0]?.content?.parts ?? [])
+      .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+      .join("\n")
+      .trim();
 
-    const parsed = JSON.parse(text);
+    if (!rawText) return null;
+
+    const cleanedText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+    const parsed = JSON.parse(cleanedText);
     const atecoCode = parsed?.ateco_code || null;
     if (!atecoCode) return null;
+
+    const confidence = Number(parsed?.confidence ?? 0);
+    const sourceUrl = parsed?.source_url || null;
+    const grounded = data?.candidates?.[0]?.groundingMetadata != null;
 
     return {
       ateco_code: atecoCode,
       ateco_description: clip(parsed?.ateco_description, 300) || null,
       business_sector: mapAtecoToSector(atecoCode),
       business_description: clip(parsed?.business_description, 500) || null,
+      source_url: sourceUrl,
+      confidence: Number.isFinite(confidence) ? confidence : 0,
+      grounded,
     };
-  } catch {
+  } catch (e) {
+    console.error(`Gemini grounding failed for ${name}:`, e instanceof Error ? e.message : e);
     return null;
   }
 }
@@ -227,11 +272,11 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
-  const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
+  const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
   const cameraleKey = (Deno.env.get("OPENAPI_CAMERALE_KEY") ?? "").trim();
 
-  if (!anthropicKey && !cameraleKey) return json({ error: "Nessuna API key configurata (ANTHROPIC_API_KEY o OPENAPI_CAMERALE_KEY)" }, 503);
+  if (!geminiKey && !cameraleKey) return json({ error: "Nessuna API key configurata (GEMINI_API_KEY o OPENAPI_CAMERALE_KEY)" }, 503);
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL non configurato" }, 503);
 
   let body: {
@@ -294,7 +339,8 @@ Deno.serve(async (req) => {
     await runWithConcurrency(targets, CONCURRENCY, async (cp) => {
       try {
         let result: EnrichResult | null = null;
-        let source = "ai";
+        let source = "ai_inferred";
+        let sourceUrl: string | null = null;
 
         // Try Camerale API first
         if (cameraleKey && cp.vat_number) {
@@ -302,19 +348,36 @@ Deno.serve(async (req) => {
           if (result) source = "camerale";
         }
 
-        // Fallback to AI
-        if (!result && anthropicKey) {
-          result = await inferAtecoWithAi(anthropicKey, cp);
-          source = "ai";
+        // Fallback to Gemini with Google Search grounding
+        if (!result && geminiKey) {
+          const geminiResult = await lookupAtecoWithGemini(geminiKey, cp);
+          if (geminiResult) {
+            result = geminiResult;
+            sourceUrl = geminiResult.source_url;
+
+            // Determine source quality based on confidence + domain trust
+            if (geminiResult.confidence >= 0.7 && hasTrustedDomain(geminiResult.source_url)) {
+              source = "web_verified";
+            } else if (geminiResult.grounded && geminiResult.confidence >= 0.6) {
+              source = "web_grounded";
+            } else {
+              source = "ai_inferred";
+            }
+          }
         }
 
         if (result && result.ateco_code) {
+          // Append source URL to business_description if available
+          const descWithSource = sourceUrl
+            ? `${result.business_description || ""} [fonte: ${sourceUrl}]`.trim()
+            : result.business_description;
+
           await sql`
             UPDATE counterparties
             SET ateco_code = ${result.ateco_code},
                 ateco_description = ${result.ateco_description},
                 business_sector = ${result.business_sector},
-                business_description = ${result.business_description},
+                business_description = ${clip(descWithSource, 600)},
                 enrichment_source = ${source},
                 enriched_at = NOW(),
                 updated_at = NOW()
