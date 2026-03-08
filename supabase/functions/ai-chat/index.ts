@@ -1423,12 +1423,18 @@ async function handleSaveUserInstruction(
   const scope = String(args.scope || "general");
   const scopeRef = args.scope_ref ? String(args.scope_ref) : null;
 
-  const [row] = await sql`
-    INSERT INTO user_instructions (company_id, scope, scope_ref, instruction, source)
-    VALUES (${companyId}, ${scope}, ${scopeRef}, ${instruction}, 'ai_chat')
-    RETURNING id, scope, instruction`;
-
-  return { saved: true, id: row.id, scope: row.scope, instruction: row.instruction };
+  try {
+    console.log(`[save_user_instruction] Saving: company=${companyId}, scope=${scope}, scopeRef=${scopeRef}, instruction="${instruction}"`);
+    const [row] = await sql`
+      INSERT INTO user_instructions (company_id, scope, scope_ref, instruction, source)
+      VALUES (${companyId}, ${scope}, ${scopeRef}, ${instruction}, 'ai_chat')
+      RETURNING id, scope, instruction`;
+    console.log(`[save_user_instruction] SUCCESS: id=${row.id}`);
+    return { saved: true, id: row.id, scope: row.scope, instruction: row.instruction };
+  } catch (err) {
+    console.error(`[save_user_instruction] ERROR:`, err);
+    return { error: `Errore salvataggio: ${err instanceof Error ? err.message : String(err)}` };
+  }
 }
 
 async function handleGetUserInstructions(
@@ -1583,14 +1589,17 @@ CLASSIFICAZIONE FATTURE:
 - get_invoices con filtro category_name o cost_center_code: per trovare fatture classificate con categoria/CdC specifico.
 - get_company_stats include sezione "classificazione" con conteggi fatture classificate/AI/non classificate.
 
-ISTRUZIONI UTENTE (MEMORIA PERSISTENTE):
-- save_user_instruction: quando l'utente dichiara una REGOLA, PREFERENZA o CONVENZIONE che deve essere ricordata per il futuro, salvala automaticamente. Non chiedere conferma, salvala e conferma. Esempi:
+ISTRUZIONI UTENTE (MEMORIA PERSISTENTE) — OBBLIGATORIO:
+REGOLA CRITICA: quando l'utente dice "ricordati", "ricorda che", "memorizza", "salva questa regola", o dichiara una REGOLA, PREFERENZA o CONVENZIONE che deve essere ricordata per il futuro, DEVI OBBLIGATORIAMENTE chiamare il tool save_user_instruction. NON rispondere MAI solo con testo tipo "Memorizzato" senza aver effettivamente chiamato il tool. Se non chiami il tool, l'istruzione NON viene salvata e l'utente perde la regola.
+- save_user_instruction: chiama SEMPRE questo tool per salvare regole utente. Esempi:
   * "le fatture CREDEMLEASING sono sempre leasing veicoli" → scope: counterparty
   * "il calcare va classificato come materia prima" → scope: classification
   * "i pagamenti F24 non vanno riconciliati" → scope: reconciliation
   * "usa sempre il centro di costo BRE-FRA per il frantoio" → scope: general
+  * "ricordati che Goldenergy è sempre energia elettrica" → scope: counterparty
 - get_user_instructions: per mostrare le regole salvate o verificare se ne esiste già una simile
 - Le istruzioni salvate vengono automaticamente iniettate nel contesto di tutte le future classificazioni AI e sessioni chat
+- RIPETO: è VIETATO dire "memorizzato/salvato/ricordato" senza aver chiamato save_user_instruction. Chiama PRIMA il tool, POI conferma all'utente.
 
 Quando presenti tabelle o elenchi, usa il formato markdown. Quando menzioni importi, specifica sempre se è un'entrata o un'uscita. Per le date usa il formato italiano (gg/mm/aaaa).`;
 
@@ -1679,7 +1688,7 @@ async function runAiChat(
       (b: { type: string }) => b.type === "tool_use",
     );
 
-    if (toolUseBlocks.length === 0 || data.stop_reason === "end_turn") {
+    if (toolUseBlocks.length === 0) {
       const textBlock = (data.content || []).find(
         (b: { type: string }) => b.type === "text",
       );
