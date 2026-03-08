@@ -505,14 +505,14 @@ Deno.serve(async (req) => {
       const openCounterparties: { name: string; open_amount: number }[] =
         await sql`
         SELECT DISTINCT c.name,
-          COALESCE(SUM(ii.amount - ii.paid_amount), 0) as open_amount
+          COALESCE(SUM(ii.amount_due - ii.paid_amount), 0) as open_amount
         FROM counterparties c
         JOIN invoices i ON i.counterparty_id = c.id
         JOIN invoice_installments ii ON ii.invoice_id = i.id
         WHERE c.company_id = ${companyId}
           AND ii.status IN ('pending', 'partial')
         GROUP BY c.id, c.name
-        HAVING COALESCE(SUM(ii.amount - ii.paid_amount), 0) > 0.01
+        HAVING COALESCE(SUM(ii.amount_due - ii.paid_amount), 0) > 0.01
         ORDER BY open_amount DESC
         LIMIT 100
       `;
