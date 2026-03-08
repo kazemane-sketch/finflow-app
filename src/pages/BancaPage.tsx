@@ -25,7 +25,7 @@ import {
 } from '@/lib/bankParser'
 import { verifyPassword } from '@/lib/invoiceSaver'
 import { triggerAutoReconciliation } from '@/lib/reconciliationTrigger'
-import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
+import { supabase, SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
 import { getValidAccessToken, type AccessTokenError } from '@/lib/getValidAccessToken'
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges'
 import { ReconciliationDot } from '@/components/ReconciliationIndicators'
@@ -919,25 +919,91 @@ export default function BancaPage() {
   const runAnalyze = useCallback(() => {
     if (!companyId) return
     analyzeStartOrStop(async (signal, updateProgress) => {
-      let totalProcessed = 0
-      while (!signal.aborted) {
-        const res = await fetch(`${SUPABASE_URL}/functions/v1/analyze-bank-transactions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
-          body: JSON.stringify({ company_id: companyId, batch_size: 15 }),
-          signal,
+      // Helper: abortable sleep
+      const sleep = (ms: number) =>
+        new Promise<void>((resolve, reject) => {
+          if (signal.aborted) return reject(new DOMException('Aborted', 'AbortError'))
+          const timer = setTimeout(resolve, ms)
+          signal.addEventListener('abort', () => { clearTimeout(timer); reject(new DOMException('Aborted', 'AbortError')) }, { once: true })
         })
-        const data = await res.json()
-        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
-        const batch = (data.triaged || 0) + (data.classified || 0)
-        if (totalProcessed === 0 && batch === 0) {
-          setToast({ message: 'Tutti i movimenti sono già stati analizzati.', type: 'info' })
-          break
-        }
-        totalProcessed += batch
-        updateProgress(totalProcessed, totalProcessed + 15)
-        if (batch < 5) break
+
+      // 1. Count total pending transactions to show accurate progress
+      let totalPending = 0
+      try {
+        const { count } = await supabase
+          .from('bank_transactions')
+          .select('id', { count: 'exact', head: true })
+          .eq('company_id', companyId)
+          .is('tx_nature', null)
+          .in('reconciliation_status', ['unmatched', 'partial'])
+        totalPending = count ?? 0
+      } catch { /* ignore count error, fallback to rolling estimate */ }
+
+      if (totalPending === 0) {
+        setToast({ message: 'Tutti i movimenti sono già stati analizzati.', type: 'info' })
+        return
       }
+
+      updateProgress(0, totalPending)
+
+      // 2. Auto-loop with retry
+      let totalProcessed = 0
+      let consecutiveFailures = 0
+      const MAX_RETRIES = 3
+      const BATCH_SIZE = 20
+
+      while (!signal.aborted) {
+        try {
+          const res = await fetch(`${SUPABASE_URL}/functions/v1/analyze-bank-transactions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
+            body: JSON.stringify({ company_id: companyId, batch_size: BATCH_SIZE }),
+            signal,
+          })
+
+          if (!res.ok) {
+            const errBody = await res.json().catch(() => ({}))
+            throw new Error(errBody.error || `HTTP ${res.status}`)
+          }
+
+          const data = await res.json()
+          consecutiveFailures = 0 // reset on success
+
+          const batch = (data.triaged || 0) + (data.classified || 0)
+
+          if (batch === 0) {
+            // All done
+            updateProgress(totalPending, totalPending)
+            setToast({ message: `Analisi completata: ${totalProcessed} movimenti analizzati.`, type: 'success' })
+            break
+          }
+
+          totalProcessed += batch
+          updateProgress(Math.min(totalProcessed, totalPending), totalPending)
+
+          // Wait 1s before next batch
+          await sleep(1000)
+        } catch (err: unknown) {
+          // Propagate abort errors to let useAIJob handle cancellation
+          if (err instanceof DOMException && err.name === 'AbortError') throw err
+          if (err instanceof Error && err.message === 'AbortError') throw err
+
+          consecutiveFailures++
+          console.warn(`[Analyze] Batch failed (${consecutiveFailures}/${MAX_RETRIES}):`, err)
+
+          if (consecutiveFailures >= MAX_RETRIES) {
+            setToast({
+              message: `Analisi interrotta dopo ${MAX_RETRIES} errori consecutivi. ${totalProcessed} movimenti analizzati.`,
+              type: 'error',
+            })
+            break
+          }
+
+          // Wait 3s before retry
+          try { await sleep(3000) } catch { break } // abort during retry wait
+        }
+      }
+
       loadDataRef.current?.(true)
     })
   }, [companyId, analyzeStartOrStop])
@@ -1565,10 +1631,10 @@ export default function BancaPage() {
               {transactions.length > 0 && (
                 <Button variant="outline" size="sm"
                   onClick={runAnalyze}
-                  disabled={analyzeRunning || !companyId}
+                  disabled={!analyzeRunning && !companyId}
                   className={analyzeRunning ? 'text-purple-700 border-purple-300 bg-purple-50' : ''}>
                   {analyzeRunning
-                    ? <><Zap className="h-3.5 w-3.5 mr-1.5 animate-pulse" />Analisi... ({analyzeJobProgress.pct}%)</>
+                    ? <>⏹ Ferma analisi ({analyzeJobProgress.current}/{analyzeJobProgress.total})</>
                     : <><Zap className="h-3.5 w-3.5 mr-1.5" />Analizza</>}
                 </Button>
               )}
