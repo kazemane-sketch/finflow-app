@@ -19,6 +19,7 @@ const TRUSTED_DOMAINS = [
   "cciaa",
   "infocamere",
   "ateco.infocamere",
+  "fatturatoitalia",
 ];
 
 /* ─── helpers ──────────────────────────────── */
@@ -152,6 +153,7 @@ type GeminiEnrichResult = EnrichResult & {
   source_url: string | null;
   confidence: number;
   grounded: boolean;
+  debug?: string;
 };
 
 function hasTrustedDomain(url: string | null): boolean {
@@ -166,40 +168,30 @@ async function lookupAtecoWithGemini(
 ): Promise<GeminiEnrichResult | null> {
   const name = clip(cp.name, 200);
   const vatNumber = cp.vat_number || "N/D";
-  const address = clip(cp.address, 200) || "N/D";
-  const legalType = cp.legal_type || "N/D";
 
-  const prompt = `Devo trovare il codice ATECO UFFICIALE (dalla Camera di Commercio italiana) di questa azienda.
-CERCA SU INTERNET usando la partita IVA su siti come registroimprese.it, visura.pro, ufficiocamerale.it, ateco.infocamere.it.
+  const cleanVat = cleanPiva(vatNumber);
+  const searchQuery = cleanVat && cleanVat !== "N/D" ? `${cleanVat} ateco` : `${name} partita iva ateco`;
 
-Azienda: ${name}
-Partita IVA: ${vatNumber}
-Sede: ${address}
-Tipo: ${legalType}
+  const prompt = `Cerca "${searchQuery}" e trova il codice ATECO di questa azienda italiana:
+- Nome: ${name}
+- P.IVA: ${vatNumber}
 
-ISTRUZIONI IMPORTANTI:
-- NON INVENTARE il codice ATECO basandoti sul nome dell'azienda.
-- CERCA ESATTAMENTE questa partita IVA sui registri ufficiali italiani.
-- Il nome dell'azienda può essere ingannevole (es. "Capricorno" non significa agricoltura/allevamento).
-- Se non trovi il codice ATECO ufficiale cercando sul web, rispondi con confidence: 0.
-- Includi la URL esatta della pagina web dove hai trovato il dato.
+I risultati di ricerca contengono sicuramente il codice ATECO su siti come fatturatoitalia.it, registroimprese.it, visura.pro.
+Estrai il codice ATECO dai risultati e rispondi SOLO con questo JSON:
+{"ateco_code": "XX.XX.XX", "ateco_description": "descrizione attività", "business_sector": "settore", "business_description": "breve descrizione", "source_url": "url dove hai trovato il dato", "confidence": 0.9}`;
 
-Rispondi con JSON:
-{"ateco_code": "XX.XX.XX", "ateco_description": "descrizione ufficiale", "business_sector": "settore", "business_description": "breve descrizione attività", "source_url": "url della fonte", "confidence": 0.0}`;
-
-  // NO responseMimeType — it disables tool/grounding use in Gemini
   const requestBody = {
     contents: [{ parts: [{ text: prompt }] }],
     tools: [{ google_search: {} }],
     generationConfig: {
-      temperature: 0,
+      temperature: 0.2,
       maxOutputTokens: 2048,
     },
   };
 
   try {
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -211,15 +203,13 @@ Rispondi con JSON:
     if (!response.ok) {
       const errBody = await response.text();
       console.error(`[enrich] Gemini HTTP ${response.status} for "${name}":`, errBody.slice(0, 300));
-      return null;
+      return { ateco_code: null, ateco_description: null, business_sector: null, business_description: null, source_url: null, confidence: 0, grounded: false, debug: `HTTP ${response.status}: ${errBody.slice(0, 200)}` };
     }
 
     const data = await response.json();
     const candidate = data?.candidates?.[0];
     const groundingMeta = candidate?.groundingMetadata;
     const groundingChunks = groundingMeta?.groundingChunks;
-
-    console.log(`[enrich] "${name}": grounded=${groundingMeta != null}, chunks=${groundingChunks?.length ?? 0}, finish=${candidate?.finishReason}`);
 
     // Extract text from response parts
     const rawText = (candidate?.content?.parts ?? [])
@@ -228,8 +218,7 @@ Rispondi con JSON:
       .trim();
 
     if (!rawText) {
-      console.warn(`[enrich] Empty response from Gemini for "${name}"`);
-      return null;
+      return { ateco_code: null, ateco_description: null, business_sector: null, business_description: null, source_url: null, confidence: 0, grounded: groundingMeta != null, debug: `empty_response, finish=${candidate?.finishReason}` };
     }
 
     // Parse JSON from text (no responseMimeType, so response may contain markdown)
@@ -237,12 +226,13 @@ Rispondi con JSON:
     const jsonStart = cleanedText.indexOf("{");
     const jsonEnd = cleanedText.lastIndexOf("}");
     if (jsonStart < 0 || jsonEnd <= jsonStart) {
-      console.warn(`[enrich] No JSON in response for "${name}":`, cleanedText.slice(0, 200));
-      return null;
+      return { ateco_code: null, ateco_description: null, business_sector: null, business_description: null, source_url: null, confidence: 0, grounded: groundingMeta != null, debug: `no_json: ${cleanedText.slice(0, 200)}` };
     }
     const parsed = JSON.parse(cleanedText.slice(jsonStart, jsonEnd + 1));
-    const atecoCode = parsed?.ateco_code || null;
-    if (!atecoCode) return null;
+    const rawAteco = parsed?.ateco_code || null;
+    // Validate ATECO format: XX.XX or XX.XX.X or XX.XX.XX (digits with dots)
+    const atecoCode = rawAteco && /^\d{2}\.\d{2}(\.\d{1,2})?$/.test(rawAteco) ? rawAteco : null;
+    if (!atecoCode) return { ateco_code: null, ateco_description: null, business_sector: null, business_description: null, source_url: null, confidence: 0, grounded: groundingMeta != null, debug: `invalid_ateco: raw="${rawAteco}"` };
 
     const confidence = Number(parsed?.confidence ?? 0);
     const sourceUrl = parsed?.source_url || null;
@@ -252,8 +242,6 @@ Rispondi con JSON:
     const effectiveSourceUrl = sourceUrl
       || (groundingChunks ?? []).map((c: any) => c?.web?.uri).filter(Boolean)[0]
       || null;
-
-    console.log(`[enrich] "${name}": ateco=${atecoCode}, confidence=${confidence}, source=${effectiveSourceUrl}`);
 
     return {
       ateco_code: atecoCode,
@@ -265,7 +253,7 @@ Rispondi con JSON:
       grounded,
     };
   } catch (e) {
-    console.error(`[enrich] Gemini failed for "${name}":`, e instanceof Error ? e.message : e);
+    console.error(`[enrich] Gemini error for "${name}":`, e instanceof Error ? e.message : e);
     return null;
   }
 }
@@ -374,19 +362,23 @@ Deno.serve(async (req) => {
         }
 
         // Fallback to Gemini with Google Search grounding
+        let debugInfo: string | null = null;
         if (!result && geminiKey) {
           const geminiResult = await lookupAtecoWithGemini(geminiKey, cp);
           if (geminiResult) {
-            result = geminiResult;
-            sourceUrl = geminiResult.source_url;
+            debugInfo = geminiResult.debug || null;
+            if (geminiResult.ateco_code) {
+              result = geminiResult;
+              sourceUrl = geminiResult.source_url;
 
-            // Determine source quality based on confidence + domain trust
-            if (geminiResult.confidence >= 0.7 && hasTrustedDomain(geminiResult.source_url)) {
-              source = "web_verified";
-            } else if (geminiResult.grounded && geminiResult.confidence >= 0.6) {
-              source = "web_grounded";
-            } else {
-              source = "ai_inferred";
+              // Determine source quality based on confidence + domain trust
+              if (geminiResult.confidence >= 0.7 && hasTrustedDomain(geminiResult.source_url)) {
+                source = "web_verified";
+              } else if (geminiResult.grounded && geminiResult.confidence >= 0.6) {
+                source = "web_grounded";
+              } else {
+                source = "ai_inferred";
+              }
             }
           }
         }
@@ -423,7 +415,7 @@ Deno.serve(async (req) => {
             name: cp.name,
             ateco_code: null,
             source: "none",
-            error: "Nessun risultato",
+            error: debugInfo || "Nessun risultato",
           });
         }
       } catch (e: unknown) {
