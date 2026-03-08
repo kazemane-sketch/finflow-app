@@ -833,7 +833,9 @@ const BANK_TX_LIST_COLS = `id, company_id, bank_account_id, import_batch_id, dat
   direction_needs_review, direction_reason, direction_updated_at, direction_updated_by,
   reference, invoice_ref, cbi_flow_id, branch, commission_amount, posting_side, hash,
   reconciliation_status, extraction_status, extraction_model, extracted_at,
-  embedding_status, embedding_model, embedding_updated_at, created_at`;
+  embedding_status, embedding_model, embedding_updated_at, created_at,
+  tx_nature, classification_status, classification_source, classification_confidence,
+  classification_reasoning, account_id, category_id, cost_center_id, fiscal_flags`;
 
 export interface BankTxFilters {
   query?: string;
@@ -845,6 +847,7 @@ export interface BankTxFilters {
   amountMin?: number;
   amountMax?: number;
   counterpartyPattern?: string;
+  natureFilter?: 'all' | 'invoice_payment' | 'no_invoice' | 'giro_conto' | 'unknown';
 }
 
 export async function loadBankTransactions(
@@ -906,6 +909,14 @@ export async function loadBankTransactions(
     // Counterparty name pattern (ILIKE)
     if (filters?.counterpartyPattern) {
       q = q.ilike('counterparty_name', `%${filters.counterpartyPattern}%`);
+    }
+    // tx_nature filter (server-side so pagination/counts are correct)
+    if (filters?.natureFilter && filters.natureFilter !== 'all') {
+      if (filters.natureFilter === 'unknown') {
+        q = q.is('tx_nature', null);
+      } else {
+        q = q.eq('tx_nature', filters.natureFilter);
+      }
     }
   }
 

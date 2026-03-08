@@ -501,17 +501,20 @@ function TxRow({ tx, selected, checked, selectMode, onClick, onCheck, onDoubleCl
         {txTypeLabel(tx.transaction_type)}
       </span>
       {tx.tx_nature === 'invoice_payment' && tx.reconciliation_status !== 'matched' && (
-        <span className="hidden md:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-sky-100 text-sky-700 flex-shrink-0" title="Probabile pagamento fattura">
+        <span className="inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-sky-100 text-sky-700 flex-shrink-0" title="Pagamento fattura">
           Pag. fattura
         </span>
       )}
       {tx.tx_nature === 'no_invoice' && (
-        <span className="hidden md:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 flex-shrink-0" title="Senza fattura">
-          Senza fatt.
+        <span className="inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 flex-shrink-0"
+          title={tx.classification_status === 'ai_suggested' && tx.classification_reasoning ? tx.classification_reasoning : 'Senza fattura'}>
+          {tx.classification_status === 'ai_suggested' && tx.classification_reasoning
+            ? tx.classification_reasoning.length > 25 ? tx.classification_reasoning.slice(0, 25) + '…' : tx.classification_reasoning
+            : 'Senza fatt.'}
         </span>
       )}
       {tx.tx_nature === 'giro_conto' && (
-        <span className="hidden md:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-gray-200 text-gray-600 flex-shrink-0" title="Giroconto">
+        <span className="inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-gray-200 text-gray-600 flex-shrink-0" title="Giroconto">
           Giroconto
         </span>
       )}
@@ -872,7 +875,8 @@ export default function BancaPage() {
     amountMin,
     amountMax,
     counterpartyPattern,
-  }), [debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds, amountMin, amountMax, counterpartyPattern])
+    natureFilter,
+  }), [debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds, amountMin, amountMax, counterpartyPattern, natureFilter])
 
   const loadData = useCallback(async (reset = true) => {
     if (!companyId) return
@@ -1025,7 +1029,7 @@ export default function BancaPage() {
     setTotalCount(0)
     loadData(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [companyId, debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds?.join(','), amountMin, amountMax, counterpartyPattern])
+  }, [companyId, debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds?.join(','), amountMin, amountMax, counterpartyPattern, natureFilter])
 
   // One-time saldo cleanup check on mount
   useEffect(() => {
@@ -1585,12 +1589,7 @@ export default function BancaPage() {
   const hasDateFilter = !!(dateFrom || dateTo)
   const hasActiveFilters = !!(debouncedQuery || dirFilter !== 'all' || typeFilter !== 'all' || hasDateFilter || aiResult || amountMin != null || amountMax != null || counterpartyPattern || natureFilter !== 'all')
 
-  // Client-side nature filter (visual only, does not change data)
-  const filteredByNature = natureFilter === 'all'
-    ? transactions
-    : natureFilter === 'unknown'
-      ? transactions.filter(t => !t.tx_nature)
-      : transactions.filter(t => t.tx_nature === natureFilter)
+  // natureFilter is now server-side (in buildFilters), no client-side filtering needed
 
   // Multi-select helpers
   const selectAll = () => {
@@ -1998,22 +1997,7 @@ export default function BancaPage() {
           )}
 
           {/* Transactions list */}
-          {filteredByNature.length === 0 && transactions.length > 0 && natureFilter !== 'all' ? (
-            <Card>
-              <CardContent className="p-10 text-center">
-                <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-gray-100 mb-4">
-                  <Search className="h-8 w-8 text-gray-400" />
-                </div>
-                <h3 className="text-lg font-semibold mb-2">Nessun movimento con questo filtro</h3>
-                <p className="text-sm text-muted-foreground mb-4">
-                  Nessun movimento corrisponde al filtro triage selezionato.
-                </p>
-                <Button variant="outline" onClick={() => setNatureFilter('all')}>
-                  <X className="h-4 w-4 mr-2" />Mostra tutti
-                </Button>
-              </CardContent>
-            </Card>
-          ) : transactions.length === 0 && !loading && !importing ? (
+          {transactions.length === 0 && !loading && !importing ? (
             hasActiveFilters ? (
               <Card>
                 <CardContent className="p-10 text-center">
@@ -2051,13 +2035,13 @@ export default function BancaPage() {
             <Card>
               <CardHeader className="py-2.5 px-4 border-b">
                 <CardTitle className="text-sm font-semibold">
-                  Movimenti ({natureFilter !== 'all' ? `${filteredByNature.length} / ` : ''}{totalCount}{transactions.length < totalCount ? `, caricati ${transactions.length}` : ''})
+                  Movimenti ({totalCount}{transactions.length < totalCount ? `, caricati ${transactions.length}` : ''})
                 </CardTitle>
               </CardHeader>
               <div className="divide-y divide-gray-50 max-h-[calc(100vh-420px)] overflow-y-auto">
-                {filteredByNature.length === 0 && !loading
+                {transactions.length === 0 && !loading
                   ? <p className="text-sm text-gray-400 text-center py-10">Nessun risultato</p>
-                  : filteredByNature.map(tx => (
+                  : transactions.map(tx => (
                     <TxRow
                       key={tx.id} tx={tx}
                       selected={selectedIds.has(tx.id) || (!selectMode && selectedTx?.id === tx.id)}
