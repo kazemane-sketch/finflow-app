@@ -324,12 +324,12 @@ async function classifyWithAI(
 ): Promise<ClassifyResult[]> {
   const accountList = accounts
     .filter((a) => !a.section.startsWith("assets") && !a.section.startsWith("liabilities") && !a.section.startsWith("equity"))
-    .map((a) => `${a.code} ${a.name} [${a.section}]`)
+    .map((a) => `${a.id}: ${a.code} ${a.name} [${a.section}]`)
     .join("\n");
 
   // Include ALL accounts for F24 payments (debits to asset/liability accounts)
   const fullAccountList = accounts
-    .map((a) => `${a.code} ${a.name} [${a.section}]`)
+    .map((a) => `${a.id}: ${a.code} ${a.name} [${a.section}]`)
     .join("\n");
 
   const catList = categories.map((c) => `${c.id}: ${c.name} (${c.type})`).join("\n");
@@ -387,8 +387,8 @@ ${userRulesSection}
 MOVIMENTI DA CLASSIFICARE:
 ${txList}
 
-Rispondi SOLO JSON array:
-[{"transaction_id": "uuid", "account_id": "uuid del conto", "category_id": "uuid della categoria o null", "cost_center_id": "uuid del CdC o null", "confidence": 0-100, "reasoning": "spiegazione breve", "fiscal_flags": {"is_tax_payment": true/false, "tax_type": "IRES|IRAP|INPS|IRPEF|INAIL|Addizionale|null", "note": "eventuale nota"}}]`;
+FORMATO RISPOSTA — SOLO JSON array. Usa gli ID uuid esatti dalla lista sopra (la parte PRIMA dei due punti):
+[{"transaction_id": "uuid", "account_id": "uuid esatto dalla lista conti", "category_id": "uuid dalla lista categorie o null", "cost_center_id": "uuid dalla lista CdC o null", "confidence": 0-100, "reasoning": "codice_conto - spiegazione breve", "fiscal_flags": {"is_tax_payment": true/false, "tax_type": "IRES|IRAP|INPS|IRPEF|INAIL|Addizionale|null", "note": "eventuale nota"}}]`;
 
   const resp = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -568,6 +568,9 @@ Deno.serve(async (req) => {
     let classifiedRules = 0;
     let classifiedAI = 0;
     let phase2Skipped = false;
+    let phase2Found = 0;
+    let phase2AIRaw = 0;
+    let phase2AISkipped = 0;
 
     // Time guard: skip Phase 2 if we've already spent too long on Phase 1
     const elapsedMs = Date.now() - startTime;
@@ -590,6 +593,7 @@ Deno.serve(async (req) => {
         LIMIT ${batchSize}
       `;
 
+      phase2Found = noInvoiceTxs.length;
       console.log(`[analyze] Phase 2: ${noInvoiceTxs.length} no_invoice pending found (limit ${batchSize})`);
 
       if (noInvoiceTxs.length > 0) {
@@ -665,20 +669,36 @@ Deno.serve(async (req) => {
 
           // Validate account_id and category_id exist
           const accountIds = new Set(accounts.map((a) => a.id));
+          const accountByCode = new Map(accounts.map((a) => [a.code, a.id]));
           const categoryIds = new Set(categories.map((c) => c.id));
           const projectIds = new Set(projects.map((p) => p.id));
+
+          phase2AIRaw = aiResults.length;
 
           for (const r of aiResults) {
             // Validate IDs before saving
             if (r.account_id && !accountIds.has(r.account_id)) {
-              // Try to match by code in the reasoning
-              const codeMatch = r.reasoning?.match(/\b(\d{5,})\b/);
-              if (codeMatch) {
-                const byCode = accounts.find((a) => a.code === codeMatch[1]);
-                if (byCode) r.account_id = byCode.id;
-                else r.account_id = null;
+              // Fallback 1: AI returned a code instead of UUID
+              const byCode = accountByCode.get(r.account_id);
+              if (byCode) {
+                console.log(`[analyze] account_id fallback: code ${r.account_id} → ${byCode}`);
+                r.account_id = byCode;
               } else {
-                r.account_id = null;
+                // Fallback 2: Try to match by code in the reasoning
+                const codeMatch = r.reasoning?.match(/\b(\d{5,})\b/);
+                if (codeMatch) {
+                  const byCode2 = accountByCode.get(codeMatch[1]);
+                  if (byCode2) {
+                    console.log(`[analyze] account_id fallback from reasoning: ${codeMatch[1]} → ${byCode2}`);
+                    r.account_id = byCode2;
+                  } else {
+                    console.log(`[analyze] account_id rejected: ${r.account_id}, code ${codeMatch?.[1]} not found`);
+                    r.account_id = null;
+                  }
+                } else {
+                  console.log(`[analyze] account_id rejected: ${r.account_id} (not valid UUID, no code in reasoning)`);
+                  r.account_id = null;
+                }
               }
             }
             if (r.category_id && !categoryIds.has(r.category_id)) {
@@ -691,10 +711,13 @@ Deno.serve(async (req) => {
             if (r.account_id || r.category_id) {
               classificationResults.push(r);
               classifiedAI++;
+            } else {
+              phase2AISkipped++;
+              console.log(`[analyze] Skipped tx ${r.transaction_id}: account_id=${r.account_id}, category_id=${r.category_id}, reasoning=${r.reasoning?.slice(0, 80)}`);
             }
           }
 
-          console.log(`[analyze] Phase 2 AI done: ${classifiedAI} classified, ${aiResults.length - classifiedAI} skipped (no valid account/category)`);
+          console.log(`[analyze] Phase 2 AI done: ${classifiedAI} classified, ${phase2AISkipped} skipped (no valid account/category), ${phase2AIRaw} raw AI results`);
         }
 
         // 2d. Save classification results
@@ -728,6 +751,9 @@ Deno.serve(async (req) => {
       classified_rules: classifiedRules,
       classified_ai: classifiedAI,
       phase2_skipped: phase2Skipped,
+      phase2_found: phase2Found,
+      phase2_ai_raw: phase2AIRaw,
+      phase2_ai_skipped: phase2AISkipped,
       elapsed_ms: totalElapsed,
       triage_details: triageResults.map((r) => ({
         id: r.transaction_id,
