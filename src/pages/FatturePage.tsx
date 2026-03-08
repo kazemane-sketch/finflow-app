@@ -820,10 +820,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setAiClassifStatus('done');
 
       // Reload classification data to reflect persisted suggestions
-      const [classif, lineClf, lineProj] = await Promise.all([
+      const [classif, lineClf, lineProj, freshInvProjs] = await Promise.all([
         loadInvoiceClassification(invoice.id),
         loadLineClassifications(invoice.id),
         loadLineProjects(invoice.id),
+        loadInvoiceProjects(invoice.id),
       ]);
       if (classif) {
         setClassification(classif);
@@ -832,6 +833,23 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       }
       setLineClassifs(lineClf);
       setLineProjects(lineProj);
+      // Update CdC from DB-persisted invoice-level projects
+      if (freshInvProjs.length > 0) {
+        setInvProjects(freshInvProjs);
+        setCdcRows(freshInvProjs.map(ip => ({
+          project_id: ip.project_id,
+          percentage: Number(ip.percentage),
+          amount: ip.amount ?? null,
+        })));
+      } else if (result.invoice_level?.project_allocations?.length > 0) {
+        // Fallback: use AI result directly if DB didn't persist yet
+        const total = Math.abs(invoice.total_amount || 0);
+        setCdcRows(result.invoice_level.project_allocations.map((pa: { project_id: string; percentage: number }) => ({
+          project_id: pa.project_id,
+          percentage: pa.percentage,
+          amount: total > 0 ? Math.round(total * pa.percentage / 100 * 100) / 100 : null,
+        })));
+      }
     } catch (e: any) {
       console.error('AI classification error:', e);
       setAiClassifStatus('error');
