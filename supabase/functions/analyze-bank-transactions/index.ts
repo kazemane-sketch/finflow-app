@@ -458,8 +458,11 @@ Deno.serve(async (req) => {
   const companyId = body.company_id;
   if (!companyId) return json({ error: "company_id richiesto" }, 400);
 
-  const batchSize = Math.min(body.batch_size || 30, 50);
+  const batchSize = Math.min(body.batch_size || 20, 20); // cap server-side to avoid 504 timeout
   const force = body.force || false;
+  const MAX_PHASE2_AI = 10; // max transactions for AI classification per batch
+  const WALL_CLOCK_LIMIT_MS = 80_000; // 80s — leave 70s buffer for Phase 2
+  const startTime = Date.now();
 
   const sql = postgres(dbUrl, { max: 1 });
 
@@ -560,6 +563,19 @@ Deno.serve(async (req) => {
     // PHASE 2: CLASSIFICATION (no_invoice only)
     // ═══════════════════════════════════════
 
+    const classificationResults: ClassifyResult[] = [];
+    let classifiedRules = 0;
+    let classifiedAI = 0;
+    let phase2Skipped = false;
+
+    // Time guard: skip Phase 2 if we've already spent too long on Phase 1
+    const elapsedMs = Date.now() - startTime;
+    if (elapsedMs > WALL_CLOCK_LIMIT_MS) {
+      console.log(`[analyze] Phase 1 took ${elapsedMs}ms, skipping Phase 2 to avoid timeout`);
+      phase2Skipped = true;
+    }
+
+    if (!phase2Skipped) {
     // 2a. Select no_invoice transactions pending classification
     const noInvoiceTxs: TxRow[] = await sql`
       SELECT id, date, amount, description, counterparty_name,
@@ -572,10 +588,6 @@ Deno.serve(async (req) => {
       ORDER BY date DESC
       LIMIT ${batchSize}
     `;
-
-    const classificationResults: ClassifyResult[] = [];
-    let classifiedRules = 0;
-    let classifiedAI = 0;
 
     if (noInvoiceTxs.length > 0) {
       // 2b. Fast-path: classification rules
@@ -596,7 +608,11 @@ Deno.serve(async (req) => {
         }
       }
 
-      // 2c. AI classification for remaining
+      // 2c. AI classification for remaining (capped to avoid timeout)
+      if (needsAIClassification.length > MAX_PHASE2_AI) {
+        console.log(`[analyze] Capping AI classification from ${needsAIClassification.length} to ${MAX_PHASE2_AI}`);
+        needsAIClassification.length = MAX_PHASE2_AI;
+      }
       if (needsAIClassification.length > 0) {
         // Load reference data
         const [accounts, categories, projects, userInstructionRows] =
@@ -690,6 +706,10 @@ Deno.serve(async (req) => {
         `;
       }
     }
+    } // end if (!phase2Skipped)
+
+    const totalElapsed = Date.now() - startTime;
+    console.log(`[analyze] Done in ${totalElapsed}ms: triaged=${triageResults.length} classified=${classificationResults.length} phase2Skipped=${phase2Skipped}`);
 
     return json({
       triaged: triageResults.length,
@@ -698,6 +718,8 @@ Deno.serve(async (req) => {
       classified: classificationResults.length,
       classified_rules: classifiedRules,
       classified_ai: classifiedAI,
+      phase2_skipped: phase2Skipped,
+      elapsed_ms: totalElapsed,
       triage_details: triageResults.map((r) => ({
         id: r.transaction_id,
         tx_nature: r.tx_nature,
