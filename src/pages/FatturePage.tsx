@@ -42,6 +42,7 @@ import {
   type LineClassification, type LineProjectAssignment,
 } from '@/lib/classificationService';
 import { createRuleFromConfirmation, findMatchingRules } from '@/lib/classificationRulesService';
+import ExportDialog from '@/components/ExportDialog';
 
 // ============================================================
 // LOOKUPS
@@ -1980,6 +1981,9 @@ export default function FatturePage() {
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
 
+  // ── Export dialog ──
+  const [exportOpen, setExportOpen] = useState(false);
+
   // ── Classification metadata for sidebar icons ──
   const [classifMeta, setClassifMeta] = useState<Map<string, InvoiceClassificationMeta>>(new Map());
 
@@ -2518,6 +2522,7 @@ export default function FatturePage() {
   return (
     <div className="h-full flex flex-col bg-gray-50">
       <ConfirmDeleteModal open={deleteModal.open} count={deleteModal.ids.length} onConfirm={handleDeleteConfirm} onCancel={() => setDeleteModal({ open: false, ids: [] })} />
+      {companyId && <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} companyId={companyId} companyName={company?.name || 'Azienda'} />}
       {/* Top bar */}
       <div className="flex items-center gap-3 px-4 py-2 bg-white border-b shadow-sm flex-shrink-0 print:hidden">
         <h1 className="text-lg font-bold text-gray-800">Fatture</h1>
@@ -2559,6 +2564,9 @@ export default function FatturePage() {
             ? <>{'\u23F9'} Stop ({batchClassifJobProgress.pct}%)</>
             : <>{'\u2728'} Classifica AI</>
           }
+        </button>
+        <button onClick={() => setExportOpen(true)} className="px-3 py-1.5 text-xs font-semibold text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">
+          Export
         </button>
         <button onClick={() => fileRef.current?.click()} className="px-3 py-1.5 text-xs font-semibold bg-blue-600 text-white rounded-lg hover:bg-blue-700">+ Importa</button>
         <input ref={fileRef} type="file" multiple accept=".xml,.p7m,.zip" onChange={e => e.target.files && handleImport(e.target.files)} className="hidden" />

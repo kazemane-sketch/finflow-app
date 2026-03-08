@@ -8,6 +8,7 @@ import {
   Upload, Landmark, RefreshCw, TrendingUp, TrendingDown,
   Search, X, CheckCircle, AlertCircle, Info,
   Building2, Trash2, AlertTriangle, Sparkles, CalendarDays,
+  Zap, FileText, ArrowLeftRight, HelpCircle, Download,
 } from 'lucide-react'
 import {
   parseBankPdf, saveBankTransactions, ensureBankAccount, createImportBatch,
@@ -499,6 +500,21 @@ function TxRow({ tx, selected, checked, selectMode, onClick, onCheck, onDoubleCl
       <span className={`hidden sm:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full flex-shrink-0 ${txTypeBadge(tx.transaction_type)}`}>
         {txTypeLabel(tx.transaction_type)}
       </span>
+      {tx.tx_nature === 'invoice_payment' && tx.reconciliation_status !== 'matched' && (
+        <span className="hidden md:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-sky-100 text-sky-700 flex-shrink-0" title="Probabile pagamento fattura">
+          Pag. fattura
+        </span>
+      )}
+      {tx.tx_nature === 'no_invoice' && (
+        <span className="hidden md:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 flex-shrink-0" title="Senza fattura">
+          Senza fatt.
+        </span>
+      )}
+      {tx.tx_nature === 'giro_conto' && (
+        <span className="hidden md:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-gray-200 text-gray-600 flex-shrink-0" title="Giroconto">
+          Giroconto
+        </span>
+      )}
       {tx.direction_needs_review && (
         <span className="hidden md:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 flex-shrink-0">
           Da verificare
@@ -715,6 +731,7 @@ export default function BancaPage() {
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [dirFilter, setDirFilter] = useState<'all' | 'in' | 'out' | 'review'>('all')
   const [typeFilter, setTypeFilter] = useState<string>('all')
+  const [natureFilter, setNatureFilter] = useState<'all' | 'invoice_payment' | 'no_invoice' | 'giro_conto' | 'unknown'>('all')
   const [dateFrom, setDateFrom] = useState<string>('')
   const [dateTo, setDateTo] = useState<string>('')
   const [amountMin, setAmountMin] = useState<number | undefined>(undefined)
@@ -759,6 +776,10 @@ export default function BancaPage() {
 
   // Extraction refs — now tracked by global AI job system
   const { isRunning: extractionRunning, progress: extractionJobProgress, startOrStop: extractionStartOrStop } = useAIJob('banca-extract-refs', 'Estrazione Riferimenti Banca')
+
+  // Analyze bank transactions (triage + classification)
+  const { isRunning: analyzeRunning, progress: analyzeJobProgress, startOrStop: analyzeStartOrStop } = useAIJob('banca-analyze', 'Analisi Movimenti')
+  const loadDataRef = useRef<((reset?: boolean) => void) | null>(null)
 
   // Import
   const [importing, setImporting] = useState(false)
@@ -837,7 +858,7 @@ export default function BancaPage() {
 
   // Helper: reset all filters to defaults (used on AI search start, query clear, etc.)
   const resetAllFilters = useCallback(() => {
-    setDateFrom(''); setDateTo(''); setDirFilter('all'); setTypeFilter('all')
+    setDateFrom(''); setDateTo(''); setDirFilter('all'); setTypeFilter('all'); setNatureFilter('all')
     setAmountMin(undefined); setAmountMax(undefined); setCounterpartyPattern(undefined)
   }, [])
 
@@ -891,6 +912,35 @@ export default function BancaPage() {
         .catch(e => console.warn('[Computed balance]', e))
     }
   }, [companyId, refreshEmbeddingHealth, buildFilters, page, bankAccounts])
+
+  // Keep loadData ref current for analyze callback
+  loadDataRef.current = loadData
+
+  const runAnalyze = useCallback(() => {
+    if (!companyId) return
+    analyzeStartOrStop(async (signal, updateProgress) => {
+      let totalProcessed = 0
+      while (!signal.aborted) {
+        const res = await fetch(`${SUPABASE_URL}/functions/v1/analyze-bank-transactions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
+          body: JSON.stringify({ company_id: companyId, batch_size: 30 }),
+          signal,
+        })
+        const data = await res.json()
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+        const batch = (data.triaged || 0) + (data.classified || 0)
+        if (totalProcessed === 0 && batch === 0) {
+          setToast({ message: 'Tutti i movimenti sono già stati analizzati.', type: 'info' })
+          break
+        }
+        totalProcessed += batch
+        updateProgress(totalProcessed, totalProcessed + 30)
+        if (batch < 10) break
+      }
+      loadDataRef.current?.(true)
+    })
+  }, [companyId, analyzeStartOrStop])
 
   // Initial load + reload when filters change
   useEffect(() => {
@@ -1459,7 +1509,14 @@ export default function BancaPage() {
   const latestBalance = balanceInfo?.opening_balance_confirmed ? balanceInfo.computed_balance : null
   const uniqueTypes = [...new Set(transactions.map(t => t.transaction_type).filter(Boolean))]
   const hasDateFilter = !!(dateFrom || dateTo)
-  const hasActiveFilters = !!(debouncedQuery || dirFilter !== 'all' || typeFilter !== 'all' || hasDateFilter || aiResult || amountMin != null || amountMax != null || counterpartyPattern)
+  const hasActiveFilters = !!(debouncedQuery || dirFilter !== 'all' || typeFilter !== 'all' || hasDateFilter || aiResult || amountMin != null || amountMax != null || counterpartyPattern || natureFilter !== 'all')
+
+  // Client-side nature filter (visual only, does not change data)
+  const filteredByNature = natureFilter === 'all'
+    ? transactions
+    : natureFilter === 'unknown'
+      ? transactions.filter(t => !t.tx_nature)
+      : transactions.filter(t => t.tx_nature === natureFilter)
 
   // Multi-select helpers
   const selectAll = () => {
@@ -1503,6 +1560,16 @@ export default function BancaPage() {
                 <Button variant="outline" size="sm"
                   onClick={() => { setSelectMode(!selectMode); if (selectMode) { setSelectedIds(new Set()) } }}>
                   {selectMode ? <><X className="h-3.5 w-3.5 mr-1.5" />Esci selezione</> : <>☐ Seleziona</>}
+                </Button>
+              )}
+              {transactions.length > 0 && (
+                <Button variant="outline" size="sm"
+                  onClick={runAnalyze}
+                  disabled={analyzeRunning || !companyId}
+                  className={analyzeRunning ? 'text-purple-700 border-purple-300 bg-purple-50' : ''}>
+                  {analyzeRunning
+                    ? <><Zap className="h-3.5 w-3.5 mr-1.5 animate-pulse" />Analisi... ({analyzeJobProgress.pct}%)</>
+                    : <><Zap className="h-3.5 w-3.5 mr-1.5" />Analizza</>}
                 </Button>
               )}
               <Button variant="outline" size="sm" onClick={() => loadData(true)} disabled={loading}>
@@ -1794,6 +1861,14 @@ export default function BancaPage() {
                     {uniqueTypes.map(t => <option key={t} value={t}>{txTypeLabel(t)}</option>)}
                   </select>
                 )}
+                <select value={natureFilter} onChange={e => setNatureFilter(e.target.value as any)}
+                  className="px-2.5 py-1.5 text-xs border border-gray-200 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-sky-500">
+                  <option value="all">Triage: tutti</option>
+                  <option value="invoice_payment">Pagamenti fattura</option>
+                  <option value="no_invoice">Senza fattura</option>
+                  <option value="giro_conto">Giroconto</option>
+                  <option value="unknown">Da analizzare</option>
+                </select>
               </div>
 
               {/* Date filters compatti */}
@@ -1849,7 +1924,22 @@ export default function BancaPage() {
           )}
 
           {/* Transactions list */}
-          {transactions.length === 0 && !loading && !importing ? (
+          {filteredByNature.length === 0 && transactions.length > 0 && natureFilter !== 'all' ? (
+            <Card>
+              <CardContent className="p-10 text-center">
+                <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-gray-100 mb-4">
+                  <Search className="h-8 w-8 text-gray-400" />
+                </div>
+                <h3 className="text-lg font-semibold mb-2">Nessun movimento con questo filtro</h3>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Nessun movimento corrisponde al filtro triage selezionato.
+                </p>
+                <Button variant="outline" onClick={() => setNatureFilter('all')}>
+                  <X className="h-4 w-4 mr-2" />Mostra tutti
+                </Button>
+              </CardContent>
+            </Card>
+          ) : transactions.length === 0 && !loading && !importing ? (
             hasActiveFilters ? (
               <Card>
                 <CardContent className="p-10 text-center">
@@ -1887,13 +1977,13 @@ export default function BancaPage() {
             <Card>
               <CardHeader className="py-2.5 px-4 border-b">
                 <CardTitle className="text-sm font-semibold">
-                  Movimenti ({totalCount}{transactions.length < totalCount ? `, caricati ${transactions.length}` : ''})
+                  Movimenti ({natureFilter !== 'all' ? `${filteredByNature.length} / ` : ''}{totalCount}{transactions.length < totalCount ? `, caricati ${transactions.length}` : ''})
                 </CardTitle>
               </CardHeader>
               <div className="divide-y divide-gray-50 max-h-[calc(100vh-420px)] overflow-y-auto">
-                {transactions.length === 0 && !loading
+                {filteredByNature.length === 0 && !loading
                   ? <p className="text-sm text-gray-400 text-center py-10">Nessun risultato</p>
-                  : transactions.map(tx => (
+                  : filteredByNature.map(tx => (
                     <TxRow
                       key={tx.id} tx={tx}
                       selected={selectedIds.has(tx.id) || (!selectMode && selectedTx?.id === tx.id)}

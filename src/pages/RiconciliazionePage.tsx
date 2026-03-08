@@ -43,6 +43,7 @@ interface SuggestionRow {
     reconciliation_status: string | null
     commission_amount: number | null
     reconciled_amount: number | null
+    tx_nature: string | null
   } | null
   invoice: {
     id: string
@@ -378,7 +379,7 @@ export default function RiconciliazionePage() {
       .select(`
         id, bank_transaction_id, installment_id, invoice_id,
         match_score, match_reason, proposed_by, rule_id, suggestion_data, status, created_at,
-        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount, reconciled_amount),
+        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount, reconciled_amount, tx_nature),
         invoice:invoices(id, number, counterparty, total_amount, date),
         installment:invoice_installments(id, installment_no, due_date, amount_due, paid_amount, status, direction)
       `)
@@ -637,9 +638,16 @@ export default function RiconciliazionePage() {
       const newTxReconciled = Number(tx?.reconciled_amount || 0) + reconcileAmount
       const txFullyMatched = tx ? newTxReconciled >= txNetAmount - 0.01 : false
       const newTxStatus = txFullyMatched ? 'matched' : 'partial'
+      // Build update payload — if tx was triaged as no_invoice, correct it
+      const txUpdate: Record<string, any> = { reconciled_amount: newTxReconciled, reconciliation_status: newTxStatus }
+      if (tx?.tx_nature === 'no_invoice') {
+        txUpdate.tx_nature = 'invoice_payment'
+        txUpdate.classification_status = 'pending' // reset classification since it's now reconciled
+        txUpdate.classification_source = null
+      }
       const { error: e3 } = await supabase
         .from('bank_transactions')
-        .update({ reconciled_amount: newTxReconciled, reconciliation_status: newTxStatus })
+        .update(txUpdate)
         .eq('id', suggestion.bank_transaction_id)
       if (e3) throw e3
 

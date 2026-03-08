@@ -241,6 +241,43 @@ export default function BankTxDetail({
         <Row l="Filiale disponente" v={tx.branch} />
         <Row l="Riferimento" v={tx.reference} />
         <Row l="Stato riconciliazione" v={tx.reconciliation_status} />
+
+        {/* Triage + Classification section */}
+        {tx.tx_nature && (
+          <div className="border-t pt-3 mt-3">
+            <p className="text-[10px] text-gray-400 uppercase tracking-wide mb-2">Analisi AI</p>
+            <div className="flex items-center gap-2 mb-2">
+              {tx.tx_nature === 'invoice_payment' && (
+                <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-sky-100 text-sky-700">Pagamento fattura</span>
+              )}
+              {tx.tx_nature === 'no_invoice' && (
+                <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-violet-100 text-violet-700">Senza fattura</span>
+              )}
+              {tx.tx_nature === 'giro_conto' && (
+                <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-gray-200 text-gray-600">Giroconto</span>
+              )}
+            </div>
+            {tx.tx_nature === 'no_invoice' && tx.classification_status !== 'pending' && (
+              <div className="space-y-1.5 bg-violet-50 rounded-lg p-2.5">
+                {tx.classification_reasoning && (
+                  <p className="text-[10px] text-violet-700">{tx.classification_reasoning}</p>
+                )}
+                {tx.classification_confidence != null && (
+                  <p className="text-[10px] text-gray-500">Confidenza: {Math.round(tx.classification_confidence)}%</p>
+                )}
+                {tx.fiscal_flags?.is_tax_payment && (
+                  <div className="flex items-center gap-1 px-2 py-1 bg-amber-50 border border-amber-200 rounded text-[10px] text-amber-800">
+                    Pagamento tributo: {tx.fiscal_flags.tax_type || 'N/D'}
+                  </div>
+                )}
+                <p className="text-[10px] text-gray-500">
+                  Stato: {tx.classification_status === 'ai_suggested' ? 'Suggerito AI' : tx.classification_status === 'confirmed' ? 'Confermato' : tx.classification_status}
+                  {tx.classification_source && ` (${tx.classification_source})`}
+                </p>
+              </div>
+            )}
+          </div>
+        )}
       </div>
       {editable && (
         <div className="border-t px-4 py-3 bg-gray-50 max-h-[50vh] overflow-y-auto">
