@@ -9,7 +9,7 @@ const corsHeaders = {
 
 const CONCURRENCY = 3;
 const MAX_BATCH = 100;
-const API_TIMEOUT_MS = 15_000;
+const API_TIMEOUT_MS = 30_000;
 
 const TRUSTED_DOMAINS = [
   "registroimprese",
@@ -169,16 +169,33 @@ async function lookupAtecoWithGemini(
   const address = clip(cp.address, 200) || "N/D";
   const legalType = cp.legal_type || "N/D";
 
-  const prompt = `Cerca sul web il codice ATECO ufficiale (dalla Camera di Commercio o dal Registro Imprese) di questa azienda italiana:
-Nome: ${name}
+  const prompt = `Devo trovare il codice ATECO UFFICIALE (dalla Camera di Commercio italiana) di questa azienda.
+CERCA SU INTERNET usando la partita IVA su siti come registroimprese.it, visura.pro, ufficiocamerale.it, ateco.infocamere.it.
+
+Azienda: ${name}
 Partita IVA: ${vatNumber}
 Sede: ${address}
 Tipo: ${legalType}
 
-Cerca su siti come registroimprese.it, visura.pro, ufficiocamerale.it, o qualsiasi fonte ufficiale.
-Rispondi SOLO con JSON valido:
-{"ateco_code": "XX.XX.XX", "ateco_description": "descrizione ufficiale", "business_sector": "settore", "business_description": "breve descrizione attività", "source_url": "url dove hai trovato il dato", "confidence": 0.0}
-Se NON trovi il codice ATECO ufficiale sul web, metti confidence < 0.5 e specifica che è inferito.`;
+ISTRUZIONI IMPORTANTI:
+- NON INVENTARE il codice ATECO basandoti sul nome dell'azienda.
+- CERCA ESATTAMENTE questa partita IVA sui registri ufficiali italiani.
+- Il nome dell'azienda può essere ingannevole (es. "Capricorno" non significa agricoltura/allevamento).
+- Se non trovi il codice ATECO ufficiale cercando sul web, rispondi con confidence: 0.
+- Includi la URL esatta della pagina web dove hai trovato il dato.
+
+Rispondi con JSON:
+{"ateco_code": "XX.XX.XX", "ateco_description": "descrizione ufficiale", "business_sector": "settore", "business_description": "breve descrizione attività", "source_url": "url della fonte", "confidence": 0.0}`;
+
+  // NO responseMimeType — it disables tool/grounding use in Gemini
+  const requestBody = {
+    contents: [{ parts: [{ text: prompt }] }],
+    tools: [{ google_search: {} }],
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: 2048,
+    },
+  };
 
   try {
     const response = await fetch(
@@ -186,61 +203,69 @@ Se NON trovi il codice ATECO ufficiale sul web, metti confidence < 0.5 e specifi
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          tools: [{
-            google_search_retrieval: {
-              dynamic_retrieval_config: {
-                mode: "MODE_DYNAMIC",
-                dynamic_threshold: 0.3,
-              },
-            },
-          }],
-          generationConfig: {
-            temperature: 0,
-            maxOutputTokens: 500,
-            responseMimeType: "application/json",
-            thinkingConfig: { thinkingBudget: 0 },
-          },
-        }),
+        body: JSON.stringify(requestBody),
         signal: AbortSignal.timeout(API_TIMEOUT_MS),
       },
     );
 
     if (!response.ok) {
       const errBody = await response.text();
-      console.error(`Gemini grounding error ${response.status}:`, errBody.slice(0, 300));
+      console.error(`[enrich] Gemini HTTP ${response.status} for "${name}":`, errBody.slice(0, 300));
       return null;
     }
 
     const data = await response.json();
-    const rawText = (data?.candidates?.[0]?.content?.parts ?? [])
+    const candidate = data?.candidates?.[0];
+    const groundingMeta = candidate?.groundingMetadata;
+    const groundingChunks = groundingMeta?.groundingChunks;
+
+    console.log(`[enrich] "${name}": grounded=${groundingMeta != null}, chunks=${groundingChunks?.length ?? 0}, finish=${candidate?.finishReason}`);
+
+    // Extract text from response parts
+    const rawText = (candidate?.content?.parts ?? [])
       .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
       .join("\n")
       .trim();
 
-    if (!rawText) return null;
+    if (!rawText) {
+      console.warn(`[enrich] Empty response from Gemini for "${name}"`);
+      return null;
+    }
 
+    // Parse JSON from text (no responseMimeType, so response may contain markdown)
     const cleanedText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-    const parsed = JSON.parse(cleanedText);
+    const jsonStart = cleanedText.indexOf("{");
+    const jsonEnd = cleanedText.lastIndexOf("}");
+    if (jsonStart < 0 || jsonEnd <= jsonStart) {
+      console.warn(`[enrich] No JSON in response for "${name}":`, cleanedText.slice(0, 200));
+      return null;
+    }
+    const parsed = JSON.parse(cleanedText.slice(jsonStart, jsonEnd + 1));
     const atecoCode = parsed?.ateco_code || null;
     if (!atecoCode) return null;
 
     const confidence = Number(parsed?.confidence ?? 0);
     const sourceUrl = parsed?.source_url || null;
-    const grounded = data?.candidates?.[0]?.groundingMetadata != null;
+    const grounded = groundingMeta != null;
+
+    // Use grounding chunk URLs as source if parsed source_url is missing
+    const effectiveSourceUrl = sourceUrl
+      || (groundingChunks ?? []).map((c: any) => c?.web?.uri).filter(Boolean)[0]
+      || null;
+
+    console.log(`[enrich] "${name}": ateco=${atecoCode}, confidence=${confidence}, source=${effectiveSourceUrl}`);
 
     return {
       ateco_code: atecoCode,
       ateco_description: clip(parsed?.ateco_description, 300) || null,
       business_sector: mapAtecoToSector(atecoCode),
       business_description: clip(parsed?.business_description, 500) || null,
-      source_url: sourceUrl,
+      source_url: effectiveSourceUrl,
       confidence: Number.isFinite(confidence) ? confidence : 0,
       grounded,
     };
   } catch (e) {
-    console.error(`Gemini grounding failed for ${name}:`, e instanceof Error ? e.message : e);
+    console.error(`[enrich] Gemini failed for "${name}":`, e instanceof Error ? e.message : e);
     return null;
   }
 }
