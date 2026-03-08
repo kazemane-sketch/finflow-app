@@ -484,79 +484,80 @@ Deno.serve(async (req) => {
       LIMIT ${batchSize}
     `;
 
-    if (targets.length === 0) {
-      return json({
-        triaged: 0,
-        classified: 0,
-        triage_details: [],
-        classification_details: [],
-      });
-    }
+    console.log(`[analyze] Phase 1: ${targets.length} untriaged targets found`);
+
+    // NOTE: Do NOT early-return here when targets.length === 0.
+    // Phase 2 runs independently on already-triaged no_invoice transactions.
 
     // 1b. Deterministic triage first
-    const needsAI: TxRow[] = [];
     const triageResults: TriageResult[] = [];
     let triagedDeterministic = 0;
-
-    for (const tx of targets) {
-      const nature = triageDeterministic(tx);
-      if (nature) {
-        triageResults.push({
-          transaction_id: tx.id,
-          tx_nature: nature,
-          confidence: 95,
-          reasoning: "Triage deterministico basato su parole chiave",
-        });
-        triagedDeterministic++;
-      } else {
-        needsAI.push(tx);
-      }
-    }
-
-    // 1c. AI triage for uncertain transactions
     let triagedAI = 0;
-    if (needsAI.length > 0) {
-      // Get counterparties with open invoices for context
-      const openCounterparties: { name: string; open_amount: number }[] =
-        await sql`
-        SELECT DISTINCT c.name,
-          COALESCE(SUM(ii.amount_due - ii.paid_amount), 0) as open_amount
-        FROM counterparties c
-        JOIN invoices i ON i.counterparty_id = c.id
-        JOIN invoice_installments ii ON ii.invoice_id = i.id
-        WHERE c.company_id = ${companyId}
-          AND ii.status IN ('pending', 'partial')
-        GROUP BY c.id, c.name
-        HAVING COALESCE(SUM(ii.amount_due - ii.paid_amount), 0) > 0.01
-        ORDER BY open_amount DESC
-        LIMIT 100
-      `;
 
-      const aiTriageResults = await triageWithAI(
-        anthropicKey,
-        needsAI,
-        openCounterparties,
-      );
-      for (const r of aiTriageResults) {
-        if (
-          r.tx_nature === "invoice_payment" ||
-          r.tx_nature === "no_invoice" ||
-          r.tx_nature === "giro_conto"
-        ) {
-          triageResults.push(r);
-          triagedAI++;
+    if (targets.length > 0) {
+      const needsAI: TxRow[] = [];
+
+      for (const tx of targets) {
+        const nature = triageDeterministic(tx);
+        if (nature) {
+          triageResults.push({
+            transaction_id: tx.id,
+            tx_nature: nature,
+            confidence: 95,
+            reasoning: "Triage deterministico basato su parole chiave",
+          });
+          triagedDeterministic++;
+        } else {
+          needsAI.push(tx);
         }
       }
-    }
 
-    // 1d. Save triage results
-    for (const r of triageResults) {
-      await sql`
-        UPDATE bank_transactions
-        SET tx_nature = ${r.tx_nature}
-        WHERE id = ${r.transaction_id}
-          AND company_id = ${companyId}
-      `;
+      // 1c. AI triage for uncertain transactions
+      if (needsAI.length > 0) {
+        // Get counterparties with open invoices for context
+        const openCounterparties: { name: string; open_amount: number }[] =
+          await sql`
+          SELECT DISTINCT c.name,
+            COALESCE(SUM(ii.amount_due - ii.paid_amount), 0) as open_amount
+          FROM counterparties c
+          JOIN invoices i ON i.counterparty_id = c.id
+          JOIN invoice_installments ii ON ii.invoice_id = i.id
+          WHERE c.company_id = ${companyId}
+            AND ii.status IN ('pending', 'partial')
+          GROUP BY c.id, c.name
+          HAVING COALESCE(SUM(ii.amount_due - ii.paid_amount), 0) > 0.01
+          ORDER BY open_amount DESC
+          LIMIT 100
+        `;
+
+        const aiTriageResults = await triageWithAI(
+          anthropicKey,
+          needsAI,
+          openCounterparties,
+        );
+        for (const r of aiTriageResults) {
+          if (
+            r.tx_nature === "invoice_payment" ||
+            r.tx_nature === "no_invoice" ||
+            r.tx_nature === "giro_conto"
+          ) {
+            triageResults.push(r);
+            triagedAI++;
+          }
+        }
+      }
+
+      // 1d. Save triage results
+      for (const r of triageResults) {
+        await sql`
+          UPDATE bank_transactions
+          SET tx_nature = ${r.tx_nature}
+          WHERE id = ${r.transaction_id}
+            AND company_id = ${companyId}
+        `;
+      }
+
+      console.log(`[analyze] Phase 1 done: ${triagedDeterministic} deterministic, ${triagedAI} AI (total ${triageResults.length})`);
     }
 
     // ═══════════════════════════════════════
@@ -576,136 +577,144 @@ Deno.serve(async (req) => {
     }
 
     if (!phase2Skipped) {
-    // 2a. Select no_invoice transactions pending classification
-    const noInvoiceTxs: TxRow[] = await sql`
-      SELECT id, date, amount, description, counterparty_name,
-             transaction_type, raw_text, direction, commission_amount,
-             category_code, reconciliation_status, tx_nature
-      FROM bank_transactions
-      WHERE company_id = ${companyId}
-        AND tx_nature = 'no_invoice'
-        AND classification_status = 'pending'
-      ORDER BY date DESC
-      LIMIT ${batchSize}
-    `;
+      // 2a. Select no_invoice transactions pending classification
+      const noInvoiceTxs: TxRow[] = await sql`
+        SELECT id, date, amount, description, counterparty_name,
+               transaction_type, raw_text, direction, commission_amount,
+               category_code, reconciliation_status, tx_nature
+        FROM bank_transactions
+        WHERE company_id = ${companyId}
+          AND tx_nature = 'no_invoice'
+          AND classification_status = 'pending'
+        ORDER BY date DESC
+        LIMIT ${batchSize}
+      `;
 
-    if (noInvoiceTxs.length > 0) {
-      // 2b. Fast-path: classification rules
-      const ruleMatches = await findMatchingRulesForTx(
-        sql,
-        companyId,
-        noInvoiceTxs,
-      );
-      const needsAIClassification: TxRow[] = [];
+      console.log(`[analyze] Phase 2: ${noInvoiceTxs.length} no_invoice pending found (limit ${batchSize})`);
 
-      for (const tx of noInvoiceTxs) {
-        const ruleResult = ruleMatches.get(tx.id);
-        if (ruleResult) {
-          classificationResults.push(ruleResult);
-          classifiedRules++;
-        } else {
-          needsAIClassification.push(tx);
-        }
-      }
-
-      // 2c. AI classification for remaining (capped to avoid timeout)
-      if (needsAIClassification.length > MAX_PHASE2_AI) {
-        console.log(`[analyze] Capping AI classification from ${needsAIClassification.length} to ${MAX_PHASE2_AI}`);
-        needsAIClassification.length = MAX_PHASE2_AI;
-      }
-      if (needsAIClassification.length > 0) {
-        // Load reference data
-        const [accounts, categories, projects, userInstructionRows] =
-          await Promise.all([
-            sql<AccountRow[]>`
-              SELECT id, code, name, section
-              FROM chart_of_accounts
-              WHERE company_id = ${companyId} AND active = true AND is_header = false
-              ORDER BY code
-            `,
-            sql<CategoryRow[]>`
-              SELECT id, name, type
-              FROM categories
-              WHERE company_id = ${companyId} AND active = true
-              ORDER BY name
-            `,
-            sql<ProjectRow[]>`
-              SELECT id, code, name
-              FROM projects
-              WHERE company_id = ${companyId} AND status = 'active'
-              ORDER BY code
-            `,
-            sql<{ instruction: string }[]>`
-              SELECT instruction
-              FROM user_instructions
-              WHERE company_id = ${companyId}
-                AND active = true
-                AND scope IN ('general', 'classification')
-              ORDER BY created_at
-            `,
-          ]);
-
-        const userInstructions = userInstructionRows.map((r) => r.instruction);
-
-        const aiResults = await classifyWithAI(
-          anthropicKey,
-          needsAIClassification,
-          accounts,
-          categories,
-          projects,
-          userInstructions,
+      if (noInvoiceTxs.length > 0) {
+        // 2b. Fast-path: classification rules
+        const ruleMatches = await findMatchingRulesForTx(
+          sql,
+          companyId,
+          noInvoiceTxs,
         );
+        let needsAIClassification: TxRow[] = [];
 
-        // Validate account_id and category_id exist
-        const accountIds = new Set(accounts.map((a) => a.id));
-        const categoryIds = new Set(categories.map((c) => c.id));
-        const projectIds = new Set(projects.map((p) => p.id));
+        for (const tx of noInvoiceTxs) {
+          const ruleResult = ruleMatches.get(tx.id);
+          if (ruleResult) {
+            classificationResults.push(ruleResult);
+            classifiedRules++;
+          } else {
+            needsAIClassification.push(tx);
+          }
+        }
 
-        for (const r of aiResults) {
-          // Validate IDs before saving
-          if (r.account_id && !accountIds.has(r.account_id)) {
-            // Try to match by code in the reasoning
-            const codeMatch = r.reasoning?.match(/\b(\d{5,})\b/);
-            if (codeMatch) {
-              const byCode = accounts.find((a) => a.code === codeMatch[1]);
-              if (byCode) r.account_id = byCode.id;
-              else r.account_id = null;
-            } else {
-              r.account_id = null;
+        console.log(`[analyze] Phase 2: ${classifiedRules} rule matches, ${needsAIClassification.length} need AI`);
+
+        // 2c. AI classification for remaining (capped to avoid timeout)
+        if (needsAIClassification.length > MAX_PHASE2_AI) {
+          console.log(`[analyze] Capping AI classification from ${needsAIClassification.length} to ${MAX_PHASE2_AI}`);
+          needsAIClassification = needsAIClassification.slice(0, MAX_PHASE2_AI);
+        }
+        if (needsAIClassification.length > 0) {
+          // Load reference data
+          const [accounts, categories, projects, userInstructionRows] =
+            await Promise.all([
+              sql<AccountRow[]>`
+                SELECT id, code, name, section
+                FROM chart_of_accounts
+                WHERE company_id = ${companyId} AND active = true AND is_header = false
+                ORDER BY code
+              `,
+              sql<CategoryRow[]>`
+                SELECT id, name, type
+                FROM categories
+                WHERE company_id = ${companyId} AND active = true
+                ORDER BY name
+              `,
+              sql<ProjectRow[]>`
+                SELECT id, code, name
+                FROM projects
+                WHERE company_id = ${companyId} AND status = 'active'
+                ORDER BY code
+              `,
+              sql<{ instruction: string }[]>`
+                SELECT instruction
+                FROM user_instructions
+                WHERE company_id = ${companyId}
+                  AND active = true
+                  AND scope IN ('general', 'classification')
+                ORDER BY created_at
+              `,
+            ]);
+
+          const userInstructions = userInstructionRows.map((r) => r.instruction);
+
+          console.log(`[analyze] Phase 2 AI: classifying ${needsAIClassification.length} txs with ${accounts.length} accounts, ${categories.length} categories`);
+
+          const aiResults = await classifyWithAI(
+            anthropicKey,
+            needsAIClassification,
+            accounts,
+            categories,
+            projects,
+            userInstructions,
+          );
+
+          // Validate account_id and category_id exist
+          const accountIds = new Set(accounts.map((a) => a.id));
+          const categoryIds = new Set(categories.map((c) => c.id));
+          const projectIds = new Set(projects.map((p) => p.id));
+
+          for (const r of aiResults) {
+            // Validate IDs before saving
+            if (r.account_id && !accountIds.has(r.account_id)) {
+              // Try to match by code in the reasoning
+              const codeMatch = r.reasoning?.match(/\b(\d{5,})\b/);
+              if (codeMatch) {
+                const byCode = accounts.find((a) => a.code === codeMatch[1]);
+                if (byCode) r.account_id = byCode.id;
+                else r.account_id = null;
+              } else {
+                r.account_id = null;
+              }
+            }
+            if (r.category_id && !categoryIds.has(r.category_id)) {
+              r.category_id = null;
+            }
+            if (r.cost_center_id && !projectIds.has(r.cost_center_id)) {
+              r.cost_center_id = null;
+            }
+
+            if (r.account_id || r.category_id) {
+              classificationResults.push(r);
+              classifiedAI++;
             }
           }
-          if (r.category_id && !categoryIds.has(r.category_id)) {
-            r.category_id = null;
-          }
-          if (r.cost_center_id && !projectIds.has(r.cost_center_id)) {
-            r.cost_center_id = null;
-          }
 
-          if (r.account_id || r.category_id) {
-            classificationResults.push(r);
-            classifiedAI++;
-          }
+          console.log(`[analyze] Phase 2 AI done: ${classifiedAI} classified, ${aiResults.length - classifiedAI} skipped (no valid account/category)`);
+        }
+
+        // 2d. Save classification results
+        for (const r of classificationResults) {
+          const isRule = r.reasoning?.startsWith("Regola appresa");
+          await sql`
+            UPDATE bank_transactions
+            SET category_id = ${r.category_id},
+                account_id = ${r.account_id},
+                cost_center_id = ${r.cost_center_id},
+                classification_status = 'ai_suggested',
+                classification_source = ${isRule ? "rule" : "ai"},
+                classification_confidence = ${r.confidence},
+                classification_reasoning = ${r.reasoning},
+                fiscal_flags = ${r.fiscal_flags ? JSON.stringify(r.fiscal_flags) : null}
+            WHERE id = ${r.transaction_id}
+              AND company_id = ${companyId}
+          `;
         }
       }
-
-      // 2d. Save classification results
-      for (const r of classificationResults) {
-        const isRule = r.reasoning?.startsWith("Regola appresa");
-        await sql`
-          UPDATE bank_transactions
-          SET category_id = ${r.category_id},
-              account_id = ${r.account_id},
-              cost_center_id = ${r.cost_center_id},
-              classification_status = 'ai_suggested',
-              classification_source = ${isRule ? "rule" : "ai"},
-              classification_confidence = ${r.confidence},
-              classification_reasoning = ${r.reasoning},
-              fiscal_flags = ${r.fiscal_flags ? JSON.stringify(r.fiscal_flags) : null}
-          WHERE id = ${r.transaction_id}
-            AND company_id = ${companyId}
-        `;
-      }
-    }
     } // end if (!phase2Skipped)
 
     const totalElapsed = Date.now() - startTime;

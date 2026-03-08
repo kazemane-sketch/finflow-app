@@ -927,16 +927,24 @@ export default function BancaPage() {
           signal.addEventListener('abort', () => { clearTimeout(timer); reject(new DOMException('Aborted', 'AbortError')) }, { once: true })
         })
 
-      // 1. Count total pending transactions to show accurate progress
+      // 1. Count total pending: untriaged + no_invoice pending classification
       let totalPending = 0
       try {
-        const { count } = await supabase
-          .from('bank_transactions')
-          .select('id', { count: 'exact', head: true })
-          .eq('company_id', companyId)
-          .is('tx_nature', null)
-          .in('reconciliation_status', ['unmatched', 'partial'])
-        totalPending = count ?? 0
+        const [untriaged, unclassified] = await Promise.all([
+          supabase
+            .from('bank_transactions')
+            .select('id', { count: 'exact', head: true })
+            .eq('company_id', companyId)
+            .is('tx_nature', null)
+            .in('reconciliation_status', ['unmatched', 'partial']),
+          supabase
+            .from('bank_transactions')
+            .select('id', { count: 'exact', head: true })
+            .eq('company_id', companyId)
+            .eq('tx_nature', 'no_invoice')
+            .eq('classification_status', 'pending'),
+        ])
+        totalPending = (untriaged.count ?? 0) + (unclassified.count ?? 0)
       } catch { /* ignore count error, fallback to rolling estimate */ }
 
       if (totalPending === 0) {
