@@ -1,6 +1,6 @@
 // src/pages/FatturePage.tsx — v6
 // Tab layout redesign: Classification-first UX with Documento/Pagamenti/Note tabs
-import { useState, useCallback, useRef, useEffect, useMemo, useSyncExternalStore } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { processInvoiceFile, TIPO, MP, REG, mpLabel, tpLabel } from '@/lib/invoiceParser';
@@ -491,6 +491,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   // AI classification suggestion state
   const [aiClassifStatus, setAiClassifStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [aiClassifResult, setAiClassifResult] = useState<any>(null);
+  const [lineFiscalFlags, setLineFiscalFlags] = useState<Record<string, any>>({});
 
   // Load articles + existing assignments when invoice changes
   useEffect(() => {
@@ -818,6 +819,15 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
       setAiClassifResult(result);
       setAiClassifStatus('done');
+
+      // Extract fiscal flags from AI results
+      const flags: Record<string, any> = {};
+      for (const lr of (aiResult?.lines || [])) {
+        if (lr.fiscal_flags && lr.line_id) {
+          flags[lr.line_id] = lr.fiscal_flags;
+        }
+      }
+      setLineFiscalFlags(flags);
 
       // Reload classification data to reflect persisted suggestions
       const [classif, lineClf, lineProj, freshInvProjs] = await Promise.all([
@@ -1313,8 +1323,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                       const lineId = dbLine?.id;
                       const lineCat = lineId ? lineClassifs[lineId]?.category_id : null;
                       const lineAcc = lineId ? lineClassifs[lineId]?.account_id : null;
+                      const ff = lineId ? lineFiscalFlags[lineId] : null;
+                      const hasFiscalFlags = ff && (ff.ritenuta_acconto || ff.reverse_charge || ff.split_payment || ff.bene_strumentale || (ff.deducibilita_pct != null && ff.deducibilita_pct < 100) || (ff.iva_detraibilita_pct != null && ff.iva_detraibilita_pct < 100));
+                      const colCount = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0);
                       return (
-                      <tr key={i} className="border-b border-gray-50 hover:bg-gray-50/50">
+                      <React.Fragment key={i}>
+                      <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                         <td className="text-left px-3 py-2 max-w-[200px]">
                           <span className="text-gray-800">{l.descrizione}</span>
                           {/* Article badge inline */}
@@ -1446,14 +1460,57 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                           ) : <span className="text-[9px] text-gray-300">{'\u2014'}</span>}
                         </td>}
                       </tr>
+                      {hasFiscalFlags && (
+                        <tr>
+                          <td colSpan={colCount} className="px-3 py-1">
+                            <div className="flex flex-wrap gap-1.5">
+                              {ff.ritenuta_acconto && (
+                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u26A0\uFE0F'} Ritenuta d'acconto {ff.ritenuta_acconto.aliquota}% sull'imponibile
+                                </span>
+                              )}
+                              {ff.reverse_charge && (
+                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u26A0\uFE0F'} Possibile reverse charge art.17 c.6
+                                </span>
+                              )}
+                              {ff.split_payment && (
+                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u26A0\uFE0F'} Split payment — IVA versata dalla PA
+                                </span>
+                              )}
+                              {ff.bene_strumentale && (
+                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u26A0\uFE0F'} Possibile bene strumentale ({'>'}516{'\u20AC'}) — da ammortizzare
+                                </span>
+                              )}
+                              {ff.deducibilita_pct != null && ff.deducibilita_pct < 100 && (
+                                <span className="inline-flex items-center gap-1 bg-sky-50 border border-sky-200 text-sky-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u2139\uFE0F'} Costo deducibile al {ff.deducibilita_pct}%
+                                </span>
+                              )}
+                              {ff.iva_detraibilita_pct != null && ff.iva_detraibilita_pct < 100 && (
+                                <span className="inline-flex items-center gap-1 bg-sky-50 border border-sky-200 text-sky-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u2139\uFE0F'} IVA detraibile al {ff.iva_detraibilita_pct}%
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      </React.Fragment>
                       );
                     })}
                     {/* Fallback: DB line items when XML not parsed */}
                     {!b?.linee?.length && detail?.invoice_lines?.map((l, i) => {
                       const lineCat = lineClassifs[l.id]?.category_id;
                       const lineAcc = lineClassifs[l.id]?.account_id;
+                      const ff2 = lineFiscalFlags[l.id];
+                      const hasFf2 = ff2 && (ff2.ritenuta_acconto || ff2.reverse_charge || ff2.split_payment || ff2.bene_strumentale || (ff2.deducibilita_pct != null && ff2.deducibilita_pct < 100) || (ff2.iva_detraibilita_pct != null && ff2.iva_detraibilita_pct < 100));
+                      const colCount2 = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0);
                       return (
-                      <tr key={i} className="border-b border-gray-50 hover:bg-gray-50/50">
+                      <React.Fragment key={i}>
+                      <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                         <td className="text-left px-3 py-2">
                           <span className="text-gray-800">{l.description}</span>
                           {articles.length > 0 && (
@@ -1529,6 +1586,45 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                           </select>
                         </td>}
                       </tr>
+                      {hasFf2 && (
+                        <tr>
+                          <td colSpan={colCount2} className="px-3 py-1">
+                            <div className="flex flex-wrap gap-1.5">
+                              {ff2.ritenuta_acconto && (
+                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u26A0\uFE0F'} Ritenuta d'acconto {ff2.ritenuta_acconto.aliquota}% sull'imponibile
+                                </span>
+                              )}
+                              {ff2.reverse_charge && (
+                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u26A0\uFE0F'} Possibile reverse charge art.17 c.6
+                                </span>
+                              )}
+                              {ff2.split_payment && (
+                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u26A0\uFE0F'} Split payment — IVA versata dalla PA
+                                </span>
+                              )}
+                              {ff2.bene_strumentale && (
+                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u26A0\uFE0F'} Possibile bene strumentale ({'>'}516{'\u20AC'}) — da ammortizzare
+                                </span>
+                              )}
+                              {ff2.deducibilita_pct != null && ff2.deducibilita_pct < 100 && (
+                                <span className="inline-flex items-center gap-1 bg-sky-50 border border-sky-200 text-sky-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u2139\uFE0F'} Costo deducibile al {ff2.deducibilita_pct}%
+                                </span>
+                              )}
+                              {ff2.iva_detraibilita_pct != null && ff2.iva_detraibilita_pct < 100 && (
+                                <span className="inline-flex items-center gap-1 bg-sky-50 border border-sky-200 text-sky-800 text-[10px] px-2 py-0.5 rounded">
+                                  {'\u2139\uFE0F'} IVA detraibile al {ff2.iva_detraibilita_pct}%
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      </React.Fragment>
                       );
                     })}
                   </tbody>

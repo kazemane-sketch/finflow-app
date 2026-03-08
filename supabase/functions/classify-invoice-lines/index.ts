@@ -72,6 +72,16 @@ interface HistoryRow {
   cost_center_allocations: unknown;
 }
 
+interface FiscalFlags {
+  ritenuta_acconto: { aliquota: number; base: string } | null;
+  reverse_charge: boolean;
+  split_payment: boolean;
+  bene_strumentale: boolean;
+  deducibilita_pct: number;
+  iva_detraibilita_pct: number;
+  note: string | null;
+}
+
 interface SonnetLineResult {
   line_id: string;
   article_code: string | null;
@@ -80,6 +90,7 @@ interface SonnetLineResult {
   cost_center_allocations: { project_id: string; percentage: number }[] | null;
   confidence: number;
   reasoning: string;
+  fiscal_flags?: FiscalFlags | null;
 }
 
 /* ─── Gemini embedding (for RAG) ────────── */
@@ -179,9 +190,8 @@ function buildPrompt(
     .map((c) => `- ${c.id}: ${c.name} (${c.type})`)
     .join("\n");
 
-  // Chart of accounts
+  // Chart of accounts (no limit — all active non-header accounts needed for accurate classification)
   const coaSection = accounts
-    .slice(0, 100)
     .map((a) => `- ${a.id}: ${a.code} ${a.name} (${a.section})`)
     .join("\n");
 
@@ -259,6 +269,66 @@ REGOLE:
 * category_id e account_id: assegna SEMPRE
 * confidence 0-100
 
+EXPERTISE CONTABILE ITALIANA — REGOLE FISCALI DA APPLICARE:
+
+DEDUCIBILITA DIFFERENZIATA (CRITICO — scegli il conto giusto in base alla percentuale):
+Questa azienda ha conti separati per diverse percentuali di deducibilità. DEVI scegliere il conto con la percentuale corretta:
+* Carburanti automezzi da trasporto (camion, escavatori, pale) → 60812 "Carburanti 100%"
+* Carburanti auto aziendali (autovetture, SUV) → 608124 "Carburanti 20%"
+* Manutenzione automezzi da trasporto → 60720 "Manutenzione automezzi 100%"
+* Manutenzione auto aziendali → 607204 "Manutenzione automezzi 20%"
+* Assicurazione automezzi da trasporto → 60822 "Assicurazioni automezzi 100%"
+* Assicurazione auto aziendali → 608224 "Assicurazioni automezzi 20%"
+* Tassa possesso automezzi da trasporto → 63207 "Tassa possesso 100%"
+* Tassa possesso auto aziendali → 632074 "Tassa possesso 20%"
+* Spese telefoniche → 608530 "Spese telefoniche 80%" (sempre 80%)
+* Ristorazione e pernottamenti → 608150 "Spese ristoranti/pernott. 75%" (sempre 75%)
+* Spese di rappresentanza → 60892 (deducibilità variabile in base al fatturato)
+Come distinguere 100% da 20%:
+* Se la controparte ha ATECO nel settore trasporti (49.xx) o commercio carburanti (47.30) e l'azienda è di autotrasporto/cave → 100%
+* Se la fattura riguarda un'autovettura specifica (targa auto, non camion) → 20%
+* Se non è chiaro, usa 100% per automezzi specifici/da lavoro e 20% per auto generiche
+* I mezzi specifici della cava (escavatori, pale, mezzi di sollevamento) sono SEMPRE 100%
+
+RITENUTA D'ACCONTO:
+* Fatture da professionisti (avvocati, consulenti, geometri, ingegneri, notai — ATECO 69.xx, 71.xx, 74.xx) → segnala "Ritenuta acconto 20% su imponibile"
+* Il costo va sul conto appropriato (60730 consulenza amm/fiscale, 6073201 consulenze legali, 607320 consulenze tecniche, 6073202 consulenze notarili)
+* Non serve un conto separato per la ritenuta nella classificazione (sarà gestito in prima nota)
+
+LEASING:
+* Ogni contratto di leasing ha il suo conto dedicato (609xxxx) e il suo conto interessi (6094xxx)
+* Se la fattura è di CREDEMLEASING, MPS Leasing, Daimler Truck Financial, BNP, Alba Leasing, Mercedes-Benz Financial → cerca il numero contratto nella descrizione e abbina al conto leasing corrispondente
+* Se non trovi il numero contratto, usa il conto leasing generico 6093 "Canoni Leasing"
+* Gli interessi su leasing vanno sempre su 6094xxx (section: financial), MAI sullo stesso conto del canone
+
+REVERSE CHARGE (art. 17 c.6 DPR 633/72):
+* Fatture per servizi edili tra imprese (subappalti) — controparte con ATECO 41.xx, 42.xx, 43.xx
+* Se la fattura NON ha IVA esposta ma il fornitore è un'impresa edile → possibile reverse charge
+* Segnala nel reasoning: "Possibile reverse charge art.17 c.6 — verificare registrazione IVA"
+
+SPLIT PAYMENT (art. 17-ter DPR 633/72):
+* Fatture ATTIVE verso la Pubblica Amministrazione (controparte con legal_type = 'pa')
+* L'IVA non viene incassata dal fornitore → segnala nel reasoning
+
+BENI STRUMENTALI vs COSTI D'ESERCIZIO:
+* Acquisto di macchinari, automezzi, attrezzature, mobili con importo significativo (> 516,46 euro) → NON è un costo d'esercizio, va su un conto immobilizzazioni (21xxx)
+* Acquisti sotto 516,46 euro → conto 21360 "Beni strumentali inferiore unità minima" oppure direttamente a costo
+* Se il bene è chiaramente un immobilizzazione (camion, escavatore, computer) → segnala nel reasoning anche se non puoi assegnare il conto patrimoniale in questa fase
+
+UTENZE E SERVIZI:
+* Bollette energia → 60830
+* Bollette gas → 60831
+* Acquedotto → 60836
+* Telefonia → 608530 (80%)
+* Internet/provider → 6085301
+* Smaltimento rifiuti → 60872
+
+CONTABILITA SPECIFICA CAVE E INERTI:
+* Questa è un'azienda di cave e inerti (ATECO 089909)
+* I ricavi principali sono: vendita pozzolana (70000), calcare frantumato (70002), minerale calcare (70003), materiale da estrazione (70004), servizi (70005), trasporto (70006), noleggio (70007), manutenzione mezzi (70008), scopertura cave (70009)
+* I costi specifici includono: locazione cava (6090020), esplosivo (rimborsato come ricavo 7063001), trasporti su acquisti (60412) e vendite (60810)
+* Distingui SEMPRE tra "trasporto su acquisto" (60412 — il fornitore ci porta la merce) e "trasporto per vendita" (60810 — noi portiamo merce al cliente) e "spese di trasporto generiche" (60702)
+
 FATTURA: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
 
 RIGHE DA CLASSIFICARE:
@@ -272,7 +342,16 @@ Rispondi con un array JSON (senza markdown):
   "account_id": "uuid",
   "cost_center_allocations": [{"project_id": "uuid", "percentage": 100}],
   "confidence": 0-100,
-  "reasoning": "spiegazione breve max 30 parole"
+  "reasoning": "spiegazione breve max 30 parole",
+  "fiscal_flags": {
+    "ritenuta_acconto": null oppure {"aliquota": 20, "base": "imponibile"},
+    "reverse_charge": false,
+    "split_payment": false,
+    "bene_strumentale": false,
+    "deducibilita_pct": 100,
+    "iva_detraibilita_pct": 100,
+    "note": null oppure "eventuale nota fiscale"
+  }
 }]
 ---KEYWORDS---
 ["keyword1", "keyword2", ...] (5-10 keywords di ricerca per questa fattura)`;
@@ -705,6 +784,7 @@ Deno.serve(async (req) => {
         100,
       ),
       reasoning: item.reasoning || "",
+      fiscal_flags: item.fiscal_flags || null,
     }));
 
     // ─── Compose invoice-level ─────────────────────────
