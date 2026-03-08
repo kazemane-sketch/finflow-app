@@ -223,7 +223,7 @@ interface ClassificationRule {
   id: string;
   description_pattern: string;
   direction: string | null;
-  vat_key: string | null;
+  counterparty_vat_key: string | null;
   category_id: string | null;
   account_id: string | null;
   confidence: number;
@@ -245,7 +245,7 @@ async function findMatchingRulesForTx(
   transactions: TxRow[],
 ): Promise<Map<string, ClassifyResult>> {
   const rules: ClassificationRule[] = await sql`
-    SELECT id, description_pattern, direction, vat_key,
+    SELECT id, description_pattern, direction, counterparty_vat_key,
            category_id, account_id, confidence
     FROM classification_rules
     WHERE company_id = ${companyId}
