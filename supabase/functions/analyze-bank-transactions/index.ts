@@ -607,8 +607,8 @@ Deno.serve(async (req) => {
               WHERE company_id = ${companyId} AND status = 'active'
               ORDER BY code
             `,
-            sql<{ content: string }[]>`
-              SELECT content
+            sql<{ instruction: string }[]>`
+              SELECT instruction
               FROM user_instructions
               WHERE company_id = ${companyId}
                 AND active = true
@@ -617,7 +617,7 @@ Deno.serve(async (req) => {
             `,
           ]);
 
-        const userInstructions = userInstructionRows.map((r) => r.content);
+        const userInstructions = userInstructionRows.map((r) => r.instruction);
 
         const aiResults = await classifyWithAI(
           anthropicKey,
