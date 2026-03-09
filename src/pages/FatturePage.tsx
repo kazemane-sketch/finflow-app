@@ -26,8 +26,8 @@ import {
   loadExtractionStats as loadExtStats,
 } from '@/lib/extractionStore';
 import {
-  loadArticles, assignArticleToLine, removeLineAssignment, recordAssignmentFeedback, loadLearnedRules,
-  type Article, type MatchResult,
+  loadArticlesWithPhases, assignArticleToLine, removeLineAssignment, recordAssignmentFeedback, loadLearnedRules,
+  type Article, type ArticleWithPhases, type ArticlePhase, type MatchResult,
 } from '@/lib/articlesService';
 import { matchWithLearnedRules, extractLocation } from '@/lib/articleMatching';
 import {
@@ -322,10 +322,11 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, is
 interface LineArticleInfo {
   article_id: string; code: string; name: string;
   assigned_by: string; verified: boolean; location: string | null;
+  phase_id: string | null; phase_code: string | null; phase_name: string | null;
 }
 
 function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove }: {
-  articles: Article[]; current: LineArticleInfo | null;
+  articles: ArticleWithPhases[]; current: LineArticleInfo | null;
   suggestion: MatchResult | null;
   onAssign: (articleId: string) => void; onRemove: () => void;
 }) {
@@ -438,6 +439,38 @@ function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove }: 
 }
 
 // ============================================================
+// PHASE DROPDOWN — cascading dropdown for article phases
+// ============================================================
+function PhaseDropdown({ phases, currentPhaseId, onSelect }: {
+  phases: ArticlePhase[];
+  currentPhaseId: string | null;
+  onSelect: (phaseId: string | null) => void;
+}) {
+  const sorted = useMemo(() => [...phases].sort((a, b) => a.sort_order - b.sort_order), [phases]);
+  const current = sorted.find(p => p.id === currentPhaseId);
+
+  return (
+    <select
+      value={currentPhaseId || ''}
+      onChange={e => onSelect(e.target.value || null)}
+      className={`px-1.5 py-0.5 text-[9px] border rounded-md outline-none cursor-pointer max-w-[140px] ${
+        currentPhaseId
+          ? 'bg-teal-50 border-teal-300 text-teal-800 font-semibold'
+          : 'bg-orange-50 border-orange-300 text-orange-700 animate-pulse'
+      }`}
+      title={current ? `${current.code} — ${current.name}` : 'Seleziona fase'}
+    >
+      <option value="">{'\u2014'} Fase {'\u2014'}</option>
+      {sorted.map(p => (
+        <option key={p.id} value={p.id}>
+          {p.is_counting_point ? '\u25CF ' : ''}{p.code} {'\u2014'} {p.name}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+// ============================================================
 // FULL INVOICE DETAIL — matches artifact output
 // ============================================================
 type DetailTab = 'classificazione' | 'documento' | 'pagamenti' | 'note';
@@ -467,7 +500,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const notesDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   // ─── Article assignment state ───
-  const [articles, setArticles] = useState<Article[]>([]);
+  const [articles, setArticles] = useState<ArticleWithPhases[]>([]);
   const [lineArticleMap, setLineArticleMap] = useState<Record<string, LineArticleInfo>>({});
   const [aiSuggestions, setAiSuggestions] = useState<Record<string, MatchResult>>({});
 
@@ -503,26 +536,29 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   }>>({});
   const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(new Set());
   const [creatingSuggestion, setCreatingSuggestion] = useState<string | null>(null);
+  // Bulk article + phase selection
+  const [bulkArticleId, setBulkArticleId] = useState<string | null>(null);
+  const [bulkPhaseId, setBulkPhaseId] = useState<string | null>(null);
 
   // Load articles + existing assignments when invoice changes
   useEffect(() => {
     const companyId = company?.id;
-    if (!companyId || !invoice?.id) { setArticles([]); setLineArticleMap({}); setAiSuggestions({}); return; }
+    if (!companyId || !invoice?.id) { setArticles([]); setLineArticleMap({}); setAiSuggestions({}); setBulkArticleId(null); setBulkPhaseId(null); return; }
     let cancelled = false;
 
     (async () => {
       // Load articles + learned rules for this company
       const [arts, rules] = await Promise.all([
-        loadArticles(companyId, { activeOnly: true }),
+        loadArticlesWithPhases(companyId, { activeOnly: true }),
         loadLearnedRules(companyId),
       ]);
       if (cancelled) return;
       setArticles(arts);
 
-      // Load existing assignments for this invoice
+      // Load existing assignments for this invoice (include phase_id + phase relation)
       const { data: assignments } = await supabase
         .from('invoice_line_articles')
-        .select('invoice_line_id, article_id, assigned_by, verified, location, confidence, article:articles!inner(id, code, name, unit, keywords)')
+        .select('invoice_line_id, article_id, phase_id, assigned_by, verified, location, confidence, article:articles!inner(id, code, name, unit, keywords)')
         .eq('invoice_id', invoice.id);
 
       if (cancelled) return;
@@ -531,11 +567,15 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
       for (const a of (assignments || [])) {
         const art = a.article as any;
+        // Resolve phase info from pre-loaded articles
+        const fullArtWithPhases = arts.find(ar => ar.id === a.article_id);
+        const phase = a.phase_id ? fullArtWithPhases?.phases?.find(p => p.id === a.phase_id) : null;
         if (a.verified) {
           // Confirmed assignment → green badge
           map[a.invoice_line_id] = {
             article_id: a.article_id, code: art?.code || '', name: art?.name || '',
             assigned_by: a.assigned_by, verified: a.verified, location: a.location,
+            phase_id: a.phase_id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
           };
         } else {
           // AI suggestion from DB → orange badge
@@ -797,6 +837,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         ...ruleSuggestions.map(s => ({
           invoice_line_id: s.line_id,
           article_id: s.article_id,
+          phase_id: null as string | null,
           category_id: s.category_id,
           account_id: s.account_id,
           project_allocations: s.cost_center_allocations || [],
@@ -807,6 +848,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         ...(aiResult?.lines || []).map((lr: any) => ({
           invoice_line_id: lr.line_id,
           article_id: lr.article_id || null,
+          phase_id: lr.phase_id || null,
           category_id: lr.category_id,
           account_id: lr.account_id,
           project_allocations: lr.cost_center_allocations || [],
@@ -854,13 +896,42 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setLineSuggestions(suggestions);
       setDismissedSuggestions(new Set());
 
-      // Reload classification data to reflect persisted suggestions
-      const [classif, lineClf, lineProj, freshInvProjs] = await Promise.all([
+      // Reload classification data + article assignments to reflect persisted suggestions (incl. phase_id)
+      const [classif, lineClf, lineProj, freshInvProjs, freshAssignments] = await Promise.all([
         loadInvoiceClassification(invoice.id),
         loadLineClassifications(invoice.id),
         loadLineProjects(invoice.id),
         loadInvoiceProjects(invoice.id),
+        supabase.from('invoice_line_articles')
+          .select('invoice_line_id, article_id, phase_id, assigned_by, verified, location, confidence, article:articles!inner(id, code, name, unit, keywords)')
+          .eq('invoice_id', invoice.id).then(r => r.data || []),
       ]);
+
+      // Rebuild lineArticleMap + aiSuggestions with fresh DB data (includes phase_id)
+      const freshMap: Record<string, LineArticleInfo> = {};
+      const freshDbSugg: Record<string, MatchResult> = {};
+      for (const a of freshAssignments) {
+        const art = (a as any).article;
+        const fullArtWithPhases = articles.find(ar => ar.id === a.article_id);
+        const phase = a.phase_id ? fullArtWithPhases?.phases?.find(p => p.id === a.phase_id) : null;
+        if (a.verified) {
+          freshMap[a.invoice_line_id] = {
+            article_id: a.article_id, code: art?.code || '', name: art?.name || '',
+            assigned_by: a.assigned_by, verified: a.verified, location: a.location,
+            phase_id: a.phase_id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
+          };
+        } else {
+          const fullArt = articles.find(ar => ar.id === a.article_id);
+          if (fullArt) {
+            freshDbSugg[a.invoice_line_id] = {
+              article: fullArt, confidence: Number(a.confidence) || 50,
+              matchedKeywords: [], totalKeywords: fullArt.keywords.length, source: 'deterministic',
+            };
+          }
+        }
+      }
+      setLineArticleMap(freshMap);
+      setAiSuggestions(freshDbSugg);
       if (classif) {
         setClassification(classif);
         setSelCategoryId(classif.category_id || selCategoryId);
@@ -913,6 +984,27 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       // Patch invoice in sidebar so ⚡ disappears (no full reload → preserves selection + scroll)
       onPatchInvoice(invoice.id, { classification_status: 'confirmed' } as Partial<DBInvoice>);
 
+      // Reload article assignments so lineArticleMap reflects confirmed state (incl. phase_id)
+      const { data: freshAssignments } = await supabase
+        .from('invoice_line_articles')
+        .select('invoice_line_id, article_id, phase_id, assigned_by, verified, location, confidence, article:articles!inner(id, code, name, unit, keywords)')
+        .eq('invoice_id', invoice.id);
+      const freshMap: Record<string, LineArticleInfo> = {};
+      for (const a of (freshAssignments || [])) {
+        const art = (a as any).article;
+        const fullArtWithPhases = articles.find(ar => ar.id === a.article_id);
+        const phase = a.phase_id ? fullArtWithPhases?.phases?.find(p => p.id === a.phase_id) : null;
+        if (a.verified) {
+          freshMap[a.invoice_line_id] = {
+            article_id: a.article_id, code: art?.code || '', name: art?.name || '',
+            assigned_by: a.assigned_by, verified: a.verified, location: a.location,
+            phase_id: a.phase_id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
+          };
+        }
+      }
+      setLineArticleMap(freshMap);
+      setAiSuggestions({});
+
       // Create classification rules from AI-confirmed lines (fire-and-forget)
       const cp = (invoice.counterparty || {}) as any;
       if (aiClassifResult.lines) {
@@ -928,7 +1020,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         }
       }
     } catch (e: any) { console.error('Confirm AI classification error:', e); }
-  }, [invoice?.id, company?.id, aiClassifResult, onPatchInvoice, detail?.invoice_lines, invoice?.counterparty, invoice?.direction]);
+  }, [invoice?.id, company?.id, aiClassifResult, articles, onPatchInvoice, detail?.invoice_lines, invoice?.counterparty, invoice?.direction]);
 
   // Reject AI suggestion — delete classification + reset status to 'none'
   const handleRejectAiClassification = useCallback(async () => {
@@ -1035,6 +1127,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     if (!companyId || !invoice?.id) return;
     const location = extractLocation(lineDesc);
     const art = articles.find(a => a.id === articleId);
+    const hasPhases = (art as ArticleWithPhases)?.phases?.length > 0;
 
     // Optimistic update BEFORE the network call — badge appears instantly
     const prevMap = { ...lineArticleMap };
@@ -1044,15 +1137,17 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       [lineId]: {
         article_id: articleId, code: art?.code || '', name: art?.name || '',
         assigned_by: 'manual', verified: true, location,
+        phase_id: null, phase_code: null, phase_name: null,
       },
     }));
     setAiSuggestions(prev => { const n = { ...prev }; delete n[lineId]; return n; });
 
     try {
       // upsert handles both INSERT and UPDATE via onConflict: 'invoice_line_id'
-      await assignArticleToLine(companyId, lineId, invoice.id, articleId, lineData, 'manual', undefined, location);
+      // For multi-step articles, phase_id will be set later via handleAssignPhase
+      await assignArticleToLine(companyId, lineId, invoice.id, articleId, lineData, 'manual', undefined, location, null);
       // Record feedback for manual assignment → creates a learned rule
-      if (lineDesc) {
+      if (lineDesc && !hasPhases) {
         recordAssignmentFeedback(companyId, articleId, lineDesc, true).catch(err =>
           console.warn('Feedback record error:', err)
         );
@@ -1064,6 +1159,47 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setAiSuggestions(prevSuggestions);
     }
   }, [company?.id, invoice?.id, articles, lineArticleMap, aiSuggestions]);
+
+  // Assign a phase to a line that already has an article
+  const handleAssignPhase = useCallback(async (lineId: string, phaseId: string | null) => {
+    const companyId = company?.id;
+    if (!companyId || !invoice?.id) return;
+    const info = lineArticleMap[lineId];
+    if (!info) return;
+    const art = articles.find(a => a.id === info.article_id) as ArticleWithPhases | undefined;
+    const phase = phaseId ? art?.phases?.find(p => p.id === phaseId) : null;
+
+    // Optimistic update
+    const prevMap = { ...lineArticleMap };
+    setLineArticleMap(prev => ({
+      ...prev,
+      [lineId]: {
+        ...prev[lineId],
+        phase_id: phaseId,
+        phase_code: phase?.code || null,
+        phase_name: phase?.name || null,
+      },
+    }));
+
+    try {
+      // Re-upsert with updated phase_id
+      const dbLine = detail?.invoice_lines?.find(dl => dl.id === lineId);
+      await assignArticleToLine(
+        companyId, lineId, invoice.id, info.article_id,
+        { quantity: dbLine?.quantity, unit_price: dbLine?.unit_price, total_price: dbLine?.total_price, vat_rate: dbLine?.vat_rate },
+        'manual', undefined, info.location, phaseId,
+      );
+      // Record feedback with phase for learned rules
+      if (dbLine?.description && phaseId) {
+        recordAssignmentFeedback(companyId, info.article_id, dbLine.description, true, phaseId).catch(err =>
+          console.warn('Feedback record error:', err)
+        );
+      }
+    } catch (err: any) {
+      console.error('Phase assign error:', err);
+      setLineArticleMap(prevMap);
+    }
+  }, [company?.id, invoice?.id, articles, lineArticleMap, detail?.invoice_lines]);
 
   const handleRemoveArticle = useCallback(async (lineId: string) => {
     // Optimistic update BEFORE the network call
@@ -1078,6 +1214,46 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setLineArticleMap(prevMap);
     }
   }, [lineArticleMap]);
+
+  // Bulk assign article + phase to all invoice lines
+  const handleBulkAssignArticle = useCallback(async () => {
+    const companyId = company?.id;
+    if (!companyId || !invoice?.id || !bulkArticleId) return;
+    const lines = detail?.invoice_lines;
+    if (!lines?.length) return;
+    const art = articles.find(a => a.id === bulkArticleId);
+    const hasPhases = (art as ArticleWithPhases)?.phases?.length > 0;
+    if (hasPhases && !bulkPhaseId) return; // validation: phase required
+    const phase = bulkPhaseId ? (art as ArticleWithPhases)?.phases?.find(p => p.id === bulkPhaseId) : null;
+    const location = null; // bulk doesn't use location
+
+    // Optimistic update
+    const prevMap = { ...lineArticleMap };
+    const newMap: Record<string, LineArticleInfo> = {};
+    for (const l of lines) {
+      newMap[l.id] = {
+        article_id: bulkArticleId, code: art?.code || '', name: art?.name || '',
+        assigned_by: 'manual', verified: true, location,
+        phase_id: bulkPhaseId, phase_code: phase?.code || null, phase_name: phase?.name || null,
+      };
+    }
+    setLineArticleMap(newMap);
+    setAiSuggestions({});
+
+    try {
+      await Promise.all(lines.map(l =>
+        assignArticleToLine(companyId, l.id, invoice.id, bulkArticleId,
+          { quantity: l.quantity, unit_price: l.unit_price, total_price: l.total_price, vat_rate: l.vat_rate },
+          'manual', undefined, location, bulkPhaseId,
+        )
+      ));
+      toast.success(`Articolo ${art?.code} assegnato a ${lines.length} righe`);
+    } catch (err: any) {
+      console.error('Bulk article assign error:', err);
+      setLineArticleMap(prevMap);
+      toast.error('Errore assegnazione bulk');
+    }
+  }, [company?.id, invoice?.id, bulkArticleId, bulkPhaseId, articles, detail?.invoice_lines, lineArticleMap]);
 
   // Reset notes when invoice changes
   useEffect(() => { setNotesText(invoice.notes || ''); }, [invoice.id, invoice.notes]);
@@ -1362,6 +1538,55 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                   </div>
                 </div>
 
+                {/* Bulk article + phase assignment */}
+                {articles.length > 0 && (
+                  <div className="flex items-end gap-2 mt-3">
+                    <div className="flex-1">
+                      <label className="block text-[10px] font-medium text-gray-500 mb-1">Articolo (tutte le righe)</label>
+                      <select
+                        value={bulkArticleId || ''}
+                        onChange={e => { setBulkArticleId(e.target.value || null); setBulkPhaseId(null); }}
+                        className="w-full px-2 py-1.5 text-xs border border-gray-200 rounded-lg bg-white focus:ring-2 focus:ring-blue-400 outline-none">
+                        <option value="">{'\u2014'} Nessuno {'\u2014'}</option>
+                        {articles.map(a => (
+                          <option key={a.id} value={a.id}>{a.code} {'\u2014'} {a.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    {/* Cascading phase dropdown — only when bulk article has phases */}
+                    {(() => {
+                      const bulkArt = bulkArticleId ? articles.find(a => a.id === bulkArticleId) : null;
+                      if (!bulkArt?.phases?.length) return null;
+                      const sorted = [...bulkArt.phases].sort((a, b) => a.sort_order - b.sort_order);
+                      return (
+                        <div className="flex-1">
+                          <label className="block text-[10px] font-medium text-gray-500 mb-1">Fase</label>
+                          <select
+                            value={bulkPhaseId || ''}
+                            onChange={e => setBulkPhaseId(e.target.value || null)}
+                            className={`w-full px-2 py-1.5 text-xs border rounded-lg bg-white focus:ring-2 focus:ring-blue-400 outline-none ${
+                              !bulkPhaseId ? 'border-orange-300 bg-orange-50' : 'border-gray-200'
+                            }`}>
+                            <option value="">{'\u2014'} Seleziona fase {'\u2014'}</option>
+                            {sorted.map(p => (
+                              <option key={p.id} value={p.id}>
+                                {p.is_counting_point ? '\u25CF ' : ''}{p.code} {'\u2014'} {p.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      );
+                    })()}
+                    <button
+                      onClick={handleBulkAssignArticle}
+                      disabled={!bulkArticleId || (articles.find(a => a.id === bulkArticleId)?.phases?.length ? !bulkPhaseId : false)}
+                      className="px-3 py-1.5 text-xs font-semibold text-white bg-teal-600 rounded-lg hover:bg-teal-700 disabled:opacity-40 transition-colors whitespace-nowrap"
+                      title={bulkArticleId && articles.find(a => a.id === bulkArticleId)?.phases?.length && !bulkPhaseId ? 'Seleziona la fase per questo articolo' : ''}>
+                      Applica articolo
+                    </button>
+                  </div>
+                )}
+
                 {/* Save button for template */}
                 {classifDirty && (
                   <div className="flex justify-end pt-2">
@@ -1410,9 +1635,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                       <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                         <td className="text-left px-3 py-2 max-w-[200px]">
                           <span className="text-gray-800">{l.descrizione}</span>
-                          {/* Article badge inline */}
+                          {/* Article badge + phase dropdown inline */}
                           {lineId && articles.length > 0 && (
-                            <span className="ml-1.5 inline-block align-middle">
+                            <span className="ml-1.5 inline-flex items-center gap-1 align-middle flex-wrap">
                               <ArticleDropdown
                                 articles={articles}
                                 current={lineArticleMap[lineId] || null}
@@ -1423,6 +1648,20 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                                 })}
                                 onRemove={() => handleRemoveArticle(lineId)}
                               />
+                              {/* Cascading phase dropdown — only for multi-step articles */}
+                              {(() => {
+                                const info = lineArticleMap[lineId];
+                                if (!info) return null;
+                                const artWithPhases = articles.find(a => a.id === info.article_id);
+                                if (!artWithPhases?.phases?.length) return null;
+                                return (
+                                  <PhaseDropdown
+                                    phases={artWithPhases.phases}
+                                    currentPhaseId={info.phase_id}
+                                    onSelect={(phaseId) => handleAssignPhase(lineId, phaseId)}
+                                  />
+                                );
+                              })()}
                             </span>
                           )}
                         </td>
@@ -1634,10 +1873,24 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                         <td className="text-left px-3 py-2">
                           <span className="text-gray-800">{l.description}</span>
                           {articles.length > 0 && (
-                            <span className="ml-1.5 inline-block align-middle">
+                            <span className="ml-1.5 inline-flex items-center gap-1 align-middle flex-wrap">
                               <ArticleDropdown articles={articles} current={lineArticleMap[l.id] || null} suggestion={aiSuggestions[l.id] || null}
                                 onAssign={(artId) => handleAssignArticle(l.id, artId, l.description, { quantity: l.quantity, unit_price: l.unit_price, total_price: l.total_price, vat_rate: l.vat_rate })}
                                 onRemove={() => handleRemoveArticle(l.id)} />
+                              {/* Cascading phase dropdown — only for multi-step articles */}
+                              {(() => {
+                                const info = lineArticleMap[l.id];
+                                if (!info) return null;
+                                const artWithPhases = articles.find(a => a.id === info.article_id);
+                                if (!artWithPhases?.phases?.length) return null;
+                                return (
+                                  <PhaseDropdown
+                                    phases={artWithPhases.phases}
+                                    currentPhaseId={info.phase_id}
+                                    onSelect={(phaseId) => handleAssignPhase(l.id, phaseId)}
+                                  />
+                                );
+                              })()}
                             </span>
                           )}
                         </td>
