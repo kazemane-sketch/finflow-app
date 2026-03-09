@@ -38,7 +38,7 @@ import {
   loadLineProjects, saveLineProjects,
   CATEGORY_TYPE_LABELS, SECTION_LABELS,
   createAccountFromSuggestion, createCategoryFromSuggestion,
-  type Category, type Project, type ChartAccount,
+  type Category, type Project, type ChartAccount, type CoaSection, type CategoryType,
   type InvoiceClassification, type InvoiceProjectAssignment,
   type LineClassification, type LineProjectAssignment,
   type AccountSuggestion, type CategorySuggestion,
@@ -561,6 +561,60 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [selAccountId, setSelAccountId] = useState<string | null>(null);
   const [classifDirty, setClassifDirty] = useState(false);
   const [classifSaving, setClassifSaving] = useState(false);
+
+  // ─── Direction-filtered categories & accounts ───
+  // Primary sections for each direction (mirrored from edge function constants)
+  const DIR_SECTIONS: Record<string, { primary: CoaSection[]; allowed: CoaSection[] }> = {
+    in:  { primary: ['cost_production','cost_personnel','depreciation','other_costs'],
+           allowed: ['cost_production','cost_personnel','depreciation','other_costs','financial','extraordinary','assets','liabilities'] },
+    out: { primary: ['revenue'],
+           allowed: ['revenue','financial','extraordinary'] },
+  };
+  const DIR_CAT_TYPES: Record<string, CategoryType[]> = {
+    in:  ['expense', 'both'],
+    out: ['revenue', 'both'],
+  };
+
+  const dir = invoice?.direction || 'in';
+  const dirCatTypes = DIR_CAT_TYPES[dir] || DIR_CAT_TYPES['in'];
+  const dirSections = DIR_SECTIONS[dir] || DIR_SECTIONS['in'];
+
+  // Categories filtered by direction for dropdowns
+  const dirCategories = useMemo(() =>
+    allCategories.filter(c => dirCatTypes.includes(c.type)),
+    [allCategories, dir],
+  );
+  const otherCategories = useMemo(() =>
+    allCategories.filter(c => !dirCatTypes.includes(c.type)),
+    [allCategories, dir],
+  );
+
+  // Accounts split: primary (main section) + secondary (allowed edge cases) + other (wrong direction)
+  const dirPrimaryAccounts = useMemo(() =>
+    allAccounts.filter(a => dirSections.primary.includes(a.section)),
+    [allAccounts, dir],
+  );
+  const dirSecondaryAccounts = useMemo(() =>
+    allAccounts.filter(a => dirSections.allowed.includes(a.section) && !dirSections.primary.includes(a.section)),
+    [allAccounts, dir],
+  );
+  const dirOtherAccounts = useMemo(() =>
+    allAccounts.filter(a => !dirSections.allowed.includes(a.section)),
+    [allAccounts, dir],
+  );
+
+  // Helper: check if a selected category/account is incompatible with direction
+  const isCategoryMismatch = useCallback((catId: string | null) => {
+    if (!catId) return false;
+    const cat = allCategories.find(c => c.id === catId);
+    return cat ? !dirCatTypes.includes(cat.type) : false;
+  }, [allCategories, dir]);
+  const isAccountMismatch = useCallback((accId: string | null) => {
+    if (!accId) return false;
+    const acc = allAccounts.find(a => a.id === accId);
+    return acc ? !dirSections.allowed.includes(acc.section) : false;
+  }, [allAccounts, dir]);
+
   // Multi-CdC state: local editable rows with percentage/amount toggle
   type CdcMode = 'percentage' | 'amount';
   type CdcRow = { project_id: string; percentage: number; amount: number | null };
@@ -1766,25 +1820,43 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 {/* Three dropdowns: Categoria | Piano conti | Centro di costo */}
                 <div className="grid grid-cols-3 gap-3 mt-3">
                   <div>
-                    <label className="block text-[10px] font-medium text-gray-500 mb-1">Categoria</label>
+                    <label className="block text-[10px] font-medium text-gray-500 mb-1">
+                      Categoria
+                      {isCategoryMismatch(selCategoryId) && <span className="ml-1 text-amber-500" title="Categoria non coerente con direzione fattura">⚠</span>}
+                    </label>
                     <select
                       value={selCategoryId || ''}
                       onChange={e => { setSelCategoryId(e.target.value || null); setClassifDirty(true); }}
-                      className="w-full px-2 py-1.5 text-xs border border-gray-200 rounded-lg bg-white focus:ring-2 focus:ring-blue-400 outline-none">
+                      className={`w-full px-2 py-1.5 text-xs border rounded-lg bg-white focus:ring-2 focus:ring-blue-400 outline-none ${isCategoryMismatch(selCategoryId) ? 'border-amber-400' : 'border-gray-200'}`}>
                       <option value="">{'\u2014'} Nessuna {'\u2014'}</option>
-                      {allCategories.map(c => (
+                      {dirCategories.map(c => (
+                        <option key={c.id} value={c.id}>{c.name} ({CATEGORY_TYPE_LABELS[c.type]})</option>
+                      ))}
+                      {otherCategories.length > 0 && <option disabled>{'─── Altre ───'}</option>}
+                      {otherCategories.map(c => (
                         <option key={c.id} value={c.id}>{c.name} ({CATEGORY_TYPE_LABELS[c.type]})</option>
                       ))}
                     </select>
                   </div>
                   <div>
-                    <label className="block text-[10px] font-medium text-gray-500 mb-1">Piano conti</label>
+                    <label className="block text-[10px] font-medium text-gray-500 mb-1">
+                      Piano conti
+                      {isAccountMismatch(selAccountId) && <span className="ml-1 text-amber-500" title="Conto non coerente con direzione fattura">⚠</span>}
+                    </label>
                     <select
                       value={selAccountId || ''}
                       onChange={e => { setSelAccountId(e.target.value || null); setClassifDirty(true); }}
-                      className="w-full px-2 py-1.5 text-xs border border-gray-200 rounded-lg bg-white focus:ring-2 focus:ring-blue-400 outline-none">
+                      className={`w-full px-2 py-1.5 text-xs border rounded-lg bg-white focus:ring-2 focus:ring-blue-400 outline-none ${isAccountMismatch(selAccountId) ? 'border-amber-400' : 'border-gray-200'}`}>
                       <option value="">{'\u2014'} Nessuno {'\u2014'}</option>
-                      {allAccounts.map(a => (
+                      {dirPrimaryAccounts.map(a => (
+                        <option key={a.id} value={a.id}>{a.code} {'\u2014'} {a.name}</option>
+                      ))}
+                      {dirSecondaryAccounts.length > 0 && <option disabled>{'─── Speciali ───'}</option>}
+                      {dirSecondaryAccounts.map(a => (
+                        <option key={a.id} value={a.id}>{a.code} {'\u2014'} {a.name}</option>
+                      ))}
+                      {dirOtherAccounts.length > 0 && <option disabled>{'─── Altra direzione ───'}</option>}
+                      {dirOtherAccounts.map(a => (
                         <option key={a.id} value={a.id}>{a.code} {'\u2014'} {a.name}</option>
                       ))}
                     </select>
@@ -1960,7 +2032,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                           {lineId ? (
                             <SearchableSelect
                               value={lineCat || null}
-                              options={allCategories.map(c => ({ id: c.id, label: c.name }))}
+                              options={dirCategories.map(c => ({ id: c.id, label: c.name }))}
                               onChange={v => handleLineClassifChange(lineId, 'category_id', v)}
                               placeholder={selCategoryId ? '\u2190 Fatt.' : '\u2014'}
                               emptyLabel={selCategoryId ? '\u2190 Fatt.' : undefined}
@@ -1999,7 +2071,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                           {lineId ? (
                             <SearchableSelect
                               value={lineAcc || null}
-                              options={allAccounts.map(a => ({ id: a.id, label: `${a.code} \u2014 ${a.name}`, searchText: `${a.code} ${a.name}` }))}
+                              options={[...dirPrimaryAccounts, ...dirSecondaryAccounts].map(a => ({ id: a.id, label: `${a.code} \u2014 ${a.name}`, searchText: `${a.code} ${a.name}` }))}
                               onChange={v => handleLineClassifChange(lineId, 'account_id', v)}
                               placeholder={selAccountId ? '\u2190 Fatt.' : '\u2014'}
                               emptyLabel={selAccountId ? '\u2190 Fatt.' : undefined}

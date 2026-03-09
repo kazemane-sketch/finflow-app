@@ -25,6 +25,28 @@ const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_DIMS = 3072;
 const MIN_CONFIDENCE = 60;
 
+/* ─── Direction enforcement constants ────── */
+// Which CoA sections are valid for each invoice direction
+const SECTIONS_FOR_DIRECTION: Record<string, { primary: string[]; allowed: string[] }> = {
+  in: {
+    // Passive (purchase) → cost accounts primarily
+    primary: ["cost_production", "cost_personnel", "depreciation", "other_costs"],
+    // Also allowed: financial (64xxx interest), assets (21xxx immobilizzazioni), extraordinary
+    allowed: ["cost_production", "cost_personnel", "depreciation", "other_costs", "financial", "extraordinary", "assets", "liabilities"],
+  },
+  out: {
+    // Active (sale) → revenue accounts primarily
+    primary: ["revenue"],
+    // Also allowed: financial (72xxx proventi), extraordinary
+    allowed: ["revenue", "financial", "extraordinary"],
+  },
+};
+// Which category types are valid for each direction
+const CAT_TYPES_FOR_DIRECTION: Record<string, string[]> = {
+  in: ["expense", "both"],
+  out: ["revenue", "both"],
+};
+
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -199,7 +221,8 @@ async function loadRagExamples(
 function buildPrompt(
   articles: ArticleRow[],
   categories: CategoryRow[],
-  accounts: AccountRow[],
+  primaryAccounts: AccountRow[],
+  secondaryAccounts: AccountRow[],
   projects: ProjectRow[],
   phases: ArticlePhaseRow[],
   counterpartyInfo: string,
@@ -246,15 +269,20 @@ function buildPrompt(
     artSection += `\n\nSe la fattura riguarda uno di questi materiali, assegna article_code e phase_code (se ha fasi). Se la fattura copre l'intero ciclo (dalla coltivazione al frantoio), usa la fase "ciclo completo". Per articoli senza fasi, imposta phase_code = null. Se non riesci a identificare il materiale, non assegnare nessun articolo.`;
   }
 
-  // Categories
+  // Categories (already direction-filtered)
   const catSection = categories
     .map((c) => `- ${c.id}: ${c.name} (${c.type})`)
     .join("\n");
 
-  // Chart of accounts (no limit — all active non-header accounts needed for accurate classification)
-  const coaSection = accounts
+  // Chart of accounts — split into primary (recommended) and secondary (edge cases)
+  const coaPrimarySection = primaryAccounts
     .map((a) => `- ${a.id}: ${a.code} ${a.name} (${a.section})`)
     .join("\n");
+  const coaSecondarySection = secondaryAccounts.length > 0
+    ? secondaryAccounts
+        .map((a) => `- ${a.id}: ${a.code} ${a.name} (${a.section})`)
+        .join("\n")
+    : "";
 
   // Cost centers
   const cdcSection =
@@ -308,11 +336,14 @@ ${userInstructionsBlock}
 ## ARTICOLI DISPONIBILI
 ${artSection || "Nessun articolo configurato."}
 
-CATEGORIE DISPONIBILI:
+CATEGORIE DISPONIBILI (filtrate per direzione fattura):
 ${catSection}
 
-PIANO DEI CONTI:
-${coaSection}
+PIANO DEI CONTI — CONTI PRINCIPALI (USA QUESTI):
+${coaPrimarySection}
+${coaSecondarySection ? `
+PIANO DEI CONTI — CONTI SPECIALI (usa SOLO per casi particolari: interessi, immobilizzazioni, straordinari):
+${coaSecondarySection}` : ""}
 
 CENTRI DI COSTO:
 ${cdcSection}
@@ -322,9 +353,22 @@ CONTROPARTE: ${counterpartyInfo}
 ${historySection}
 ${ragSection}
 
+=== VINCOLO DIREZIONE FATTURA (OBBLIGATORIO — VIOLAZIONI = ERRORE GRAVE) ===
+Questa fattura è: ${direction === "in" ? "PASSIVA (acquisto/costo)" : "ATTIVA (vendita/ricavo)"}
+${direction === "in" ? `FATTURA PASSIVA → CONTI DI COSTO:
+- category.type DEVE essere "expense" o "both" — MAI "revenue"
+- account.section DEVE essere cost_production, cost_personnel, depreciation, other_costs
+- Eccezionalmente ammessi: financial (interessi passivi 64xxx), assets (immobilizzazioni 21xxx)
+- VIETATO assegnare conti con section "revenue" (70xxx) — ERRORE FATALE` : `FATTURA ATTIVA → CONTI DI RICAVO:
+- category.type DEVE essere "revenue" o "both" — MAI "expense"
+- account.section DEVE essere "revenue" (70xxx+)
+- Eccezionalmente ammessi: financial (proventi finanziari 72xxx)
+- VIETATO assegnare conti con section cost_production/cost_personnel/depreciation/other_costs (60xxx-69xxx) — ERRORE FATALE
+- Ricavi tipici: 70000-70009 (vendita materiali), 70005 (servizi), 70006 (trasporto), 70007 (noleggio)`}
+DOPO AVER CLASSIFICATO OGNI RIGA → VERIFICA che conto e categoria siano coerenti con la direzione.
+===
+
 REGOLE:
-* PASSIVA (acquisto/direction=in): categorie "expense", conti di costo (60xxx-69xxx o come nel piano conti)
-* ATTIVA (vendita/direction=out): categorie "revenue", conti di ricavo (70xxx+)
 UTILIZZO DELLO STORICO CONTROPARTE:
   - Lo storico mostra classificazioni di righe precedenti. NON copiarlo ciecamente.
   - Per OGNI riga attuale, confronta la DESCRIZIONE con le descrizioni nello storico.
@@ -723,13 +767,25 @@ Deno.serve(async (req) => {
 
   try {
     // ─── Load all context in parallel ───────────────────
-    const [articles, categories, accounts, projects, phases] = await Promise.all([
+    const [articles, allCategories, allAccounts, projects, phases] = await Promise.all([
       sql<ArticleRow[]>`SELECT id, code, name, description, keywords FROM articles WHERE company_id = ${companyId} AND active = true ORDER BY code`,
       sql<CategoryRow[]>`SELECT id, name, type FROM categories WHERE company_id = ${companyId} AND active = true ORDER BY sort_order, name`,
       sql<AccountRow[]>`SELECT id, code, name, section FROM chart_of_accounts WHERE company_id = ${companyId} AND active = true AND is_header = false ORDER BY code`,
       sql<ProjectRow[]>`SELECT id, code, name FROM projects WHERE company_id = ${companyId} AND status = 'active' ORDER BY code`,
       sql<ArticlePhaseRow[]>`SELECT id, article_id, code, name, phase_type, is_counting_point, invoice_direction FROM article_phases WHERE company_id = ${companyId} AND active = true ORDER BY article_id, sort_order`,
     ]);
+
+    // ─── Filter categories and accounts by direction ────
+    const dirSections = SECTIONS_FOR_DIRECTION[direction] || SECTIONS_FOR_DIRECTION["in"];
+    const allowedCatTypes = CAT_TYPES_FOR_DIRECTION[direction] || CAT_TYPES_FOR_DIRECTION["in"];
+    // Direction-appropriate categories for prompt (allCategories kept for fallback resolution)
+    const categories = allCategories.filter((c) => allowedCatTypes.includes(c.type));
+    // Split accounts: primary (recommended) vs secondary (allowed in edge cases)
+    const primaryAccounts = allAccounts.filter((a) => dirSections.primary.includes(a.section));
+    const secondaryAccounts = allAccounts.filter(
+      (a) => dirSections.allowed.includes(a.section) && !dirSections.primary.includes(a.section),
+    );
+    console.log(`[classify] direction=${direction}: ${categories.length}/${allCategories.length} cats, ${primaryAccounts.length} primary + ${secondaryAccounts.length} secondary accounts`);
 
     // ─── Counterparty ATECO info ────────────────────────
     let counterpartyInfo = counterpartyName || "N.D.";
@@ -761,7 +817,7 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ─── Counterparty classification history ────────────
+    // ─── Counterparty classification history (direction-filtered) ──
     let history: HistoryRow[] = [];
     if (counterpartyVatKey) {
       const vatKey = counterpartyVatKey
@@ -769,6 +825,7 @@ Deno.serve(async (req) => {
         .replace(/^IT/i, "")
         .replace(/[^A-Z0-9]/gi, "");
       if (vatKey) {
+        // First: load history matching the SAME direction (prevents cost/revenue bias)
         history = (await sql`
           SELECT il.description, c.name as category_name, a.code as account_code, a.name as account_name,
                  art.code as article_code, art.name as article_name,
@@ -782,6 +839,7 @@ Deno.serve(async (req) => {
           LEFT JOIN articles art ON ila.article_id = art.id
           LEFT JOIN article_phases ap ON ila.phase_id = ap.id
           WHERE i.company_id = ${companyId}
+            AND i.direction = ${direction}
             AND i.counterparty_id = (
               SELECT id FROM counterparties
               WHERE vat_key = ${vatKey} AND company_id = ${companyId}
@@ -791,6 +849,38 @@ Deno.serve(async (req) => {
             AND (il.category_id IS NOT NULL OR il.account_id IS NOT NULL)
           ORDER BY i.date DESC
           LIMIT 30`) as HistoryRow[];
+        // Fallback: if sparse history for this direction (<3 rows), supplement with all directions
+        // This handles counterparties that are both suppliers and customers
+        if (history.length < 3) {
+          const allDirHistory = (await sql`
+            SELECT il.description, c.name as category_name, a.code as account_code, a.name as account_name,
+                   art.code as article_code, art.name as article_name,
+                   ap.code as phase_code, ap.name as phase_name,
+                   null::jsonb as cost_center_allocations
+            FROM invoice_lines il
+            JOIN invoices i ON il.invoice_id = i.id
+            LEFT JOIN categories c ON il.category_id = c.id
+            LEFT JOIN chart_of_accounts a ON il.account_id = a.id
+            LEFT JOIN invoice_line_articles ila ON ila.invoice_line_id = il.id
+            LEFT JOIN articles art ON ila.article_id = art.id
+            LEFT JOIN article_phases ap ON ila.phase_id = ap.id
+            WHERE i.company_id = ${companyId}
+              AND i.direction != ${direction}
+              AND i.counterparty_id = (
+                SELECT id FROM counterparties
+                WHERE vat_key = ${vatKey} AND company_id = ${companyId}
+                LIMIT 1
+              )
+              AND i.classification_status = 'confirmed'
+              AND (il.category_id IS NOT NULL OR il.account_id IS NOT NULL)
+            ORDER BY i.date DESC
+            LIMIT 10`) as HistoryRow[];
+          if (allDirHistory.length > 0) {
+            // Mark other-direction entries so the prompt can warn about them
+            history = [...history, ...allDirHistory];
+            console.log(`[classify] Supplemented history: ${history.length - allDirHistory.length} same-dir + ${allDirHistory.length} other-dir entries`);
+          }
+        }
       }
     }
 
@@ -833,7 +923,8 @@ Deno.serve(async (req) => {
     const prompt = buildPrompt(
       articles,
       categories,
-      accounts,
+      primaryAccounts,
+      secondaryAccounts,
       projects,
       phases,
       counterpartyInfo,
@@ -963,22 +1054,26 @@ Deno.serve(async (req) => {
 
     // ─── Fallback: resolve category/account by name/code when UUID missing or invalid ───
     for (const lr of lineResults) {
-      // Fallback category: if UUID missing/invalid, match by name
-      if (!lr.category_id || !categories.find((c) => c.id === lr.category_id)) {
+      // Fallback category: prefer direction-filtered, then allCategories
+      if (!lr.category_id || !allCategories.find((c) => c.id === lr.category_id)) {
         if (lr.category_name) {
-          const match = categories.find(
-            (c) => c.name.toLowerCase().trim() === lr.category_name!.toLowerCase().trim(),
-          );
+          const nameLower = lr.category_name.toLowerCase().trim();
+          // First: match in direction-filtered categories
+          let match = categories.find((c) => c.name.toLowerCase().trim() === nameLower);
+          // Fallback: match in all categories
+          if (!match) match = allCategories.find((c) => c.name.toLowerCase().trim() === nameLower);
           if (match) {
             console.log(`[classify] Fallback category: "${lr.category_name}" → ${match.id}`);
             lr.category_id = match.id;
           }
         }
       }
-      // Fallback account: if UUID missing/invalid, match by code
-      if (!lr.account_id || !accounts.find((a) => a.id === lr.account_id)) {
+      // Fallback account: prefer primary, then secondary, then allAccounts
+      if (!lr.account_id || !allAccounts.find((a) => a.id === lr.account_id)) {
         if (lr.account_code) {
-          const match = accounts.find((a) => a.code === lr.account_code);
+          let match = primaryAccounts.find((a) => a.code === lr.account_code);
+          if (!match) match = secondaryAccounts.find((a) => a.code === lr.account_code);
+          if (!match) match = allAccounts.find((a) => a.code === lr.account_code);
           if (match) {
             console.log(`[classify] Fallback account: "${lr.account_code}" → ${match.id}`);
             lr.account_id = match.id;
@@ -996,7 +1091,7 @@ Deno.serve(async (req) => {
 
       // Check description vs account coherence heuristics
       if (lr.account_id) {
-        const acc = accounts.find((a) => a.id === lr.account_id);
+        const acc = allAccounts.find((a) => a.id === lr.account_id);
         if (acc) {
           const accName = acc.name.toLowerCase();
           // Flag: transport-related description but non-transport account
@@ -1030,6 +1125,86 @@ Deno.serve(async (req) => {
             lr.confidence = Math.min(lr.confidence, 70);
           }
         }
+      }
+    }
+
+    // ─── Level 1: Direction enforcement (hard safety net) ──────────
+    // This is the last line of defense: if the AI returned cost accounts
+    // for an active invoice (or revenue accounts for a passive one),
+    // we auto-correct here. This catches 100% of direction errors.
+    {
+      const allowedSections = dirSections.allowed;
+      const allowedCatTypes = CAT_TYPES_FOR_DIRECTION[direction] || CAT_TYPES_FOR_DIRECTION["in"];
+      let directionCorrections = 0;
+
+      for (const lr of lineResults) {
+        let accountCorrected = false;
+        let categoryCorrected = false;
+
+        // Check account section against direction
+        if (lr.account_id) {
+          const acc = allAccounts.find((a) => a.id === lr.account_id);
+          if (acc && !allowedSections.includes(acc.section)) {
+            console.warn(`[classify-direction] ⛔ Line ${lr.line_id}: account "${acc.code} ${acc.name}" (section=${acc.section}) is INVALID for direction=${direction} — removing`);
+            // Try to auto-substitute with first primary account that matches
+            const fallbackAcc = primaryAccounts.length > 0 ? primaryAccounts[0] : null;
+            if (fallbackAcc) {
+              lr.account_id = fallbackAcc.id;
+              lr.account_code = fallbackAcc.code;
+              console.log(`[classify-direction] → Auto-substituted with primary account "${fallbackAcc.code} ${fallbackAcc.name}"`);
+            } else {
+              lr.account_id = null;
+              lr.account_code = null;
+            }
+            lr.confidence = Math.min(lr.confidence, 55);
+            lr.reasoning = `[DIR-FIX] Conto originale incompatibile con fattura ${direction === "out" ? "attiva" : "passiva"} — sostituito. ${lr.reasoning}`;
+            accountCorrected = true;
+            directionCorrections++;
+          }
+        }
+
+        // Check category type against direction
+        if (lr.category_id) {
+          const cat = allCategories.find((c) => c.id === lr.category_id);
+          if (cat && !allowedCatTypes.includes(cat.type)) {
+            console.warn(`[classify-direction] ⛔ Line ${lr.line_id}: category "${cat.name}" (type=${cat.type}) is INVALID for direction=${direction} — removing`);
+            // Try to auto-substitute with first direction-filtered category
+            const fallbackCat = categories.length > 0 ? categories[0] : null;
+            if (fallbackCat) {
+              lr.category_id = fallbackCat.id;
+              lr.category_name = fallbackCat.name;
+              console.log(`[classify-direction] → Auto-substituted with category "${fallbackCat.name}"`);
+            } else {
+              lr.category_id = null;
+              lr.category_name = null;
+            }
+            if (!accountCorrected) {
+              lr.confidence = Math.min(lr.confidence, 55);
+            }
+            categoryCorrected = true;
+            directionCorrections++;
+          }
+        }
+
+        // Level 5: Validate suggest_new_account/category against direction
+        if (lr.suggest_new_account) {
+          const suggestedSection = lr.suggest_new_account.section || "";
+          if (suggestedSection && !allowedSections.includes(suggestedSection)) {
+            console.warn(`[classify-direction] Nullifying suggest_new_account: section "${suggestedSection}" is invalid for direction=${direction}`);
+            lr.suggest_new_account = null;
+          }
+        }
+        if (lr.suggest_new_category) {
+          const suggestedType = lr.suggest_new_category.type || "";
+          if (suggestedType && !allowedCatTypes.includes(suggestedType)) {
+            console.warn(`[classify-direction] Nullifying suggest_new_category: type "${suggestedType}" is invalid for direction=${direction}`);
+            lr.suggest_new_category = null;
+          }
+        }
+      }
+
+      if (directionCorrections > 0) {
+        console.warn(`[classify-direction] ⚠ Corrected ${directionCorrections} direction violations for invoice ${invoiceId} (direction=${direction})`);
       }
     }
 
