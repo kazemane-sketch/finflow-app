@@ -64,6 +64,10 @@ const NAT: Record<string, string> = {
 const ESI: Record<string, string> = { I: 'Immediata', D: 'Differita', S: 'Split payment' };
 const RIT: Record<string, string> = { RT01: 'Pers. fisiche', RT02: 'Pers. giuridiche', RT03: 'INPS', RT04: 'ENASARCO', RT05: 'ENPAM' };
 const STATUS_LABELS: Record<string, string> = { pending: 'Da Pagare', overdue: 'Scaduta', paid: 'Pagata' };
+const getStatusLabel = (status: string, direction?: string) => {
+  if (status === 'pending') return direction === 'out' ? 'Da Incassare' : 'Da Pagare';
+  return STATUS_LABELS[status] || status;
+};
 const STATUS_COLORS: Record<string, string> = { pending: 'bg-yellow-100 text-yellow-800', overdue: 'bg-red-100 text-red-800', paid: 'bg-green-100 text-green-800' };
 
 // ============================================================
@@ -239,7 +243,7 @@ function EditForm({ invoice, onSave, onCancel }: { invoice: DBInvoice; onSave: (
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Numero</label><input value={form.number || ''} onChange={e => setForm({ ...form, number: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Data</label><input type="date" value={form.date || ''} onChange={e => setForm({ ...form, date: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Totale (€)</label><input type="number" step="0.01" value={form.total_amount ?? ''} onChange={e => setForm({ ...form, total_amount: parseFloat(e.target.value) || 0 })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
-        <div><label className="block text-xs font-medium text-gray-600 mb-1">Stato</label><div className="w-full px-2 py-1.5 text-sm border rounded bg-gray-100 text-gray-600">{STATUS_LABELS[invoice.payment_status] || invoice.payment_status}</div></div>
+        <div><label className="block text-xs font-medium text-gray-600 mb-1">Stato</label><div className="w-full px-2 py-1.5 text-sm border rounded bg-gray-100 text-gray-600">{getStatusLabel(invoice.payment_status, invoice.direction)}</div></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Scadenza</label><input type="date" value={form.payment_due_date || ''} onChange={e => setForm({ ...form, payment_due_date: e.target.value || null })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none" /></div>
         <div><label className="block text-xs font-medium text-gray-600 mb-1">Modalità Pag.</label><select value={form.payment_method || ''} onChange={e => setForm({ ...form, payment_method: e.target.value })} className="w-full px-2 py-1.5 text-sm border rounded focus:ring-1 focus:ring-blue-400 outline-none"><option value="">—</option>{Object.entries(MP).map(([k, v]) => <option key={k} value={k}>{k} — {v}</option>)}</select></div>
       </div>
@@ -299,7 +303,7 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, is
             {isMatched && <ReconciledIcon size={12} />}
             {!isMatched && suggestionScore != null && <ReconciliationDot score={suggestionScore} invoiceId={inv.id} />}
             {nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}
-            <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{STATUS_LABELS[inv.payment_status] || inv.payment_status}</span>
+            <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{getStatusLabel(inv.payment_status, inv.direction)}</span>
           </span>
         </div>
         {/* Classification chip badges */}
@@ -1504,7 +1508,13 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     const hasPhases = (art?.phases?.length ?? 0) > 0;
 
     // If a suggested phase was provided (from AI), resolve its details
-    const phase = suggestedPhaseId ? art?.phases?.find(p => p.id === suggestedPhaseId) : null;
+    let phase = suggestedPhaseId ? art?.phases?.find(p => p.id === suggestedPhaseId) : null;
+
+    // Auto-select first phase if article has phases but none was suggested
+    if (!phase && hasPhases && art?.phases) {
+      const sorted = [...art.phases].sort((a, b) => a.sort_order - b.sort_order);
+      phase = sorted.find(p => p.is_counting_point) || sorted[0] || null;
+    }
 
     // LOCAL ONLY — DB write deferred to explicit "Salva"
     setLineArticleMap(prev => ({
@@ -1695,7 +1705,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               {cp?.denom || invoice.source_filename || 'Sconosciuto'}
             </button>
             <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${STATUS_COLORS[invoice.payment_status] || 'bg-gray-100 text-gray-600'}`}>
-              {STATUS_LABELS[invoice.payment_status] || invoice.payment_status}
+              {getStatusLabel(invoice.payment_status, invoice.direction)}
             </span>
           </div>
           <div className="flex items-center gap-1">
@@ -3530,7 +3540,7 @@ export default function FatturePage() {
             {/* Status filter */}
             <div className="flex gap-1">
               {(['all', 'pending', 'overdue', 'paid'] as const).map(s => (
-                <button key={s} onClick={() => { setStatusFilter(s); setAiSuggestedFilter(false); }} className={`flex-1 py-1 text-[10px] font-semibold rounded ${statusFilter === s && !aiSuggestedFilter ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>{s === 'all' ? 'Tutte' : STATUS_LABELS[s]}</button>
+                <button key={s} onClick={() => { setStatusFilter(s); setAiSuggestedFilter(false); }} className={`flex-1 py-1 text-[10px] font-semibold rounded ${statusFilter === s && !aiSuggestedFilter ? 'bg-sky-100 text-sky-700 border border-sky-300' : 'bg-gray-50 text-gray-500 border border-gray-200'}`}>{s === 'all' ? 'Tutte' : getStatusLabel(s, directionFilter)}</button>
               ))}
             </div>
             {/* AI classification filter */}

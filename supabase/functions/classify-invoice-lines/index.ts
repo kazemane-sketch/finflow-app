@@ -340,6 +340,14 @@ UTILIZZO DELLO STORICO CONTROPARTE:
 * phase_code: se l'articolo ha fasi, assegna la fase più appropriata dal suo elenco. Se l'articolo non ha fasi, phase_code = null.
 * category_id e account_id: assegna SEMPRE
 
+ATTENZIONE — ERRORE FREQUENTE DA EVITARE (SERVIZI vs MATERIALI):
+* PRIMA analizza la DESCRIZIONE della riga. Solo DOPO controlla lo storico.
+* Se la descrizione contiene "opere edili", "lavori", "manutenzione", "installazione", "realizzazione", "ripristino", "costruzione", "demolizione" → è un SERVIZIO/LAVORO, NON un materiale
+* NON assegnare articoli di materiale (calcare, pozzolana, inerti, pietrisco, ghiaia, sabbia) a righe che descrivono servizi/lavori/opere
+* Esempio SBAGLIATO: riga "OPERE EDILI PER REALIZZAZIONE CABINA" → article_code: "calcare" ← ERRORE GRAVE!
+* Esempio CORRETTO: riga "OPERE EDILI PER REALIZZAZIONE CABINA" → article_code: null, categoria: servizi/lavori edili
+* Anche se lo STORICO della controparte mostra quasi sempre "calcare", se la riga attuale parla di SERVIZI → article_code = null
+
 FASI ARTICOLO — REGOLE:
 * Quando assegni un articolo che ha fasi, DEVI SEMPRE assegnare anche phase_code. Non lasciare phase_code = null per articoli con fasi.
 * Usa la DESCRIZIONE della riga fattura per capire la fase:
@@ -604,7 +612,7 @@ async function persistResults(
               account_id = COALESCE(${lr.account_id}, account_id),
               classification_status = 'ai_suggested'
           WHERE id = ${lr.line_id}
-            AND category_id IS NULL AND account_id IS NULL`;
+            AND (category_id IS NULL OR account_id IS NULL)`;
       } catch (e: unknown) {
         console.error(`[persist] line ${lr.line_id} UPDATE invoice_lines failed:`, (e as Error).message);
       }
@@ -933,9 +941,16 @@ Deno.serve(async (req) => {
         const article = articles.find((a) => a.code === lr.article_code);
         if (article) {
           const articlePhases = phases.filter((p) => p.article_id === article.id);
-          // Article has phases but AI returned no phase → warn
+          // Article has phases but AI returned no phase → auto-assign default
           if (articlePhases.length > 0 && !lr.phase_code) {
-            console.warn(`[classify] Article ${lr.article_code} has ${articlePhases.length} phases but AI returned no phase_code for line ${lr.line_id}`);
+            const sortedPhases = [...articlePhases].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+            const defaultPhase = sortedPhases.find(p => p.is_counting_point) || sortedPhases[0];
+            if (defaultPhase) {
+              lr.phase_code = defaultPhase.code;
+              console.log(`[classify] Auto-assigned default phase "${defaultPhase.code}" for article ${lr.article_code} on line ${lr.line_id}`);
+            } else {
+              console.warn(`[classify] Article ${lr.article_code} has ${articlePhases.length} phases but could not determine default for line ${lr.line_id}`);
+            }
           }
           // AI returned a phase that doesn't exist → nullify
           if (lr.phase_code && !articlePhases.find((p) => p.code === lr.phase_code)) {
@@ -1009,7 +1024,10 @@ Deno.serve(async (req) => {
           const artService = /trasport|noleggi|servizi|consulenz|manutenzi/.test(artName);
           const artMaterial = /calcar|pozzolan|inert|ghiai|sabbia|pietr/.test(artName);
           if (descService && artMaterial && !artService) {
-            console.warn(`[classify-sanity] Line ${lr.line_id}: desc mentions service ("${desc.slice(0, 50)}") but article "${lr.article_code} ${art.name}" is a material. Possible history over-reliance.`);
+            console.warn(`[classify-sanity] Auto-correcting line ${lr.line_id}: desc mentions service ("${desc.slice(0, 50)}") but article "${lr.article_code} ${art.name}" is a material — removing article assignment`);
+            lr.article_code = null;
+            lr.phase_code = null;
+            lr.confidence = Math.min(lr.confidence, 70);
           }
         }
       }
