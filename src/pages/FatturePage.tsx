@@ -832,12 +832,16 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         for (const line of detail.invoice_lines) {
           const lc = lineClassifs[line.id];
           if (lc?.category_id || lc?.account_id) {
+            const lineCdc = lineProjects[line.id]?.length
+              ? lineProjects[line.id].map(p => ({ project_id: p.project_id, percentage: p.percentage }))
+              : (cdcRows.length > 0 ? cdcRows.map(c => ({ project_id: c.project_id, percentage: c.percentage })) : null);
             createRuleFromConfirmation(
               companyId, cp?.piva || null, cp?.denom || null,
               line.description, invoice.direction as 'in' | 'out',
               { category_id: lc.category_id, account_id: lc.account_id,
                 article_id: lineArticleMap[line.id]?.article_id || null,
-                phase_id: lineArticleMap[line.id]?.phase_id || null },
+                phase_id: lineArticleMap[line.id]?.phase_id || null,
+                cost_center_allocations: lineCdc },
             ).catch(err => console.warn('[rules] error:', err));
           }
         }
@@ -984,7 +988,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         ...ruleSuggestions.map(s => ({
           invoice_line_id: s.line_id,
           article_id: s.article_id,
-          phase_id: null as string | null,
+          phase_id: s.phase_id || null,
           category_id: s.category_id,
           account_id: s.account_id,
           project_allocations: s.cost_center_allocations || [],
@@ -1005,13 +1009,18 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         })),
       ];
 
+      // Aggregate CdC from rule suggestions for invoice-level fallback
+      const ruleProjectAllocations = ruleSuggestions
+        .find(s => s.cost_center_allocations && s.cost_center_allocations.length > 0)
+        ?.cost_center_allocations || [];
+
       const result = {
         invoice_id: invoice.id,
         lines: mergedLines,
         invoice_level: aiResult?.invoice_level || {
           category_id: ruleSuggestions[0]?.category_id || null,
           account_id: ruleSuggestions[0]?.account_id || null,
-          project_allocations: [],
+          project_allocations: ruleProjectAllocations,
           confidence: ruleSuggestions[0]?.confidence || 0,
           reasoning: `${ruleSuggestions.length} righe da regole, ${aiResult?.lines?.length || 0} da AI`,
         },
@@ -1210,10 +1219,14 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         for (const lr of aiClassifResult.lines) {
           const lineDesc = detail?.invoice_lines?.find(l => l.id === lr.invoice_line_id)?.description;
           if (lineDesc && (lr.category_id || lr.account_id)) {
+            const lrCdc = lr.project_allocations?.length
+              ? lr.project_allocations.map((p: any) => ({ project_id: p.project_id, percentage: p.percentage }))
+              : (cdcRows.length > 0 ? cdcRows.map(c => ({ project_id: c.project_id, percentage: c.percentage })) : null);
             createRuleFromConfirmation(
               company.id, cp?.piva || null, cp?.denom || null,
               lineDesc, invoice.direction as 'in' | 'out',
-              { category_id: lr.category_id, account_id: lr.account_id, article_id: lr.article_id, phase_id: lr.phase_id || null },
+              { category_id: lr.category_id, account_id: lr.account_id, article_id: lr.article_id, phase_id: lr.phase_id || null,
+                cost_center_allocations: lrCdc },
             ).catch(err => console.warn('[rules] error:', err));
           }
         }
@@ -1279,12 +1292,16 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         for (const line of detail.invoice_lines) {
           const lc = lineClassifs[line.id];
           if (lc?.category_id || lc?.account_id) {
+            const lineCdc = lineProjects[line.id]?.length
+              ? lineProjects[line.id].map(p => ({ project_id: p.project_id, percentage: p.percentage }))
+              : (cdcRows.length > 0 ? cdcRows.map(c => ({ project_id: c.project_id, percentage: c.percentage })) : null);
             createRuleFromConfirmation(
               company.id, cp?.piva || null, cp?.denom || null,
               line.description, invoice.direction as 'in' | 'out',
               { category_id: lc.category_id, account_id: lc.account_id,
                 article_id: lineArticleMap[line.id]?.article_id || null,
-                phase_id: lineArticleMap[line.id]?.phase_id || null },
+                phase_id: lineArticleMap[line.id]?.phase_id || null,
+                cost_center_allocations: lineCdc },
             ).catch(err => console.warn('[rules] error:', err));
           }
         }
@@ -1448,12 +1465,16 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         for (const line of detail.invoice_lines) {
           const lc = lineClassifs[line.id];
           if (lc?.category_id || lc?.account_id) {
+            const lineCdc = lineProjects[line.id]?.length
+              ? lineProjects[line.id].map(p => ({ project_id: p.project_id, percentage: p.percentage }))
+              : (cdcRows.length > 0 ? cdcRows.map(c => ({ project_id: c.project_id, percentage: c.percentage })) : null);
             createRuleFromConfirmation(
               companyId, cp?.piva || null, cp?.denom || null,
               line.description, invoice.direction as 'in' | 'out',
               { category_id: lc.category_id, account_id: lc.account_id,
                 article_id: lineArticleMap[line.id]?.article_id || null,
-                phase_id: lineArticleMap[line.id]?.phase_id || null },
+                phase_id: lineArticleMap[line.id]?.phase_id || null,
+                cost_center_allocations: lineCdc },
             ).catch(err => console.warn('[rules] error:', err));
           }
         }
