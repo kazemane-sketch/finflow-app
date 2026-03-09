@@ -815,6 +815,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setSelCategoryId(classif?.category_id || null);
         setSelAccountId(classif?.account_id || null);
         setClassifDirty(false);
+        // Reset transient AI state from previous invoice
+        setAiClassifResult(null);
+        setAiClassifStatus('idle');
+        setLineFiscalFlags({});
+        setLineSuggestions({});
+        setDismissedSuggestions(new Set());
       } catch (e) { console.error('Classification load error:', e); }
     })();
     return () => { cancelled = true; };
