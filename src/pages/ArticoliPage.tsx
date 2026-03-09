@@ -1256,9 +1256,13 @@ export default function ArticoliPage() {
                           <span className="flex items-center gap-2 text-xs font-medium text-gray-700">
                             <Layers className="h-3.5 w-3.5 text-blue-500" />
                             Fasi del ciclo produttivo
-                            {selectedPhases.length > 0 && (
+                            {selectedPhases.length > 0 ? (
                               <span className="text-[10px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full font-semibold">
                                 {selectedPhases.length}
+                              </span>
+                            ) : !phasesLoading && (
+                              <span className="text-[10px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full">
+                                Articolo semplice
                               </span>
                             )}
                           </span>

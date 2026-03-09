@@ -213,21 +213,34 @@ function buildPrompt(
     phasesByArticle.get(p.article_id)!.push(p);
   }
 
-  // Articles section (with inline phases)
-  const artSection = articles
-    .slice(0, 100)
-    .map((a) => {
-      let line = `- ${a.code}: ${a.name}${a.description ? ` (${a.description.slice(0, 60)})` : ""} [${(a.keywords || []).join(", ")}]`;
-      const artPhases = phasesByArticle.get(a.id);
-      if (artPhases && artPhases.length > 0) {
-        const phaseList = artPhases.map(p =>
-          `${p.code}(${p.phase_type},${p.invoice_direction || '?'}${p.is_counting_point ? ',COUNTING' : ''})`
-        ).join(', ');
-        line += ` FASI: ${phaseList}`;
-      }
+  // Articles section — split multi-step (with phases) vs single-step (no phases)
+  const multiStep = articles.filter(a => phasesByArticle.has(a.id) && phasesByArticle.get(a.id)!.length > 0);
+  const singleStep = articles.filter(a => !phasesByArticle.has(a.id) || phasesByArticle.get(a.id)!.length === 0);
+
+  let artSection = "";
+  if (multiStep.length > 0) {
+    artSection += `ARTICOLI CON FASI — assegna article_code + phase_code:\n`;
+    artSection += multiStep.slice(0, 50).map(a => {
+      const phases = phasesByArticle.get(a.id)!;
+      const kwPart = a.keywords?.length ? ` [${a.keywords.join(", ")}]` : "";
+      let line = `- ${a.code} (${a.name})${kwPart}:\n`;
+      line += phases.map(p =>
+        `  • ${p.code}: ${p.name}${p.is_counting_point ? " (COUNTING)" : ""}`
+      ).join("\n");
       return line;
-    })
-    .join("\n");
+    }).join("\n");
+  }
+  if (singleStep.length > 0) {
+    if (artSection) artSection += "\n\n";
+    artSection += `ARTICOLI SENZA FASI — assegna solo article_code, phase_code = null:\n`;
+    artSection += singleStep.slice(0, 50).map(a => {
+      const kwPart = a.keywords?.length ? ` [${a.keywords.join(", ")}]` : "";
+      return `- ${a.code} (${a.name})${kwPart}`;
+    }).join("\n");
+  }
+  if (multiStep.length > 0 || singleStep.length > 0) {
+    artSection += `\n\nSe la fattura riguarda uno di questi materiali, assegna article_code e phase_code (se ha fasi). Se la fattura copre l'intero ciclo (dalla coltivazione al frantoio), usa la fase "ciclo completo". Per articoli senza fasi, imposta phase_code = null. Se non riesci a identificare il materiale, non assegnare nessun articolo.`;
+  }
 
   // Categories
   const catSection = categories
@@ -282,8 +295,8 @@ function buildPrompt(
   return `${systemPrompt}
 ${userInstructionsBlock}
 
-ARTICOLI DISPONIBILI (codice: nome [keywords]):
-${artSection}
+## ARTICOLI DISPONIBILI
+${artSection || "Nessun articolo configurato."}
 
 CATEGORIE DISPONIBILI:
 ${catSection}
@@ -307,11 +320,8 @@ REGOLE:
 * TRASPORTO/TRASPORTI nella descrizione → servizio di trasporto, NON il materiale
 * NOLO/NOLEGGIO → è noleggio, non acquisto
 * FORNITURA/VENDITA → è il materiale/prodotto
-* article_code: assegna SOLO se pertinente, altrimenti null
-* phase_code: se l'articolo ha fasi, assegna la fase coerente con la direzione della fattura:
-  - PASSIVA (acquisto/direction=in) → fasi con dir=in: extraction, processing, transport_in, service
-  - ATTIVA (vendita/direction=out) → fasi con dir=out: sale, transport_out, surcharge, discount
-  Se l'articolo non ha fasi, lascia null.
+* article_code: assegna SOLO se la riga riguarda uno degli articoli configurati, altrimenti null
+* phase_code: se l'articolo ha fasi, assegna la fase più appropriata dal suo elenco. Se l'articolo non ha fasi, phase_code = null.
 * category_id e account_id: assegna SEMPRE
 * confidence 0-100
 
