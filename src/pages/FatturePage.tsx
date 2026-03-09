@@ -540,6 +540,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [articles, setArticles] = useState<ArticleWithPhases[]>([]);
   const [lineArticleMap, setLineArticleMap] = useState<Record<string, LineArticleInfo>>({});
   const [aiSuggestions, setAiSuggestions] = useState<Record<string, MatchResult>>({});
+  // Track dismissed AI article suggestions — triggers dirty state so Salva persists the removal
+  const [dismissedArticleLineIds, setDismissedArticleLineIds] = useState<Set<string>>(new Set());
 
   // ─── Classification state ───
   const [allCategories, setAllCategories] = useState<Category[]>([]);
@@ -610,6 +612,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
   // Dirty state: any line classification, article, or CdC changed vs originals
   const isPostConfirmDirty = useMemo(() => {
+    // Check dismissed AI article suggestions (need saving to delete from DB)
+    if (dismissedArticleLineIds.size > 0) return true;
     // Check line classifications changed
     const lcKeys = new Set([...Object.keys(lineClassifs), ...Object.keys(originalLineClassifs)]);
     for (const k of lcKeys) {
@@ -635,12 +639,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     }
     // Also check invoice-level dirty (CdC etc.)
     return classifDirty;
-  }, [lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap, lineProjects, originalLineProjects, classifDirty]);
+  }, [dismissedArticleLineIds, lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap, lineProjects, originalLineProjects, classifDirty]);
 
   // Load articles + existing assignments when invoice changes
   useEffect(() => {
     const companyId = company?.id;
-    if (!companyId || !invoice?.id) { setArticles([]); setLineArticleMap({}); setAiSuggestions({}); setBulkArticleId(null); setBulkPhaseId(null); return; }
+    if (!companyId || !invoice?.id) { setArticles([]); setLineArticleMap({}); setAiSuggestions({}); setDismissedArticleLineIds(new Set()); setBulkArticleId(null); setBulkPhaseId(null); return; }
     let cancelled = false;
 
     (async () => {
@@ -1336,6 +1340,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         }
       }
 
+      // 3a. Delete dismissed AI article suggestions from DB
+      for (const lineId of dismissedArticleLineIds) {
+        await removeLineAssignment(lineId).catch(() => {});
+      }
+
       // 3b. Save changed line-level CdC allocations
       const projKeys = new Set([...Object.keys(lineProjects), ...Object.keys(originalLineProjects)]);
       for (const k of projKeys) {
@@ -1369,6 +1378,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setOriginalLineClassifs({ ...lineClassifs });
       setOriginalLineArticleMap({ ...lineArticleMap });
       setOriginalLineProjects({ ...lineProjects });
+      setDismissedArticleLineIds(new Set());
       setClassifDirty(false);
 
       // 6. Create classification rules from confirmed data (fire-and-forget)
@@ -1399,7 +1409,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   }, [company?.id, invoice?.id, invoice?.total_amount, invoice?.counterparty, invoice?.direction,
     isConfirmed, classification, classifDirty, selCategoryId, selAccountId, cdcRows, cdcMode,
     lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap,
-    lineProjects, originalLineProjects,
+    lineProjects, originalLineProjects, dismissedArticleLineIds,
     detail?.invoice_lines, onPatchInvoice, onRefreshBadges]);
 
   // Copy classification from a line
@@ -1468,6 +1478,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setLineProjects({});
       setLineArticleMap({});
       setAiSuggestions({});
+      setDismissedArticleLineIds(new Set());
       setClassifDirty(false);
       setOriginalLineClassifs({});
       setOriginalLineArticleMap({});
@@ -1526,8 +1537,10 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   }, []);
 
   // Dismiss AI article suggestion for a line (removes from aiSuggestions without assigning)
+  // Also tracks the dismissal so dirty state triggers Salva → persists removal to DB
   const handleDismissArticleSuggestion = useCallback((lineId: string) => {
     setAiSuggestions(prev => { const n = { ...prev }; delete n[lineId]; return n; });
+    setDismissedArticleLineIds(prev => new Set([...prev, lineId]));
   }, []);
 
   // Bulk assign article + phase to all invoice lines
@@ -2004,10 +2017,15 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                             </span>
                           )}
                         </td>
-                        <td className="text-right px-2 py-2 text-gray-600">{l.quantita ? fmtNum(safeFloat(l.quantita)) : '1'}</td>
+                        <td className={`text-right px-2 py-2 ${safeFloat(l.prezzoTotale) < 0 && lineId && lineArticleMap[lineId] ? 'text-gray-300 line-through' : 'text-gray-600'}`}>
+                          {l.quantita ? fmtNum(safeFloat(l.quantita)) : '1'}
+                          {safeFloat(l.prezzoTotale) < 0 && lineId && lineArticleMap[lineId] && (
+                            <span title="Riga esclusa dal conteggio quantità (importo negativo — sconto/abbuono)" className="ml-0.5 text-red-400 text-[9px] cursor-help no-underline" style={{ textDecoration: 'none' }}>✕</span>
+                          )}
+                        </td>
                         <td className="text-right px-2 py-2 text-gray-600">{fmtNum(safeFloat(l.prezzoUnitario))}</td>
                         <td className="text-right px-2 py-2 text-gray-600">{fmtNum(safeFloat(l.aliquotaIVA))}%</td>
-                        <td className="text-right px-2 py-2 font-bold text-gray-800">{fmtNum(safeFloat(l.prezzoTotale))}</td>
+                        <td className={`text-right px-2 py-2 font-bold ${safeFloat(l.prezzoTotale) < 0 ? 'text-red-600' : 'text-gray-800'}`}>{fmtNum(safeFloat(l.prezzoTotale))}</td>
                         {allCategories.length > 0 && <td className="text-center px-1 py-1">
                           {lineId ? (
                             <SearchableSelect
@@ -2198,10 +2216,15 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                             </span>
                           )}
                         </td>
-                        <td className="text-right px-2 py-2 text-gray-600">{fmtNum(l.quantity)}</td>
+                        <td className={`text-right px-2 py-2 ${(l.total_price ?? 0) < 0 && lineArticleMap[l.id] ? 'text-gray-300 line-through' : 'text-gray-600'}`}>
+                          {fmtNum(l.quantity)}
+                          {(l.total_price ?? 0) < 0 && lineArticleMap[l.id] && (
+                            <span title="Riga esclusa dal conteggio quantità (importo negativo — sconto/abbuono)" className="ml-0.5 text-red-400 text-[9px] cursor-help no-underline" style={{ textDecoration: 'none' }}>✕</span>
+                          )}
+                        </td>
                         <td className="text-right px-2 py-2 text-gray-600">{fmtNum(l.unit_price)}</td>
                         <td className="text-right px-2 py-2 text-gray-600">{fmtNum(l.vat_rate)}%</td>
-                        <td className="text-right px-2 py-2 font-bold text-gray-800">{fmtNum(l.total_price)}</td>
+                        <td className={`text-right px-2 py-2 font-bold ${(l.total_price ?? 0) < 0 ? 'text-red-600' : 'text-gray-800'}`}>{fmtNum(l.total_price)}</td>
                         {allCategories.length > 0 && <td className="text-center px-1 py-1">
                           <SearchableSelect
                             value={lineCat || null}

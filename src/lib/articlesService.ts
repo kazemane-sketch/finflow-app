@@ -874,12 +874,15 @@ export async function loadDashboardStats(
   const articleMap = new Map((articles || []).map(a => [a.id, a]))
 
   // Aggregate by article
+  // qty: only positive-price lines (exclude discounts/adjustments from production counting)
+  // rev: all lines (negative amounts reduce net revenue — needed for accurate price-per-unit)
   const agg = new Map<string, { qty: number; rev: number; count: number }>()
   for (const l of lines) {
     if (validInvoiceIds && !validInvoiceIds.has(l.invoice_id)) continue
     const prev = agg.get(l.article_id) || { qty: 0, rev: 0, count: 0 }
-    prev.qty += Number(l.quantity || 0)
-    prev.rev += Number(l.total_price || 0)
+    const tp = Number(l.total_price || 0)
+    if (tp > 0) prev.qty += Number(l.quantity || 0) // only count positive-price lines for production
+    prev.rev += tp                                   // all lines for economic breakdown
     prev.count++
     agg.set(l.article_id, prev)
   }
@@ -895,7 +898,7 @@ export async function loadDashboardStats(
       unit: art.unit,
       total_quantity: stats.qty,
       total_revenue: stats.rev,
-      avg_price: stats.qty > 0 ? stats.rev / stats.qty : 0,
+      avg_price: stats.qty > 0 ? stats.rev / stats.qty : 0, // net price per unit
       line_count: stats.count,
     })
   }
@@ -1387,8 +1390,9 @@ export async function loadDashboardByPhase(
     if (validInvoiceIds && !validInvoiceIds.has(l.invoice_id)) continue
     const key = aggKey(l.article_id, l.phase_id)
     const prev = agg.get(key) || { artId: l.article_id, phaseId: l.phase_id, qty: 0, amt: 0, count: 0 }
-    prev.qty += Number(l.quantity || 0)
-    prev.amt += Number(l.total_price || 0)
+    const tp = Number(l.total_price || 0)
+    if (tp > 0) prev.qty += Number(l.quantity || 0) // only count positive-price lines for production
+    prev.amt += tp                                   // all lines for economic breakdown
     prev.count++
     agg.set(key, prev)
   }

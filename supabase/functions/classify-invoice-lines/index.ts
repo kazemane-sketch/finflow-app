@@ -104,7 +104,9 @@ interface SonnetLineResult {
   article_code: string | null;
   phase_code: string | null;
   category_id: string | null;
+  category_name: string | null;    // fallback when AI garbles UUID
   account_id: string | null;
+  account_code: string | null;     // fallback when AI garbles UUID
   cost_center_allocations: { project_id: string; percentage: number }[] | null;
   confidence: number;
   reasoning: string;
@@ -412,6 +414,18 @@ Per scegliere il CdC corretto, NON indovinare. Ragiona usando TUTTE le informazi
 6. COSTI GENERALI: per spese non legate a un sito specifico (assicurazioni generali, consulenze fiscali/legali, abbonamenti SaaS, servizi centralizzati), usa il CdC che rappresenta la sede principale/corporate dell'azienda.
 REGOLA CHIAVE: non assegnare il CdC "sede/corporate" per default quando ci sono indizi che il costo è legato a un sito specifico. Usa il ragionamento sopra per dedurre il CdC corretto.
 
+RIGHE SCONTO / ABBUONO / AGGIUSTAMENTO PREZZO:
+* Le righe con importo negativo o con descrizione che contiene "sconto", "abbuono", "superamento quantitativi", "riduzione prezzo", "aggiustamento", "rettifica" sono aggiustamenti commerciali, NON produzione.
+* Se la riga sconto è chiaramente relativa a un articolo (es. "sconto su trasporto travertino"), assegna lo stesso articolo e la stessa fase della riga di produzione corrispondente. Questo serve per calcolare il prezzo medio netto per unità.
+* Se la riga sconto è generica (es. "sconto commerciale" senza riferimento a un materiale specifico), NON assegnare articolo.
+* La categoria e il conto possono essere quelli dell'articolo principale OPPURE un conto sconti specifico se presente nel piano dei conti (es. "Sconti su vendite", "Abbuoni attivi").
+* Nel reasoning, segnala: "Riga sconto/abbuono — esclusa dal conteggio quantità nel report"
+
+COERENZA CLASSIFICAZIONE:
+* Se assegni un article_code, DEVI anche assegnare category_id e account_id coerenti. Se sai che è un certo materiale (hai assegnato l'articolo), hai sicuramente abbastanza contesto per assegnare anche categoria e conto.
+* NON lasciare category_id o account_id null a meno che non abbia davvero nessun indizio. Se hai assegnato articolo e CdC, hai le informazioni per classificare completamente.
+* Copia gli UUID ESATTAMENTE dalla lista. Come backup, compila SEMPRE anche category_name e account_code.
+
 FATTURA: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
 
 RIGHE DA CLASSIFICARE:
@@ -423,7 +437,9 @@ Rispondi con un array JSON (senza markdown):
   "article_code": "CODICE" o null,
   "phase_code": "extraction" o null,
   "category_id": "uuid",
+  "category_name": "nome esatto della categoria come scritto nella lista (fallback)",
   "account_id": "uuid",
+  "account_code": "codice numerico del conto come scritto nella lista (fallback)",
   "cost_center_allocations": [{"project_id": "uuid", "percentage": 100}],
   "confidence": 0-100,
   "reasoning": "spiegazione breve max 30 parole",
@@ -880,7 +896,9 @@ Deno.serve(async (req) => {
       article_code: item.article_code || null,
       phase_code: item.phase_code || null,
       category_id: item.category_id || null,
+      category_name: item.category_name || null,
       account_id: item.account_id || null,
+      account_code: item.account_code || null,
       cost_center_allocations: item.cost_center_allocations || [],
       confidence: Math.min(
         Math.max(Number(item.confidence) || 50, 0),
@@ -906,6 +924,32 @@ Deno.serve(async (req) => {
           if (lr.phase_code && !articlePhases.find((p) => p.code === lr.phase_code)) {
             console.warn(`[classify] Invalid phase_code "${lr.phase_code}" for article ${lr.article_code} — nullifying`);
             lr.phase_code = null;
+          }
+        }
+      }
+    }
+
+    // ─── Fallback: resolve category/account by name/code when UUID missing or invalid ───
+    for (const lr of lineResults) {
+      // Fallback category: if UUID missing/invalid, match by name
+      if (!lr.category_id || !categories.find((c) => c.id === lr.category_id)) {
+        if (lr.category_name) {
+          const match = categories.find(
+            (c) => c.name.toLowerCase().trim() === lr.category_name!.toLowerCase().trim(),
+          );
+          if (match) {
+            console.log(`[classify] Fallback category: "${lr.category_name}" → ${match.id}`);
+            lr.category_id = match.id;
+          }
+        }
+      }
+      // Fallback account: if UUID missing/invalid, match by code
+      if (!lr.account_id || !accounts.find((a) => a.id === lr.account_id)) {
+        if (lr.account_code) {
+          const match = accounts.find((a) => a.code === lr.account_code);
+          if (match) {
+            console.log(`[classify] Fallback account: "${lr.account_code}" → ${match.id}`);
+            lr.account_id = match.id;
           }
         }
       }
