@@ -35,7 +35,7 @@ export default function SearchableSelect({
 }: SearchableSelectProps) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
-  const [pos, setPos] = useState<{ top: number; left: number; flip: boolean }>({ top: 0, left: 0, flip: false });
+  const [pos, setPos] = useState<{ top: number; left: number | undefined; right: number | undefined; flip: boolean }>({ top: 0, left: 0, right: undefined, flip: false });
   const triggerRef = useRef<HTMLButtonElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -55,11 +55,15 @@ export default function SearchableSelect({
     if (!triggerRef.current) return;
     const rect = triggerRef.current.getBoundingClientRect();
     const dropH = 280; // approx max dropdown height
+    const dropW = 300; // approx dropdown width (between minWidth 260 and maxWidth 340)
     const spaceBelow = window.innerHeight - rect.bottom;
     const flip = spaceBelow < dropH && rect.top > spaceBelow;
+    // Horizontal: if dropdown would overflow right edge, align to right instead
+    const overflowsRight = rect.left + dropW > window.innerWidth - 8;
     setPos({
       top: flip ? rect.top : rect.bottom + 2,
-      left: rect.left,
+      left: overflowsRight ? undefined : rect.left,
+      right: overflowsRight ? Math.max(8, window.innerWidth - rect.right) : undefined,
       flip,
     });
   }, []);
@@ -139,6 +143,7 @@ export default function SearchableSelect({
         top: pos.flip ? undefined : pos.top,
         bottom: pos.flip ? (window.innerHeight - pos.top + 2) : undefined,
         left: pos.left,
+        right: pos.right,
         zIndex: 9999,
         minWidth: 260,
         maxWidth: 340,
