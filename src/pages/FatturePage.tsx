@@ -2380,8 +2380,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                           ? '\u2713 Classificazione salvata'
                           : 'Nessuna classificazione'}
                   </span>
-                  {/* "Cancella tutto" — clears entire classification */}
-                  {(classification || Object.keys(lineClassifs).length > 0) && !isPostConfirmDirty && (
+                  {/* "Cancella tutto" — clears entire classification (always visible when there's data) */}
+                  {(classification || Object.keys(lineClassifs).length > 0 || Object.keys(lineArticleMap).length > 0 || Object.keys(aiSuggestions).length > 0) && (
                     <button onClick={() => setShowClearDialog(true)}
                       className="px-2 py-1 text-[10px] font-semibold rounded-md border border-red-200 text-red-500 hover:bg-red-50 transition-colors">
                       {'\uD83D\uDDD1'} Cancella tutto
