@@ -407,16 +407,24 @@ export async function loadInvoices(
 
 export interface InvoiceClassificationMeta {
   line_count: number
-  assigned_count: number    // verified=true article assignments
+  assigned_count: number       // verified=true article assignments (distinct lines)
+  lines_with_category: number  // lines where category_id IS NOT NULL
+  lines_with_account: number   // lines where account_id IS NOT NULL
+  lines_with_cdc: number       // distinct lines with at least one invoice_line_projects row
+  lines_with_article: number   // distinct lines with at least one invoice_line_articles row
+  // Convenience booleans — true when ALL lines have the field
   has_category: boolean
   has_account: boolean
   has_cost_center: boolean
+  has_article: boolean
 }
 
 /**
  * Load lightweight classification metadata for a batch of invoices.
- * Used to show 📦🏷️🏗️📒 icons in the sidebar invoice list.
- * Runs 4 parallel queries per batch of 100 IDs.
+ * Used to show Cat/CdC/Conto/Art badges + warning indicators in the sidebar.
+ * Per-line completeness: counts how many lines have each field assigned,
+ * so partial classification can show warning badges on missing fields.
+ * Runs 5 parallel queries per batch of 100 IDs.
  */
 export async function loadInvoiceClassificationMeta(
   companyId: string,
@@ -430,69 +438,99 @@ export async function loadInvoiceClassificationMeta(
   for (let i = 0; i < invoiceIds.length; i += BATCH) {
     const batchIds = invoiceIds.slice(i, i + BATCH)
 
-    const [linesRes, assignedRes, classifRes, projRes] = await Promise.all([
-      // 1. Line count per invoice
+    const [linesRes, assignedRes, lineProjRes, classifRes, projRes] = await Promise.all([
+      // 1. Lines with category_id and account_id per invoice
       supabase
         .from('invoice_lines')
-        .select('invoice_id')
+        .select('invoice_id, category_id, account_id')
         .in('invoice_id', batchIds),
-      // 2. Assigned (verified=true) count per invoice
+      // 2. Article assignments per line (distinct invoice_line_id)
       supabase
         .from('invoice_line_articles')
-        .select('invoice_id')
+        .select('invoice_id, invoice_line_id')
         .eq('company_id', companyId)
-        .eq('verified', true)
         .in('invoice_id', batchIds),
-      // 3. Invoice classifications (category + account)
+      // 3. Line-level CdC assignments (distinct invoice_line_id)
+      supabase
+        .from('invoice_line_projects')
+        .select('invoice_id, invoice_line_id')
+        .in('invoice_id', batchIds),
+      // 4. Invoice-level classifications (fallback for category + account)
       supabase
         .from('invoice_classifications')
         .select('invoice_id, category_id, account_id')
         .in('invoice_id', batchIds),
-      // 4. Invoice projects (cost centers)
+      // 5. Invoice-level projects (fallback for CdC)
       supabase
         .from('invoice_projects')
         .select('invoice_id')
         .in('invoice_id', batchIds),
     ])
 
-    // Count lines per invoice
-    const lineCounts = new Map<string, number>()
-    for (const row of (linesRes.data || [])) {
-      lineCounts.set(row.invoice_id, (lineCounts.get(row.invoice_id) || 0) + 1)
+    // Per-invoice line stats
+    const lineStats = new Map<string, { total: number; withCat: number; withAcct: number }>()
+    for (const row of (linesRes.data || []) as any[]) {
+      const prev = lineStats.get(row.invoice_id) || { total: 0, withCat: 0, withAcct: 0 }
+      prev.total++
+      if (row.category_id) prev.withCat++
+      if (row.account_id) prev.withAcct++
+      lineStats.set(row.invoice_id, prev)
     }
 
-    // Count assigned per invoice
-    const assignedCounts = new Map<string, number>()
-    for (const row of (assignedRes.data || [])) {
-      assignedCounts.set(row.invoice_id, (assignedCounts.get(row.invoice_id) || 0) + 1)
+    // Distinct lines with article assignments per invoice
+    const articleLinesByInv = new Map<string, Set<string>>()
+    for (const row of (assignedRes.data || []) as any[]) {
+      if (!articleLinesByInv.has(row.invoice_id)) articleLinesByInv.set(row.invoice_id, new Set())
+      articleLinesByInv.get(row.invoice_id)!.add(row.invoice_line_id)
     }
 
-    // Category/account per invoice
-    const classifMap = new Map<string, { has_category: boolean; has_account: boolean }>()
+    // Distinct lines with CdC assignments per invoice
+    const cdcLinesByInv = new Map<string, Set<string>>()
+    for (const row of (lineProjRes.data || []) as any[]) {
+      if (!cdcLinesByInv.has(row.invoice_id)) cdcLinesByInv.set(row.invoice_id, new Set())
+      cdcLinesByInv.get(row.invoice_id)!.add(row.invoice_line_id)
+    }
+
+    // Invoice-level classification fallbacks
+    const invClassif = new Map<string, { has_category: boolean; has_account: boolean }>()
     for (const row of (classifRes.data || []) as any[]) {
-      classifMap.set(row.invoice_id, {
+      invClassif.set(row.invoice_id, {
         has_category: !!row.category_id,
         has_account: !!row.account_id,
       })
     }
 
-    // Cost center per invoice
-    const projSet = new Set<string>()
+    // Invoice-level CdC fallback
+    const invProjSet = new Set<string>()
     for (const row of (projRes.data || [])) {
-      projSet.add(row.invoice_id)
+      invProjSet.add(row.invoice_id)
     }
 
-    // Merge for each invoice in this batch
+    // Merge per invoice
     for (const id of batchIds) {
-      const lc = lineCounts.get(id) || 0
-      const ac = assignedCounts.get(id) || 0
-      const cf = classifMap.get(id)
+      const ls = lineStats.get(id) || { total: 0, withCat: 0, withAcct: 0 }
+      const lc = ls.total
+      const artLines = articleLinesByInv.get(id)?.size || 0
+      const cdcLines = cdcLinesByInv.get(id)?.size || 0
+      const invCf = invClassif.get(id)
+
+      // For category/account: use line-level if any lines have it, otherwise fall back to invoice-level
+      const linesWithCat = ls.withCat > 0 ? ls.withCat : (invCf?.has_category ? lc : 0)
+      const linesWithAcct = ls.withAcct > 0 ? ls.withAcct : (invCf?.has_account ? lc : 0)
+      // For CdC: use line-level if any lines have it, otherwise fall back to invoice-level
+      const linesWithCdc = cdcLines > 0 ? cdcLines : (invProjSet.has(id) ? lc : 0)
+
       result.set(id, {
         line_count: lc,
-        assigned_count: ac,
-        has_category: cf?.has_category || false,
-        has_account: cf?.has_account || false,
-        has_cost_center: projSet.has(id),
+        assigned_count: artLines,
+        lines_with_category: linesWithCat,
+        lines_with_account: linesWithAcct,
+        lines_with_cdc: linesWithCdc,
+        lines_with_article: artLines,
+        has_category: lc > 0 && linesWithCat >= lc,
+        has_account: lc > 0 && linesWithAcct >= lc,
+        has_cost_center: lc > 0 && linesWithCdc >= lc,
+        has_article: lc > 0 && artLines >= lc,
       })
     }
   }

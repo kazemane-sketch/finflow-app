@@ -278,8 +278,12 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, is
   const nc = inv.doc_type === 'TD04' || inv.doc_type === 'TD05';
   const cp = (inv.counterparty || {}) as any;
   const displayName = cp?.denom || inv.source_filename || 'Sconosciuto';
-  const isClassified = meta && (meta.has_category || meta.has_cost_center || meta.has_account);
-  const needsClassification = !isClassified && inv.classification_status !== 'ai_suggested';
+  // Classification started = at least one field present on at least one line
+  const hasAnyField = meta && (
+    meta.lines_with_category > 0 || meta.lines_with_account > 0 ||
+    meta.lines_with_cdc > 0 || meta.lines_with_article > 0
+  );
+  const needsClassification = !hasAnyField && inv.classification_status !== 'ai_suggested';
   return (
     <div className={`flex items-start gap-2 px-3 py-2.5 cursor-pointer border-b border-gray-100 transition-all ${checked ? 'bg-blue-50 border-l-4 border-l-blue-500' : selected ? 'bg-sky-50 border-l-4 border-l-sky-500' : 'border-l-4 border-l-transparent hover:bg-gray-50'}`}>
       {selectMode && <input type="checkbox" checked={checked} onChange={onCheck} className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />}
@@ -299,11 +303,24 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, is
         </div>
         {/* Classification chip badges */}
         <div className="flex items-center gap-1 mt-1 flex-wrap">
-          {isClassified ? (
+          {hasAnyField && meta ? (
             <>
-              {meta!.has_category && <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">Cat</span>}
-              {meta!.has_cost_center && <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700">CdC</span>}
-              {meta!.has_account && <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">Conto</span>}
+              {/* Category badge */}
+              {meta.has_category
+                ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">Cat</span>
+                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Cat</span>}
+              {/* CdC badge */}
+              {meta.has_cost_center
+                ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700">CdC</span>
+                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!CdC</span>}
+              {/* Account badge */}
+              {meta.has_account
+                ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">Conto</span>
+                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Conto</span>}
+              {/* Article badge */}
+              {meta.has_article
+                ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">Art</span>
+                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Art</span>}
             </>
           ) : inv.classification_status === 'ai_suggested' ? (
             <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 flex items-center gap-0.5">&#9889; Da confermare</span>
