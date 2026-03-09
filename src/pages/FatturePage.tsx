@@ -1145,10 +1145,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       }
       setLineArticleMap(mergedArticleMap);
 
-      // Update originals to merged state so isPostConfirmDirty starts from new baseline
-      setOriginalLineClassifs(mergedLineClf);
-      setOriginalLineArticleMap(mergedArticleMap);
-      setOriginalLineProjects(mergedLineProj);
+      // NOTE: Do NOT update originals here — we want isPostConfirmDirty = true
+      // so the Save button appears after AI/rule suggestions fill in the fields.
 
       // Update CdC from DB-persisted invoice-level projects
       if (freshInvProjs.length > 0) {
@@ -1167,8 +1165,6 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           amount: total > 0 ? Math.round(total * pa.percentage / 100 * 100) / 100 : null,
         })));
       }
-      // Reset classifDirty so save button doesn't appear immediately after AI classification
-      setClassifDirty(false);
     } catch (e: any) {
       console.error('AI classification error:', e);
       setAiClassifStatus('error');
@@ -1176,146 +1172,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   }, [invoice?.id, company?.id, invoice?.counterparty, invoice?.direction, detail?.invoice_lines, selCategoryId, selAccountId]);
 
   // Confirm AI suggestion — set verified=true on invoice_classifications + line-level records
-  const handleConfirmAiClassification = useCallback(async () => {
-    if (!invoice?.id || !company?.id || !aiClassifResult) return;
-    try {
-      const il = aiClassifResult.invoice_level;
-      // Save invoice-level as confirmed (verified=true)
-      await saveInvoiceClassification(company.id, invoice.id, il.category_id, il.account_id);
-      // Also confirm AI-suggested line-level article assignments (so deterministic matching learns from them)
-      await supabase
-        .from('invoice_line_articles')
-        .update({ verified: true, assigned_by: 'manual' } as any)
-        .eq('invoice_id', invoice.id)
-        .eq('verified', false);
-      const classif = await loadInvoiceClassification(invoice.id);
-      setClassification(classif);
-      setSelCategoryId(classif?.category_id || null);
-      setSelAccountId(classif?.account_id || null);
-      setAiClassifResult(null);
-      setAiClassifStatus('idle');
-      // Patch invoice in sidebar so ⚡ disappears (no full reload → preserves selection + scroll)
-      onPatchInvoice(invoice.id, { classification_status: 'confirmed' } as Partial<DBInvoice>);
-
-      // Reload article assignments so lineArticleMap reflects confirmed state (incl. phase_id)
-      const { data: freshAssignments } = await supabase
-        .from('invoice_line_articles')
-        .select('invoice_line_id, article_id, phase_id, assigned_by, verified, location, confidence, article:articles!inner(id, code, name, unit, keywords)')
-        .eq('invoice_id', invoice.id);
-      const freshMap: Record<string, LineArticleInfo> = {};
-      for (const a of (freshAssignments || [])) {
-        const art = (a as any).article;
-        const fullArtWithPhases = articles.find(ar => ar.id === a.article_id);
-        const phase = a.phase_id ? fullArtWithPhases?.phases?.find(p => p.id === a.phase_id) : null;
-        if (a.verified) {
-          freshMap[a.invoice_line_id] = {
-            article_id: a.article_id, code: art?.code || '', name: art?.name || '',
-            assigned_by: a.assigned_by, verified: a.verified, location: a.location,
-            phase_id: a.phase_id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
-          };
-        }
-      }
-      setLineArticleMap(freshMap);
-      setAiSuggestions({});
-
-      // Create classification rules from AI-confirmed lines (fire-and-forget)
-      const cp = (invoice.counterparty || {}) as any;
-      if (aiClassifResult.lines) {
-        for (const lr of aiClassifResult.lines) {
-          const lineDesc = detail?.invoice_lines?.find(l => l.id === lr.invoice_line_id)?.description;
-          if (lineDesc && (lr.category_id || lr.account_id)) {
-            const lrCdc = lr.project_allocations?.length
-              ? lr.project_allocations.map((p: any) => ({ project_id: p.project_id, percentage: p.percentage }))
-              : (cdcRows.length > 0 ? cdcRows.map(c => ({ project_id: c.project_id, percentage: c.percentage })) : null);
-            createRuleFromConfirmation(
-              company.id, cp?.piva || null, cp?.denom || null,
-              lineDesc, invoice.direction as 'in' | 'out',
-              { category_id: lr.category_id, account_id: lr.account_id, article_id: lr.article_id, phase_id: lr.phase_id || null,
-                cost_center_allocations: lrCdc },
-            ).catch(err => console.warn('[rules] error:', err));
-          }
-        }
-      }
-
-      // Refresh sidebar badges
-      onRefreshBadges(invoice.id);
-    } catch (e: any) { console.error('Confirm AI classification error:', e); }
-  }, [invoice?.id, company?.id, aiClassifResult, articles, onPatchInvoice, onRefreshBadges, detail?.invoice_lines, invoice?.counterparty, invoice?.direction]);
-
-  // Reject AI suggestion — delete classification + reset status to 'none'
-  const handleRejectAiClassification = useCallback(async () => {
-    if (!invoice?.id) return;
-    try {
-      await deleteInvoiceClassification(invoice.id);
-      await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
-      setClassification(null);
-      setSelCategoryId(null);
-      setSelAccountId(null);
-      setCdcRows([]);
-      setClassifDirty(false);
-      // Patch invoice in sidebar (no full reload → preserves selection + scroll)
-      onPatchInvoice(invoice.id, { classification_status: 'none' } as Partial<DBInvoice>);
-    } catch (e: any) { console.error('Reject AI classification error:', e); }
-  }, [invoice?.id, onPatchInvoice]);
-
-  // Confirm existing AI-suggested classification (from banner, not from inline AI trigger)
-  const handleConfirmExistingClassification = useCallback(async () => {
-    if (!invoice?.id || !company?.id) return;
-    try {
-      // Save article assignments that may have been set locally
-      if (detail?.invoice_lines) {
-        for (const line of detail.invoice_lines) {
-          const curr = lineArticleMap[line.id];
-          const orig = originalLineArticleMap[line.id];
-          const changed = (!curr && orig) || (curr && !orig) ||
-            (curr && orig && (curr.article_id !== orig.article_id || curr.phase_id !== orig.phase_id));
-          if (!changed) continue;
-          if (!curr && orig) {
-            await removeLineAssignment(line.id).catch(() => {});
-          } else if (curr) {
-            await assignArticleToLine(
-              company.id, line.id, invoice.id, curr.article_id,
-              { quantity: line.quantity, unit_price: line.unit_price, total_price: line.total_price, vat_rate: line.vat_rate },
-              'manual', undefined, curr.location, curr.phase_id,
-            );
-          }
-        }
-        setOriginalLineArticleMap({ ...lineArticleMap });
-      }
-
-      // Mark as confirmed
-      await supabase.from('invoice_classifications').update({ verified: true, assigned_by: 'manual', updated_at: new Date().toISOString() }).eq('invoice_id', invoice.id);
-      await supabase.from('invoices').update({ classification_status: 'confirmed' } as any).eq('id', invoice.id);
-      const classif = await loadInvoiceClassification(invoice.id);
-      setClassification(classif);
-      // Patch invoice in sidebar (no full reload → preserves selection + scroll)
-      onPatchInvoice(invoice.id, { classification_status: 'confirmed' } as Partial<DBInvoice>);
-
-      // Create classification rules from confirmed line data (fire-and-forget)
-      const cp = (invoice.counterparty || {}) as any;
-      if (detail?.invoice_lines) {
-        for (const line of detail.invoice_lines) {
-          const lc = lineClassifs[line.id];
-          if (lc?.category_id || lc?.account_id) {
-            const lineCdc = lineProjects[line.id]?.length
-              ? lineProjects[line.id].map(p => ({ project_id: p.project_id, percentage: p.percentage }))
-              : (cdcRows.length > 0 ? cdcRows.map(c => ({ project_id: c.project_id, percentage: c.percentage })) : null);
-            createRuleFromConfirmation(
-              company.id, cp?.piva || null, cp?.denom || null,
-              line.description, invoice.direction as 'in' | 'out',
-              { category_id: lc.category_id, account_id: lc.account_id,
-                article_id: lineArticleMap[line.id]?.article_id || null,
-                phase_id: lineArticleMap[line.id]?.phase_id || null,
-                cost_center_allocations: lineCdc },
-            ).catch(err => console.warn('[rules] error:', err));
-          }
-        }
-      }
-
-      // Refresh sidebar badges
-      onRefreshBadges(invoice.id);
-    } catch (e: any) { console.error('Confirm existing classification error:', e); }
-  }, [invoice?.id, company?.id, onPatchInvoice, onRefreshBadges, detail?.invoice_lines, lineClassifs, lineArticleMap, originalLineArticleMap, invoice?.counterparty, invoice?.direction]);
+  // NOTE: handleConfirmAiClassification, handleRejectAiClassification, handleConfirmExistingClassification
+  // have been removed. All saves go through the universal handleConfirmChanges (Save button).
 
   // Handle "Crea e usa" for AI-suggested new account/category
   const handleCreateSuggestion = useCallback(async (lineId: string) => {
@@ -1439,23 +1297,33 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         }
       }
 
-      // 4. Update classification status based on current state
-      const newStatus = isConfirmed ? 'confirmed' : 'manual';
-      await supabase.from('invoice_classifications').update({ verified: true, assigned_by: 'manual', updated_at: new Date().toISOString() }).eq('invoice_id', invoice.id);
-      // Ensure invoice_classifications row exists (upsert for fresh classifications)
-      if (!isConfirmed && !classification) {
-        await supabase.from('invoice_classifications').upsert({
-          invoice_id: invoice.id,
-          company_id: company.id,
-          category_id: selCategoryId,
-          account_id: selAccountId,
-          assigned_by: 'manual',
-          verified: true,
-          updated_at: new Date().toISOString(),
-        }, { onConflict: 'invoice_id' });
+      // 4. Determine and apply classification status
+      const hasAnyData = selCategoryId || selAccountId ||
+        Object.values(lineClassifs).some(lc => lc?.category_id || lc?.account_id) ||
+        Object.keys(lineArticleMap).length > 0;
+      if (!hasAnyData) {
+        // User cleared everything → delete classification and set status 'none'
+        await deleteInvoiceClassification(invoice.id);
+        await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
+        onPatchInvoice(invoice.id, { classification_status: 'none' } as Partial<DBInvoice>);
+      } else {
+        const newStatus = isConfirmed ? 'confirmed' : 'manual';
+        await supabase.from('invoice_classifications').update({ verified: true, assigned_by: 'manual', updated_at: new Date().toISOString() }).eq('invoice_id', invoice.id);
+        // Ensure invoice_classifications row exists (upsert for fresh classifications)
+        if (!isConfirmed && !classification) {
+          await supabase.from('invoice_classifications').upsert({
+            invoice_id: invoice.id,
+            company_id: company.id,
+            category_id: selCategoryId,
+            account_id: selAccountId,
+            assigned_by: 'manual',
+            verified: true,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'invoice_id' });
+        }
+        await supabase.from('invoices').update({ classification_status: newStatus } as any).eq('id', invoice.id);
+        onPatchInvoice(invoice.id, { classification_status: newStatus } as Partial<DBInvoice>);
       }
-      await supabase.from('invoices').update({ classification_status: newStatus } as any).eq('id', invoice.id);
-      onPatchInvoice(invoice.id, { classification_status: newStatus } as Partial<DBInvoice>);
 
       // 5. Update original snapshots so dirty state resets
       setOriginalLineClassifs({ ...lineClassifs });
@@ -1542,41 +1410,26 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   }, [copiedClassif, company?.id, invoice?.id]);
 
   // Clear all classification
-  const handleClearAllClassification = useCallback(async () => {
-    if (!invoice?.id || !company?.id) return;
-    try {
-      // 1. Delete invoice-level classification
-      await deleteInvoiceClassification(invoice.id);
-      // 2. Clear all line classifications
-      const lines = detail?.invoice_lines || [];
-      await Promise.all(lines.map(l => saveLineCategoryAndAccount(l.id, null, null)));
-      // 3. Clear line CdC allocations
-      await Promise.all(lines.map(l => saveLineProjects(company.id, invoice.id, l.id, [])));
-      // 4. Clear article assignments
-      await Promise.all(lines.map(l => removeLineAssignment(l.id).catch(() => {})));
-      // 5. Reset invoice status
-      await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
-      // 6. Reset local state
-      setClassification(null);
-      setSelCategoryId(null);
-      setSelAccountId(null);
-      setCdcRows([]);
-      setLineClassifs({});
-      setLineProjects({});
-      setLineArticleMap({});
-      setAiSuggestions({});
-      setDismissedArticleLineIds(new Set());
-      setClassifDirty(false);
-      setOriginalLineClassifs({});
-      setOriginalLineArticleMap({});
-      setOriginalLineProjects({});
-      // 7. Patch sidebar
-      onPatchInvoice(invoice.id, { classification_status: 'none' } as Partial<DBInvoice>);
-      onRefreshBadges(invoice.id);
-      toast.success('Classificazione cancellata');
-    } catch (e: any) { console.error('Clear classification error:', e); toast.error('Errore'); }
+  const handleClearAllClassification = useCallback(() => {
+    if (!invoice?.id) return;
+    // LOCAL ONLY — clears all fields without touching DB.
+    // The user must press "Salva" to persist the clearing.
+    setClassification(null);
+    setSelCategoryId(null);
+    setSelAccountId(null);
+    setCdcRows([]);
+    setLineClassifs({});
+    setLineProjects({});
+    setLineArticleMap({});
+    setAiSuggestions({});
+    setDismissedArticleLineIds(new Set());
+    setAiClassifResult(null);
+    setAiClassifStatus('idle');
+    // Mark invoice-level as dirty so Save button detects the change
+    setClassifDirty(true);
+    // NOTE: Do NOT reset originals — we want isPostConfirmDirty = true → Save appears
     setShowClearDialog(false);
-  }, [invoice?.id, company?.id, detail?.invoice_lines, onPatchInvoice, onRefreshBadges]);
+  }, [invoice?.id]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }, suggestedPhaseId?: string | null) => {
     const companyId = company?.id;
@@ -1880,44 +1733,25 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                   )}
                 </div>
 
-                {/* AI Suggestion Banner */}
+                {/* AI Suggestion Banner — info only, user saves with universal Save button */}
                 {invoice.classification_status === 'ai_suggested' && (
                   <div className="flex items-center gap-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3">
                     <span className="text-amber-500 text-sm flex-shrink-0">{'\u26A1'}</span>
-                    <span className="text-xs text-amber-800 flex-1">Classificazione suggerita dall'AI {'\u2014'} verifica e conferma</span>
-                    <button onClick={handleConfirmExistingClassification}
-                      className="px-2.5 py-1 text-[11px] font-semibold rounded-md bg-emerald-600 text-white hover:bg-emerald-700 flex-shrink-0">
-                      {'\u2713'} Conferma
-                    </button>
-                    <button onClick={handleRejectAiClassification}
-                      className="px-2.5 py-1 text-[11px] font-semibold rounded-md bg-red-100 text-red-700 hover:bg-red-200 flex-shrink-0">
-                      {'\u2715'} Rifiuta
-                    </button>
+                    <span className="text-xs text-amber-800 flex-1">Classificazione suggerita dall'AI {'\u2014'} verifica i campi e premi Salva</span>
                   </div>
                 )}
 
-                {/* AI result panel */}
-                {aiClassifResult && !classification?.verified && (
-                  <div className="bg-purple-50 border border-purple-200 rounded-lg px-3 py-2 mb-3">
-                    <div className="flex items-center gap-2 mb-1">
+                {/* AI result info (no Conferma/Ignora — user saves with universal Save button) */}
+                {aiClassifResult && (
+                  <div className="bg-purple-50 border border-purple-200 rounded-lg px-2.5 py-1.5 mb-3">
+                    <div className="flex items-center gap-2">
                       <span className="text-purple-600 text-sm">{'\u2728'}</span>
-                      <span className="text-xs font-semibold text-purple-800">Suggerimento AI</span>
-                      <span className="text-[10px] text-purple-500 ml-auto">
-                        Confidenza: {aiClassifResult.invoice_level?.confidence ?? 0}%
+                      <span className="text-[10px] text-purple-700">
+                        {aiClassifResult.invoice_level?.reasoning || 'Suggerimento AI applicato'}
                       </span>
-                    </div>
-                    {aiClassifResult.invoice_level?.reasoning && (
-                      <p className="text-[10px] text-purple-700 mb-2">{aiClassifResult.invoice_level.reasoning}</p>
-                    )}
-                    <div className="flex gap-2">
-                      <button onClick={handleConfirmAiClassification}
-                        className="px-2.5 py-1 text-xs font-semibold rounded bg-emerald-600 text-white hover:bg-emerald-700">
-                        Conferma
-                      </button>
-                      <button onClick={() => { setAiClassifResult(null); setAiClassifStatus('idle'); }}
-                        className="px-2.5 py-1 text-xs font-semibold rounded bg-gray-200 text-gray-700 hover:bg-gray-300">
-                        Ignora
-                      </button>
+                      <span className="text-[10px] text-purple-500 ml-auto">
+                        {aiClassifResult.invoice_level?.confidence ?? 0}%
+                      </span>
                     </div>
                   </div>
                 )}
@@ -2493,19 +2327,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                       {confirmChangesSaving ? 'Salvataggio...' : '\uD83D\uDCBE Salva'}
                     </button>
                   )}
-                  {/* "Conferma tutte" + "Ignora" — only visible for ai_suggested without local changes */}
-                  {invoice.classification_status === 'ai_suggested' && !isPostConfirmDirty && (
-                    <>
-                      <button onClick={handleConfirmExistingClassification}
-                        className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 transition-colors">
-                        {'\u2713'} Conferma tutte
-                      </button>
-                      <button onClick={handleRejectAiClassification}
-                        className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-100 transition-colors">
-                        Ignora suggerimenti
-                      </button>
-                    </>
-                  )}
+                  {/* No Conferma/Ignora — user uses universal Save button above */}
                 </div>
               </div>
             </div>
