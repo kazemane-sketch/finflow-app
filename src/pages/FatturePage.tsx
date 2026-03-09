@@ -544,6 +544,20 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   // Line-level CdC allocations (per line)
   const [lineProjects, setLineProjects] = useState<Record<string, LineProjectAssignment[]>>({});
   const [cdcPopoverLineId, setCdcPopoverLineId] = useState<string | null>(null);
+  const [cdcPopoverPos, setCdcPopoverPos] = useState<{ top: number; left: number | undefined; right: number | undefined }>({ top: 0, left: 0, right: undefined });
+  const cdcPopoverRef = useRef<HTMLDivElement>(null);
+
+  // Close CdC popover on outside click
+  useEffect(() => {
+    if (!cdcPopoverLineId) return;
+    const handler = (e: MouseEvent) => {
+      if (cdcPopoverRef.current?.contains(e.target as Node)) return;
+      setCdcPopoverLineId(null);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [cdcPopoverLineId]);
+
   // AI classification suggestion state
   const [aiClassifStatus, setAiClassifStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [aiClassifResult, setAiClassifResult] = useState<any>(null);
@@ -1979,11 +1993,21 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                             />
                           ) : <span className="text-[9px] text-gray-300">{'\u2014'}</span>}
                         </td>}
-                        {allProjects.length > 0 && <td className="text-center px-1 py-1 relative">
+                        {allProjects.length > 0 && <td className="text-center px-1 py-1">
                           {lineId ? (
-                            <>
                               <button
-                                onClick={() => setCdcPopoverLineId(cdcPopoverLineId === lineId ? null : lineId)}
+                                onClick={(e) => {
+                                  if (cdcPopoverLineId === lineId) { setCdcPopoverLineId(null); return; }
+                                  const rect = e.currentTarget.getBoundingClientRect();
+                                  const popW = 272;
+                                  const overflowsRight = rect.left + popW > window.innerWidth - 8;
+                                  setCdcPopoverPos({
+                                    top: rect.bottom + 4,
+                                    left: overflowsRight ? undefined : rect.left,
+                                    right: overflowsRight ? Math.max(8, window.innerWidth - rect.right) : undefined,
+                                  });
+                                  setCdcPopoverLineId(lineId);
+                                }}
                                 title={lineProjects[lineId]?.length ? lineProjects[lineId].map(lp => { const p = allProjects.find(pp => pp.id === lp.project_id); return p ? `${p.code} ${p.name}` : ''; }).filter(Boolean).join(', ') : ''}
                                 className={`text-[10px] hover:underline cursor-pointer w-full text-center px-1 py-1 rounded-md border ${
                                   lineProjects[lineId]?.length ? 'bg-indigo-50 border-indigo-200 text-indigo-700 font-semibold' : 'border-gray-200 text-gray-500'
@@ -1994,102 +2018,6 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                                   : (cdcRows.length > 0 ? '\u2190 Fatt.' : '\u2014')
                                 }
                               </button>
-                              {cdcPopoverLineId === lineId && (
-                                <div className="absolute z-50 top-full right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-xl p-3 w-64" onClick={e => e.stopPropagation()}>
-                                  <div className="flex items-center justify-between mb-2">
-                                    <span className="text-[10px] font-semibold text-gray-700">CdC Riga</span>
-                                    <button onClick={() => setCdcPopoverLineId(null)} className="text-gray-400 hover:text-gray-600 text-xs">x</button>
-                                  </div>
-                                  {(lineProjects[lineId] || []).map((lp, lpIdx) => {
-                                    const proj = allProjects.find(p => p.id === lp.project_id);
-                                    return (
-                                      <div key={lp.id || lpIdx} className="flex items-center gap-1 mb-1">
-                                        <span className="text-[9px] text-gray-600 flex-1 truncate">{proj?.code} {proj?.name}</span>
-                                        <input type="number" min={0} max={100} step={1}
-                                          value={lp.percentage}
-                                          onChange={e => {
-                                            const pct = Math.max(0, Math.min(100, Number(e.target.value)));
-                                            setLineProjects(prev => ({
-                                              ...prev,
-                                              [lineId]: (prev[lineId] || []).map((r, ri) => ri === lpIdx ? { ...r, percentage: pct } : r),
-                                            }));
-                                          }}
-                                          className="w-12 text-[9px] text-right border rounded px-1 py-0.5"
-                                        />
-                                        <span className="text-[9px] text-gray-400">%</span>
-                                        <button onClick={() => {
-                                          setLineProjects(prev => ({
-                                            ...prev,
-                                            [lineId]: (prev[lineId] || []).filter((_, ri) => ri !== lpIdx),
-                                          }));
-                                        }} className="text-red-400 hover:text-red-600 text-[9px]">x</button>
-                                      </div>
-                                    );
-                                  })}
-                                  {(() => {
-                                    const lps = lineProjects[lineId] || [];
-                                    if (lps.length <= 1) return null;
-                                    const total = lps.reduce((s, p) => s + p.percentage, 0);
-                                    const isValid = Math.abs(total - 100) < 0.01;
-                                    return !isValid ? (
-                                      <div className="text-[9px] text-red-600 font-medium mt-1">
-                                        {'\u26A0'} Percentuali devono sommare a 100% (attuale: {Math.round(total)}%)
-                                      </div>
-                                    ) : null;
-                                  })()}
-                                  <div className="flex items-center gap-1 mt-1">
-                                    <select className="flex-1 text-[9px] border rounded px-1 py-0.5" value=""
-                                      onChange={e => {
-                                        if (!e.target.value) return;
-                                        const existing = lineProjects[lineId] || [];
-                                        // Auto-default 50/50 when adding second CdC
-                                        if (existing.length === 1 && existing[0].percentage === 100) {
-                                          setLineProjects(prev => ({
-                                            ...prev,
-                                            [lineId]: [
-                                              { ...existing[0], percentage: 50 },
-                                              { id: crypto.randomUUID(), invoice_line_id: lineId, project_id: e.target.value, percentage: 50, amount: null },
-                                            ],
-                                          }));
-                                        } else {
-                                          setLineProjects(prev => ({
-                                            ...prev,
-                                            [lineId]: [...existing, { id: crypto.randomUUID(), invoice_line_id: lineId, project_id: e.target.value, percentage: 100, amount: null }],
-                                          }));
-                                        }
-                                      }}
-                                    >
-                                      <option value="">+ Aggiungi CdC</option>
-                                      {allProjects.filter(p => !(lineProjects[lineId] || []).some(lp => lp.project_id === p.id)).map(p => (
-                                        <option key={p.id} value={p.id}>{p.code} - {p.name}</option>
-                                      ))}
-                                    </select>
-                                  </div>
-                                  <button
-                                    disabled={(() => {
-                                      const lps = lineProjects[lineId] || [];
-                                      if (lps.length <= 1) return false;
-                                      return Math.abs(lps.reduce((s, p) => s + p.percentage, 0) - 100) >= 0.01;
-                                    })()}
-                                    onClick={async () => {
-                                      if (!company?.id || !invoice?.id) return;
-                                      try {
-                                        const toSave = (lineProjects[lineId] || []).map(lp => ({
-                                          project_id: lp.project_id, percentage: lp.percentage, amount: lp.amount,
-                                        }));
-                                        await saveLineProjects(company.id, invoice.id, lineId, toSave);
-                                        const fresh = await loadLineProjects(invoice.id);
-                                        setLineProjects(fresh);
-                                        setCdcPopoverLineId(null);
-                                      } catch (e: any) { console.error('Save line CdC error:', e); }
-                                    }}
-                                    className="mt-2 w-full text-[10px] font-semibold bg-sky-600 text-white rounded px-2 py-1 hover:bg-sky-700 disabled:opacity-40 disabled:cursor-not-allowed"
-                                  >
-                                    Salva
-                                  </button>
-                                </div>
-                              )}
-                            </>
                           ) : <span className="text-[9px] text-gray-300">{'\u2014'}</span>}
                         </td>}
                         {allAccounts.length > 0 && <td className="text-center px-1 py-1">
@@ -2256,87 +2184,23 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                             truncate={18}
                           />
                         </td>}
-                        {allProjects.length > 0 && <td className="text-center px-1 py-1 relative">
-                          <button onClick={() => setCdcPopoverLineId(cdcPopoverLineId === l.id ? null : l.id)}
+                        {allProjects.length > 0 && <td className="text-center px-1 py-1">
+                          <button onClick={(e) => {
+                              if (cdcPopoverLineId === l.id) { setCdcPopoverLineId(null); return; }
+                              const rect = e.currentTarget.getBoundingClientRect();
+                              const popW = 272;
+                              const overflowsRight = rect.left + popW > window.innerWidth - 8;
+                              setCdcPopoverPos({
+                                top: rect.bottom + 4,
+                                left: overflowsRight ? undefined : rect.left,
+                                right: overflowsRight ? Math.max(8, window.innerWidth - rect.right) : undefined,
+                              });
+                              setCdcPopoverLineId(l.id);
+                            }}
                             title={lineProjects[l.id]?.length ? lineProjects[l.id].map(lp => { const p = allProjects.find(pp => pp.id === lp.project_id); return p ? `${p.code} ${p.name}` : ''; }).filter(Boolean).join(', ') : ''}
                             className={`text-[10px] cursor-pointer w-full text-center px-1 py-1 rounded-md border ${lineProjects[l.id]?.length ? 'bg-indigo-50 border-indigo-200 text-indigo-700 font-semibold' : 'border-gray-200 text-gray-500'}`}>
                             {lineProjects[l.id]?.length ? lineProjects[l.id].map(lp => { const p = allProjects.find(pp => pp.id === lp.project_id); return p ? `${p.code} ${p.name?.substring(0, 8) || ''}` : ''; }).filter(Boolean).join(', ').substring(0, 18) : (cdcRows.length > 0 ? '\u2190 Fatt.' : '\u2014')}
                           </button>
-                          {cdcPopoverLineId === l.id && (
-                            <div className="absolute z-50 top-full right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-xl p-3 w-64" onClick={e => e.stopPropagation()}>
-                              <div className="flex items-center justify-between mb-2">
-                                <span className="text-[10px] font-semibold text-gray-700">CdC Riga</span>
-                                <button onClick={() => setCdcPopoverLineId(null)} className="text-gray-400 hover:text-gray-600 text-xs">x</button>
-                              </div>
-                              {(lineProjects[l.id] || []).map((lp, lpIdx) => {
-                                const proj = allProjects.find(p => p.id === lp.project_id);
-                                return (
-                                  <div key={lp.id || lpIdx} className="flex items-center gap-1 mb-1">
-                                    <span className="text-[9px] text-gray-600 flex-1 truncate">{proj?.code} {proj?.name}</span>
-                                    <input type="number" min={0} max={100} step={1} value={lp.percentage}
-                                      onChange={e => { const pct = Math.max(0, Math.min(100, Number(e.target.value))); setLineProjects(prev => ({ ...prev, [l.id]: (prev[l.id] || []).map((r, ri) => ri === lpIdx ? { ...r, percentage: pct } : r) })); }}
-                                      className="w-12 text-[9px] text-right border rounded px-1 py-0.5" />
-                                    <span className="text-[9px] text-gray-400">%</span>
-                                    <button onClick={() => { setLineProjects(prev => ({ ...prev, [l.id]: (prev[l.id] || []).filter((_, ri) => ri !== lpIdx) })); }} className="text-red-400 hover:text-red-600 text-[9px]">x</button>
-                                  </div>
-                                );
-                              })}
-                              {(() => {
-                                const lps = lineProjects[l.id] || [];
-                                if (lps.length <= 1) return null;
-                                const total = lps.reduce((s, p) => s + p.percentage, 0);
-                                const isValid = Math.abs(total - 100) < 0.01;
-                                return !isValid ? (
-                                  <div className="text-[9px] text-red-600 font-medium mt-1">
-                                    {'\u26A0'} Percentuali devono sommare a 100% (attuale: {Math.round(total)}%)
-                                  </div>
-                                ) : null;
-                              })()}
-                              <div className="flex items-center gap-1 mt-1">
-                                <select className="flex-1 text-[9px] border rounded px-1 py-0.5" value=""
-                                  onChange={e => {
-                                    if (!e.target.value) return;
-                                    const existing = lineProjects[l.id] || [];
-                                    if (existing.length === 1 && existing[0].percentage === 100) {
-                                      setLineProjects(prev => ({
-                                        ...prev,
-                                        [l.id]: [
-                                          { ...existing[0], percentage: 50 },
-                                          { id: crypto.randomUUID(), invoice_line_id: l.id, project_id: e.target.value, percentage: 50, amount: null },
-                                        ],
-                                      }));
-                                    } else {
-                                      setLineProjects(prev => ({
-                                        ...prev,
-                                        [l.id]: [...existing, { id: crypto.randomUUID(), invoice_line_id: l.id, project_id: e.target.value, percentage: 100, amount: null }],
-                                      }));
-                                    }
-                                  }}>
-                                  <option value="">+ Aggiungi CdC</option>
-                                  {allProjects.filter(p => !(lineProjects[l.id] || []).some(lp => lp.project_id === p.id)).map(p => (
-                                    <option key={p.id} value={p.id}>{p.code} - {p.name}</option>
-                                  ))}
-                                </select>
-                              </div>
-                              <button
-                                disabled={(() => {
-                                  const lps = lineProjects[l.id] || [];
-                                  if (lps.length <= 1) return false;
-                                  return Math.abs(lps.reduce((s, p) => s + p.percentage, 0) - 100) >= 0.01;
-                                })()}
-                                onClick={async () => {
-                                  if (!company?.id || !invoice?.id) return;
-                                  try {
-                                    const toSave = (lineProjects[l.id] || []).map(lp => ({ project_id: lp.project_id, percentage: lp.percentage, amount: lp.amount }));
-                                    await saveLineProjects(company.id, invoice.id, l.id, toSave);
-                                    const fresh = await loadLineProjects(invoice.id);
-                                    setLineProjects(fresh);
-                                    setCdcPopoverLineId(null);
-                                  } catch (e: any) { console.error('Save line CdC error:', e); }
-                                }}
-                                className="mt-2 w-full text-[10px] font-semibold bg-sky-600 text-white rounded px-2 py-1 hover:bg-sky-700 disabled:opacity-40 disabled:cursor-not-allowed">Salva</button>
-                            </div>
-                          )}
                         </td>}
                         {allAccounts.length > 0 && <td className="text-center px-1 py-1">
                           <SearchableSelect
@@ -2499,6 +2363,93 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               </div>
             </div>
           </div>
+        )}
+
+        {/* CdC line popover — Portal-rendered to escape overflow-hidden table */}
+        {cdcPopoverLineId && createPortal(
+          <div
+            ref={cdcPopoverRef}
+            style={{
+              position: 'fixed',
+              top: cdcPopoverPos.top,
+              left: cdcPopoverPos.left,
+              right: cdcPopoverPos.right,
+              zIndex: 9999,
+            }}
+            className="bg-white border border-gray-200 rounded-lg shadow-2xl p-3 w-[272px]"
+          >
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[10px] font-semibold text-gray-700">CdC Riga</span>
+              <button onClick={() => setCdcPopoverLineId(null)} className="text-gray-400 hover:text-gray-600 text-xs">✕</button>
+            </div>
+            {(lineProjects[cdcPopoverLineId] || []).map((lp, lpIdx) => {
+              const proj = allProjects.find(p => p.id === lp.project_id);
+              return (
+                <div key={lp.id || lpIdx} className="flex items-center gap-1 mb-1">
+                  <span className="text-[9px] text-gray-600 flex-1 truncate">{proj?.code} {proj?.name}</span>
+                  <input type="number" min={0} max={100} step={1}
+                    value={lp.percentage}
+                    onChange={e => {
+                      const pct = Math.max(0, Math.min(100, Number(e.target.value)));
+                      const lid = cdcPopoverLineId;
+                      setLineProjects(prev => ({
+                        ...prev,
+                        [lid]: (prev[lid] || []).map((r, ri) => ri === lpIdx ? { ...r, percentage: pct } : r),
+                      }));
+                    }}
+                    className="w-12 text-[9px] text-right border rounded px-1 py-0.5"
+                  />
+                  <span className="text-[9px] text-gray-400">%</span>
+                  <button onClick={() => {
+                    const lid = cdcPopoverLineId;
+                    setLineProjects(prev => ({
+                      ...prev,
+                      [lid]: (prev[lid] || []).filter((_, ri) => ri !== lpIdx),
+                    }));
+                  }} className="text-red-400 hover:text-red-600 text-[9px]">✕</button>
+                </div>
+              );
+            })}
+            {(() => {
+              const lps = lineProjects[cdcPopoverLineId] || [];
+              if (lps.length <= 1) return null;
+              const total = lps.reduce((s, p) => s + p.percentage, 0);
+              const isValid = Math.abs(total - 100) < 0.01;
+              return !isValid ? (
+                <div className="text-[9px] text-red-600 font-medium mt-1">
+                  ⚠ Percentuali devono sommare a 100% (attuale: {Math.round(total)}%)
+                </div>
+              ) : null;
+            })()}
+            <div className="flex items-center gap-1 mt-1">
+              <select className="flex-1 text-[9px] border rounded px-1 py-0.5" value=""
+                onChange={e => {
+                  if (!e.target.value) return;
+                  const lid = cdcPopoverLineId;
+                  const existing = lineProjects[lid] || [];
+                  if (existing.length === 1 && existing[0].percentage === 100) {
+                    setLineProjects(prev => ({
+                      ...prev,
+                      [lid]: [
+                        { ...existing[0], percentage: 50 },
+                        { id: crypto.randomUUID(), invoice_line_id: lid, project_id: e.target.value, percentage: 50, amount: null },
+                      ],
+                    }));
+                  } else {
+                    setLineProjects(prev => ({
+                      ...prev,
+                      [lid]: [...existing, { id: crypto.randomUUID(), invoice_line_id: lid, project_id: e.target.value, percentage: 100, amount: null }],
+                    }));
+                  }
+                }}>
+                <option value="">+ Aggiungi CdC</option>
+                {allProjects.filter(p => !(lineProjects[cdcPopoverLineId] || []).some(lp => lp.project_id === p.id)).map(p => (
+                  <option key={p.id} value={p.id}>{p.code} - {p.name}</option>
+                ))}
+              </select>
+            </div>
+          </div>,
+          document.body,
         )}
 
         {/* Clear classification confirmation dialog */}
