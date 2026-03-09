@@ -1090,6 +1090,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         const lineId = ml.invoice_line_id;
         if (lineId && (ml.category_id || ml.account_id)) {
           mergedLineClf[lineId] = {
+            invoice_line_id: lineId,
             category_id: ml.category_id || mergedLineClf[lineId]?.category_id || null,
             account_id: ml.account_id || mergedLineClf[lineId]?.account_id || null,
           };
