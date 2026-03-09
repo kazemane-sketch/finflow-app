@@ -38,6 +38,7 @@ export interface RuleSuggestion {
   line_id: string
   rule_id: string
   article_id: string | null
+  phase_id: string | null
   category_id: string | null
   account_id: string | null
   cost_center_allocations: { project_id: string; percentage: number }[] | null
@@ -166,6 +167,7 @@ export async function findMatchingRules(
         line_id: line.id,
         rule_id: bestRule.id,
         article_id: bestRule.article_id,
+        phase_id: bestRule.phase_id,
         category_id: bestRule.category_id,
         account_id: bestRule.account_id,
         cost_center_allocations: bestRule.cost_center_allocations,

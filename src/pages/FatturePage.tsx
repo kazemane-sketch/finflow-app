@@ -343,10 +343,11 @@ interface LineArticleInfo {
   phase_id: string | null; phase_code: string | null; phase_name: string | null;
 }
 
-function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove }: {
+function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove, onDismissSuggestion }: {
   articles: ArticleWithPhases[]; current: LineArticleInfo | null;
   suggestion: MatchResult | null;
   onAssign: (articleId: string) => void; onRemove: () => void;
+  onDismissSuggestion?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
@@ -411,13 +412,21 @@ function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove }: 
           </button>
         )}
         {isSuggested && !search && (
-          <button onClick={() => { onAssign(suggestion!.article.id); setOpen(false); setSearch(''); }}
-            className="w-full text-left px-2.5 py-1.5 text-[11px] bg-orange-50 text-orange-800 hover:bg-orange-100 border-b border-gray-100 flex items-center gap-1.5">
-            <span>⚡</span>
-            <span className="font-semibold">{suggestion!.article.code}</span>
-            <span className="text-gray-500">— {suggestion!.article.name}</span>
-            <span className="ml-auto text-[9px] text-orange-600">{Math.round(suggestion!.confidence)}%</span>
-          </button>
+          <>
+            <button onClick={() => { onAssign(suggestion!.article.id); setOpen(false); setSearch(''); }}
+              className="w-full text-left px-2.5 py-1.5 text-[11px] bg-orange-50 text-orange-800 hover:bg-orange-100 border-b border-gray-100 flex items-center gap-1.5">
+              <span>⚡</span>
+              <span className="font-semibold">{suggestion!.article.code}</span>
+              <span className="text-gray-500">— {suggestion!.article.name}</span>
+              <span className="ml-auto text-[9px] text-orange-600">{Math.round(suggestion!.confidence)}%</span>
+            </button>
+            {onDismissSuggestion && (
+              <button onClick={() => { onDismissSuggestion(); setOpen(false); setSearch(''); }}
+                className="w-full text-left px-2.5 py-1.5 text-[11px] text-red-600 hover:bg-red-50 border-b border-gray-100">
+                ✕ Ignora suggerimento
+              </button>
+            )}
+          </>
         )}
         {filtered.map(a => (
           <button key={a.id}
@@ -441,10 +450,19 @@ function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove }: 
           {current.code}
         </button>
       ) : isSuggested ? (
-        <button ref={btnRef} onClick={() => setOpen(!open)}
-          className="px-1.5 py-0.5 text-[9px] font-medium rounded bg-orange-50 text-orange-700 border border-orange-300 hover:bg-orange-100 transition-colors cursor-pointer whitespace-nowrap flex items-center gap-0.5">
-          <span>⚡</span><span>{suggestion!.article.code}</span>
-        </button>
+        <span className="inline-flex items-center gap-0">
+          <button ref={btnRef} onClick={() => setOpen(!open)}
+            className="px-1.5 py-0.5 text-[9px] font-medium rounded-l bg-orange-50 text-orange-700 border border-orange-300 border-r-0 hover:bg-orange-100 transition-colors cursor-pointer whitespace-nowrap flex items-center gap-0.5">
+            <span>⚡</span><span>{suggestion!.article.code}</span>
+          </button>
+          {onDismissSuggestion && (
+            <button onClick={(e) => { e.stopPropagation(); onDismissSuggestion(); }}
+              title="Ignora suggerimento"
+              className="px-1 py-0.5 text-[9px] rounded-r bg-orange-50 text-orange-400 border border-orange-300 border-l-0 hover:bg-red-50 hover:text-red-600 transition-colors cursor-pointer">
+              ✕
+            </button>
+          )}
+        </span>
       ) : (
         <button ref={btnRef} onClick={() => setOpen(!open)}
           className="px-1.5 py-0.5 text-[9px] text-gray-400 rounded border border-dashed border-gray-300 hover:border-gray-400 hover:text-gray-600 transition-colors cursor-pointer whitespace-nowrap">
@@ -1507,6 +1525,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     setLineArticleMap(prev => { const n = { ...prev }; delete n[lineId]; return n; });
   }, []);
 
+  // Dismiss AI article suggestion for a line (removes from aiSuggestions without assigning)
+  const handleDismissArticleSuggestion = useCallback((lineId: string) => {
+    setAiSuggestions(prev => { const n = { ...prev }; delete n[lineId]; return n; });
+  }, []);
+
   // Bulk assign article + phase to all invoice lines
   const handleBulkAssignArticle = useCallback(async () => {
     const companyId = company?.id;
@@ -1962,6 +1985,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                                   total_price: safeFloat(l.prezzoTotale), vat_rate: safeFloat(l.aliquotaIVA),
                                 })}
                                 onRemove={() => handleRemoveArticle(lineId)}
+                                onDismissSuggestion={() => handleDismissArticleSuggestion(lineId)}
                               />
                               {/* Cascading phase dropdown — only for multi-step articles */}
                               {(() => {
@@ -2155,7 +2179,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                             <span className="ml-1.5 inline-flex items-center gap-1 align-middle flex-wrap">
                               <ArticleDropdown articles={articles} current={lineArticleMap[l.id] || null} suggestion={aiSuggestions[l.id] || null}
                                 onAssign={(artId) => handleAssignArticle(l.id, artId, l.description, { quantity: l.quantity, unit_price: l.unit_price, total_price: l.total_price, vat_rate: l.vat_rate })}
-                                onRemove={() => handleRemoveArticle(l.id)} />
+                                onRemove={() => handleRemoveArticle(l.id)}
+                                onDismissSuggestion={() => handleDismissArticleSuggestion(l.id)} />
                               {/* Cascading phase dropdown — only for multi-step articles */}
                               {(() => {
                                 const info = lineArticleMap[l.id];
