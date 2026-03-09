@@ -305,22 +305,22 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, is
         <div className="flex items-center gap-1 mt-1 flex-wrap">
           {hasAnyField && meta ? (
             <>
-              {/* Category badge */}
-              {meta.has_category
+              {/* Category: no badge when 0, full when all, warning when partial */}
+              {meta.lines_with_category > 0 && (meta.has_category
                 ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">Cat</span>
-                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Cat</span>}
-              {/* CdC badge */}
-              {meta.has_cost_center
+                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Cat</span>)}
+              {/* CdC */}
+              {meta.lines_with_cdc > 0 && (meta.has_cost_center
                 ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700">CdC</span>
-                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!CdC</span>}
-              {/* Account badge */}
-              {meta.has_account
+                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!CdC</span>)}
+              {/* Account */}
+              {meta.lines_with_account > 0 && (meta.has_account
                 ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">Conto</span>
-                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Conto</span>}
-              {/* Article badge */}
-              {meta.has_article
+                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Conto</span>)}
+              {/* Article: uses lines_with_complete_article for phase-aware check */}
+              {meta.lines_with_article > 0 && (meta.has_article
                 ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">Art</span>
-                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Art</span>}
+                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Art</span>)}
             </>
           ) : inv.classification_status === 'ai_suggested' ? (
             <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 flex items-center gap-0.5">&#9889; Da confermare</span>
@@ -498,10 +498,11 @@ const DETAIL_TABS: { key: DetailTab; label: string; icon: string }[] = [
   { key: 'note', label: 'Note', icon: '\uD83D\uDCDD' },
 ];
 
-function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, onDelete, onReload, onPatchInvoice, onOpenCounterparty, onOpenScadenzario, onNavigateCounterparty }: {
+function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, onDelete, onReload, onPatchInvoice, onRefreshBadges, onOpenCounterparty, onOpenScadenzario, onNavigateCounterparty }: {
   invoice: DBInvoice; detail: DBInvoiceDetail | null; installments: InvoiceInstallment[]; loadingDetail: boolean;
   onEdit: (u: InvoiceUpdate) => Promise<void>; onDelete: () => void; onReload: () => void;
   onPatchInvoice: (invoiceId: string, patch: Partial<DBInvoice>) => void;
+  onRefreshBadges: (invoiceId: string) => void;
   onOpenCounterparty: (mode: 'verify' | 'edit') => void;
   onOpenScadenzario: () => void;
   onNavigateCounterparty: () => void;
@@ -556,6 +557,34 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   // Bulk article + phase selection
   const [bulkArticleId, setBulkArticleId] = useState<string | null>(null);
   const [bulkPhaseId, setBulkPhaseId] = useState<string | null>(null);
+  // Original snapshots for dirty-state tracking on confirmed invoices
+  const [originalLineClassifs, setOriginalLineClassifs] = useState<Record<string, LineClassification>>({});
+  const [originalLineArticleMap, setOriginalLineArticleMap] = useState<Record<string, LineArticleInfo>>({});
+  const [confirmChangesSaving, setConfirmChangesSaving] = useState(false);
+  const isConfirmed = invoice.classification_status === 'confirmed';
+
+  // Post-confirmation dirty state: any line classification or article assignment changed
+  const isPostConfirmDirty = useMemo(() => {
+    if (!isConfirmed) return false;
+    // Check line classifications changed
+    const lcKeys = new Set([...Object.keys(lineClassifs), ...Object.keys(originalLineClassifs)]);
+    for (const k of lcKeys) {
+      const curr = lineClassifs[k];
+      const orig = originalLineClassifs[k];
+      if (curr?.category_id !== orig?.category_id || curr?.account_id !== orig?.account_id) return true;
+    }
+    // Check article assignments changed
+    const artKeys = new Set([...Object.keys(lineArticleMap), ...Object.keys(originalLineArticleMap)]);
+    for (const k of artKeys) {
+      const curr = lineArticleMap[k];
+      const orig = originalLineArticleMap[k];
+      if (!curr && !orig) continue;
+      if (!curr || !orig) return true;
+      if (curr.article_id !== orig.article_id || curr.phase_id !== orig.phase_id) return true;
+    }
+    // Also check invoice-level dirty (CdC etc.)
+    return classifDirty;
+  }, [isConfirmed, lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap, classifDirty]);
 
   // Load articles + existing assignments when invoice changes
   useEffect(() => {
@@ -609,6 +638,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         }
       }
       setLineArticleMap(map);
+      setOriginalLineArticleMap(map);
 
       // Compute AI suggestions for lines with NO DB record at all
       // (runtime matching — learned rules first, then keyword fallback)
@@ -655,6 +685,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setClassification(classif);
         setInvProjects(iProjs);
         setLineClassifs(lineClf);
+        setOriginalLineClassifs(lineClf);
         setLineProjects(lineProj);
         // Initialize local CdC rows from DB assignments
         setCdcRows(iProjs.map(ip => ({
@@ -711,9 +742,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           }
         }
       }
+
+      // Refresh sidebar badges
+      onRefreshBadges(invoice.id);
     } catch (e: any) { console.error('Save classification error:', e); }
     setClassifSaving(false);
-  }, [company?.id, invoice?.id, selCategoryId, selAccountId, cdcRows, cdcMode, detail?.invoice_lines, lineClassifs, lineArticleMap, invoice?.counterparty, invoice?.direction]);
+  }, [company?.id, invoice?.id, selCategoryId, selAccountId, cdcRows, cdcMode, detail?.invoice_lines, lineClassifs, lineArticleMap, invoice?.counterparty, invoice?.direction, onRefreshBadges]);
 
   // Local CdC row management (no DB calls)
   const handleAddCdc = useCallback(() => {
@@ -780,7 +814,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
   // Line-level classification: update category or account for a single line
   const handleLineClassifChange = useCallback(async (lineId: string, field: 'category_id' | 'account_id', value: string | null) => {
-    // Optimistic update
+    // Optimistic / local update
     setLineClassifs(prev => ({
       ...prev,
       [lineId]: {
@@ -790,6 +824,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         account_id: field === 'account_id' ? value : (prev[lineId]?.account_id ?? null),
       },
     }));
+    // For confirmed invoices, defer DB write until "Conferma modifica"
+    if (isConfirmed) return;
     try {
       const current = lineClassifs[lineId];
       await saveLineCategoryAndAccount(
@@ -797,8 +833,10 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         field === 'category_id' ? value : (current?.category_id ?? null),
         field === 'account_id' ? value : (current?.account_id ?? null),
       );
+      // Refresh sidebar badges after line save
+      if (invoice?.id) onRefreshBadges(invoice.id);
     } catch (e: any) { console.error('Save line classification error:', e); }
-  }, [lineClassifs]);
+  }, [lineClassifs, isConfirmed, invoice?.id, onRefreshBadges]);
 
   // AI classification — fast-path rules first, then unified Sonnet classifier
   const handleRequestAiClassification = useCallback(async () => {
@@ -1036,8 +1074,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           }
         }
       }
+
+      // Refresh sidebar badges
+      onRefreshBadges(invoice.id);
     } catch (e: any) { console.error('Confirm AI classification error:', e); }
-  }, [invoice?.id, company?.id, aiClassifResult, articles, onPatchInvoice, detail?.invoice_lines, invoice?.counterparty, invoice?.direction]);
+  }, [invoice?.id, company?.id, aiClassifResult, articles, onPatchInvoice, onRefreshBadges, detail?.invoice_lines, invoice?.counterparty, invoice?.direction]);
 
   // Reject AI suggestion — delete classification + reset status to 'none'
   const handleRejectAiClassification = useCallback(async () => {
@@ -1082,8 +1123,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           }
         }
       }
+
+      // Refresh sidebar badges
+      onRefreshBadges(invoice.id);
     } catch (e: any) { console.error('Confirm existing classification error:', e); }
-  }, [invoice?.id, company?.id, onPatchInvoice, detail?.invoice_lines, lineClassifs, lineArticleMap, invoice?.counterparty, invoice?.direction]);
+  }, [invoice?.id, company?.id, onPatchInvoice, onRefreshBadges, detail?.invoice_lines, lineClassifs, lineArticleMap, invoice?.counterparty, invoice?.direction]);
 
   // Handle "Crea e usa" for AI-suggested new account/category
   const handleCreateSuggestion = useCallback(async (lineId: string) => {
@@ -1124,6 +1168,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setLineClassifs(lineClf);
         setAllCategories(freshCats);
         setAllAccounts(freshAccs.filter(a => !a.is_header && a.active));
+        // Refresh sidebar badges
+        onRefreshBadges(invoice!.id);
       }
 
       // Dismiss this suggestion
@@ -1132,12 +1178,101 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       toast.error(`Errore: ${err.message}`);
     }
     setCreatingSuggestion(null);
-  }, [company?.id, invoice?.id, lineSuggestions, lineClassifs]);
+  }, [company?.id, invoice?.id, lineSuggestions, lineClassifs, onRefreshBadges]);
 
   // Handle "Ignora" for AI-suggested new account/category
   const handleDismissSuggestion = useCallback((lineId: string) => {
     setDismissedSuggestions(prev => new Set([...prev, lineId]));
   }, []);
+
+  // Batch-save all deferred changes on confirmed invoices ("Conferma modifica")
+  const handleConfirmChanges = useCallback(async () => {
+    const companyId = company?.id;
+    if (!companyId || !invoice?.id) return;
+    setConfirmChangesSaving(true);
+    try {
+      // 1. Save invoice-level classification (category, account, CdC) if dirty
+      if (classifDirty) {
+        await saveInvoiceClassification(companyId, invoice.id, selCategoryId, selAccountId);
+        const total = Math.abs(invoice.total_amount || 0);
+        const rowsToSave = cdcRows.map(r => ({
+          project_id: r.project_id,
+          percentage: r.percentage,
+          amount: cdcMode === 'amount' ? r.amount : (total > 0 ? Math.round(total * r.percentage / 100 * 100) / 100 : null),
+        }));
+        await saveInvoiceProjects(companyId, invoice.id, rowsToSave);
+      }
+
+      // 2. Save changed line classifications
+      const lcKeys = new Set([...Object.keys(lineClassifs), ...Object.keys(originalLineClassifs)]);
+      for (const k of lcKeys) {
+        const curr = lineClassifs[k];
+        const orig = originalLineClassifs[k];
+        if (curr?.category_id !== orig?.category_id || curr?.account_id !== orig?.account_id) {
+          await saveLineCategoryAndAccount(k, curr?.category_id ?? null, curr?.account_id ?? null);
+        }
+      }
+
+      // 3. Save changed article assignments
+      const artKeys = new Set([...Object.keys(lineArticleMap), ...Object.keys(originalLineArticleMap)]);
+      for (const k of artKeys) {
+        const curr = lineArticleMap[k];
+        const orig = originalLineArticleMap[k];
+        const changed = (!curr && orig) || (curr && !orig) ||
+          (curr && orig && (curr.article_id !== orig.article_id || curr.phase_id !== orig.phase_id));
+        if (!changed) continue;
+        if (!curr && orig) {
+          // Removed
+          await removeLineAssignment(k);
+        } else if (curr) {
+          // Added or changed
+          const dbLine = detail?.invoice_lines?.find(dl => dl.id === k);
+          await assignArticleToLine(
+            companyId, k, invoice.id, curr.article_id,
+            { quantity: dbLine?.quantity, unit_price: dbLine?.unit_price, total_price: dbLine?.total_price, vat_rate: dbLine?.vat_rate },
+            'manual', undefined, curr.location, curr.phase_id,
+          );
+        }
+      }
+
+      // 4. Mark classification as confirmed (update timestamp)
+      await supabase.from('invoice_classifications').update({ verified: true, assigned_by: 'manual', updated_at: new Date().toISOString() }).eq('invoice_id', invoice.id);
+      await supabase.from('invoices').update({ classification_status: 'confirmed' } as any).eq('id', invoice.id);
+      onPatchInvoice(invoice.id, { classification_status: 'confirmed' } as Partial<DBInvoice>);
+
+      // 5. Update original snapshots so dirty state resets
+      setOriginalLineClassifs({ ...lineClassifs });
+      setOriginalLineArticleMap({ ...lineArticleMap });
+      setClassifDirty(false);
+
+      // 6. Create classification rules from confirmed data (fire-and-forget)
+      const cp = (invoice.counterparty || {}) as any;
+      if (detail?.invoice_lines) {
+        for (const line of detail.invoice_lines) {
+          const lc = lineClassifs[line.id];
+          if (lc?.category_id || lc?.account_id) {
+            createRuleFromConfirmation(
+              companyId, cp?.piva || null, cp?.denom || null,
+              line.description, invoice.direction as 'in' | 'out',
+              { category_id: lc.category_id, account_id: lc.account_id,
+                article_id: lineArticleMap[line.id]?.article_id || null },
+            ).catch(err => console.warn('[rules] error:', err));
+          }
+        }
+      }
+
+      // 7. Refresh badges in sidebar
+      onRefreshBadges(invoice.id);
+      toast.success('Modifiche salvate');
+    } catch (e: any) {
+      console.error('Confirm changes error:', e);
+      toast.error('Errore nel salvataggio delle modifiche');
+    }
+    setConfirmChangesSaving(false);
+  }, [company?.id, invoice?.id, invoice?.total_amount, invoice?.counterparty, invoice?.direction,
+    classifDirty, selCategoryId, selAccountId, cdcRows, cdcMode,
+    lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap,
+    detail?.invoice_lines, onPatchInvoice, onRefreshBadges]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }) => {
     const companyId = company?.id;
@@ -1146,7 +1281,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     const art = articles.find(a => a.id === articleId);
     const hasPhases = (art as ArticleWithPhases)?.phases?.length > 0;
 
-    // Optimistic update BEFORE the network call — badge appears instantly
+    // Optimistic / local update — badge appears instantly
     const prevMap = { ...lineArticleMap };
     const prevSuggestions = { ...aiSuggestions };
     setLineArticleMap(prev => ({
@@ -1158,6 +1293,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       },
     }));
     setAiSuggestions(prev => { const n = { ...prev }; delete n[lineId]; return n; });
+
+    // For confirmed invoices, defer DB write until "Conferma modifica"
+    if (isConfirmed) return;
 
     try {
       // upsert handles both INSERT and UPDATE via onConflict: 'invoice_line_id'
@@ -1175,7 +1313,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setLineArticleMap(prevMap);
       setAiSuggestions(prevSuggestions);
     }
-  }, [company?.id, invoice?.id, articles, lineArticleMap, aiSuggestions]);
+  }, [company?.id, invoice?.id, articles, lineArticleMap, aiSuggestions, isConfirmed]);
 
   // Assign a phase to a line that already has an article
   const handleAssignPhase = useCallback(async (lineId: string, phaseId: string | null) => {
@@ -1186,7 +1324,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     const art = articles.find(a => a.id === info.article_id) as ArticleWithPhases | undefined;
     const phase = phaseId ? art?.phases?.find(p => p.id === phaseId) : null;
 
-    // Optimistic update
+    // Optimistic / local update
     const prevMap = { ...lineArticleMap };
     setLineArticleMap(prev => ({
       ...prev,
@@ -1197,6 +1335,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         phase_name: phase?.name || null,
       },
     }));
+
+    // For confirmed invoices, defer DB write until "Conferma modifica"
+    if (isConfirmed) return;
 
     try {
       // Re-upsert with updated phase_id
@@ -1216,12 +1357,15 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       console.error('Phase assign error:', err);
       setLineArticleMap(prevMap);
     }
-  }, [company?.id, invoice?.id, articles, lineArticleMap, detail?.invoice_lines]);
+  }, [company?.id, invoice?.id, articles, lineArticleMap, detail?.invoice_lines, isConfirmed]);
 
   const handleRemoveArticle = useCallback(async (lineId: string) => {
-    // Optimistic update BEFORE the network call
+    // Optimistic / local update
     const prevMap = { ...lineArticleMap };
     setLineArticleMap(prev => { const n = { ...prev }; delete n[lineId]; return n; });
+
+    // For confirmed invoices, defer DB write until "Conferma modifica"
+    if (isConfirmed) return;
 
     try {
       await removeLineAssignment(lineId);
@@ -1230,7 +1374,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       // Revert optimistic update on failure
       setLineArticleMap(prevMap);
     }
-  }, [lineArticleMap]);
+  }, [lineArticleMap, isConfirmed]);
 
   // Bulk assign article + phase to all invoice lines
   const handleBulkAssignArticle = useCallback(async () => {
@@ -1244,7 +1388,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     const phase = bulkPhaseId ? (art as ArticleWithPhases)?.phases?.find(p => p.id === bulkPhaseId) : null;
     const location = null; // bulk doesn't use location
 
-    // Optimistic update
+    // Optimistic / local update
     const prevMap = { ...lineArticleMap };
     const newMap: Record<string, LineArticleInfo> = {};
     for (const l of lines) {
@@ -1256,6 +1400,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     }
     setLineArticleMap(newMap);
     setAiSuggestions({});
+
+    // For confirmed invoices, defer DB write until "Conferma modifica"
+    if (isConfirmed) {
+      toast.info(`Articolo ${art?.code} assegnato localmente a ${lines.length} righe — conferma per salvare`);
+      return;
+    }
 
     try {
       await Promise.all(lines.map(l =>
@@ -1270,7 +1420,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setLineArticleMap(prevMap);
       toast.error('Errore assegnazione bulk');
     }
-  }, [company?.id, invoice?.id, bulkArticleId, bulkPhaseId, articles, detail?.invoice_lines, lineArticleMap]);
+  }, [company?.id, invoice?.id, bulkArticleId, bulkPhaseId, articles, detail?.invoice_lines, lineArticleMap, isConfirmed]);
 
   // Reset notes when invoice changes
   useEffect(() => { setNotesText(invoice.notes || ''); }, [invoice.id, invoice.notes]);
@@ -1604,14 +1754,19 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                   </div>
                 )}
 
-                {/* Save button for template */}
-                {classifDirty && (
+                {/* Save button for template — skip when confirmed (deferred to "Conferma modifica") */}
+                {classifDirty && !isConfirmed && (
                   <div className="flex justify-end pt-2">
                     <button onClick={handleSaveClassification} disabled={classifSaving || !cdcValidation.valid}
                       className="px-3 py-1.5 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors"
                       title={!cdcValidation.valid ? cdcValidation.message : ''}>
                       {classifSaving ? 'Salvataggio...' : 'Salva classificazione'}
                     </button>
+                  </div>
+                )}
+                {classifDirty && isConfirmed && (
+                  <div className="flex justify-end pt-2">
+                    <span className="text-[10px] text-orange-600 italic">Modifiche in sospeso — premi &ldquo;Conferma modifica&rdquo; in basso</span>
                   </div>
                 )}
               </div>
@@ -2063,8 +2218,19 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               </div>
               {/* Footer */}
               <div className="flex items-center justify-between px-4 py-2.5 border-t bg-gray-50">
-                <span className="text-[11px] text-gray-400">Classificazione salvata automaticamente per riga</span>
+                <span className="text-[11px] text-gray-400">
+                  {isPostConfirmDirty ? 'Modifiche non salvate' : 'Classificazione salvata automaticamente per riga'}
+                </span>
                 <div className="flex items-center gap-2">
+                  {/* "Conferma modifica" — visible when confirmed invoice has unsaved changes */}
+                  {isPostConfirmDirty && (
+                    <button onClick={handleConfirmChanges} disabled={confirmChangesSaving || !cdcValidation.valid}
+                      className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-orange-500 text-white hover:bg-orange-600 disabled:opacity-50 transition-colors animate-pulse"
+                      title={!cdcValidation.valid ? cdcValidation.message : 'Salva tutte le modifiche'}>
+                      {confirmChangesSaving ? 'Salvataggio...' : '\u2713 Conferma modifica'}
+                    </button>
+                  )}
+                  {/* "Conferma tutte" — only for ai_suggested status */}
                   <button onClick={handleConfirmExistingClassification} disabled={invoice.classification_status !== 'ai_suggested'}
                     className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
                     {'\u2713'} Conferma tutte
@@ -2416,6 +2582,20 @@ export default function FatturePage() {
 
   // ── Classification metadata for sidebar icons ──
   const [classifMeta, setClassifMeta] = useState<Map<string, InvoiceClassificationMeta>>(new Map());
+
+  // Refresh classification metadata for a single invoice (called after confirm/save)
+  const refreshClassifMeta = useCallback(async (invoiceId: string) => {
+    if (!companyId) return;
+    try {
+      const meta = await loadInvoiceClassificationMeta(companyId, [invoiceId]);
+      setClassifMeta(prev => {
+        const next = new Map(prev);
+        const m = meta.get(invoiceId);
+        if (m) next.set(invoiceId, m); else next.delete(invoiceId);
+        return next;
+      });
+    } catch (err) { console.error('refreshClassifMeta error:', err); }
+  }, [companyId]);
 
   // ── AI search (BancaPage-style: filter + analysis modes) ──
   const [aiResult, setAiResult] = useState<InvoiceAiResult | null>(null);
@@ -3105,6 +3285,7 @@ export default function FatturePage() {
             onDelete={() => setDeleteModal({ open: true, ids: [selectedInvoice.id] })}
             onReload={reload}
             onPatchInvoice={patchInvoice}
+            onRefreshBadges={refreshClassifMeta}
             onOpenCounterparty={(mode) => {
               if (selectedInvoice.counterparty_id) {
                 navigate(`/controparti?counterpartyId=${selectedInvoice.counterparty_id}&mode=${mode}`);

@@ -412,11 +412,12 @@ export interface InvoiceClassificationMeta {
   lines_with_account: number   // lines where account_id IS NOT NULL
   lines_with_cdc: number       // distinct lines with at least one invoice_line_projects row
   lines_with_article: number   // distinct lines with at least one invoice_line_articles row
+  lines_with_complete_article: number // lines where article is assigned AND (article has no phases OR phase_id IS NOT NULL)
   // Convenience booleans — true when ALL lines have the field
   has_category: boolean
   has_account: boolean
   has_cost_center: boolean
-  has_article: boolean
+  has_article: boolean         // all lines have article AND complete (including phase if needed)
 }
 
 /**
@@ -438,16 +439,16 @@ export async function loadInvoiceClassificationMeta(
   for (let i = 0; i < invoiceIds.length; i += BATCH) {
     const batchIds = invoiceIds.slice(i, i + BATCH)
 
-    const [linesRes, assignedRes, lineProjRes, classifRes, projRes] = await Promise.all([
+    const [linesRes, assignedRes, lineProjRes, classifRes, projRes, phasesRes] = await Promise.all([
       // 1. Lines with category_id and account_id per invoice
       supabase
         .from('invoice_lines')
         .select('invoice_id, category_id, account_id')
         .in('invoice_id', batchIds),
-      // 2. Article assignments per line (distinct invoice_line_id)
+      // 2. Article assignments per line (with phase_id + article_id for phase completeness check)
       supabase
         .from('invoice_line_articles')
-        .select('invoice_id, invoice_line_id')
+        .select('invoice_id, invoice_line_id, article_id, phase_id')
         .eq('company_id', companyId)
         .in('invoice_id', batchIds),
       // 3. Line-level CdC assignments (distinct invoice_line_id)
@@ -465,6 +466,12 @@ export async function loadInvoiceClassificationMeta(
         .from('invoice_projects')
         .select('invoice_id')
         .in('invoice_id', batchIds),
+      // 6. Articles with phases (to know which articles are multi-step)
+      supabase
+        .from('article_phases')
+        .select('article_id')
+        .eq('company_id', companyId)
+        .eq('active', true),
     ])
 
     // Per-invoice line stats
@@ -477,11 +484,25 @@ export async function loadInvoiceClassificationMeta(
       lineStats.set(row.invoice_id, prev)
     }
 
-    // Distinct lines with article assignments per invoice
+    // Build set of article_ids that have phases (multi-step)
+    const articlesWithPhases = new Set<string>()
+    for (const row of (phasesRes.data || []) as any[]) {
+      articlesWithPhases.add(row.article_id)
+    }
+
+    // Distinct lines with article assignments per invoice + completeness tracking
     const articleLinesByInv = new Map<string, Set<string>>()
+    const completeArticleLinesByInv = new Map<string, Set<string>>()
     for (const row of (assignedRes.data || []) as any[]) {
       if (!articleLinesByInv.has(row.invoice_id)) articleLinesByInv.set(row.invoice_id, new Set())
       articleLinesByInv.get(row.invoice_id)!.add(row.invoice_line_id)
+      // Complete = article has no phases, OR article has phases AND phase_id is set
+      const isMultiStep = articlesWithPhases.has(row.article_id)
+      const isComplete = !isMultiStep || !!row.phase_id
+      if (isComplete) {
+        if (!completeArticleLinesByInv.has(row.invoice_id)) completeArticleLinesByInv.set(row.invoice_id, new Set())
+        completeArticleLinesByInv.get(row.invoice_id)!.add(row.invoice_line_id)
+      }
     }
 
     // Distinct lines with CdC assignments per invoice
@@ -511,6 +532,7 @@ export async function loadInvoiceClassificationMeta(
       const ls = lineStats.get(id) || { total: 0, withCat: 0, withAcct: 0 }
       const lc = ls.total
       const artLines = articleLinesByInv.get(id)?.size || 0
+      const completeArtLines = completeArticleLinesByInv.get(id)?.size || 0
       const cdcLines = cdcLinesByInv.get(id)?.size || 0
       const invCf = invClassif.get(id)
 
@@ -527,10 +549,11 @@ export async function loadInvoiceClassificationMeta(
         lines_with_account: linesWithAcct,
         lines_with_cdc: linesWithCdc,
         lines_with_article: artLines,
+        lines_with_complete_article: completeArtLines,
         has_category: lc > 0 && linesWithCat >= lc,
         has_account: lc > 0 && linesWithAcct >= lc,
         has_cost_center: lc > 0 && linesWithCdc >= lc,
-        has_article: lc > 0 && artLines >= lc,
+        has_article: lc > 0 && completeArtLines >= lc,
       })
     }
   }
