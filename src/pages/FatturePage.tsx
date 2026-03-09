@@ -346,7 +346,7 @@ interface LineArticleInfo {
 function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove, onDismissSuggestion }: {
   articles: ArticleWithPhases[]; current: LineArticleInfo | null;
   suggestion: MatchResult | null;
-  onAssign: (articleId: string) => void; onRemove: () => void;
+  onAssign: (articleId: string, suggestedPhaseId?: string | null) => void; onRemove: () => void;
   onDismissSuggestion?: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -413,11 +413,15 @@ function ArticleDropdown({ articles, current, suggestion, onAssign, onRemove, on
         )}
         {isSuggested && !search && (
           <>
-            <button onClick={() => { onAssign(suggestion!.article.id); setOpen(false); setSearch(''); }}
+            <button onClick={() => { onAssign(suggestion!.article.id, suggestion!.phase_id); setOpen(false); setSearch(''); }}
               className="w-full text-left px-2.5 py-1.5 text-[11px] bg-orange-50 text-orange-800 hover:bg-orange-100 border-b border-gray-100 flex items-center gap-1.5">
               <span>⚡</span>
               <span className="font-semibold">{suggestion!.article.code}</span>
               <span className="text-gray-500">— {suggestion!.article.name}</span>
+              {suggestion!.phase_id && (() => {
+                const ph = (suggestion!.article as ArticleWithPhases)?.phases?.find(p => p.id === suggestion!.phase_id);
+                return ph ? <span className="text-[9px] text-purple-600 font-medium">{ph.code}</span> : null;
+              })()}
               <span className="ml-auto text-[9px] text-orange-600">{Math.round(suggestion!.confidence)}%</span>
             </button>
             {onDismissSuggestion && (
@@ -679,7 +683,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
             phase_id: a.phase_id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
           };
         } else {
-          // AI suggestion from DB → orange badge
+          // AI suggestion from DB → orange badge (preserve phase_id from AI classification)
           const fullArt = arts.find(ar => ar.id === a.article_id);
           if (fullArt) {
             dbSuggestions[a.invoice_line_id] = {
@@ -688,6 +692,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               matchedKeywords: [],
               totalKeywords: fullArt.keywords.length,
               source: 'deterministic',
+              phase_id: a.phase_id || null,
             };
           }
         }
@@ -1491,12 +1496,15 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     setShowClearDialog(false);
   }, [invoice?.id, company?.id, detail?.invoice_lines, onPatchInvoice, onRefreshBadges]);
 
-  const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }) => {
+  const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }, suggestedPhaseId?: string | null) => {
     const companyId = company?.id;
     if (!companyId || !invoice?.id) return;
     const location = extractLocation(lineDesc);
-    const art = articles.find(a => a.id === articleId);
-    const hasPhases = (art as ArticleWithPhases)?.phases?.length > 0;
+    const art = articles.find(a => a.id === articleId) as ArticleWithPhases | undefined;
+    const hasPhases = (art?.phases?.length ?? 0) > 0;
+
+    // If a suggested phase was provided (from AI), resolve its details
+    const phase = suggestedPhaseId ? art?.phases?.find(p => p.id === suggestedPhaseId) : null;
 
     // LOCAL ONLY — DB write deferred to explicit "Salva"
     setLineArticleMap(prev => ({
@@ -1504,7 +1512,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       [lineId]: {
         article_id: articleId, code: art?.code || '', name: art?.name || '',
         assigned_by: 'manual', verified: true, location,
-        phase_id: null, phase_code: null, phase_name: null,
+        phase_id: phase?.id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
       },
     }));
     setAiSuggestions(prev => { const n = { ...prev }; delete n[lineId]; return n; });
@@ -1993,10 +2001,10 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                                 articles={articles}
                                 current={lineArticleMap[lineId] || null}
                                 suggestion={aiSuggestions[lineId] || null}
-                                onAssign={(artId) => handleAssignArticle(lineId, artId, l.descrizione || '', {
+                                onAssign={(artId, sugPhaseId) => handleAssignArticle(lineId, artId, l.descrizione || '', {
                                   quantity: safeFloat(l.quantita) || 1, unit_price: safeFloat(l.prezzoUnitario),
                                   total_price: safeFloat(l.prezzoTotale), vat_rate: safeFloat(l.aliquotaIVA),
-                                })}
+                                }, sugPhaseId)}
                                 onRemove={() => handleRemoveArticle(lineId)}
                                 onDismissSuggestion={() => handleDismissArticleSuggestion(lineId)}
                               />
@@ -2196,7 +2204,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                           {articles.length > 0 && (
                             <span className="ml-1.5 inline-flex items-center gap-1 align-middle flex-wrap">
                               <ArticleDropdown articles={articles} current={lineArticleMap[l.id] || null} suggestion={aiSuggestions[l.id] || null}
-                                onAssign={(artId) => handleAssignArticle(l.id, artId, l.description, { quantity: l.quantity, unit_price: l.unit_price, total_price: l.total_price, vat_rate: l.vat_rate })}
+                                onAssign={(artId, sugPhaseId) => handleAssignArticle(l.id, artId, l.description, { quantity: l.quantity, unit_price: l.unit_price, total_price: l.total_price, vat_rate: l.vat_rate }, sugPhaseId)}
                                 onRemove={() => handleRemoveArticle(l.id)}
                                 onDismissSuggestion={() => handleDismissArticleSuggestion(l.id)} />
                               {/* Cascading phase dropdown — only for multi-step articles */}

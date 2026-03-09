@@ -276,7 +276,9 @@ function buildPrompt(
       if (h.account_code) parts.push(`conto: ${h.account_code} ${h.account_name || ""}`);
       return parts.join(" → ");
     });
-    historySection = `STORICO CLASSIFICAZIONI DI QUESTA CONTROPARTE (ultime confermate dall'utente):\n${histLines.join("\n")}\n(Se lo storico è consistente al 80%+, segui lo storico con alta confidence)`;
+    historySection = `STORICO CLASSIFICAZIONI DI QUESTA CONTROPARTE (ultime confermate dall'utente):
+ATTENZIONE: lo storico mostra classificazioni di righe PRECEDENTI. Usalo SOLO se la riga attuale descrive lo STESSO tipo di bene/servizio. Se la riga attuale è diversa (es. "opere edili" vs storico di "calcare"), classifica dalla descrizione attuale, NON dallo storico.
+${histLines.join("\n")}`;
   } else {
     historySection =
       "Nessuno storico di classificazione per questa controparte.";
@@ -323,7 +325,13 @@ ${ragSection}
 REGOLE:
 * PASSIVA (acquisto/direction=in): categorie "expense", conti di costo (60xxx-69xxx o come nel piano conti)
 * ATTIVA (vendita/direction=out): categorie "revenue", conti di ricavo (70xxx+)
-* Se storico controparte è consistente → SEGUILO con confidence 90+
+UTILIZZO DELLO STORICO CONTROPARTE:
+  - Lo storico mostra classificazioni di righe precedenti. NON copiarlo ciecamente.
+  - Per OGNI riga attuale, confronta la DESCRIZIONE con le descrizioni nello storico.
+  - Se la descrizione attuale corrisponde semanticamente a una riga storica (stesso tipo di bene/servizio) → usa la stessa classificazione con confidence 85-95
+  - Se la descrizione attuale è DIVERSA (es. storico: "calcare", riga: "trasporto") → classifica dalla descrizione attuale, ignora lo storico per quella riga
+  - Se la controparte ha storico misto (più categorie/conti diversi), NON scegliere la più frequente — scegli quella che corrisponde alla DESCRIZIONE ATTUALE
+  - Se hai dubbi, classifica dalla descrizione. È meglio una classificazione corretta con confidence 70 che una copiata dallo storico con confidence 90 ma sbagliata
 * Se ATECO disponibile → usalo per guidare categoria e conto
 * TRASPORTO/TRASPORTI nella descrizione → servizio di trasporto, NON il materiale
 * NOLO/NOLEGGIO → è noleggio, non acquisto
@@ -425,6 +433,15 @@ COERENZA CLASSIFICAZIONE:
 * Se assegni un article_code, DEVI anche assegnare category_id e account_id coerenti. Se sai che è un certo materiale (hai assegnato l'articolo), hai sicuramente abbastanza contesto per assegnare anche categoria e conto.
 * NON lasciare category_id o account_id null a meno che non abbia davvero nessun indizio. Se hai assegnato articolo e CdC, hai le informazioni per classificare completamente.
 * Copia gli UUID ESATTAMENTE dalla lista. Come backup, compila SEMPRE anche category_name e account_code.
+
+SANITY CHECK — VERIFICA COERENZA PRIMA DI RISPONDERE:
+Prima di finalizzare ogni riga, verifica:
+1. La DESCRIZIONE della riga parla di X (es. "trasporto", "calcare", "opere edili", "noleggio")
+2. La CATEGORIA/CONTO che hai assegnato è coerente con X? Se la riga dice "trasporto" ma hai assegnato conto "acquisto materie prime" → ERRORE, correggi.
+3. L'ARTICOLO che hai assegnato è coerente con la descrizione? Se la riga dice "noleggio escavatore" ma hai assegnato articolo "Calcare" → ERRORE, correggi.
+4. Se la riga NON corrisponde a nessun articolo configurato, lascia article_code = null. Non forzare un articolo sbagliato.
+5. Se lo storico suggerisce una classificazione diversa dalla descrizione attuale, SEGUI LA DESCRIZIONE.
+Nel reasoning, spiega BREVEMENTE perché la classificazione è coerente con la descrizione (max 30 parole).
 
 FATTURA: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
 
@@ -950,6 +967,49 @@ Deno.serve(async (req) => {
           if (match) {
             console.log(`[classify] Fallback account: "${lr.account_code}" → ${match.id}`);
             lr.account_id = match.id;
+          }
+        }
+      }
+    }
+
+    // ─── Post-processing: suspicious classification detection ──
+    // Log when AI may have blindly followed history instead of matching descriptions
+    for (const lr of lineResults) {
+      const inputLine = inputLines.find((l) => l.line_id === lr.line_id);
+      if (!inputLine) continue;
+      const desc = (inputLine.description || "").toLowerCase();
+
+      // Check description vs account coherence heuristics
+      if (lr.account_id) {
+        const acc = accounts.find((a) => a.id === lr.account_id);
+        if (acc) {
+          const accName = acc.name.toLowerCase();
+          // Flag: transport-related description but non-transport account
+          const descTransport = /trasport|consegn|sped|vettor|carico/.test(desc);
+          const accTransport = /trasport|sped|vettor/.test(accName);
+          if (descTransport && !accTransport && !/noleggi|leasing|fermo/.test(accName)) {
+            console.warn(`[classify-sanity] Line ${lr.line_id}: desc mentions trasporto ("${desc.slice(0, 50)}") but account "${acc.code} ${acc.name}" is not trasporto-related. Confidence: ${lr.confidence}`);
+          }
+          // Flag: rental/noleggio description but non-rental account
+          const descRental = /noleggi|nolo|fermo macchina/.test(desc);
+          const accRental = /noleggi|nolo/.test(accName);
+          if (descRental && !accRental && !/trasport|leasing/.test(accName)) {
+            console.warn(`[classify-sanity] Line ${lr.line_id}: desc mentions noleggio ("${desc.slice(0, 50)}") but account "${acc.code} ${acc.name}" is not noleggio-related. Confidence: ${lr.confidence}`);
+          }
+        }
+      }
+
+      // Check description vs article coherence
+      if (lr.article_code) {
+        const art = articles.find((a) => a.code === lr.article_code);
+        if (art) {
+          const artName = art.name.toLowerCase();
+          // Flag: description clearly about a service but article is a material (or vice versa)
+          const descService = /trasport|noleggi|servizi|consulenz|manutenzi|opere|lavori/.test(desc);
+          const artService = /trasport|noleggi|servizi|consulenz|manutenzi/.test(artName);
+          const artMaterial = /calcar|pozzolan|inert|ghiai|sabbia|pietr/.test(artName);
+          if (descService && artMaterial && !artService) {
+            console.warn(`[classify-sanity] Line ${lr.line_id}: desc mentions service ("${desc.slice(0, 50)}") but article "${lr.article_code} ${art.name}" is a material. Possible history over-reliance.`);
           }
         }
       }
