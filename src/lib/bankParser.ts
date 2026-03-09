@@ -847,7 +847,7 @@ export interface BankTxFilters {
   amountMin?: number;
   amountMax?: number;
   counterpartyPattern?: string;
-  natureFilter?: 'all' | 'invoice_payment' | 'no_invoice' | 'giro_conto' | 'unknown';
+  classificationFilter?: 'all' | 'classified' | 'unclassified';
 }
 
 export async function loadBankTransactions(
@@ -910,12 +910,12 @@ export async function loadBankTransactions(
     if (filters?.counterpartyPattern) {
       q = q.ilike('counterparty_name', `%${filters.counterpartyPattern}%`);
     }
-    // tx_nature filter (server-side so pagination/counts are correct)
-    if (filters?.natureFilter && filters.natureFilter !== 'all') {
-      if (filters.natureFilter === 'unknown') {
-        q = q.is('tx_nature', null);
-      } else {
-        q = q.eq('tx_nature', filters.natureFilter);
+    // Classification filter (server-side so pagination/counts are correct)
+    if (filters?.classificationFilter && filters.classificationFilter !== 'all') {
+      if (filters.classificationFilter === 'classified') {
+        q = q.in('classification_status', ['ai_suggested', 'confirmed']);
+      } else if (filters.classificationFilter === 'unclassified') {
+        q = q.eq('classification_status', 'pending');
       }
     }
   }

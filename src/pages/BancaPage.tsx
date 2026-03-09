@@ -500,22 +500,16 @@ function TxRow({ tx, selected, checked, selectMode, onClick, onCheck, onDoubleCl
       <span className={`hidden sm:inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full flex-shrink-0 ${txTypeBadge(tx.transaction_type)}`}>
         {txTypeLabel(tx.transaction_type)}
       </span>
-      {tx.tx_nature === 'invoice_payment' && tx.reconciliation_status !== 'matched' && (
-        <span className="inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-sky-100 text-sky-700 flex-shrink-0" title="Pagamento fattura">
-          Pag. fattura
-        </span>
-      )}
-      {tx.tx_nature === 'no_invoice' && (
+      {tx.classification_status === 'ai_suggested' && tx.classification_reasoning && (
         <span className="inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-violet-100 text-violet-700 flex-shrink-0"
-          title={tx.classification_status === 'ai_suggested' && tx.classification_reasoning ? tx.classification_reasoning : 'Senza fattura'}>
-          {tx.classification_status === 'ai_suggested' && tx.classification_reasoning
-            ? tx.classification_reasoning.length > 25 ? tx.classification_reasoning.slice(0, 25) + '…' : tx.classification_reasoning
-            : 'Senza fatt.'}
+          title={tx.classification_reasoning}>
+          {tx.classification_reasoning.length > 25 ? tx.classification_reasoning.slice(0, 25) + '…' : tx.classification_reasoning}
         </span>
       )}
-      {tx.tx_nature === 'giro_conto' && (
-        <span className="inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-gray-200 text-gray-600 flex-shrink-0" title="Giroconto">
-          Giroconto
+      {tx.classification_status === 'confirmed' && tx.classification_reasoning && (
+        <span className="inline-flex text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-blue-100 text-blue-700 flex-shrink-0"
+          title={tx.classification_reasoning}>
+          {tx.classification_reasoning.length > 25 ? tx.classification_reasoning.slice(0, 25) + '…' : tx.classification_reasoning}
         </span>
       )}
       {tx.direction_needs_review && (
@@ -734,7 +728,7 @@ export default function BancaPage() {
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [dirFilter, setDirFilter] = useState<'all' | 'in' | 'out' | 'review'>('all')
   const [typeFilter, setTypeFilter] = useState<string>('all')
-  const [natureFilter, setNatureFilter] = useState<'all' | 'invoice_payment' | 'no_invoice' | 'giro_conto' | 'unknown'>('all')
+  const [classificationFilter, setClassificationFilter] = useState<'all' | 'classified' | 'unclassified'>('all')
   const [dateFrom, setDateFrom] = useState<string>('')
   const [dateTo, setDateTo] = useState<string>('')
   const [amountMin, setAmountMin] = useState<number | undefined>(undefined)
@@ -861,7 +855,7 @@ export default function BancaPage() {
 
   // Helper: reset all filters to defaults (used on AI search start, query clear, etc.)
   const resetAllFilters = useCallback(() => {
-    setDateFrom(''); setDateTo(''); setDirFilter('all'); setTypeFilter('all'); setNatureFilter('all')
+    setDateFrom(''); setDateTo(''); setDirFilter('all'); setTypeFilter('all'); setClassificationFilter('all')
     setAmountMin(undefined); setAmountMax(undefined); setCounterpartyPattern(undefined)
   }, [])
 
@@ -875,8 +869,8 @@ export default function BancaPage() {
     amountMin,
     amountMax,
     counterpartyPattern,
-    natureFilter,
-  }), [debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds, amountMin, amountMax, counterpartyPattern, natureFilter])
+    classificationFilter,
+  }), [debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds, amountMin, amountMax, counterpartyPattern, classificationFilter])
 
   const loadData = useCallback(async (reset = true) => {
     if (!companyId) return
@@ -920,10 +914,9 @@ export default function BancaPage() {
   // Keep loadData ref current for analyze callback
   loadDataRef.current = loadData
 
-  const runAnalyze = useCallback(() => {
+  const runClassify = useCallback(() => {
     if (!companyId) return
     analyzeStartOrStop(async (signal, updateProgress) => {
-      // Helper: abortable sleep
       const sleep = (ms: number) =>
         new Promise<void>((resolve, reject) => {
           if (signal.aborted) return reject(new DOMException('Aborted', 'AbortError'))
@@ -931,34 +924,25 @@ export default function BancaPage() {
           signal.addEventListener('abort', () => { clearTimeout(timer); reject(new DOMException('Aborted', 'AbortError')) }, { once: true })
         })
 
-      // 1. Count total pending: untriaged + no_invoice pending classification
+      // Count unmatched + pending classification
       let totalPending = 0
       try {
-        const [untriaged, unclassified] = await Promise.all([
-          supabase
-            .from('bank_transactions')
-            .select('id', { count: 'exact', head: true })
-            .eq('company_id', companyId)
-            .is('tx_nature', null)
-            .in('reconciliation_status', ['unmatched', 'partial']),
-          supabase
-            .from('bank_transactions')
-            .select('id', { count: 'exact', head: true })
-            .eq('company_id', companyId)
-            .eq('tx_nature', 'no_invoice')
-            .eq('classification_status', 'pending'),
-        ])
-        totalPending = (untriaged.count ?? 0) + (unclassified.count ?? 0)
-      } catch { /* ignore count error, fallback to rolling estimate */ }
+        const { count } = await supabase
+          .from('bank_transactions')
+          .select('id', { count: 'exact', head: true })
+          .eq('company_id', companyId)
+          .eq('reconciliation_status', 'unmatched')
+          .eq('classification_status', 'pending')
+        totalPending = count ?? 0
+      } catch { /* ignore */ }
 
       if (totalPending === 0) {
-        setToast({ message: 'Tutti i movimenti sono già stati analizzati.', type: 'info' })
+        setToast({ message: 'Tutti i movimenti non riconciliati sono già classificati.', type: 'info' })
         return
       }
 
       updateProgress(0, totalPending)
 
-      // 2. Auto-loop with retry
       let totalProcessed = 0
       let consecutiveFailures = 0
       const MAX_RETRIES = 3
@@ -979,40 +963,36 @@ export default function BancaPage() {
           }
 
           const data = await res.json()
-          consecutiveFailures = 0 // reset on success
+          consecutiveFailures = 0
 
-          const batch = (data.triaged || 0) + (data.classified || 0)
+          const batch = data.classified || 0
 
           if (batch === 0) {
-            // All done
             updateProgress(totalPending, totalPending)
-            setToast({ message: `Analisi completata: ${totalProcessed} movimenti analizzati.`, type: 'success' })
+            setToast({ message: `Classificazione completata: ${totalProcessed} movimenti classificati.`, type: 'success' })
             break
           }
 
           totalProcessed += batch
           updateProgress(Math.min(totalProcessed, totalPending), totalPending)
 
-          // Wait 1s before next batch
           await sleep(1000)
         } catch (err: unknown) {
-          // Propagate abort errors to let useAIJob handle cancellation
           if (err instanceof DOMException && err.name === 'AbortError') throw err
           if (err instanceof Error && err.message === 'AbortError') throw err
 
           consecutiveFailures++
-          console.warn(`[Analyze] Batch failed (${consecutiveFailures}/${MAX_RETRIES}):`, err)
+          console.warn(`[Classify] Batch failed (${consecutiveFailures}/${MAX_RETRIES}):`, err)
 
           if (consecutiveFailures >= MAX_RETRIES) {
             setToast({
-              message: `Analisi interrotta dopo ${MAX_RETRIES} errori consecutivi. ${totalProcessed} movimenti analizzati.`,
+              message: `Classificazione interrotta dopo ${MAX_RETRIES} errori. ${totalProcessed} movimenti classificati.`,
               type: 'error',
             })
             break
           }
 
-          // Wait 3s before retry
-          try { await sleep(3000) } catch { break } // abort during retry wait
+          try { await sleep(3000) } catch { break }
         }
       }
 
@@ -1029,7 +1009,7 @@ export default function BancaPage() {
     setTotalCount(0)
     loadData(true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [companyId, debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds?.join(','), amountMin, amountMax, counterpartyPattern, natureFilter])
+  }, [companyId, debouncedQuery, dirFilter, typeFilter, dateFrom, dateTo, aiResult?.candidateIds?.join(','), amountMin, amountMax, counterpartyPattern, classificationFilter])
 
   // One-time saldo cleanup check on mount
   useEffect(() => {
@@ -1587,9 +1567,9 @@ export default function BancaPage() {
   const latestBalance = balanceInfo?.opening_balance_confirmed ? balanceInfo.computed_balance : null
   const uniqueTypes = [...new Set(transactions.map(t => t.transaction_type).filter(Boolean))]
   const hasDateFilter = !!(dateFrom || dateTo)
-  const hasActiveFilters = !!(debouncedQuery || dirFilter !== 'all' || typeFilter !== 'all' || hasDateFilter || aiResult || amountMin != null || amountMax != null || counterpartyPattern || natureFilter !== 'all')
+  const hasActiveFilters = !!(debouncedQuery || dirFilter !== 'all' || typeFilter !== 'all' || hasDateFilter || aiResult || amountMin != null || amountMax != null || counterpartyPattern || classificationFilter !== 'all')
 
-  // natureFilter is now server-side (in buildFilters), no client-side filtering needed
+  // classificationFilter is server-side (in buildFilters), no client-side filtering needed
 
   // Multi-select helpers
   const selectAll = () => {
@@ -1637,12 +1617,12 @@ export default function BancaPage() {
               )}
               {transactions.length > 0 && (
                 <Button variant="outline" size="sm"
-                  onClick={runAnalyze}
+                  onClick={runClassify}
                   disabled={!analyzeRunning && !companyId}
                   className={analyzeRunning ? 'text-purple-700 border-purple-300 bg-purple-50' : ''}>
                   {analyzeRunning
-                    ? <>⏹ Ferma analisi ({analyzeJobProgress.current}/{analyzeJobProgress.total})</>
-                    : <><Zap className="h-3.5 w-3.5 mr-1.5" />Analizza</>}
+                    ? <>⏹ Ferma ({analyzeJobProgress.current}/{analyzeJobProgress.total})</>
+                    : <><Zap className="h-3.5 w-3.5 mr-1.5" />Classifica non riconciliati</>}
                 </Button>
               )}
               <Button variant="outline" size="sm" onClick={() => loadData(true)} disabled={loading}>
@@ -1934,13 +1914,11 @@ export default function BancaPage() {
                     {uniqueTypes.map(t => <option key={t} value={t}>{txTypeLabel(t)}</option>)}
                   </select>
                 )}
-                <select value={natureFilter} onChange={e => setNatureFilter(e.target.value as any)}
+                <select value={classificationFilter} onChange={e => setClassificationFilter(e.target.value as any)}
                   className="px-2.5 py-1.5 text-xs border border-gray-200 rounded-md bg-white focus:outline-none focus:ring-2 focus:ring-sky-500">
-                  <option value="all">Triage: tutti</option>
-                  <option value="invoice_payment">Pagamenti fattura</option>
-                  <option value="no_invoice">Senza fattura</option>
-                  <option value="giro_conto">Giroconto</option>
-                  <option value="unknown">Da analizzare</option>
+                  <option value="all">Classificazione: tutti</option>
+                  <option value="classified">Classificati</option>
+                  <option value="unclassified">Da classificare</option>
                 </select>
               </div>
 

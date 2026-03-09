@@ -7,6 +7,11 @@
 // on invoices table). NEVER 'confirmed'. User must always confirm.
 
 import postgres from "npm:postgres@3.4.5";
+import {
+  getAccountingSystemPrompt,
+  getUserInstructionsBlock,
+  type CompanyContext,
+} from "../_shared/accounting-system-prompt.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -174,7 +179,8 @@ function buildPrompt(
   ragExamples: RagExample[],
   direction: string,
   lines: InputLine[],
-  userInstructions: { scope: string; instruction: string }[] = [],
+  systemPrompt: string,
+  userInstructionsBlock: string,
 ): string {
   // Articles section
   const artSection = articles
@@ -235,7 +241,8 @@ function buildPrompt(
     )
     .join("\n");
 
-  return `Sei un contabile italiano esperto specializzato nella classificazione di fatture per PMI.
+  return `${systemPrompt}
+${userInstructionsBlock}
 
 ARTICOLI DISPONIBILI (codice: nome [keywords]):
 ${artSection}
@@ -253,10 +260,7 @@ CONTROPARTE: ${counterpartyInfo}
 
 ${historySection}
 ${ragSection}
-${userInstructions.length > 0 ? `
-REGOLE UTENTE (PRIORITÀ ALTA — applica SEMPRE queste regole dell'utente):
-${userInstructions.map((ui) => `- [${ui.scope}] ${ui.instruction}`).join("\n")}
-` : ""}
+
 REGOLE:
 * PASSIVA (acquisto/direction=in): categorie "expense", conti di costo (60xxx-69xxx o come nel piano conti)
 * ATTIVA (vendita/direction=out): categorie "revenue", conti di ricavo (70xxx+)
@@ -672,20 +676,22 @@ Deno.serve(async (req) => {
       );
     }
 
-    // ─── Load user instructions ────────────────────────
-    interface UserInstruction { scope: string; instruction: string }
-    let userInstructions: UserInstruction[] = [];
-    try {
-      userInstructions = await sql<UserInstruction[]>`
-        SELECT scope, instruction FROM user_instructions
-        WHERE company_id = ${companyId} AND active = true
-          AND scope IN ('general', 'classification', 'counterparty')
-        ORDER BY scope, created_at`;
-      if (userInstructions.length > 0) {
-        console.log(`[classify-invoice-lines] Loaded ${userInstructions.length} user instructions`);
-      }
-    } catch (err) {
-      console.warn("[classify-invoice-lines] Error loading user instructions:", err);
+    // ─── Load shared system prompt + user instructions ──
+    const companyRow = await sql`
+      SELECT name, vat_number FROM companies WHERE id = ${companyId} LIMIT 1
+    `;
+    const companyContext: CompanyContext | undefined = companyRow.length > 0
+      ? {
+          company_name: companyRow[0].name,
+          sector: 'servizi',
+          vat_number: companyRow[0].vat_number,
+        }
+      : undefined;
+
+    const systemPrompt = getAccountingSystemPrompt(companyContext);
+    const userInstructionsBlock = await getUserInstructionsBlock(sql, companyId);
+    if (userInstructionsBlock) {
+      console.log(`[classify-invoice-lines] Loaded user instructions`);
     }
 
     // ─── Build prompt and call Sonnet ──────────────────
@@ -699,7 +705,8 @@ Deno.serve(async (req) => {
       ragExamples,
       direction,
       inputLines,
-      userInstructions,
+      systemPrompt,
+      userInstructionsBlock,
     );
 
     console.log(

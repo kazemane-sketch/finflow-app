@@ -1,4 +1,9 @@
 import postgres from "npm:postgres@3.4.5";
+import {
+  getAccountingSystemPrompt,
+  getUserInstructionsBlock,
+  type CompanyContext,
+} from "../_shared/accounting-system-prompt.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -1866,19 +1871,25 @@ Deno.serve(async (req) => {
     }
     claudeMessages.push({ role: "user", content: userMessage });
 
-    // Load active user instructions to inject as context
-    const userInstructions = await sql`
-      SELECT scope, instruction FROM user_instructions
-      WHERE company_id = ${companyId} AND active = true
-      ORDER BY scope, created_at`;
+    // Load shared accounting context + user instructions
+    const companyRow = await sql`
+      SELECT name, vat_number FROM companies WHERE id = ${companyId} LIMIT 1
+    `;
+    const companyContext: CompanyContext | undefined = companyRow.length > 0
+      ? {
+          company_name: companyRow[0].name,
+          sector: 'servizi',
+          vat_number: companyRow[0].vat_number,
+        }
+      : undefined;
 
-    let instructionsContext = "";
-    if (userInstructions.length > 0) {
-      const lines = userInstructions.map(
-        (ui: { scope: string; instruction: string }) => `- [${ui.scope}] ${ui.instruction}`,
-      );
-      instructionsContext = `REGOLE UTENTE SALVATE (applica SEMPRE queste regole nelle analisi e risposte):\n${lines.join("\n")}`;
-    }
+    const accountingPrompt = getAccountingSystemPrompt(companyContext);
+    const userInstructionsBlock = await getUserInstructionsBlock(sql, companyId);
+
+    const instructionsContext = [
+      `COMPETENZE CONTABILI DI BASE:\n${accountingPrompt}`,
+      userInstructionsBlock,
+    ].filter(Boolean).join("\n\n");
 
     // Run AI (model based on user preference: fast=haiku, thinking=sonnet with extended thinking)
     const isThinking = modelPreference === "thinking";
