@@ -128,6 +128,13 @@ function TypeDropdown({ value, onChange }: { value: string; onChange: (v: string
 
 // ---- component ----
 
+export interface AccountSuggestionBrief {
+  code: string; name: string; section: string; parent_code: string; reason: string;
+}
+export interface CategorySuggestionBrief {
+  name: string; type: string; reason: string;
+}
+
 export interface BankTxDetailProps {
   tx: any
   onClose: () => void
@@ -141,6 +148,11 @@ export interface BankTxDetailProps {
   onEditSave?: () => void
   onEnableEdit?: () => void
   onCancelEdit?: () => void
+  /** AI suggestion for new account/category */
+  suggestion?: { suggest_new_account?: AccountSuggestionBrief | null; suggest_new_category?: CategorySuggestionBrief | null } | null
+  onCreateSuggestion?: () => void
+  onDismissSuggestion?: () => void
+  creatingSuggestion?: boolean
 }
 
 export default function BankTxDetail({
@@ -154,6 +166,10 @@ export default function BankTxDetail({
   onEditSave,
   onEnableEdit,
   onCancelEdit,
+  suggestion,
+  onCreateSuggestion,
+  onDismissSuggestion,
+  creatingSuggestion = false,
 }: BankTxDetailProps) {
   if (!tx) return null
   const currentDirection = txDirection(tx)
@@ -274,6 +290,38 @@ export default function BankTxDetail({
                   Stato: {tx.classification_status === 'ai_suggested' ? 'Suggerito AI' : tx.classification_status === 'confirmed' ? 'Confermato' : tx.classification_status}
                   {tx.classification_source && ` (${tx.classification_source})`}
                 </p>
+              </div>
+            )}
+            {/* AI suggestion banner for new account/category */}
+            {suggestion && (suggestion.suggest_new_account || suggestion.suggest_new_category) && (
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 space-y-1.5">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-amber-500 text-xs">{'\uD83D\uDCA1'}</span>
+                  <span className="text-[10px] font-semibold text-amber-800">L'AI suggerisce di creare:</span>
+                </div>
+                {suggestion.suggest_new_account && (
+                  <div className="text-[10px] text-amber-900 space-y-0.5 pl-4">
+                    <p className="font-medium">{'\uD83D\uDCCA'} Nuovo conto: &ldquo;{suggestion.suggest_new_account.name}&rdquo; ({suggestion.suggest_new_account.code})</p>
+                    <p className="text-amber-700">sotto: {suggestion.suggest_new_account.parent_code}</p>
+                    <p className="text-amber-600 italic">{suggestion.suggest_new_account.reason}</p>
+                  </div>
+                )}
+                {suggestion.suggest_new_category && (
+                  <div className="text-[10px] text-amber-900 space-y-0.5 pl-4">
+                    <p className="font-medium">{'\uD83C\uDFF7\uFE0F'} Nuova categoria: &ldquo;{suggestion.suggest_new_category.name}&rdquo; ({suggestion.suggest_new_category.type})</p>
+                    <p className="text-amber-600 italic">{suggestion.suggest_new_category.reason}</p>
+                  </div>
+                )}
+                <div className="flex gap-2 pl-4 pt-1">
+                  <button onClick={onCreateSuggestion} disabled={creatingSuggestion}
+                    className="px-2 py-0.5 text-[10px] font-semibold rounded bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50">
+                    {creatingSuggestion ? 'Creando...' : 'Crea e usa'}
+                  </button>
+                  <button onClick={onDismissSuggestion}
+                    className="px-2 py-0.5 text-[10px] font-semibold rounded bg-gray-200 text-gray-700 hover:bg-gray-300">
+                    Ignora
+                  </button>
+                </div>
               </div>
             )}
           </div>

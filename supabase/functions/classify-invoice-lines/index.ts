@@ -107,6 +107,18 @@ interface SonnetLineResult {
   confidence: number;
   reasoning: string;
   fiscal_flags?: FiscalFlags | null;
+  suggest_new_account?: {
+    code: string;
+    name: string;
+    section: string;
+    parent_code: string;
+    reason: string;
+  } | null;
+  suggest_new_category?: {
+    name: string;
+    type: string;
+    reason: string;
+  } | null;
 }
 
 /* ─── Gemini embedding (for RAG) ────────── */
@@ -386,7 +398,9 @@ Rispondi con un array JSON (senza markdown):
     "deducibilita_pct": 100,
     "iva_detraibilita_pct": 100,
     "note": null oppure "eventuale nota fiscale"
-  }
+  },
+  "suggest_new_account": null oppure {"code": "180.50", "name": "Canoni leasing escavatore", "section": "cost_production", "parent_code": "180", "reason": "motivo in italiano"},
+  "suggest_new_category": null oppure {"name": "Noleggio attrezzature", "type": "expense", "reason": "motivo in italiano"}
 }]
 ---KEYWORDS---
 ["keyword1", "keyword2", ...] (5-10 keywords di ricerca per questa fattura)`;
@@ -834,6 +848,8 @@ Deno.serve(async (req) => {
       ),
       reasoning: item.reasoning || "",
       fiscal_flags: item.fiscal_flags || null,
+      suggest_new_account: item.suggest_new_account || null,
+      suggest_new_category: item.suggest_new_category || null,
     }));
 
     // ─── Compose invoice-level ─────────────────────────

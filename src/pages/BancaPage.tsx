@@ -38,7 +38,11 @@ import BankTxDetail, {
   txDirection as _txDirection,
   txDirectionSourceLabel as _txDirectionSourceLabel,
   txDirectionConfidenceLabel as _txDirectionConfidenceLabel,
+  type AccountSuggestionBrief, type CategorySuggestionBrief,
 } from '@/components/BankTxDetail'
+import {
+  createAccountFromSuggestion, createCategoryFromSuggestion,
+} from '@/lib/classificationService'
 
 // ============================================================
 // UTILS
@@ -778,6 +782,13 @@ export default function BancaPage() {
   const { isRunning: analyzeRunning, progress: analyzeJobProgress, startOrStop: analyzeStartOrStop } = useAIJob('banca-analyze', 'Analisi Movimenti')
   const loadDataRef = useRef<((reset?: boolean) => void) | null>(null)
 
+  // AI suggestion state for new accounts/categories on bank transactions
+  const [bankSuggestions, setBankSuggestions] = useState<Record<string, {
+    suggest_new_account?: AccountSuggestionBrief | null;
+    suggest_new_category?: CategorySuggestionBrief | null;
+  }>>({})
+  const [creatingSuggestion, setCreatingSuggestion] = useState(false)
+
   // Import
   const [importing, setImporting] = useState(false)
   const [importProgress, setImportProgress] = useState<BankParseProgress | null>(null)
@@ -964,6 +975,19 @@ export default function BancaPage() {
 
           const data = await res.json()
           consecutiveFailures = 0
+
+          // Accumulate AI suggestions for new accounts/categories
+          for (const d of (data.classification_details || [])) {
+            if (d.suggest_new_account || d.suggest_new_category) {
+              setBankSuggestions(prev => ({
+                ...prev,
+                [d.id]: {
+                  suggest_new_account: d.suggest_new_account || null,
+                  suggest_new_category: d.suggest_new_category || null,
+                },
+              }))
+            }
+          }
 
           const batch = data.classified || 0
 
@@ -1220,6 +1244,59 @@ export default function BancaPage() {
       alert('Errore aggiornamento: ' + e.message)
     }
     setEditSaving(false)
+  }
+
+  // Handle "Crea e usa" for AI-suggested new account/category on bank tx
+  const handleBankCreateSuggestion = async (txId: string) => {
+    if (!companyId) return
+    setCreatingSuggestion(true)
+    try {
+      const sugg = bankSuggestions[txId]
+      let newAccountId: string | null = null
+      let newCategoryId: string | null = null
+
+      if (sugg?.suggest_new_account) {
+        const acct = await createAccountFromSuggestion(companyId, sugg.suggest_new_account)
+        newAccountId = acct.id
+        setToast({ message: `Conto ${acct.code} "${acct.name}" creato`, type: 'success' })
+      }
+      if (sugg?.suggest_new_category) {
+        const { category, wasExisting } = await createCategoryFromSuggestion(companyId, sugg.suggest_new_category)
+        newCategoryId = category.id
+        setToast({ message: wasExisting ? `Categoria "${category.name}" già esistente — usata` : `Categoria "${category.name}" creata`, type: 'success' })
+      }
+
+      // Update bank_transaction with new IDs
+      if (newAccountId || newCategoryId) {
+        const updates: Record<string, any> = {}
+        if (newAccountId) updates.account_id = newAccountId
+        if (newCategoryId) updates.category_id = newCategoryId
+        await supabase.from('bank_transactions').update(updates).eq('id', txId).eq('company_id', companyId)
+        // Update local state
+        setTransactions(prev => prev.map(tx => tx.id === txId ? { ...tx, ...updates } : tx))
+        if (selectedTx?.id === txId) {
+          setSelectedTx((prev: any) => prev ? { ...prev, ...updates } : prev)
+        }
+      }
+
+      // Remove suggestion
+      setBankSuggestions(prev => {
+        const next = { ...prev }
+        delete next[txId]
+        return next
+      })
+    } catch (err: any) {
+      setToast({ message: `Errore: ${err.message}`, type: 'error' })
+    }
+    setCreatingSuggestion(false)
+  }
+
+  const handleBankDismissSuggestion = (txId: string) => {
+    setBankSuggestions(prev => {
+      const next = { ...prev }
+      delete next[txId]
+      return next
+    })
   }
 
   const handleBulkVerify = async () => {
@@ -2058,6 +2135,10 @@ export default function BancaPage() {
             onEditSave={handleEditSave}
             onEnableEdit={() => { setEditDraft(initEditDraft(selectedTx)); setEditMode(true) }}
             onCancelEdit={() => setEditMode(false)}
+            suggestion={bankSuggestions[selectedTx.id] || null}
+            onCreateSuggestion={() => handleBankCreateSuggestion(selectedTx.id)}
+            onDismissSuggestion={() => handleBankDismissSuggestion(selectedTx.id)}
+            creatingSuggestion={creatingSuggestion}
           />
         </div>
       )}

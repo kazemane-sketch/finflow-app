@@ -1248,7 +1248,7 @@ export default function ArticoliPage() {
 
                     {/* ─── Phases section ─── */}
                     {draft.id && (
-                      <div className="border rounded-lg overflow-hidden">
+                      <div className="border rounded-lg">
                         <button
                           onClick={() => setPhasesExpanded(!phasesExpanded)}
                           className="w-full flex items-center justify-between px-3 py-2 bg-gray-50 hover:bg-gray-100 transition-colors"

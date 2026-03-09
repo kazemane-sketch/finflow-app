@@ -91,6 +91,13 @@ COMPETENZE FONDAMENTALI:
 - Tipo documento: TD01 (fattura), TD04 (nota di credito), TD05 (nota di debito), TD06 (parcella)
 - SDI: Sistema di Interscambio dell'Agenzia delle Entrate
 - Codice destinatario: identificativo per la ricezione delle fatture elettroniche
+
+11. SUGGERIMENTO NUOVI CONTI E CATEGORIE
+- Se il miglior conto disponibile nel piano dei conti è troppo generico per la riga che stai classificando, aggiungi il campo opzionale "suggest_new_account" alla risposta JSON con: code (segui la numerazione del parent, es. se il parent è 180 e esistono 180.10, 180.20, suggerisci 180.30), name (descrittivo e specifico), section (usa la section esatta dal piano dei conti: cost_production, revenue, financial, etc.), parent_code (conto padre esistente), reason (spiegazione in italiano)
+- Se nessuna delle categorie esistenti cattura bene la natura della spesa/ricavo, aggiungi il campo opzionale "suggest_new_category" con: name, type ("expense" o "revenue"), reason (spiegazione in italiano)
+- ANCHE quando suggerisci un nuovo conto/categoria, DEVI COMUNQUE assegnare il miglior conto/categoria ESISTENTE come fallback nei campi standard. Il suggerimento è AGGIUNTIVO, non sostitutivo
+- Suggerisci un nuovo conto/categoria solo quando c'è un VERO gap — NON suggerire per ogni riga. Casi tipici: nuovo contratto leasing specifico, nuova banca, tipo di spesa mai incontrato, attività operativa molto specifica dell'azienda
+- Non suggerire mai duplicati di conti/categorie che già esistono con nomi simili
 ${company ? `
 CONTESTO AZIENDA:
 - Nome: ${company.company_name}

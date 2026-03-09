@@ -63,6 +63,18 @@ interface ClassifyResult {
     tax_type: string | null;
     note: string | null;
   } | null;
+  suggest_new_account?: {
+    code: string;
+    name: string;
+    section: string;
+    parent_code: string;
+    reason: string;
+  } | null;
+  suggest_new_category?: {
+    name: string;
+    type: string;
+    reason: string;
+  } | null;
 }
 
 interface AccountRow {
@@ -216,7 +228,7 @@ Classifica ogni movimento con il conto contabile appropriato dal piano dei conti
 Questi movimenti NON hanno una fattura associata (sono già stati esclusi dalla riconciliazione).
 
 FORMATO RISPOSTA — SOLO JSON array. Usa gli ID uuid esatti dalla lista sopra (la parte PRIMA dei due punti):
-[{"transaction_id": "uuid", "account_id": "uuid esatto dalla lista conti", "category_id": "uuid dalla lista categorie o null", "cost_center_id": "uuid dalla lista CdC o null", "confidence": 0-100, "reasoning": "codice_conto - spiegazione breve", "fiscal_flags": {"is_tax_payment": true/false, "tax_type": "IRES|IRAP|INPS|IRPEF|INAIL|Addizionale|null", "note": "eventuale nota"}}]`;
+[{"transaction_id": "uuid", "account_id": "uuid esatto dalla lista conti", "category_id": "uuid dalla lista categorie o null", "cost_center_id": "uuid dalla lista CdC o null", "confidence": 0-100, "reasoning": "codice_conto - spiegazione breve", "fiscal_flags": {"is_tax_payment": true/false, "tax_type": "IRES|IRAP|INPS|IRPEF|INAIL|Addizionale|null", "note": "eventuale nota"}, "suggest_new_account": null, "suggest_new_category": null}]`;
 
   const resp = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -490,6 +502,8 @@ Deno.serve(async (req) => {
         id: r.transaction_id,
         account_id: r.account_id,
         confidence: r.confidence,
+        suggest_new_account: r.suggest_new_account || null,
+        suggest_new_category: r.suggest_new_category || null,
       })),
     });
   } catch (e: unknown) {

@@ -37,10 +37,13 @@ import {
   loadLineClassifications, saveLineCategoryAndAccount,
   loadLineProjects, saveLineProjects,
   CATEGORY_TYPE_LABELS, SECTION_LABELS,
+  createAccountFromSuggestion, createCategoryFromSuggestion,
   type Category, type Project, type ChartAccount,
   type InvoiceClassification, type InvoiceProjectAssignment,
   type LineClassification, type LineProjectAssignment,
+  type AccountSuggestion, type CategorySuggestion,
 } from '@/lib/classificationService';
+import { toast } from 'sonner';
 import { createRuleFromConfirmation, findMatchingRules } from '@/lib/classificationRulesService';
 import ExportDialog from '@/components/ExportDialog';
 
@@ -493,6 +496,13 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [aiClassifStatus, setAiClassifStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [aiClassifResult, setAiClassifResult] = useState<any>(null);
   const [lineFiscalFlags, setLineFiscalFlags] = useState<Record<string, any>>({});
+  // AI suggestion state for new accounts/categories
+  const [lineSuggestions, setLineSuggestions] = useState<Record<string, {
+    suggest_new_account?: AccountSuggestion | null;
+    suggest_new_category?: CategorySuggestion | null;
+  }>>({});
+  const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(new Set());
+  const [creatingSuggestion, setCreatingSuggestion] = useState<string | null>(null);
 
   // Load articles + existing assignments when invoice changes
   useEffect(() => {
@@ -830,6 +840,20 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       }
       setLineFiscalFlags(flags);
 
+      // Extract AI suggestions for new accounts/categories
+      const suggestions: Record<string, { suggest_new_account?: AccountSuggestion | null; suggest_new_category?: CategorySuggestion | null }> = {};
+      for (const lr of (result.lines || [])) {
+        const lid = lr.line_id || lr.invoice_line_id;
+        if (lid && (lr.suggest_new_account || lr.suggest_new_category)) {
+          suggestions[lid] = {
+            suggest_new_account: lr.suggest_new_account || null,
+            suggest_new_category: lr.suggest_new_category || null,
+          };
+        }
+      }
+      setLineSuggestions(suggestions);
+      setDismissedSuggestions(new Set());
+
       // Reload classification data to reflect persisted suggestions
       const [classif, lineClf, lineProj, freshInvProjs] = await Promise.all([
         loadInvoiceClassification(invoice.id),
@@ -951,6 +975,60 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       }
     } catch (e: any) { console.error('Confirm existing classification error:', e); }
   }, [invoice?.id, company?.id, onPatchInvoice, detail?.invoice_lines, lineClassifs, lineArticleMap, invoice?.counterparty, invoice?.direction]);
+
+  // Handle "Crea e usa" for AI-suggested new account/category
+  const handleCreateSuggestion = useCallback(async (lineId: string) => {
+    if (!company?.id) return;
+    setCreatingSuggestion(lineId);
+    try {
+      const sugg = lineSuggestions[lineId];
+      let newAccountId: string | null = null;
+      let newCategoryId: string | null = null;
+
+      if (sugg?.suggest_new_account) {
+        const acct = await createAccountFromSuggestion(company.id, sugg.suggest_new_account);
+        newAccountId = acct.id;
+        toast.success(`Conto ${acct.code} "${acct.name}" creato`);
+      }
+      if (sugg?.suggest_new_category) {
+        const { category, wasExisting } = await createCategoryFromSuggestion(company.id, sugg.suggest_new_category);
+        newCategoryId = category.id;
+        if (wasExisting) toast.info(`Categoria "${category.name}" già esistente — usata`);
+        else toast.success(`Categoria "${category.name}" creata`);
+      }
+
+      // Update line classification with new IDs
+      if (newAccountId || newCategoryId) {
+        const current = lineClassifs[lineId] || {} as any;
+        await saveLineCategoryAndAccount(
+          lineId,
+          newCategoryId || current.category_id || null,
+          newAccountId || current.account_id || null,
+        );
+        // Reload line classifications + refresh accounts/categories lists
+        const companyId = company.id;
+        const [lineClf, freshCats, freshAccs] = await Promise.all([
+          loadLineClassifications(invoice!.id),
+          loadCategories(companyId, true),
+          loadChartOfAccounts(companyId),
+        ]);
+        setLineClassifs(lineClf);
+        setAllCategories(freshCats);
+        setAllAccounts(freshAccs.filter(a => !a.is_header && a.active));
+      }
+
+      // Dismiss this suggestion
+      setDismissedSuggestions(prev => new Set([...prev, lineId]));
+    } catch (err: any) {
+      toast.error(`Errore: ${err.message}`);
+    }
+    setCreatingSuggestion(null);
+  }, [company?.id, invoice?.id, lineSuggestions, lineClassifs]);
+
+  // Handle "Ignora" for AI-suggested new account/category
+  const handleDismissSuggestion = useCallback((lineId: string) => {
+    setDismissedSuggestions(prev => new Set([...prev, lineId]));
+  }, []);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }) => {
     const companyId = company?.id;
@@ -1499,6 +1577,47 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                           </td>
                         </tr>
                       )}
+                      {/* AI suggestion banner for new account/category */}
+                      {lineId && lineSuggestions[lineId] && !dismissedSuggestions.has(lineId) && (
+                        <tr>
+                          <td colSpan={colCount} className="px-3 py-1.5">
+                            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-amber-500 text-xs">{'\uD83D\uDCA1'}</span>
+                                <span className="text-[11px] font-semibold text-amber-800">L'AI suggerisce di creare:</span>
+                              </div>
+                              {lineSuggestions[lineId].suggest_new_account && (
+                                <div className="text-[10px] text-amber-900 space-y-0.5 pl-5">
+                                  <p className="font-medium">
+                                    {'\uD83D\uDCCA'} Nuovo conto: &ldquo;{lineSuggestions[lineId].suggest_new_account!.name}&rdquo; ({lineSuggestions[lineId].suggest_new_account!.code})
+                                  </p>
+                                  <p className="text-amber-700">sotto: {lineSuggestions[lineId].suggest_new_account!.parent_code}</p>
+                                  <p className="text-amber-600 italic">{lineSuggestions[lineId].suggest_new_account!.reason}</p>
+                                </div>
+                              )}
+                              {lineSuggestions[lineId].suggest_new_category && (
+                                <div className="text-[10px] text-amber-900 space-y-0.5 pl-5">
+                                  <p className="font-medium">
+                                    {'\uD83C\uDFF7\uFE0F'} Nuova categoria: &ldquo;{lineSuggestions[lineId].suggest_new_category!.name}&rdquo; ({lineSuggestions[lineId].suggest_new_category!.type})
+                                  </p>
+                                  <p className="text-amber-600 italic">{lineSuggestions[lineId].suggest_new_category!.reason}</p>
+                                </div>
+                              )}
+                              <div className="flex gap-2 pl-5 pt-1">
+                                <button onClick={() => handleCreateSuggestion(lineId)}
+                                  disabled={creatingSuggestion === lineId}
+                                  className="px-2.5 py-1 text-[10px] font-semibold rounded bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50">
+                                  {creatingSuggestion === lineId ? 'Creando...' : 'Crea e usa'}
+                                </button>
+                                <button onClick={() => handleDismissSuggestion(lineId)}
+                                  className="px-2.5 py-1 text-[10px] font-semibold rounded bg-gray-200 text-gray-700 hover:bg-gray-300">
+                                  Ignora
+                                </button>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
                       </React.Fragment>
                       );
                     })}
@@ -1621,6 +1740,47 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                                   {'\u2139\uFE0F'} IVA detraibile al {ff2.iva_detraibilita_pct}%
                                 </span>
                               )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      {/* AI suggestion banner for new account/category (DB fallback lines) */}
+                      {lineSuggestions[l.id] && !dismissedSuggestions.has(l.id) && (
+                        <tr>
+                          <td colSpan={colCount2} className="px-3 py-1.5">
+                            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 space-y-2">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-amber-500 text-xs">{'\uD83D\uDCA1'}</span>
+                                <span className="text-[11px] font-semibold text-amber-800">L'AI suggerisce di creare:</span>
+                              </div>
+                              {lineSuggestions[l.id].suggest_new_account && (
+                                <div className="text-[10px] text-amber-900 space-y-0.5 pl-5">
+                                  <p className="font-medium">
+                                    {'\uD83D\uDCCA'} Nuovo conto: &ldquo;{lineSuggestions[l.id].suggest_new_account!.name}&rdquo; ({lineSuggestions[l.id].suggest_new_account!.code})
+                                  </p>
+                                  <p className="text-amber-700">sotto: {lineSuggestions[l.id].suggest_new_account!.parent_code}</p>
+                                  <p className="text-amber-600 italic">{lineSuggestions[l.id].suggest_new_account!.reason}</p>
+                                </div>
+                              )}
+                              {lineSuggestions[l.id].suggest_new_category && (
+                                <div className="text-[10px] text-amber-900 space-y-0.5 pl-5">
+                                  <p className="font-medium">
+                                    {'\uD83C\uDFF7\uFE0F'} Nuova categoria: &ldquo;{lineSuggestions[l.id].suggest_new_category!.name}&rdquo; ({lineSuggestions[l.id].suggest_new_category!.type})
+                                  </p>
+                                  <p className="text-amber-600 italic">{lineSuggestions[l.id].suggest_new_category!.reason}</p>
+                                </div>
+                              )}
+                              <div className="flex gap-2 pl-5 pt-1">
+                                <button onClick={() => handleCreateSuggestion(l.id)}
+                                  disabled={creatingSuggestion === l.id}
+                                  className="px-2.5 py-1 text-[10px] font-semibold rounded bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50">
+                                  {creatingSuggestion === l.id ? 'Creando...' : 'Crea e usa'}
+                                </button>
+                                <button onClick={() => handleDismissSuggestion(l.id)}
+                                  className="px-2.5 py-1 text-[10px] font-semibold rounded bg-gray-200 text-gray-700 hover:bg-gray-300">
+                                  Ignora
+                                </button>
+                              </div>
                             </div>
                           </td>
                         </tr>

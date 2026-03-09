@@ -574,3 +574,118 @@ export async function saveLineProjects(
   const { error } = await supabase.from('invoice_line_projects').insert(rows as any);
   if (error) throw error;
 }
+
+// ─── AI Suggestion Types & Helpers ────────────────────────
+
+export interface AccountSuggestion {
+  code: string;
+  name: string;
+  section: string;     // CoaSection value (e.g. 'cost_production', 'revenue')
+  parent_code: string;
+  reason: string;
+}
+
+export interface CategorySuggestion {
+  name: string;
+  type: string;        // 'expense' | 'revenue' (or Italian: 'Costo' | 'Ricavo')
+  reason: string;
+}
+
+/**
+ * Pick the first unused color from COLOR_PALETTE, or random if all taken.
+ */
+export function pickNextColor(existingColors: string[]): string {
+  const used = new Set(existingColors.map(c => c.toLowerCase()));
+  const available = COLOR_PALETTE.find(c => !used.has(c));
+  return available || COLOR_PALETTE[Math.floor(Math.random() * COLOR_PALETTE.length)];
+}
+
+/**
+ * Create a new chart_of_accounts entry from an AI suggestion.
+ * Handles duplicate code detection (auto-increments) and section validation.
+ */
+export async function createAccountFromSuggestion(
+  companyId: string,
+  suggestion: AccountSuggestion,
+): Promise<ChartAccount> {
+  // Validate section — fallback to 'other_costs' if AI hallucinated
+  const validSections: CoaSection[] = [
+    'assets', 'liabilities', 'equity', 'revenue',
+    'cost_production', 'cost_personnel', 'depreciation',
+    'other_costs', 'financial', 'extraordinary',
+  ];
+  const section = validSections.includes(suggestion.section as CoaSection)
+    ? (suggestion.section as CoaSection)
+    : 'other_costs';
+
+  // Check for duplicate code → increment (180.30 → 180.31 → 180.32...)
+  let code = suggestion.code;
+  let attempts = 0;
+  while (attempts < 10) {
+    const { data: existing } = await supabase
+      .from('chart_of_accounts')
+      .select('id')
+      .eq('company_id', companyId)
+      .eq('code', code)
+      .maybeSingle();
+    if (!existing) break;
+    // Increment the last numeric segment
+    const parts = code.split('.');
+    if (parts.length > 1) {
+      const last = parseInt(parts[parts.length - 1] || '0', 10);
+      parts[parts.length - 1] = String(last + 1);
+    } else {
+      // No dot separator — try appending .01
+      parts.push(String(attempts + 1).padStart(2, '0'));
+    }
+    code = parts.join('.');
+    attempts++;
+  }
+
+  return createChartAccount(companyId, {
+    code,
+    name: suggestion.name,
+    section,
+    parent_code: suggestion.parent_code || null,
+    level: 3,
+    is_header: false,
+  });
+}
+
+/**
+ * Create a new category from an AI suggestion.
+ * Detects existing categories with same name (case-insensitive) and returns them instead.
+ */
+export async function createCategoryFromSuggestion(
+  companyId: string,
+  suggestion: CategorySuggestion,
+): Promise<{ category: Category; wasExisting: boolean }> {
+  // Check for duplicate name (case-insensitive)
+  const { data: existing } = await supabase
+    .from('categories')
+    .select('*')
+    .eq('company_id', companyId)
+    .ilike('name', suggestion.name)
+    .maybeSingle();
+  if (existing) return { category: existing as Category, wasExisting: true };
+
+  // Pick an unused color
+  const allCats = await loadCategories(companyId);
+  const usedColors = allCats.map(c => c.color).filter(Boolean);
+  const color = pickNextColor(usedColors);
+
+  // Map AI type string to CategoryType
+  const typeMap: Record<string, CategoryType> = {
+    expense: 'expense', revenue: 'revenue', both: 'both',
+    Costo: 'expense', Ricavo: 'revenue',
+    costo: 'expense', ricavo: 'revenue',
+  };
+  const catType: CategoryType = typeMap[suggestion.type] || 'expense';
+
+  const category = await createCategory(companyId, {
+    name: suggestion.name,
+    type: catType,
+    color,
+  });
+  return { category, wasExisting: false };
+}
