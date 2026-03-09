@@ -948,13 +948,18 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       );
 
       const coveredLineIds = new Set(ruleSuggestions.map(s => s.line_id));
+      const rulesMissingCdc = ruleSuggestions.length > 0 &&
+        !ruleSuggestions.some(s => s.cost_center_allocations && s.cost_center_allocations.length > 0);
       const uncoveredLines = lines
         .filter(l => !coveredLineIds.has(l.id))
         .filter(l => (l.total_price ?? 0) !== 0 || (l.unit_price ?? 0) !== 0); // skip /D metadata lines
+      // Also call AI when rules cover all lines but none have CdC
+      const linesToClassify = uncoveredLines.length > 0 ? uncoveredLines
+        : (rulesMissingCdc ? lines.filter(l => (l.total_price ?? 0) !== 0 || (l.unit_price ?? 0) !== 0) : []);
 
-      // Step 2: For uncovered lines, call unified classifier (Sonnet)
+      // Step 2: For uncovered/incomplete lines, call unified classifier (Sonnet)
       let aiResult: any = null;
-      if (uncoveredLines.length > 0) {
+      if (linesToClassify.length > 0) {
         const token = await getValidAccessToken();
         const res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
           method: 'POST',
@@ -966,7 +971,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           body: JSON.stringify({
             company_id: company.id,
             invoice_id: invoice.id,
-            lines: uncoveredLines.map(l => ({
+            lines: linesToClassify.map(l => ({
               line_id: l.id,
               description: l.description,
               quantity: l.quantity,
