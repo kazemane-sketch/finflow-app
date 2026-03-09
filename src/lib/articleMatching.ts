@@ -19,6 +19,7 @@ import type { Article, MatchResult } from '@/lib/articlesService'
 export interface LearnedRule {
   id: string
   article_id: string
+  phase_id: string | null
   pattern: { description_contains?: string[] } | null
   confidence: number
   hit_count: number

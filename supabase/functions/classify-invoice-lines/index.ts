@@ -67,6 +67,16 @@ interface ProjectRow {
   code: string;
   name: string;
 }
+interface ArticlePhaseRow {
+  id: string;
+  article_id: string;
+  code: string;
+  name: string;
+  phase_type: string;
+  is_counting_point: boolean;
+  invoice_direction: string | null;
+}
+
 interface HistoryRow {
   description: string;
   category_name: string | null;
@@ -90,6 +100,7 @@ interface FiscalFlags {
 interface SonnetLineResult {
   line_id: string;
   article_code: string | null;
+  phase_code: string | null;
   category_id: string | null;
   account_id: string | null;
   cost_center_allocations: { project_id: string; percentage: number }[] | null;
@@ -174,6 +185,7 @@ function buildPrompt(
   categories: CategoryRow[],
   accounts: AccountRow[],
   projects: ProjectRow[],
+  phases: ArticlePhaseRow[],
   counterpartyInfo: string,
   history: HistoryRow[],
   ragExamples: RagExample[],
@@ -182,13 +194,27 @@ function buildPrompt(
   systemPrompt: string,
   userInstructionsBlock: string,
 ): string {
-  // Articles section
+  // Build phases-by-article map
+  const phasesByArticle = new Map<string, ArticlePhaseRow[]>();
+  for (const p of phases) {
+    if (!phasesByArticle.has(p.article_id)) phasesByArticle.set(p.article_id, []);
+    phasesByArticle.get(p.article_id)!.push(p);
+  }
+
+  // Articles section (with inline phases)
   const artSection = articles
     .slice(0, 100)
-    .map(
-      (a) =>
-        `- ${a.code}: ${a.name}${a.description ? ` (${a.description.slice(0, 60)})` : ""} [${(a.keywords || []).join(", ")}]`,
-    )
+    .map((a) => {
+      let line = `- ${a.code}: ${a.name}${a.description ? ` (${a.description.slice(0, 60)})` : ""} [${(a.keywords || []).join(", ")}]`;
+      const artPhases = phasesByArticle.get(a.id);
+      if (artPhases && artPhases.length > 0) {
+        const phaseList = artPhases.map(p =>
+          `${p.code}(${p.phase_type},${p.invoice_direction || '?'}${p.is_counting_point ? ',COUNTING' : ''})`
+        ).join(', ');
+        line += ` FASI: ${phaseList}`;
+      }
+      return line;
+    })
     .join("\n");
 
   // Categories
@@ -270,6 +296,10 @@ REGOLE:
 * NOLO/NOLEGGIO → è noleggio, non acquisto
 * FORNITURA/VENDITA → è il materiale/prodotto
 * article_code: assegna SOLO se pertinente, altrimenti null
+* phase_code: se l'articolo ha fasi, assegna la fase coerente con la direzione della fattura:
+  - PASSIVA (acquisto/direction=in) → fasi con dir=in: extraction, processing, transport_in, service
+  - ATTIVA (vendita/direction=out) → fasi con dir=out: sale, transport_out, surcharge, discount
+  Se l'articolo non ha fasi, lascia null.
 * category_id e account_id: assegna SEMPRE
 * confidence 0-100
 
@@ -342,6 +372,7 @@ Rispondi con un array JSON (senza markdown):
 [{
   "line_id": "uuid",
   "article_code": "CODICE" o null,
+  "phase_code": "extraction" o null,
   "category_id": "uuid",
   "account_id": "uuid",
   "cost_center_allocations": [{"project_id": "uuid", "percentage": 100}],
@@ -462,6 +493,7 @@ async function persistResults(
   lineResults: SonnetLineResult[],
   invoiceLevel: ReturnType<typeof composeInvoiceLevel>,
   articles: ArticleRow[],
+  phases: ArticlePhaseRow[],
 ): Promise<void> {
   const codeToId = new Map(articles.map((a) => [a.code, a.id]));
   let persisted = 0;
@@ -471,6 +503,13 @@ async function persistResults(
 
     // Resolve article_code → article_id
     const articleId = lr.article_code ? (codeToId.get(lr.article_code) || null) : null;
+
+    // Resolve phase_code → phase_id
+    let phaseId: string | null = null;
+    if (articleId && lr.phase_code) {
+      const match = phases.find(p => p.article_id === articleId && p.code === lr.phase_code);
+      if (match) phaseId = match.id;
+    }
 
     // Save line-level category/account + mark as ai_suggested
     if (lr.category_id || lr.account_id) {
@@ -487,13 +526,13 @@ async function persistResults(
       }
     }
 
-    // Save article suggestion as unverified
+    // Save article suggestion as unverified (with phase_id if resolved)
     if (articleId) {
       try {
         await sql`
           INSERT INTO invoice_line_articles
-            (company_id, invoice_id, invoice_line_id, article_id, assigned_by, verified, confidence)
-          VALUES (${companyId}, ${invoiceId}, ${lr.line_id}, ${articleId}, 'ai_classification', false, ${lr.confidence})
+            (company_id, invoice_id, invoice_line_id, article_id, phase_id, assigned_by, verified, confidence)
+          VALUES (${companyId}, ${invoiceId}, ${lr.line_id}, ${articleId}, ${phaseId}, 'ai_classification', false, ${lr.confidence})
           ON CONFLICT (invoice_line_id) DO NOTHING`;
       } catch (e: unknown) {
         console.error(`[persist] line ${lr.line_id} INSERT invoice_line_articles failed:`, (e as Error).message);
@@ -592,11 +631,12 @@ Deno.serve(async (req) => {
 
   try {
     // ─── Load all context in parallel ───────────────────
-    const [articles, categories, accounts, projects] = await Promise.all([
+    const [articles, categories, accounts, projects, phases] = await Promise.all([
       sql<ArticleRow[]>`SELECT id, code, name, description, keywords FROM articles WHERE company_id = ${companyId} AND active = true ORDER BY code`,
       sql<CategoryRow[]>`SELECT id, name, type FROM categories WHERE company_id = ${companyId} AND active = true ORDER BY sort_order, name`,
       sql<AccountRow[]>`SELECT id, code, name, section FROM chart_of_accounts WHERE company_id = ${companyId} AND active = true AND is_header = false ORDER BY code`,
       sql<ProjectRow[]>`SELECT id, code, name FROM projects WHERE company_id = ${companyId} AND status = 'active' ORDER BY code`,
+      sql<ArticlePhaseRow[]>`SELECT id, article_id, code, name, phase_type, is_counting_point, invoice_direction FROM article_phases WHERE company_id = ${companyId} AND active = true ORDER BY article_id, sort_order`,
     ]);
 
     // ─── Counterparty ATECO info ────────────────────────
@@ -700,6 +740,7 @@ Deno.serve(async (req) => {
       categories,
       accounts,
       projects,
+      phases,
       counterpartyInfo,
       history,
       ragExamples,
@@ -783,6 +824,7 @@ Deno.serve(async (req) => {
     const lineResults: SonnetLineResult[] = parsed.map((item) => ({
       line_id: item.line_id,
       article_code: item.article_code || null,
+      phase_code: item.phase_code || null,
       category_id: item.category_id || null,
       account_id: item.account_id || null,
       cost_center_allocations: item.cost_center_allocations || [],
@@ -805,6 +847,7 @@ Deno.serve(async (req) => {
       lineResults,
       invoiceLevel,
       articles,
+      phases,
     );
 
     // Mark invoice as ai_suggested + save keywords
@@ -830,14 +873,23 @@ Deno.serve(async (req) => {
     // Resolve article codes to IDs for the response
     const codeToId = new Map(articles.map((a) => [a.code, a.id]));
 
+    // Build phase resolution map for response
+    const phaseResolution = new Map<string, string>();
+    for (const p of phases) phaseResolution.set(`${p.article_id}:${p.code}`, p.id);
+
     return json({
       invoice_id: invoiceId,
-      lines: lineResults.map((lr) => ({
-        ...lr,
-        article_id: lr.article_code
-          ? codeToId.get(lr.article_code) || null
-          : null,
-      })),
+      lines: lineResults.map((lr) => {
+        const articleId = lr.article_code ? codeToId.get(lr.article_code) || null : null;
+        const phaseId = articleId && lr.phase_code
+          ? phaseResolution.get(`${articleId}:${lr.phase_code}`) || null
+          : null;
+        return {
+          ...lr,
+          article_id: articleId,
+          phase_id: phaseId,
+        };
+      }),
       invoice_level: invoiceLevel,
       keywords,
       stats: {

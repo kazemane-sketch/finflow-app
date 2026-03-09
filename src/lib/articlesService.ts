@@ -38,6 +38,29 @@ export interface Article {
   updated_at: string
 }
 
+export interface ArticlePhase {
+  id: string
+  company_id: string
+  article_id: string
+  code: string
+  name: string
+  phase_type: 'cost' | 'revenue' | 'neutral'
+  is_counting_point: boolean
+  invoice_direction: 'in' | 'out' | null
+  default_account_id: string | null
+  default_category_id: string | null
+  sort_order: number
+  notes: string | null
+  active: boolean
+  created_at: string
+}
+
+export interface ArticleWithPhases extends Article {
+  phases: ArticlePhase[]
+}
+
+export type PhasePreset = 'ciclo_completo' | 'acquisto_vendita' | 'solo_vendita' | 'personalizzato'
+
 export interface ArticleCreate {
   code: string
   name: string
@@ -66,6 +89,7 @@ export interface InvoiceLineArticle {
   invoice_line_id: string
   invoice_id: string
   article_id: string
+  phase_id: string | null
   quantity: number | null
   unit_price: number | null
   total_price: number | null
@@ -94,6 +118,7 @@ export interface MatchResult {
   totalKeywords: number
   source: 'deterministic' | 'ai'
   reasoning?: string
+  phase_id?: string | null
 }
 
 export interface UnassignedLine {
@@ -329,7 +354,7 @@ import type { LearnedRule } from '@/lib/articleMatching'
 export async function loadLearnedRules(companyId: string): Promise<LearnedRule[]> {
   const { data, error } = await supabase
     .from('article_assignment_rules')
-    .select('id, article_id, pattern, confidence, hit_count, reject_count, source')
+    .select('id, article_id, phase_id, pattern, confidence, hit_count, reject_count, source')
     .eq('company_id', companyId)
 
   if (error) throw error
@@ -508,23 +533,27 @@ export async function assignArticleToLine(
   assignedBy: 'manual' | 'ai_auto' | 'ai_confirmed',
   confidence?: number,
   location?: string | null,
+  phaseId?: string | null,
 ): Promise<void> {
+  const row: Record<string, unknown> = {
+    company_id: companyId,
+    invoice_line_id: invoiceLineId,
+    invoice_id: invoiceId,
+    article_id: articleId,
+    quantity: lineData.quantity ?? null,
+    unit_price: lineData.unit_price ?? null,
+    total_price: lineData.total_price ?? null,
+    vat_rate: lineData.vat_rate ?? null,
+    assigned_by: assignedBy,
+    confidence: confidence ?? null,
+    verified: assignedBy === 'manual' || assignedBy === 'ai_confirmed',
+    location: location ?? null,
+  }
+  if (phaseId) row.phase_id = phaseId
+
   const { error } = await supabase
     .from('invoice_line_articles')
-    .upsert({
-      company_id: companyId,
-      invoice_line_id: invoiceLineId,
-      invoice_id: invoiceId,
-      article_id: articleId,
-      quantity: lineData.quantity ?? null,
-      unit_price: lineData.unit_price ?? null,
-      total_price: lineData.total_price ?? null,
-      vat_rate: lineData.vat_rate ?? null,
-      assigned_by: assignedBy,
-      confidence: confidence ?? null,
-      verified: assignedBy === 'manual' || assignedBy === 'ai_confirmed',
-      location: location ?? null,
-    }, { onConflict: 'invoice_line_id' })
+    .upsert(row, { onConflict: 'invoice_line_id' })
 
   if (error) throw error
 }
@@ -580,6 +609,7 @@ export async function recordAssignmentFeedback(
   articleId: string,
   description: string,
   accepted: boolean,
+  phaseId?: string | null,
 ): Promise<void> {
   // Build significant keywords from description (filter out stop words, short words, numbers)
   const descKeywords = extractSignificantKeywords(description)
@@ -640,13 +670,15 @@ export async function recordAssignmentFeedback(
     }
   } else if (accepted) {
     // No matching rule found — create a new learned rule
-    await supabase.from('article_assignment_rules').insert({
+    const newRule: Record<string, unknown> = {
       company_id: companyId,
       article_id: articleId,
       pattern: { description_contains: descKeywords },
       confidence: 0.6,
       source: 'learned',
-    })
+    }
+    if (phaseId) newRule.phase_id = phaseId
+    await supabase.from('article_assignment_rules').insert(newRule)
   }
 
   // RAG: create learning example for accepted assignments (fire-and-forget)
@@ -655,7 +687,7 @@ export async function recordAssignmentFeedback(
       .from('articles').select('code, name').eq('id', articleId).single()
     if (artData) {
       createArticleExample(companyId, description, null, null,
-        artData.code, artData.name, articleId, null,
+        artData.code, artData.name, articleId, null, phaseId,
       ).catch(err => console.warn('[recordAssignmentFeedback] learning example error:', err))
     }
   }
@@ -667,6 +699,7 @@ interface FeedbackItem {
   articleId: string
   description: string
   accepted: boolean
+  phaseId?: string | null
 }
 
 /**
@@ -694,7 +727,7 @@ export async function batchRecordFeedback(
   // 2. In-memory: accumulate deltas per rule + collect new rules
   const ruleDelta = new Map<string, { hits: number; rejects: number; currentHits: number; currentRejects: number; currentConf: number }>()
   // Track new rules needed: key = articleId|kw_key
-  const newRuleMap = new Map<string, { articleId: string; keywords: string[]; hits: number }>()
+  const newRuleMap = new Map<string, { articleId: string; keywords: string[]; hits: number; phaseId: string | null }>()
 
   for (const fb of feedbacks) {
     const descKeywords = extractSignificantKeywords(fb.description)
@@ -733,7 +766,7 @@ export async function batchRecordFeedback(
       if (existing) {
         existing.hits++
       } else {
-        newRuleMap.set(kwKey, { articleId: fb.articleId, keywords: descKeywords, hits: 1 })
+        newRuleMap.set(kwKey, { articleId: fb.articleId, keywords: descKeywords, hits: 1, phaseId: fb.phaseId || null })
       }
     }
   }
@@ -766,14 +799,18 @@ export async function batchRecordFeedback(
   if (updatePromises.length > 0) await Promise.all(updatePromises)
 
   // 4. Bulk insert new rules
-  const newRules = [...newRuleMap.values()].map(nr => ({
-    company_id: companyId,
-    article_id: nr.articleId,
-    pattern: { description_contains: nr.keywords },
-    confidence: Math.min(0.6 + (nr.hits - 1) * 0.05, 0.95),
-    source: 'learned',
-    hit_count: nr.hits,
-  }))
+  const newRules = [...newRuleMap.values()].map(nr => {
+    const rule: Record<string, unknown> = {
+      company_id: companyId,
+      article_id: nr.articleId,
+      pattern: { description_contains: nr.keywords },
+      confidence: Math.min(0.6 + (nr.hits - 1) * 0.05, 0.95),
+      source: 'learned',
+      hit_count: nr.hits,
+    }
+    if (nr.phaseId) rule.phase_id = nr.phaseId
+    return rule
+  })
   if (newRules.length > 0) {
     await supabase.from('article_assignment_rules').insert(newRules)
   }
@@ -879,6 +916,7 @@ export interface SavedSuggestion {
   invoice_line_id: string
   invoice_id: string
   article_id: string
+  phase_id: string | null
   confidence: number
   article_code: string
   article_name: string
@@ -954,7 +992,7 @@ export async function loadSavedSuggestions(companyId: string): Promise<SavedSugg
     const { data, error } = await supabase
       .from('invoice_line_articles')
       .select(`
-        invoice_line_id, invoice_id, article_id, confidence,
+        invoice_line_id, invoice_id, article_id, phase_id, confidence,
         article:articles!inner(code, name, unit, keywords),
         line:invoice_lines!inner(description, line_number, quantity, unit_price, total_price, vat_rate, article_code),
         invoice:invoices!inner(number, date, direction, counterparty)
@@ -971,6 +1009,7 @@ export async function loadSavedSuggestions(companyId: string): Promise<SavedSugg
         invoice_line_id: row.invoice_line_id,
         invoice_id: row.invoice_id,
         article_id: row.article_id,
+        phase_id: row.phase_id || null,
         confidence: row.confidence,
         article_code: row.article?.code || '',
         article_name: row.article?.name || '',
@@ -1006,6 +1045,7 @@ export interface ClassifiedLine {
   invoice_line_id: string
   invoice_id: string
   article_id: string
+  phase_id: string | null
   article_code: string
   article_name: string
   confidence: number | null
@@ -1043,7 +1083,7 @@ export async function loadClassifiedLines(companyId: string): Promise<Classified
     const { data, error } = await supabase
       .from('invoice_line_articles')
       .select(`
-        invoice_line_id, invoice_id, article_id, confidence, assigned_by,
+        invoice_line_id, invoice_id, article_id, phase_id, confidence, assigned_by,
         article:articles!inner(code, name),
         line:invoice_lines!inner(description, quantity, total_price),
         invoice:invoices!inner(number, date, counterparty)
@@ -1060,6 +1100,7 @@ export async function loadClassifiedLines(companyId: string): Promise<Classified
         invoice_line_id: row.invoice_line_id,
         invoice_id: row.invoice_id,
         article_id: row.article_id,
+        phase_id: row.phase_id || null,
         article_code: row.article?.code || '',
         article_name: row.article?.name || '',
         confidence: row.confidence,
@@ -1139,6 +1180,244 @@ export async function unskipLine(lineId: string): Promise<void> {
     .update({ classification_status: 'pending' } as any)
     .eq('id', lineId)
   if (error) throw error
+}
+
+/* ─── Phase CRUD ─────────────────────────────── */
+
+export async function loadPhases(articleId: string): Promise<ArticlePhase[]> {
+  const { data, error } = await supabase
+    .from('article_phases')
+    .select('*')
+    .eq('article_id', articleId)
+    .order('sort_order', { ascending: true })
+  if (error) throw error
+  return (data || []) as ArticlePhase[]
+}
+
+export async function createPhase(
+  companyId: string,
+  articleId: string,
+  phase: Partial<ArticlePhase>,
+): Promise<ArticlePhase> {
+  const { data, error } = await supabase
+    .from('article_phases')
+    .insert({
+      company_id: companyId,
+      article_id: articleId,
+      code: phase.code || 'custom',
+      name: phase.name || 'Nuova fase',
+      phase_type: phase.phase_type || 'cost',
+      is_counting_point: phase.is_counting_point ?? false,
+      invoice_direction: phase.invoice_direction || null,
+      sort_order: phase.sort_order ?? 0,
+      notes: phase.notes || null,
+    })
+    .select()
+    .single()
+  if (error) throw error
+  return data as ArticlePhase
+}
+
+export async function updatePhase(
+  phaseId: string,
+  updates: Partial<ArticlePhase>,
+): Promise<void> {
+  const allowed: Record<string, unknown> = {}
+  if (updates.code !== undefined) allowed.code = updates.code
+  if (updates.name !== undefined) allowed.name = updates.name
+  if (updates.phase_type !== undefined) allowed.phase_type = updates.phase_type
+  if (updates.is_counting_point !== undefined) allowed.is_counting_point = updates.is_counting_point
+  if (updates.invoice_direction !== undefined) allowed.invoice_direction = updates.invoice_direction
+  if (updates.default_account_id !== undefined) allowed.default_account_id = updates.default_account_id
+  if (updates.default_category_id !== undefined) allowed.default_category_id = updates.default_category_id
+  if (updates.sort_order !== undefined) allowed.sort_order = updates.sort_order
+  if (updates.notes !== undefined) allowed.notes = updates.notes
+  if (updates.active !== undefined) allowed.active = updates.active
+
+  const { error } = await supabase.from('article_phases').update(allowed).eq('id', phaseId)
+  if (error) throw error
+}
+
+export async function deletePhase(phaseId: string): Promise<void> {
+  const { error } = await supabase.from('article_phases').delete().eq('id', phaseId)
+  if (error) throw error
+}
+
+/** Get phase preset template data */
+export function getPhasePresetData(preset: PhasePreset): Partial<ArticlePhase>[] {
+  switch (preset) {
+    case 'ciclo_completo':
+      return [
+        { code: 'extraction',    name: 'Estrazione',         phase_type: 'cost',    is_counting_point: false, invoice_direction: 'in',  sort_order: 1 },
+        { code: 'processing',    name: 'Lavorazione',        phase_type: 'cost',    is_counting_point: false, invoice_direction: 'in',  sort_order: 2 },
+        { code: 'transport_in',  name: 'Trasporto Ingresso', phase_type: 'cost',    is_counting_point: false, invoice_direction: 'in',  sort_order: 3 },
+        { code: 'transport_out', name: 'Trasporto Uscita',   phase_type: 'cost',    is_counting_point: false, invoice_direction: 'out', sort_order: 4 },
+        { code: 'sale',          name: 'Vendita',            phase_type: 'revenue', is_counting_point: true,  invoice_direction: 'out', sort_order: 5 },
+      ]
+    case 'acquisto_vendita':
+      return [
+        { code: 'service',       name: 'Acquisto',           phase_type: 'cost',    is_counting_point: false, invoice_direction: 'in',  sort_order: 1 },
+        { code: 'sale',          name: 'Vendita',            phase_type: 'revenue', is_counting_point: true,  invoice_direction: 'out', sort_order: 2 },
+      ]
+    case 'solo_vendita':
+      return [
+        { code: 'sale',          name: 'Vendita',            phase_type: 'revenue', is_counting_point: true,  invoice_direction: 'out', sort_order: 1 },
+      ]
+    default:
+      return []
+  }
+}
+
+/** Create phases from a preset template */
+export async function createPhasesFromPreset(
+  companyId: string,
+  articleId: string,
+  preset: PhasePreset,
+): Promise<ArticlePhase[]> {
+  const templates = getPhasePresetData(preset)
+  if (templates.length === 0) return []
+
+  const rows = templates.map(t => ({
+    company_id: companyId,
+    article_id: articleId,
+    code: t.code || 'custom',
+    name: t.name || 'Fase',
+    phase_type: t.phase_type || 'cost',
+    is_counting_point: t.is_counting_point ?? false,
+    invoice_direction: t.invoice_direction || null,
+    sort_order: t.sort_order ?? 0,
+  }))
+
+  const { data, error } = await supabase
+    .from('article_phases')
+    .upsert(rows, { onConflict: 'article_id,code', ignoreDuplicates: true })
+    .select()
+
+  if (error) throw error
+  return (data || []) as ArticlePhase[]
+}
+
+/** Load all articles with their phases pre-loaded */
+export async function loadArticlesWithPhases(
+  companyId: string,
+  filters?: ArticleFilters,
+): Promise<ArticleWithPhases[]> {
+  const articles = await loadArticles(companyId, filters)
+
+  // Batch load all phases for this company's active articles
+  const articleIds = articles.map(a => a.id)
+  if (articleIds.length === 0) return articles.map(a => ({ ...a, phases: [] }))
+
+  const { data: phases, error } = await supabase
+    .from('article_phases')
+    .select('*')
+    .in('article_id', articleIds)
+    .eq('active', true)
+    .order('sort_order', { ascending: true })
+
+  if (error) throw error
+
+  const phasesByArticle = new Map<string, ArticlePhase[]>()
+  for (const p of (phases || []) as ArticlePhase[]) {
+    if (!phasesByArticle.has(p.article_id)) phasesByArticle.set(p.article_id, [])
+    phasesByArticle.get(p.article_id)!.push(p)
+  }
+
+  return articles.map(a => ({ ...a, phases: phasesByArticle.get(a.id) || [] }))
+}
+
+/* ─── Dashboard by Phase ─────────────────────── */
+
+export interface DashboardPhaseRow {
+  article_id: string
+  article_code: string
+  article_name: string
+  phase_id: string | null
+  phase_code: string | null
+  phase_name: string | null
+  phase_type: string | null
+  is_counting_point: boolean
+  total_quantity: number
+  total_amount: number
+  avg_price: number
+  line_count: number
+}
+
+export async function loadDashboardByPhase(
+  companyId: string,
+  year?: number,
+): Promise<DashboardPhaseRow[]> {
+  // Load all verified line articles with phase info
+  const { data: lines, error: e1 } = await supabase
+    .from('invoice_line_articles')
+    .select('article_id, phase_id, quantity, total_price, invoice_id')
+    .eq('company_id', companyId)
+    .eq('verified', true)
+
+  if (e1) throw e1
+  if (!lines || lines.length === 0) return []
+
+  // If year filter, load invoices for that year
+  let validInvoiceIds: Set<string> | null = null
+  if (year) {
+    const invoiceIds = [...new Set(lines.map(l => l.invoice_id))]
+    const { data: invoices } = await supabase
+      .from('invoices')
+      .select('id, date')
+      .in('id', invoiceIds)
+      .gte('date', `${year}-01-01`)
+      .lte('date', `${year}-12-31`)
+    validInvoiceIds = new Set((invoices || []).map(i => i.id))
+  }
+
+  // Load articles + phases
+  const [{ data: articles }, { data: phases }] = await Promise.all([
+    supabase.from('articles').select('id, code, name').eq('company_id', companyId),
+    supabase.from('article_phases').select('id, article_id, code, name, phase_type, is_counting_point').eq('company_id', companyId),
+  ])
+
+  const artMap = new Map((articles || []).map(a => [a.id, a]))
+  const phaseMap = new Map((phases || []).map(p => [p.id, p]))
+
+  // Aggregate by article+phase
+  const aggKey = (artId: string, phaseId: string | null) => `${artId}|${phaseId || '_'}`
+  const agg = new Map<string, { artId: string; phaseId: string | null; qty: number; amt: number; count: number }>()
+
+  for (const l of lines) {
+    if (validInvoiceIds && !validInvoiceIds.has(l.invoice_id)) continue
+    const key = aggKey(l.article_id, l.phase_id)
+    const prev = agg.get(key) || { artId: l.article_id, phaseId: l.phase_id, qty: 0, amt: 0, count: 0 }
+    prev.qty += Number(l.quantity || 0)
+    prev.amt += Number(l.total_price || 0)
+    prev.count++
+    agg.set(key, prev)
+  }
+
+  const results: DashboardPhaseRow[] = []
+  for (const stats of agg.values()) {
+    const art = artMap.get(stats.artId)
+    if (!art) continue
+    const phase = stats.phaseId ? phaseMap.get(stats.phaseId) : null
+    results.push({
+      article_id: stats.artId,
+      article_code: art.code,
+      article_name: art.name,
+      phase_id: stats.phaseId,
+      phase_code: phase?.code || null,
+      phase_name: phase?.name || null,
+      phase_type: phase?.phase_type || null,
+      is_counting_point: phase?.is_counting_point ?? true, // null phase = legacy = counting
+      total_quantity: stats.qty,
+      total_amount: stats.amt,
+      avg_price: stats.qty > 0 ? stats.amt / stats.qty : 0,
+      line_count: stats.count,
+    })
+  }
+
+  return results.sort((a, b) => {
+    if (a.article_code !== b.article_code) return a.article_code.localeCompare(b.article_code)
+    return (a.phase_code || 'zzz').localeCompare(b.phase_code || 'zzz')
+  })
 }
 
 /* ─── Categories helper ──────────────────────── */

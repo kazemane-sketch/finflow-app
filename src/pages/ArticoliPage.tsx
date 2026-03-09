@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -14,10 +14,13 @@ import {
   loadClassificationCounts, markLineSkipped, markLinesSkippedBulk,
   deleteBulkSuggestions, saveBulkSuggestions, loadSavedSuggestions,
   loadClassifiedLines, loadSkippedLines, unskipLine,
+  loadPhases, createPhase, updatePhase, deletePhase,
+  createPhasesFromPreset, loadDashboardByPhase,
   type Article, type ArticleCreate, type ArticleStats, type ArticleLineRow,
   type UnassignedLine, type MatchResult, type DashboardArticleRow,
   type ClassificationCounts, type BulkSuggestion,
   type ClassifiedLine, type SkippedLine,
+  type ArticlePhase, type PhasePreset, type DashboardPhaseRow,
   callArticleAiMatch, type AiMatchRequest,
 } from '@/lib/articlesService'
 import {
@@ -30,8 +33,8 @@ import { toast } from 'sonner'
 import { useAIJob } from '@/hooks/useAIJob'
 import {
   Package, Plus, Search, Loader2, Trash2, Save, X, Check,
-  XCircle, RefreshCw, Zap, BarChart3, Tag, ChevronRight,
-  CheckCircle2, AlertTriangle, Sparkles, Filter, Eye, Ban, Brain,
+  XCircle, RefreshCw, Zap, BarChart3, Tag, ChevronRight, ChevronDown,
+  CheckCircle2, AlertTriangle, Sparkles, Filter, Eye, Ban, Brain, Layers,
 } from 'lucide-react'
 import {
   ResponsiveContainer, BarChart, CartesianGrid, XAxis, YAxis,
@@ -108,6 +111,16 @@ export default function ArticoliPage() {
   const [showNewForm, setShowNewForm] = useState(false)
   const [newKeywordInput, setNewKeywordInput] = useState('')
 
+  // ─ Phase management state (Articles tab)
+  const [selectedPhases, setSelectedPhases] = useState<ArticlePhase[]>([])
+  const [phasesLoading, setPhasesLoading] = useState(false)
+  const [phasesExpanded, setPhasesExpanded] = useState(false)
+  const [editingPhaseId, setEditingPhaseId] = useState<string | null>(null)
+  const [phasePresetOpen, setPhasePresetOpen] = useState(false)
+
+  // ─ Phase overrides for assignment tab (lineId → phaseId)
+  const [phaseOverrides, setPhaseOverrides] = useState<Map<string, string>>(new Map())
+
   // ─ Assignment tab state
   const [unassignedLines, setUnassignedLines] = useState<UnassignedLine[]>([])
   const [matchResults, setMatchResults] = useState<Map<string, MatchResult>>(new Map())
@@ -147,6 +160,8 @@ export default function ArticoliPage() {
 
   // ─ Dashboard state
   const [dashboardData, setDashboardData] = useState<DashboardArticleRow[]>([])
+  const [dashPhaseData, setDashPhaseData] = useState<DashboardPhaseRow[]>([])
+  const [expandedDashArticles, setExpandedDashArticles] = useState<Set<string>>(new Set())
   const [dashboardLoading, setDashboardLoading] = useState(false)
   const [dashYear, setDashYear] = useState(new Date().getFullYear())
   const [totalAssigned, setTotalAssigned] = useState(0)
@@ -176,6 +191,7 @@ export default function ArticoliPage() {
     if (!selectedId || !companyId) {
       setArticleStats(null)
       setArticleLines([])
+      setSelectedPhases([])
       return
     }
     const art = articles.find(a => a.id === selectedId)
@@ -194,15 +210,18 @@ export default function ArticoliPage() {
     }
 
     setStatsLoading(true)
+    setPhasesLoading(true)
     Promise.all([
       loadArticleStats(selectedId, companyId),
       loadArticleLines(selectedId, companyId),
-    ]).then(([stats, lines]) => {
+      loadPhases(selectedId),
+    ]).then(([stats, lines, phases]) => {
       setArticleStats(stats)
       setArticleLines(lines)
+      setSelectedPhases(phases)
     }).catch(err => {
       console.error('Stats load error:', err)
-    }).finally(() => setStatsLoading(false))
+    }).finally(() => { setStatsLoading(false); setPhasesLoading(false) })
   }, [selectedId, companyId, articles])
 
   // ─── filtered articles ──────────────────────
@@ -421,6 +440,53 @@ export default function ArticoliPage() {
     })
   }, [companyId, analyzeStartOrStop])
 
+  // ─── phases by article (for assignment tab dropdown) ─
+  const [articlePhasesMap, setArticlePhasesMap] = useState<Map<string, ArticlePhase[]>>(new Map())
+
+  // Load phases for all unique articles in match results
+  useEffect(() => {
+    const articleIds = new Set<string>()
+    for (const [, match] of matchResults) {
+      articleIds.add(match.article.id)
+    }
+    // Also include overridden articles
+    for (const [, art] of articleOverrides) {
+      articleIds.add(art.id)
+    }
+    if (articleIds.size === 0) { setArticlePhasesMap(new Map()); return }
+
+    // Only load phases for articles we don't already have cached
+    const toLoad = [...articleIds].filter(id => !articlePhasesMap.has(id))
+    if (toLoad.length === 0) return
+
+    let cancelled = false
+    Promise.all(toLoad.map(id => loadPhases(id).then(phases => [id, phases] as const)))
+      .then(results => {
+        if (cancelled) return
+        setArticlePhasesMap(prev => {
+          const next = new Map(prev)
+          for (const [id, phases] of results) next.set(id, phases)
+          return next
+        })
+      })
+      .catch(err => console.warn('[ArticoliPage] phases load error:', err))
+    return () => { cancelled = true }
+  }, [matchResults, articleOverrides]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Helper: get best default phase for a line given its invoice direction
+  const getDefaultPhaseId = useCallback((articleId: string, invoiceDirection: string | null): string | null => {
+    const phases = articlePhasesMap.get(articleId)
+    if (!phases || phases.length === 0) return null
+    // Passive invoice (in = acquisto) → cost phases (invoice_direction = 'in')
+    // Active invoice (out = vendita) → revenue phases (invoice_direction = 'out')
+    const dir = invoiceDirection // 'in' or 'out'
+    const eligible = phases.filter(p => p.active && (!p.invoice_direction || p.invoice_direction === dir))
+    if (eligible.length > 0) return eligible[0].id
+    // Fallback: first active phase
+    const firstActive = phases.find(p => p.active)
+    return firstActive?.id || null
+  }, [articlePhasesMap])
+
   // ─── Assignment: confirm single (with override support) ──
   const confirmAssignment = useCallback(async (line: UnassignedLine, match: MatchResult) => {
     if (!companyId) return
@@ -431,6 +497,10 @@ export default function ArticoliPage() {
       const finalArticle = override || match.article
       const wasChanged = !!(override && override.id !== match.article.id)
 
+      // Resolve phase: user override > auto-default > null
+      const phaseId = phaseOverrides.get(line.id)
+        || getDefaultPhaseId(finalArticle.id, line.invoice_direction)
+
       const location = extractLocation(line.description || '')
       await assignArticleToLine(
         companyId, line.id, line.invoice_id, finalArticle.id,
@@ -438,16 +508,17 @@ export default function ArticoliPage() {
         wasChanged ? 'manual' : 'ai_confirmed',
         wasChanged ? undefined : match.confidence,
         location,
+        phaseId,
       )
 
       if (wasChanged) {
         // Reject feedback on original suggestion's rule
-        await recordAssignmentFeedback(companyId, match.article.id, line.description || '', false)
+        await recordAssignmentFeedback(companyId, match.article.id, line.description || '', false, null)
         // Accept feedback for the user-chosen article
-        await recordAssignmentFeedback(companyId, finalArticle.id, line.description || '', true)
+        await recordAssignmentFeedback(companyId, finalArticle.id, line.description || '', true, phaseId)
       } else {
         // Confirmed without changes → hit_count++ as before
-        await recordAssignmentFeedback(companyId, match.article.id, line.description || '', true)
+        await recordAssignmentFeedback(companyId, match.article.id, line.description || '', true, phaseId)
       }
 
       // Cleanup
@@ -455,6 +526,7 @@ export default function ArticoliPage() {
       matchResults.delete(line.id)
       setMatchResults(new Map(matchResults))
       setArticleOverrides(prev => { const next = new Map(prev); next.delete(line.id); return next })
+      setPhaseOverrides(prev => { const next = new Map(prev); next.delete(line.id); return next })
       setKpiCounts(prev => ({
         ...prev,
         classified: prev.classified + 1,
@@ -465,7 +537,7 @@ export default function ArticoliPage() {
       toast.error(`Errore: ${err.message}`)
     }
     setConfirmingLineId(null)
-  }, [companyId, matchResults, articleOverrides])
+  }, [companyId, matchResults, articleOverrides, phaseOverrides, getDefaultPhaseId])
 
   // ─── Assignment: reject single ──────────────
   const rejectAssignment = useCallback(async (lineId: string, match: MatchResult) => {
@@ -475,8 +547,9 @@ export default function ArticoliPage() {
       if (line) await recordAssignmentFeedback(companyId, match.article.id, line.description || '', false)
       matchResults.delete(lineId)
       setMatchResults(new Map(matchResults))
-      // Cleanup any override for this line
+      // Cleanup any overrides for this line
       setArticleOverrides(prev => { const next = new Map(prev); next.delete(lineId); return next })
+      setPhaseOverrides(prev => { const next = new Map(prev); next.delete(lineId); return next })
     } catch (err: any) {
       console.error('Reject feedback error:', err)
     }
@@ -489,8 +562,12 @@ export default function ArticoliPage() {
     try {
       const dateFrom = `${dashYear}-01-01`
       const dateTo = `${dashYear}-12-31`
-      const data = await loadDashboardStats(companyId, dateFrom, dateTo)
+      const [data, phaseData] = await Promise.all([
+        loadDashboardStats(companyId, dateFrom, dateTo),
+        loadDashboardByPhase(companyId, dashYear),
+      ])
       setDashboardData(data)
+      setDashPhaseData(phaseData)
 
       // Count totals for KPI
       const { count: assigned } = await supabase
@@ -582,14 +659,25 @@ export default function ArticoliPage() {
     if (activeTab === 'dashboard') loadDashboard()
   }, [activeTab, loadDashboard])
 
-  // ─── chart data ─────────────────────────────
+  // ─── chart data (stacked: costi vs ricavi from phase data) ─
   const chartData = useMemo(() => {
-    return dashboardData.map(d => ({
-      name: d.code,
-      quantita: Math.round(d.total_quantity),
-      fatturato: Math.round(d.total_revenue),
-    }))
-  }, [dashboardData])
+    return dashboardData.map(d => {
+      // Sum cost phases and revenue phases from dashPhaseData
+      const phaseRows = dashPhaseData.filter(p => p.article_id === d.article_id)
+      const costi = phaseRows
+        .filter(p => p.phase_type === 'cost')
+        .reduce((s, p) => s + Math.abs(p.total_amount), 0)
+      const ricavi = phaseRows
+        .filter(p => p.phase_type === 'revenue')
+        .reduce((s, p) => s + Math.abs(p.total_amount), 0)
+      return {
+        name: d.code,
+        costi: Math.round(costi || d.total_revenue * 0), // fallback 0 if no phase data
+        ricavi: Math.round(ricavi || d.total_revenue),   // fallback to total if no phases
+        fatturato: Math.round(d.total_revenue),
+      }
+    })
+  }, [dashboardData, dashPhaseData])
 
   const dashTotals = useMemo(() => {
     const qty = dashboardData.reduce((s, d) => s + d.total_quantity, 0)
@@ -678,7 +766,7 @@ export default function ArticoliPage() {
       // ── Phase 1: Build bulk upsert rows for invoice_line_articles ──
       setBulkProgress(`Preparando ${total} righe...`)
       const upsertRows: any[] = []
-      const feedbacks: { articleId: string; description: string; accepted: boolean }[] = []
+      const feedbacks: { articleId: string; description: string; accepted: boolean; phaseId?: string | null }[] = []
 
       for (const line of filteredMatchedLines) {
         const match = matchResults.get(line.id)
@@ -686,6 +774,10 @@ export default function ArticoliPage() {
         const override = articleOverrides.get(line.id)
         const finalArticle = override || match.article
         const wasChanged = !!(override && override.id !== match.article.id)
+
+        // Resolve phase: user override > auto-default > null
+        const phaseId = phaseOverrides.get(line.id)
+          || getDefaultPhaseId(finalArticle.id, line.invoice_direction)
 
         upsertRows.push({
           company_id: companyId,
@@ -700,14 +792,15 @@ export default function ArticoliPage() {
           confidence: wasChanged ? null : match.confidence ?? null,
           verified: true,
           location: extractLocation(line.description || '') ?? null,
+          phase_id: phaseId ?? null,
         })
 
         // Collect feedback items (reject old + accept new if overridden)
         if (wasChanged) {
           feedbacks.push({ articleId: match.article.id, description: line.description || '', accepted: false })
-          feedbacks.push({ articleId: finalArticle.id, description: line.description || '', accepted: true })
+          feedbacks.push({ articleId: finalArticle.id, description: line.description || '', accepted: true, phaseId })
         } else {
-          feedbacks.push({ articleId: match.article.id, description: line.description || '', accepted: true })
+          feedbacks.push({ articleId: match.article.id, description: line.description || '', accepted: true, phaseId })
         }
       }
 
@@ -744,7 +837,7 @@ export default function ArticoliPage() {
     } finally {
       setAssignmentLoading(false)
     }
-  }, [companyId, filteredMatchedLines, matchResults, articleOverrides, analyzeUnassigned])
+  }, [companyId, filteredMatchedLines, matchResults, articleOverrides, phaseOverrides, getDefaultPhaseId, analyzeUnassigned])
 
   // ─── Skip: single line ────────────────────────
   const skipLine = useCallback(async (lineId: string) => {
@@ -1152,6 +1245,217 @@ export default function ArticoliPage() {
                       </div>
                       <p className="text-[9px] text-gray-400 mt-1">Premi Invio o virgola per aggiungere</p>
                     </div>
+
+                    {/* ─── Phases section ─── */}
+                    {draft.id && (
+                      <div className="border rounded-lg overflow-hidden">
+                        <button
+                          onClick={() => setPhasesExpanded(!phasesExpanded)}
+                          className="w-full flex items-center justify-between px-3 py-2 bg-gray-50 hover:bg-gray-100 transition-colors"
+                        >
+                          <span className="flex items-center gap-2 text-xs font-medium text-gray-700">
+                            <Layers className="h-3.5 w-3.5 text-blue-500" />
+                            Fasi del ciclo produttivo
+                            {selectedPhases.length > 0 && (
+                              <span className="text-[10px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full font-semibold">
+                                {selectedPhases.length}
+                              </span>
+                            )}
+                          </span>
+                          {phasesExpanded ? <ChevronDown className="h-3.5 w-3.5 text-gray-400" /> : <ChevronRight className="h-3.5 w-3.5 text-gray-400" />}
+                        </button>
+
+                        {phasesExpanded && (
+                          <div className="px-3 py-2 space-y-2">
+                            {phasesLoading ? (
+                              <div className="flex items-center justify-center py-4">
+                                <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
+                              </div>
+                            ) : selectedPhases.length === 0 ? (
+                              <p className="text-[11px] text-gray-400 text-center py-3">Nessuna fase configurata</p>
+                            ) : (
+                              <div className="space-y-1">
+                                {selectedPhases.map(phase => (
+                                  <div
+                                    key={phase.id}
+                                    className={`flex items-center gap-2 px-2 py-1.5 rounded text-[11px] ${
+                                      editingPhaseId === phase.id ? 'bg-blue-50 ring-1 ring-blue-200' : 'bg-gray-50 hover:bg-gray-100'
+                                    } transition-colors cursor-pointer`}
+                                    onClick={() => setEditingPhaseId(editingPhaseId === phase.id ? null : phase.id)}
+                                  >
+                                    <span className={`font-mono font-bold px-1.5 py-0.5 rounded text-[10px] ${
+                                      phase.phase_type === 'revenue' ? 'bg-emerald-100 text-emerald-800' :
+                                      phase.phase_type === 'neutral' ? 'bg-gray-100 text-gray-600' :
+                                      'bg-slate-100 text-slate-700'
+                                    }`}>{phase.code}</span>
+                                    <span className="flex-1 text-gray-800">{phase.name}</span>
+                                    {phase.is_counting_point && (
+                                      <span className="h-2 w-2 rounded-full bg-emerald-500 shrink-0" title="Counting point" />
+                                    )}
+                                    {phase.invoice_direction && (
+                                      <span className={`text-[9px] px-1 py-0.5 rounded ${
+                                        phase.invoice_direction === 'in' ? 'bg-blue-50 text-blue-600' : 'bg-amber-50 text-amber-600'
+                                      }`}>{phase.invoice_direction === 'in' ? 'IN' : 'OUT'}</span>
+                                    )}
+                                    <button
+                                      onClick={async (e) => {
+                                        e.stopPropagation()
+                                        if (!confirm(`Eliminare fase "${phase.name}"?`)) return
+                                        try {
+                                          await deletePhase(phase.id)
+                                          setSelectedPhases(prev => prev.filter(p => p.id !== phase.id))
+                                          toast.success('Fase eliminata')
+                                        } catch (err: any) { toast.error(err.message) }
+                                      }}
+                                      className="text-gray-300 hover:text-red-500 transition-colors"
+                                    >
+                                      <Trash2 className="h-3 w-3" />
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            {/* Inline edit form for selected phase */}
+                            {editingPhaseId && (() => {
+                              const ph = selectedPhases.find(p => p.id === editingPhaseId)
+                              if (!ph) return null
+                              return (
+                                <div className="p-2 bg-blue-50 rounded border border-blue-200 space-y-2 mt-1">
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <div>
+                                      <Label className="text-[10px]">Codice</Label>
+                                      <Input
+                                        value={ph.code}
+                                        onChange={e => setSelectedPhases(prev => prev.map(p => p.id === ph.id ? { ...p, code: e.target.value } : p))}
+                                        className="h-7 text-[11px]"
+                                      />
+                                    </div>
+                                    <div>
+                                      <Label className="text-[10px]">Nome</Label>
+                                      <Input
+                                        value={ph.name}
+                                        onChange={e => setSelectedPhases(prev => prev.map(p => p.id === ph.id ? { ...p, name: e.target.value } : p))}
+                                        className="h-7 text-[11px]"
+                                      />
+                                    </div>
+                                  </div>
+                                  <div className="grid grid-cols-3 gap-2">
+                                    <div>
+                                      <Label className="text-[10px]">Tipo</Label>
+                                      <select
+                                        value={ph.phase_type}
+                                        onChange={e => setSelectedPhases(prev => prev.map(p => p.id === ph.id ? { ...p, phase_type: e.target.value as any } : p))}
+                                        className="w-full h-7 text-[11px] border rounded px-1"
+                                      >
+                                        <option value="cost">Costo</option>
+                                        <option value="revenue">Ricavo</option>
+                                        <option value="neutral">Neutro</option>
+                                      </select>
+                                    </div>
+                                    <div>
+                                      <Label className="text-[10px]">Direzione</Label>
+                                      <select
+                                        value={ph.invoice_direction || ''}
+                                        onChange={e => setSelectedPhases(prev => prev.map(p => p.id === ph.id ? { ...p, invoice_direction: (e.target.value || null) as any } : p))}
+                                        className="w-full h-7 text-[11px] border rounded px-1"
+                                      >
+                                        <option value="">—</option>
+                                        <option value="in">Passiva (IN)</option>
+                                        <option value="out">Attiva (OUT)</option>
+                                      </select>
+                                    </div>
+                                    <div className="flex items-end gap-1 pb-0.5">
+                                      <label className="flex items-center gap-1 text-[10px] cursor-pointer">
+                                        <input
+                                          type="checkbox"
+                                          checked={ph.is_counting_point}
+                                          onChange={e => setSelectedPhases(prev => prev.map(p => p.id === ph.id ? { ...p, is_counting_point: e.target.checked } : p))}
+                                          className="w-3 h-3"
+                                        />
+                                        Tonnellaggio
+                                      </label>
+                                    </div>
+                                  </div>
+                                  <Button
+                                    size="sm"
+                                    className="h-6 text-[10px] bg-blue-600 hover:bg-blue-700"
+                                    onClick={async () => {
+                                      try {
+                                        await updatePhase(ph.id, { code: ph.code, name: ph.name, phase_type: ph.phase_type, invoice_direction: ph.invoice_direction, is_counting_point: ph.is_counting_point })
+                                        toast.success('Fase aggiornata')
+                                        setEditingPhaseId(null)
+                                      } catch (err: any) { toast.error(err.message) }
+                                    }}
+                                  >
+                                    <Save className="h-2.5 w-2.5 mr-1" /> Salva fase
+                                  </Button>
+                                </div>
+                              )
+                            })()}
+
+                            {/* Add phase: preset dropdown */}
+                            <div className="relative pt-1">
+                              <button
+                                onClick={() => setPhasePresetOpen(!phasePresetOpen)}
+                                className="flex items-center gap-1 text-[10px] text-blue-600 hover:text-blue-800 transition-colors"
+                              >
+                                <Plus className="h-3 w-3" /> Aggiungi fasi
+                              </button>
+                              {phasePresetOpen && (
+                                <div className="absolute left-0 top-6 z-20 bg-white shadow-lg border rounded-lg py-1 text-[11px] w-48">
+                                  {([
+                                    ['ciclo_completo', 'Ciclo completo (5 fasi)'],
+                                    ['acquisto_vendita', 'Acquisto + Vendita (2)'],
+                                    ['solo_vendita', 'Solo vendita (1)'],
+                                  ] as [PhasePreset, string][]).map(([preset, label]) => (
+                                    <button
+                                      key={preset}
+                                      className="w-full text-left px-3 py-1.5 hover:bg-blue-50 transition-colors"
+                                      onClick={async () => {
+                                        if (!companyId || !draft.id) return
+                                        try {
+                                          const newPhases = await createPhasesFromPreset(companyId, draft.id, preset)
+                                          setSelectedPhases(prev => {
+                                            const existing = new Set(prev.map(p => p.code))
+                                            return [...prev, ...newPhases.filter(p => !existing.has(p.code))]
+                                              .sort((a, b) => a.sort_order - b.sort_order)
+                                          })
+                                          toast.success(`Fasi "${label}" create`)
+                                        } catch (err: any) { toast.error(err.message) }
+                                        setPhasePresetOpen(false)
+                                      }}
+                                    >
+                                      {label}
+                                    </button>
+                                  ))}
+                                  <button
+                                    className="w-full text-left px-3 py-1.5 hover:bg-blue-50 transition-colors border-t"
+                                    onClick={async () => {
+                                      if (!companyId || !draft.id) return
+                                      try {
+                                        const newPhase = await createPhase(companyId, draft.id, {
+                                          code: 'custom',
+                                          name: 'Nuova fase',
+                                          phase_type: 'cost',
+                                          sort_order: selectedPhases.length + 1,
+                                        })
+                                        setSelectedPhases(prev => [...prev, newPhase])
+                                        setEditingPhaseId(newPhase.id)
+                                        toast.success('Fase creata — modifica i campi')
+                                      } catch (err: any) { toast.error(err.message) }
+                                      setPhasePresetOpen(false)
+                                    }}
+                                  >
+                                    Personalizzata...
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
 
                     {/* Action buttons */}
                     <div className="flex items-center gap-2 pt-2">
@@ -1614,6 +1918,40 @@ export default function ArticoliPage() {
                                     {displayArticle.name}
                                     {isOverridden && <span className="text-purple-500 ml-1 font-medium">(modificato)</span>}
                                   </span>
+                                  {/* Phase select dropdown */}
+                                  {(() => {
+                                    const phases = articlePhasesMap.get(displayArticle.id) || []
+                                    if (phases.length === 0) return null
+                                    const dir = line.invoice_direction
+                                    const eligible = phases.filter(p => p.active && (!p.invoice_direction || p.invoice_direction === dir))
+                                    const selectedPhaseId = phaseOverrides.get(line.id)
+                                      || getDefaultPhaseId(displayArticle.id, dir)
+                                    return (
+                                      <select
+                                        value={selectedPhaseId || ''}
+                                        onChange={(e) => {
+                                          e.stopPropagation()
+                                          setPhaseOverrides(prev => {
+                                            const next = new Map(prev)
+                                            next.set(line.id, e.target.value)
+                                            return next
+                                          })
+                                        }}
+                                        onClick={(e) => e.stopPropagation()}
+                                        className="text-[10px] border rounded px-1.5 py-0.5 bg-slate-50 text-slate-700 focus:outline-none focus:ring-1 focus:ring-orange-400 max-w-[160px]"
+                                        title="Fase del ciclo produttivo"
+                                      >
+                                        {eligible.length === 0 && phases.length > 0 && (
+                                          <option value="">— fase —</option>
+                                        )}
+                                        {(eligible.length > 0 ? eligible : phases.filter(p => p.active)).map(p => (
+                                          <option key={p.id} value={p.id}>
+                                            {p.name}{p.is_counting_point ? ' ●' : ''}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    )
+                                  })()}
                                 </div>
                                 <p className="text-[11px] text-gray-700 mt-1 line-clamp-2">{line.description}</p>
                                 <div className="flex items-center gap-3 mt-1 text-[10px] text-gray-400">
@@ -1852,47 +2190,117 @@ export default function ArticoliPage() {
             </Card>
           ) : (
             <>
-              {/* Summary table */}
+              {/* Summary table with expandable phase rows */}
               <Card>
                 <CardHeader className="pb-2">
-                  <CardTitle className="text-sm">Riepilogo per articolo</CardTitle>
+                  <CardTitle className="text-sm flex items-center gap-2">
+                    Riepilogo per articolo
+                    {dashPhaseData.length > 0 && (
+                      <span className="text-[10px] font-normal text-gray-400 flex items-center gap-1">
+                        <Layers className="h-3 w-3" /> con fasi
+                      </span>
+                    )}
+                  </CardTitle>
                 </CardHeader>
                 <CardContent className="p-0">
                   <table className="w-full text-xs">
                     <thead className="bg-gray-50">
                       <tr className="border-b">
+                        <th className="text-left px-4 py-2.5 font-medium text-gray-500 w-8"></th>
                         <th className="text-left px-4 py-2.5 font-medium text-gray-500">Articolo</th>
-                        <th className="text-right px-4 py-2.5 font-medium text-gray-500">Quantità</th>
-                        <th className="text-right px-4 py-2.5 font-medium text-gray-500">Fatturato</th>
+                        <th className="text-right px-4 py-2.5 font-medium text-gray-500">Tonnellaggio</th>
+                        <th className="text-right px-4 py-2.5 font-medium text-gray-500">Importo</th>
                         <th className="text-right px-4 py-2.5 font-medium text-gray-500">P. Medio</th>
                         <th className="text-right px-4 py-2.5 font-medium text-gray-500">Righe</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y">
-                      {dashboardData.map(row => (
-                        <tr key={row.article_id} className="hover:bg-gray-50/50">
-                          <td className="px-4 py-2">
-                            <div className="flex items-center gap-2">
-                              <span className="font-mono font-bold text-orange-700 text-[11px] bg-orange-50 px-1.5 py-0.5 rounded">{row.code}</span>
-                              <span className="text-gray-800">{row.name}</span>
-                            </div>
-                          </td>
-                          <td className="px-4 py-2 text-right font-mono">{fmtNum(row.total_quantity)} {UNIT_SHORT[row.unit] || row.unit}</td>
-                          <td className="px-4 py-2 text-right font-semibold text-emerald-700">{fmtEur(row.total_revenue)}</td>
-                          <td className="px-4 py-2 text-right text-blue-700">{fmtEur(row.avg_price)}/{UNIT_SHORT[row.unit] || row.unit}</td>
-                          <td className="px-4 py-2 text-right text-gray-500">{row.line_count}</td>
-                        </tr>
-                      ))}
+                      {dashboardData.map(row => {
+                        const phaseRows = dashPhaseData.filter(p => p.article_id === row.article_id)
+                        const hasPhases = phaseRows.length > 0
+                        const isExpanded = expandedDashArticles.has(row.article_id)
+                        // Tonnage = only counting_point phases (from v_article_tonnage via dashboardData)
+                        return (
+                          <React.Fragment key={row.article_id}>
+                            <tr
+                              className={`hover:bg-gray-50/50 ${hasPhases ? 'cursor-pointer' : ''}`}
+                              onClick={() => {
+                                if (!hasPhases) return
+                                setExpandedDashArticles(prev => {
+                                  const next = new Set(prev)
+                                  if (next.has(row.article_id)) next.delete(row.article_id)
+                                  else next.add(row.article_id)
+                                  return next
+                                })
+                              }}
+                            >
+                              <td className="px-2 py-2 text-center w-8">
+                                {hasPhases && (
+                                  isExpanded
+                                    ? <ChevronDown className="h-3.5 w-3.5 text-gray-400 inline" />
+                                    : <ChevronRight className="h-3.5 w-3.5 text-gray-400 inline" />
+                                )}
+                              </td>
+                              <td className="px-4 py-2">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono font-bold text-orange-700 text-[11px] bg-orange-50 px-1.5 py-0.5 rounded">{row.code}</span>
+                                  <span className="text-gray-800 font-medium">{row.name}</span>
+                                  {hasPhases && (
+                                    <span className="text-[9px] text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded-full">{phaseRows.length} fasi</span>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="px-4 py-2 text-right font-mono">{fmtNum(row.total_quantity)} {UNIT_SHORT[row.unit] || row.unit}</td>
+                              <td className="px-4 py-2 text-right font-semibold text-emerald-700">{fmtEur(row.total_revenue)}</td>
+                              <td className="px-4 py-2 text-right text-blue-700">{fmtEur(row.avg_price)}/{UNIT_SHORT[row.unit] || row.unit}</td>
+                              <td className="px-4 py-2 text-right text-gray-500">{row.line_count}</td>
+                            </tr>
+                            {/* Expanded phase rows */}
+                            {isExpanded && phaseRows.map(pr => (
+                              <tr key={`${row.article_id}-${pr.phase_id || 'null'}`} className="bg-slate-50/60">
+                                <td className="px-2 py-1.5 w-8"></td>
+                                <td className="px-4 py-1.5 pl-10">
+                                  <div className="flex items-center gap-2">
+                                    <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${
+                                      pr.phase_type === 'revenue' ? 'bg-emerald-100 text-emerald-700'
+                                      : pr.phase_type === 'cost' ? 'bg-slate-200 text-slate-700'
+                                      : 'bg-gray-100 text-gray-600'
+                                    }`}>
+                                      {pr.phase_code || '—'}
+                                    </span>
+                                    <span className="text-[11px] text-gray-600">{pr.phase_name || 'Senza fase'}</span>
+                                    {pr.is_counting_point && (
+                                      <span className="h-2 w-2 rounded-full bg-emerald-500 inline-block" title="Punto di conteggio tonnellaggio" />
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="px-4 py-1.5 text-right font-mono text-[11px] text-gray-500">
+                                  {fmtNum(pr.total_quantity)} {UNIT_SHORT[row.unit] || row.unit}
+                                </td>
+                                <td className={`px-4 py-1.5 text-right text-[11px] font-medium ${
+                                  pr.phase_type === 'revenue' ? 'text-emerald-600' : 'text-gray-600'
+                                }`}>
+                                  {fmtEur(pr.total_amount)}
+                                </td>
+                                <td className="px-4 py-1.5 text-right text-[11px] text-gray-500">
+                                  {pr.total_quantity > 0 ? `${fmtEur(pr.avg_price)}/${UNIT_SHORT[row.unit] || row.unit}` : '—'}
+                                </td>
+                                <td className="px-4 py-1.5 text-right text-[11px] text-gray-400">{pr.line_count}</td>
+                              </tr>
+                            ))}
+                          </React.Fragment>
+                        )
+                      })}
                     </tbody>
                   </table>
                 </CardContent>
               </Card>
 
-              {/* Chart */}
+              {/* Stacked bar chart — cost vs revenue by article */}
               {chartData.length > 0 && (
                 <Card>
                   <CardHeader className="pb-2">
-                    <CardTitle className="text-sm">Fatturato per articolo</CardTitle>
+                    <CardTitle className="text-sm">Costi vs Ricavi per articolo</CardTitle>
                   </CardHeader>
                   <CardContent>
                     <ResponsiveContainer width="100%" height={300}>
@@ -1904,13 +2312,11 @@ export default function ArticoliPage() {
                           tickFormatter={(v: number) => v >= 1000 ? `${(v / 1000).toFixed(0)}k` : String(v)}
                         />
                         <Tooltip
-                          formatter={(value: number, name: string) => [
-                            name === 'fatturato' ? fmtEur(value) : fmtNum(value),
-                            name === 'fatturato' ? 'Fatturato' : 'Quantità',
-                          ]}
+                          formatter={(value: number, name: string) => [fmtEur(value), name]}
                         />
                         <Legend />
-                        <Bar dataKey="fatturato" name="Fatturato (€)" fill="#f97316" radius={[4, 4, 0, 0]} />
+                        <Bar dataKey="costi" name="Costi" fill="#94a3b8" stackId="stack" radius={[0, 0, 0, 0]} />
+                        <Bar dataKey="ricavi" name="Ricavi" fill="#10b981" stackId="stack" radius={[4, 4, 0, 0]} />
                       </BarChart>
                     </ResponsiveContainer>
                   </CardContent>

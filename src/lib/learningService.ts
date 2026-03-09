@@ -98,6 +98,7 @@ export async function createArticleExample(
   articleName: string,
   articleId: string,
   lineId: string | null,
+  phaseId?: string | null,
 ): Promise<string | null> {
   const inputText = `${description} | Fornitore: ${counterpartyName || 'N/D'} | Quantita: ${quantity ?? 'N/D'}`
   const metadata: Record<string, unknown> = {
@@ -105,6 +106,7 @@ export async function createArticleExample(
     article_name: articleName,
   }
   if (lineId) metadata.invoice_line_id = lineId
+  if (phaseId) metadata.phase_id = phaseId
 
   // source_id for dedup: use article_id + description hash
   const sourceId = `art_fb:${articleId}:${description.slice(0, 80).replace(/\s+/g, '_')}`
