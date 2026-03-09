@@ -369,10 +369,10 @@ export async function exportForCommercialista(
     if (reconErr) throw reconErr
 
     const reconHeaders = [
-      'Data Conferma', 'Data Movimento', 'Importo Movimento', 'Controparte (Banca)',
+      'Data Conferma', 'Metodo', 'Data Movimento', 'Importo Movimento', 'Controparte (Banca)',
       'Descrizione Movimento', 'Banca',
       'Data Fattura', 'Numero Fattura', 'Controparte (Fattura)', 'Totale Fattura',
-      'Importo Rata', 'Importo Riconciliato', 'Tipo Match', 'Motivo',
+      'Importo Rata', 'Importo Riconciliato', 'Tipo Match', 'Motivo', 'Note',
     ]
     const reconRows: any[][] = [reconHeaders]
 
@@ -382,13 +382,44 @@ export async function exportForCommercialista(
       const inst = rec.installment as any
       reconRows.push([
         fmtDateIT(rec.confirmed_at?.slice(0, 10)),
+        'Banca',
         fmtDateIT(btx?.date), fmtNum(btx?.amount),
         btx?.counterparty_name || '', btx?.description || '',
         btx?.bank_account?.bank_name || '',
         fmtDateIT(inv?.date), inv?.number || '',
         inv?.counterparty?.name || '', fmtNum(inv?.total_amount),
         fmtNum(inst?.amount_due), fmtNum(rec.reconciled_amount),
-        rec.match_type || '', rec.match_reason || '',
+        rec.match_type || '', rec.match_reason || '', '',
+      ])
+    }
+
+    // Add cash payments to the same sheet
+    const { data: cashPayments, error: cashErr } = await supabase
+      .from('cash_payments')
+      .select(`
+        amount, payment_date, notes, created_at,
+        invoice:invoices(number, date, total_amount, counterparty:counterparties(name)),
+        installment:invoice_installments(amount_due)
+      `)
+      .eq('company_id', companyId)
+      .gte('payment_date', filters.dateFrom)
+      .lte('payment_date', filters.dateTo)
+      .order('payment_date', { ascending: true })
+
+    if (cashErr) console.warn('[export] cash payments query error:', cashErr)
+
+    for (const cp of (cashPayments || [])) {
+      const inv = cp.invoice as any
+      const inst = cp.installment as any
+      reconRows.push([
+        fmtDateIT(cp.payment_date),
+        'Contanti',
+        fmtDateIT(cp.payment_date), fmtNum(cp.amount),
+        '', '', '',
+        fmtDateIT(inv?.date), inv?.number || '',
+        inv?.counterparty?.name || '', fmtNum(inv?.total_amount),
+        fmtNum(inst?.amount_due), fmtNum(cp.amount),
+        'cash', 'Pagamento contanti', cp.notes || '',
       ])
     }
 
@@ -442,6 +473,11 @@ export async function exportForCommercialista(
     .eq('company_id', companyId).eq('reconciliation_status', 'unmatched')
     .gte('date', filters.dateFrom).lte('date', filters.dateTo)
 
+  const { count: cashPaymentCount } = await supabase
+    .from('cash_payments').select('id', { count: 'exact', head: true })
+    .eq('company_id', companyId)
+    .gte('payment_date', filters.dateFrom).lte('payment_date', filters.dateTo)
+
   const summaryRows: any[][] = [
     ['Riepilogo Export FinFlow'],
     [],
@@ -453,6 +489,7 @@ export async function exportForCommercialista(
     [],
     ['Movimenti bancari senza fattura', bankNoInvCount || 0],
     ['Riconciliazioni confermate', reconCount || 0],
+    ['Pagamenti in contanti', cashPaymentCount || 0],
     ['Movimenti non riconciliati', unmatchedCount || 0],
   ]
 

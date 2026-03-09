@@ -102,6 +102,10 @@ export interface ScadenzarioRow {
   nc_residual_after_compensation_preview: number
   days: number
   notes: string | null
+  payment_method: 'bank' | 'cash' | 'manual' | null
+  cash_payment_id: string | null
+  cash_payment_date: string | null
+  cash_payment_notes: string | null
 }
 
 export interface ScadenzarioKpis {
@@ -982,6 +986,10 @@ function toScadenzarioInstallmentRow(item: ListInstallmentJoinRow): ScadenzarioR
     nc_residual_after_compensation_preview: 0,
     days,
     notes: item.notes || null,
+    payment_method: null,
+    cash_payment_id: null,
+    cash_payment_date: null,
+    cash_payment_notes: null,
   }
 }
 
@@ -1079,6 +1087,10 @@ function toScadenzarioVatRow(row: {
     nc_residual_after_compensation_preview: 0,
     days,
     notes: null,
+    payment_method: null,
+    cash_payment_id: null,
+    cash_payment_date: null,
+    cash_payment_notes: null,
   }
 }
 
@@ -1219,6 +1231,57 @@ export async function listScadenzarioRows(companyId: string, filters: Scadenzari
       row.nc_available_amount = ncAvailable
       row.nc_net_amount = round2(Math.max(debitOpen - ncAvailable, 0))
       row.nc_residual_after_compensation_preview = round2(Math.max(ncAvailable - debitOpen, 0))
+    }
+  }
+
+  // ─── Enrich with payment method (cash / bank / manual) ───
+  const installmentIds = rows
+    .filter(r => r.kind === 'installment' && (r.status === 'paid' || r.status === 'partial'))
+    .map(r => r.id)
+
+  if (installmentIds.length > 0) {
+    // Load cash payments for these installments
+    const { data: cashPayments } = await supabase
+      .from('cash_payments')
+      .select('installment_id, id, payment_date, notes')
+      .in('installment_id', installmentIds)
+      .order('created_at', { ascending: false })
+
+    const cashMap = new Map<string, { id: string; date: string; notes: string | null }>()
+    for (const cp of (cashPayments || [])) {
+      if (cp.installment_id && !cashMap.has(cp.installment_id)) {
+        cashMap.set(cp.installment_id, { id: cp.id, date: cp.payment_date, notes: cp.notes })
+      }
+    }
+
+    // Load reconciliations for the invoice_ids to detect bank payments
+    const invoiceIds = [...new Set(rows.filter(r => r.invoice_id && installmentIds.includes(r.id)).map(r => r.invoice_id!))]
+    const reconMap = new Set<string>()
+    if (invoiceIds.length > 0) {
+      const { data: recons } = await supabase
+        .from('reconciliations')
+        .select('invoice_id')
+        .in('invoice_id', invoiceIds)
+        .not('confirmed_at', 'is', null)
+      for (const r of (recons || [])) {
+        if (r.invoice_id) reconMap.add(r.invoice_id)
+      }
+    }
+
+    for (const row of rows) {
+      if (row.kind !== 'installment') continue
+      if (row.status !== 'paid' && row.status !== 'partial') continue
+      const cash = cashMap.get(row.id)
+      if (cash) {
+        row.payment_method = 'cash'
+        row.cash_payment_id = cash.id
+        row.cash_payment_date = cash.date
+        row.cash_payment_notes = cash.notes
+      } else if (row.invoice_id && reconMap.has(row.invoice_id)) {
+        row.payment_method = 'bank'
+      } else if (row.status === 'paid' || row.status === 'partial') {
+        row.payment_method = 'manual'
+      }
     }
   }
 
@@ -1467,4 +1530,71 @@ export async function getScadenzarioAuditTotals(companyId: string): Promise<Scad
     delta_incassi: ensureAmount(row.delta_incassi),
     delta_uscite: ensureAmount(row.delta_uscite),
   }
+}
+
+/* ─── Cash Payments ─────────────────────── */
+
+export interface CashPayment {
+  id: string
+  company_id: string
+  invoice_id: string
+  installment_id: string | null
+  amount: number
+  payment_date: string
+  notes: string | null
+  registered_by: string | null
+  created_at: string
+}
+
+export async function registerCashPayment(input: {
+  companyId: string
+  invoiceId: string
+  installmentId: string
+  paymentDate: string
+  amount: number
+  notes?: string | null
+}): Promise<CashPayment> {
+  const { data: authData } = await supabase.auth.getUser()
+  const userId = authData?.user?.id || null
+
+  const { data, error } = await supabase
+    .from('cash_payments')
+    .insert({
+      company_id: input.companyId,
+      invoice_id: input.invoiceId,
+      installment_id: input.installmentId,
+      amount: input.amount,
+      payment_date: input.paymentDate,
+      notes: input.notes || null,
+      registered_by: userId,
+    })
+    .select()
+    .single()
+
+  if (error) throw new Error(error.message)
+  return data as CashPayment
+}
+
+export async function deleteCashPayment(cashPaymentId: string): Promise<void> {
+  const { error } = await supabase
+    .from('cash_payments')
+    .delete()
+    .eq('id', cashPaymentId)
+
+  if (error) throw new Error(error.message)
+}
+
+export async function listCashPayments(companyId: string, filters?: { dateFrom?: string; dateTo?: string }): Promise<CashPayment[]> {
+  let query = supabase
+    .from('cash_payments')
+    .select('*')
+    .eq('company_id', companyId)
+    .order('payment_date', { ascending: true })
+
+  if (filters?.dateFrom) query = query.gte('payment_date', filters.dateFrom)
+  if (filters?.dateTo) query = query.lte('payment_date', filters.dateTo)
+
+  const { data, error } = await query
+  if (error) throw new Error(error.message)
+  return (data || []) as CashPayment[]
 }

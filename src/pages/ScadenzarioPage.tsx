@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { CalendarClock, Receipt, ArrowDownLeft, ArrowUpRight, Search, Filter, Landmark, PencilLine, Sparkles, X, CheckCircle2, ExternalLink } from 'lucide-react'
+import { CalendarClock, Receipt, ArrowDownLeft, ArrowUpRight, Search, Filter, Landmark, PencilLine, Sparkles, X, CheckCircle2, ExternalLink, Banknote } from 'lucide-react'
 import { toast } from 'sonner'
 import { useCompany } from '@/hooks/useCompany'
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges'
@@ -19,13 +19,15 @@ import {
   settleInstallment,
   rebuildInstallmentsFull,
   touchOverdueInstallments,
+  registerCashPayment,
+  deleteCashPayment,
   type AgingResult,
   type InstallmentStatus,
   type ScadenzarioFilters,
   type ScadenzarioRow,
 } from '@/lib/scadenzario'
 
-type SettleUiMode = 'bank' | 'manual' | 'nc'
+type SettleUiMode = 'bank' | 'manual' | 'nc' | 'cash'
 
 interface BankCandidate {
   id: string
@@ -192,6 +194,7 @@ export default function ScadenzarioPage() {
     settleMode: SettleUiMode
     paymentDate: string
     amount: string
+    cashNotes: string
     bankCandidates: BankCandidate[]
     bankSearchInfo: BankSearchInfo | null
     ncCandidates: NcCandidate[]
@@ -205,6 +208,7 @@ export default function ScadenzarioPage() {
     settleMode: 'manual',
     paymentDate: new Date().toISOString().slice(0, 10),
     amount: '0',
+    cashNotes: '',
     bankCandidates: [],
     bankSearchInfo: null,
     ncCandidates: [],
@@ -827,6 +831,7 @@ export default function ScadenzarioPage() {
       settleMode: defaultMode,
       paymentDate: today,
       amount: String(isZeroNetCase ? 0 : absRemaining),
+      cashNotes: '',
       bankCandidates: [],
       bankSearchInfo: null,
       ncCandidates: [],
@@ -883,6 +888,13 @@ export default function ScadenzarioPage() {
       const amount = Number(paymentModal.amount)
       if (!Number.isFinite(amount) || amount <= 0) {
         setPaymentModal((prev) => ({ ...prev, error: 'Importo pagamento non valido' }))
+        return
+      }
+      cashAmount = round2(amount)
+    } else if (paymentModal.settleMode === 'cash') {
+      const amount = Number(paymentModal.amount)
+      if (!Number.isFinite(amount) || amount <= 0) {
+        setPaymentModal((prev) => ({ ...prev, error: 'Importo pagamento contanti non valido' }))
         return
       }
       cashAmount = round2(amount)
@@ -955,8 +967,22 @@ export default function ScadenzarioPage() {
           .eq('id', row.invoice_id)
       }
 
+      // Register cash payment record for audit trail
+      if (paymentModal.settleMode === 'cash' && row.invoice_id) {
+        await registerCashPayment({
+          companyId: company.id,
+          invoiceId: row.invoice_id,
+          installmentId: row.id,
+          amount: cashAmount,
+          paymentDate,
+          notes: paymentModal.cashNotes.trim() || null,
+        })
+      }
+
       if (result.mode === 'net') {
         toast.success(`Compensazione NC applicata: usato ${fmtEur(result.credit_used)} · cassa ${fmtEur(result.cash_paid)} · credito residuo ${fmtEur(result.credit_residual)}`)
+      } else if (paymentModal.settleMode === 'cash') {
+        toast.success(`${row.type === 'incasso' ? 'Incasso' : 'Pagamento'} contanti registrato — ${fmtEur(cashAmount)}`)
       } else {
         toast.success(`${row.type === 'incasso' ? 'Incasso' : 'Pagamento'} registrato`)
       }
@@ -967,6 +993,7 @@ export default function ScadenzarioPage() {
         settleMode: 'manual',
         paymentDate: today,
         amount: '0',
+        cashNotes: '',
         bankCandidates: [],
         bankSearchInfo: null,
         ncCandidates: [],
@@ -997,11 +1024,57 @@ export default function ScadenzarioPage() {
       ...prev,
       settleMode: nextMode,
       error: null,
-      amount: nextMode === 'nc' ? '0' : nextMode === 'manual' ? String(fallbackAmount) : prev.amount,
+      amount: nextMode === 'nc' ? '0' : (nextMode === 'manual' || nextMode === 'cash') ? String(fallbackAmount) : prev.amount,
+      ...(nextMode === 'cash' ? { cashNotes: '' } : {}),
     }))
 
     if (nextMode !== 'bank') return
     await refreshBankCandidates(row, netSuggested)
+  }
+
+  const handleUndoCashPayment = async (row: ScadenzarioRow) => {
+    if (!company?.id || !row.cash_payment_id) return
+    try {
+      // Fetch the actual cash payment amount before deleting
+      const { data: cpRow, error: cpErr } = await supabase
+        .from('cash_payments')
+        .select('amount')
+        .eq('id', row.cash_payment_id)
+        .single()
+      if (cpErr) throw new Error(cpErr.message)
+      const cpAmount = round2(Math.abs(Number(cpRow.amount)))
+
+      // Delete cash payment record
+      await deleteCashPayment(row.cash_payment_id)
+
+      // Reverse the installment: subtract cash payment amount from paid_amount
+      const { data: inst, error: instErr } = await supabase
+        .from('invoice_installments')
+        .select('paid_amount, amount_due')
+        .eq('id', row.id)
+        .single()
+      if (instErr) throw new Error(instErr.message)
+
+      const prevPaid = round2(Math.abs(Number(inst.paid_amount || 0)))
+      const amountDue = round2(Math.abs(Number(inst.amount_due || 0)))
+      const newPaid = round2(Math.max(0, prevPaid - cpAmount))
+      const newStatus = newPaid <= 0.01 ? 'pending' : (newPaid >= amountDue - 0.01 ? 'paid' : 'partial')
+
+      await supabase
+        .from('invoice_installments')
+        .update({
+          paid_amount: newPaid,
+          payment_status: newStatus,
+        })
+        .eq('id', row.id)
+
+      toast.success('Pagamento contanti annullato')
+      const scrollY = window.scrollY
+      await loadRows()
+      requestAnimationFrame(() => window.scrollTo(0, scrollY))
+    } catch (e: any) {
+      toast.error(`Errore annullamento: ${e.message}`)
+    }
   }
 
   const openReminder = (row: ScadenzarioRow) => {
@@ -1415,6 +1488,24 @@ export default function ScadenzarioPage() {
                                   {row.status === 'paid' && row.kind === 'installment' && (
                                     <CheckCircle2 className="h-3 w-3 text-emerald-500" />
                                   )}
+                                  {(row.status === 'paid' || row.status === 'partial') && row.payment_method && (
+                                    <span
+                                      title={
+                                        row.payment_method === 'cash'
+                                          ? `Contanti${row.cash_payment_date ? ` il ${fmtDate(row.cash_payment_date)}` : ''}${row.cash_payment_notes ? ` — ${row.cash_payment_notes}` : ''}`
+                                          : undefined
+                                      }
+                                      className={`text-[9px] px-1.5 py-0.5 rounded-full font-medium ${
+                                        row.payment_method === 'bank' ? 'bg-sky-100 text-sky-700' :
+                                        row.payment_method === 'cash' ? 'bg-amber-100 text-amber-700' :
+                                        'bg-gray-100 text-gray-600'
+                                      }`}
+                                    >
+                                      {row.payment_method === 'bank' ? '🏦 Banca' :
+                                       row.payment_method === 'cash' ? '💵 Contanti' :
+                                       '✏️ Manuale'}
+                                    </span>
+                                  )}
                                   {row.kind === 'installment' && row.status !== 'paid' && installmentScores.has(row.id) && (
                                     <span title={`Suggerimento AI: ${installmentScores.get(row.id)}%`} className={`w-2 h-2 rounded-full animate-pulse ${(installmentScores.get(row.id) || 0) >= 85 ? 'bg-red-500' : 'bg-amber-500'}`} />
                                   )}
@@ -1435,6 +1526,20 @@ export default function ScadenzarioPage() {
                                       }}
                                     >
                                       {row.type === 'incasso' ? 'Segna incassato' : 'Segna pagato'}
+                                    </Button>
+                                  )}
+                                  {row.kind === 'installment' && row.payment_method === 'cash' && row.cash_payment_id && (
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      className="text-amber-700 border-amber-300 hover:bg-amber-50"
+                                      title={row.cash_payment_notes ? `Note: ${row.cash_payment_notes}` : 'Annulla pagamento contanti'}
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        handleUndoCashPayment(row)
+                                      }}
+                                    >
+                                      Annulla contanti
                                     </Button>
                                   )}
                                   {row.kind === 'installment' && row.type === 'incasso' && row.status === 'overdue' && !row.is_credit_note && (
@@ -1582,6 +1687,13 @@ export default function ScadenzarioPage() {
                   onClick={() => switchPaymentMode('manual')}
                 >
                   <PencilLine className="h-3.5 w-3.5 mr-1.5" /> Manuale
+                </Button>
+                <Button
+                  size="sm"
+                  variant={paymentModal.settleMode === 'cash' ? 'default' : 'outline'}
+                  onClick={() => switchPaymentMode('cash')}
+                >
+                  <Banknote className="h-3.5 w-3.5 mr-1.5" /> Contanti
                 </Button>
                 {paymentPreview?.canNet && (
                   <Button
@@ -1736,6 +1848,47 @@ export default function ScadenzarioPage() {
                 </div>
               )}
 
+              {paymentModal.settleMode === 'cash' && (
+                <div className="space-y-3">
+                  <div className="text-xs border rounded-md px-3 py-2 bg-amber-50 text-amber-800">
+                    <Banknote className="h-3.5 w-3.5 inline-block mr-1 -mt-0.5" />
+                    Pagamento in contanti — nessun movimento bancario verrà associato.
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div>
+                      <Label className="text-xs">Data pagamento</Label>
+                      <Input
+                        type="date"
+                        value={paymentModal.paymentDate}
+                        onChange={(e) => setPaymentModal((prev) => ({ ...prev, paymentDate: e.target.value }))}
+                        className="mt-1"
+                      />
+                    </div>
+                    <div>
+                      <Label className="text-xs">Importo</Label>
+                      <Input
+                        type="number"
+                        step="0.01"
+                        min={0}
+                        value={paymentModal.amount}
+                        onChange={(e) => setPaymentModal((prev) => ({ ...prev, amount: e.target.value }))}
+                        className="mt-1"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <Label className="text-xs">Note (opzionale)</Label>
+                    <Input
+                      type="text"
+                      placeholder="es. Pagamento cassa sede, ricevuta #123..."
+                      value={paymentModal.cashNotes}
+                      onChange={(e) => setPaymentModal((prev) => ({ ...prev, cashNotes: e.target.value }))}
+                      className="mt-1"
+                    />
+                  </div>
+                </div>
+              )}
+
               {paymentModal.error && <p className="text-xs text-red-600">{paymentModal.error}</p>}
             </div>
             <div className="mt-5 flex justify-end gap-2">
@@ -1747,7 +1900,9 @@ export default function ScadenzarioPage() {
                     ? 'Conferma e abbina movimento'
                     : paymentModal.settleMode === 'nc'
                       ? 'Compensa con NC'
-                      : (paymentModal.row.type === 'incasso' ? 'Segna incassato' : 'Segna pagato')}
+                      : paymentModal.settleMode === 'cash'
+                        ? 'Conferma pagamento contanti'
+                        : (paymentModal.row.type === 'incasso' ? 'Segna incassato' : 'Segna pagato')}
               </Button>
             </div>
           </div>
