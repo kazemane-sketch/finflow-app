@@ -1077,15 +1077,64 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           }
         }
       }
-      setLineArticleMap(freshMap);
+      // NOTE: setLineArticleMap is handled below after merging AI suggestions
       setAiSuggestions(freshDbSugg);
       if (classif) {
         setClassification(classif);
         setSelCategoryId(classif.category_id || selCategoryId);
         setSelAccountId(classif.account_id || selAccountId);
       }
-      setLineClassifs(lineClf);
-      setLineProjects(lineProj);
+      // Merge AI/rule suggestions into lineClassifs (handles re-classification of already-classified invoices)
+      const mergedLineClf = { ...lineClf };
+      for (const ml of mergedLines) {
+        const lineId = ml.invoice_line_id;
+        if (lineId && (ml.category_id || ml.account_id)) {
+          mergedLineClf[lineId] = {
+            category_id: ml.category_id || mergedLineClf[lineId]?.category_id || null,
+            account_id: ml.account_id || mergedLineClf[lineId]?.account_id || null,
+          };
+        }
+      }
+      setLineClassifs(mergedLineClf);
+
+      // Merge AI/rule suggestions into lineProjects per-line
+      const mergedLineProj = { ...lineProj };
+      for (const ml of mergedLines) {
+        const lineId = ml.invoice_line_id;
+        if (lineId && ml.project_allocations?.length > 0 && !mergedLineProj[lineId]?.length) {
+          mergedLineProj[lineId] = ml.project_allocations.map((pa: { project_id: string; percentage: number }) => ({
+            project_id: pa.project_id,
+            percentage: pa.percentage,
+          }));
+        }
+      }
+      setLineProjects(mergedLineProj);
+
+      // Merge AI/rule article suggestions into lineArticleMap (for re-classification)
+      const mergedArticleMap = { ...freshMap };
+      for (const ml of mergedLines) {
+        const lineId = ml.invoice_line_id;
+        if (lineId && ml.article_id && !mergedArticleMap[lineId]) {
+          const art = articles.find(a => a.id === ml.article_id);
+          if (art) {
+            const fullArt = art as ArticleWithPhases;
+            const phase = ml.phase_id ? fullArt.phases?.find(p => p.id === ml.phase_id) : null;
+            mergedArticleMap[lineId] = {
+              article_id: ml.article_id, code: art.code || '', name: art.name || '',
+              assigned_by: ml.match_type === 'rule' ? 'rule' : 'ai_classification',
+              verified: false, location: null,
+              phase_id: ml.phase_id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
+            };
+          }
+        }
+      }
+      setLineArticleMap(mergedArticleMap);
+
+      // Update originals to merged state so isPostConfirmDirty starts from new baseline
+      setOriginalLineClassifs(mergedLineClf);
+      setOriginalLineArticleMap(mergedArticleMap);
+      setOriginalLineProjects(mergedLineProj);
+
       // Update CdC from DB-persisted invoice-level projects
       if (freshInvProjs.length > 0) {
         setInvProjects(freshInvProjs);
@@ -1103,6 +1152,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           amount: total > 0 ? Math.round(total * pa.percentage / 100 * 100) / 100 : null,
         })));
       }
+      // Reset classifDirty so save button doesn't appear immediately after AI classification
+      setClassifDirty(false);
     } catch (e: any) {
       console.error('AI classification error:', e);
       setAiClassifStatus('error');
