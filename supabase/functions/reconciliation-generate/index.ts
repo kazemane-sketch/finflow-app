@@ -344,6 +344,13 @@ async function matchByInvoiceRefs(
       paramIdx++;
     }
 
+    // Date filter: invoice must be issued BEFORE the payment date
+    const dateClause = tx.date ? ` AND i.date <= $${paramIdx}::date` : "";
+    if (tx.date) {
+      params.push(tx.date);
+      paramIdx++;
+    }
+
     const query = `
       SELECT i.id as invoice_id, i.number, i.total_amount, i.date,
              i.counterparty->>'denom' as counterparty_name,
@@ -355,6 +362,7 @@ async function matchByInvoiceRefs(
         AND i.direction = $2
         AND (${matchClauses.join(" OR ")})
         ${yearClause}
+        ${dateClause}
       ORDER BY i.date DESC
       LIMIT 20`;
 
@@ -379,7 +387,11 @@ async function matchByInvoiceRefs(
       // If amount is WAY off (> 50% difference), lower confidence significantly
       // A ref match with wildly different amount is suspicious
       let score: number;
-      let reason = `Rif. fattura "${ref}" → Fatt. ${m.number} (${m.counterparty_name})`;
+      const daysDiff = tx.date && m.date
+        ? Math.max(0, (new Date(tx.date).getTime() - new Date(m.date as string).getTime()) / 86400000)
+        : null;
+      const temporalNote = daysDiff !== null ? `, fattura ${Math.round(daysDiff)}gg prima` : "";
+      let reason = `Rif. fattura "${ref}" → Fatt. ${m.number} (${m.counterparty_name}${temporalNote})`;
 
       if (amountRatio < 0.05) {
         score = 98;
@@ -453,6 +465,7 @@ async function matchByMandate(
     `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
             ii.amount_due, ii.paid_amount,
             inv.number as invoice_number,
+            inv.date as invoice_date,
             inv.counterparty->>'denom' as counterparty_name
      FROM invoice_installments ii
      JOIN invoices inv ON inv.id = ii.invoice_id
@@ -461,9 +474,10 @@ async function matchByMandate(
        AND ii.status IN ('pending','overdue','partial')
        AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
        AND abs(ii.amount_due - ii.paid_amount) BETWEEN $4 * 0.85 AND $4 * 1.15
-     ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $4) ASC
+       AND ($5::date IS NULL OR inv.date <= $5::date)
+     ORDER BY inv.date DESC
      LIMIT 5`,
-    [companyId, expectedDirection, cpWord, remainingAmount],
+    [companyId, expectedDirection, cpWord, remainingAmount, tx.date || null],
   );
 
   for (const m of openInst) {
@@ -471,18 +485,30 @@ async function matchByMandate(
     if (instRemaining < 0.01) continue;
     const amountDiff = Math.abs(remainingAmount - instRemaining);
 
+    // Temporal scoring: recent invoices score higher
+    const daysDiff = tx.date && m.invoice_date
+      ? Math.max(0, (new Date(tx.date).getTime() - new Date(m.invoice_date).getTime()) / 86400000)
+      : 60; // default if no dates
+    let score: number;
+    if (daysDiff < 30) score = 88;
+    else if (daysDiff > 120) score = 80;
+    else score = 85;
+
+    const temporalNote = tx.date && m.invoice_date ? `, fattura ${Math.round(daysDiff)}gg prima` : "";
+
     suggestions.push({
       bank_transaction_id: tx.id,
       installment_id: m.installment_id,
       invoice_id: m.invoice_id,
-      match_score: 85,
-      match_reason: `Mandato SDD "${mandateId}" → ${cpName} + importo simile`,
+      match_score: score,
+      match_reason: `Mandato SDD "${mandateId}" → ${cpName} + importo simile${temporalNote}`,
       proposed_by: "deterministic",
       rule_id: null,
       suggestion_data: {
         mandate_id: mandateId,
         counterparty: cpName,
         amount_diff: amountDiff,
+        days_diff: Math.round(daysDiff),
         level: "mandate",
       },
     });
@@ -506,22 +532,28 @@ async function matchByCounterpartyAmount(
   const cpWord = tx.counterparty_name.split(/\s+/)[0];
   if (!cpWord || cpWord.length < 3) return [];
 
-  // Miglioria 5: wider tolerance 40%-115% (was ±10%)
+  // v2: wider tolerance 40%-115%, date filter, DSO/PSO join, ORDER BY inv.date DESC
   const cpMatches = await sql.unsafe(
     `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
             ii.amount_due, ii.paid_amount, ii.status,
             inv.number as invoice_number,
-            inv.counterparty->>'denom' as counterparty_name
+            inv.date as invoice_date,
+            inv.counterparty->>'denom' as counterparty_name,
+            cp.payment_terms_days,
+            cp.dso_days_override,
+            cp.pso_days_override
      FROM invoice_installments ii
      JOIN invoices inv ON inv.id = ii.invoice_id
+     LEFT JOIN counterparties cp ON cp.id = inv.counterparty_id
      WHERE ii.company_id = $1
        AND inv.direction = $2
        AND ii.status IN ('pending','overdue','partial')
        AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
        AND abs(ii.amount_due - ii.paid_amount) BETWEEN $4 * 0.40 AND $4 * 1.15
-     ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $4) ASC
+       AND ($5::date IS NULL OR inv.date <= $5::date)
+     ORDER BY inv.date DESC
      LIMIT 10`,
-    [companyId, expectedDirection, cpWord, remainingAmount],
+    [companyId, expectedDirection, cpWord, remainingAmount, tx.date || null],
   );
 
   for (const m of cpMatches) {
@@ -529,21 +561,49 @@ async function matchByCounterpartyAmount(
     if (instRemaining < 0.01) continue;
     const amountDiff = Math.abs(remainingAmount - instRemaining);
     const amountRatio = remainingAmount > 0 ? amountDiff / remainingAmount : 1;
-    const daysDiff = tx.date && m.due_date
-      ? Math.abs(
-          (new Date(tx.date).getTime() - new Date(m.due_date).getTime()) / 86400000,
-        )
+
+    // v2: daysDiff from INVOICE DATE (not due_date), always positive due to SQL filter
+    const daysDiff = tx.date && m.invoice_date
+      ? Math.max(0, (new Date(tx.date).getTime() - new Date(m.invoice_date).getTime()) / 86400000)
       : 999;
 
-    // Miglioria 5: tiered scoring based on amount difference
-    let score: number;
-    if (amountRatio < 0.02 && daysDiff < 30) score = 85;
-    else if (amountRatio < 0.05 && daysDiff < 30) score = 80;
-    else if (amountRatio < 0.05 && daysDiff < 60) score = 78;
-    else if (amountRatio < 0.10 && daysDiff < 30) score = 75;
-    else if (amountRatio < 0.10) score = 70;
-    else if (amountRatio < 0.20) score = 60;
-    else score = 50; // 20%-60% diff — still show but low confidence
+    // ── v2 scoring formula ──
+    // base = 50
+    // + amountPoints (0-20)
+    // + temporalPoints (0-30)
+    // + exactBonus (0-10)
+    // + dsoBonus (0-5)
+    const base = 50;
+
+    // Amount points: how close is the amount match?
+    let amountPoints: number;
+    if (amountRatio < 0.01) amountPoints = 20;
+    else if (amountRatio < 0.05) amountPoints = 16;
+    else if (amountRatio < 0.10) amountPoints = 12;
+    else if (amountRatio < 0.20) amountPoints = 6;
+    else amountPoints = 0;
+
+    // Temporal points: how recent is the invoice?
+    let temporalPoints: number;
+    if (daysDiff <= 7) temporalPoints = 30;
+    else if (daysDiff <= 15) temporalPoints = 27;
+    else if (daysDiff <= 30) temporalPoints = 24;
+    else if (daysDiff <= 60) temporalPoints = 18;
+    else if (daysDiff <= 90) temporalPoints = 12;
+    else if (daysDiff <= 180) temporalPoints = 6;
+    else temporalPoints = 0;
+
+    // Exact bonus: near-exact amount + recent invoice
+    const exactBonus = (amountRatio < 0.02 && daysDiff <= 60) ? 10 : 0;
+
+    // DSO/PSO bonus: payment within expected window
+    let dsoBonus = 0;
+    const expectedDays = Number(m.pso_days_override || m.dso_days_override || m.payment_terms_days || 0);
+    if (expectedDays > 0 && Math.abs(daysDiff - expectedDays) <= 15) {
+      dsoBonus = 5;
+    }
+
+    const score = Math.min(98, base + amountPoints + temporalPoints + exactBonus + dsoBonus);
 
     // Amount note for large differences (common Italian patterns)
     let amountNote = "";
@@ -556,20 +616,25 @@ async function matchByCounterpartyAmount(
       amountNote = `Differenza ${pctDiff > 0 ? "+" : ""}${pctDiff.toFixed(0)}%`;
     }
 
+    // v2: rich match_reason with temporal + DSO info
+    const dsoNote = dsoBonus > 0 ? ` (in finestra pagamento ${expectedDays}gg)` : "";
+    const temporalNote = daysDiff < 999 ? ` — fattura ${Math.round(daysDiff)}gg prima${dsoNote}` : "";
+
     suggestions.push({
       bank_transaction_id: tx.id,
       installment_id: m.installment_id,
       invoice_id: m.invoice_id,
       match_score: score,
-      match_reason: `Controparte "${m.counterparty_name}" + importo simile (diff €${amountDiff.toFixed(2)})${daysDiff < 30 ? " + data vicina" : ""}${amountNote ? ` — ${amountNote}` : ""}`,
+      match_reason: `Controparte "${m.counterparty_name}" + importo ${amountRatio < 0.02 ? "esatto" : "simile"} (diff €${amountDiff.toFixed(2)})${temporalNote}${amountNote ? ` — ${amountNote}` : ""}`,
       proposed_by: "deterministic",
       rule_id: null,
       suggestion_data: {
         counterparty: m.counterparty_name,
         amount_diff: amountDiff,
-        days_diff: daysDiff,
+        days_diff: Math.round(daysDiff),
         level: "counterparty",
         ...(amountNote ? { amount_note: amountNote } : {}),
+        ...(dsoBonus > 0 ? { dso_match: true, expected_days: expectedDays } : {}),
       },
     });
   }
@@ -629,9 +694,10 @@ async function matchByRules(
          AND ii.status IN ('pending','overdue','partial')
          AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
          AND abs(ii.amount_due - ii.paid_amount) BETWEEN $4 * 0.90 AND $4 * 1.10
+         AND ($5::date IS NULL OR inv.date <= $5::date)
        ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $4) ASC
        LIMIT 3`,
-      [companyId, expectedDirection, cpWord, remainingAmount],
+      [companyId, expectedDirection, cpWord, remainingAmount, tx.date || null],
     );
 
     for (const m of ruleMatches) {
@@ -666,17 +732,37 @@ async function matchByRules(
 
 /* ─── dedup helper ────────────────────── */
 
-function dedup(suggestions: Suggestion[], maxResults: number): Suggestion[] {
+function dedup(suggestions: Suggestion[], _maxResults: number): Suggestion[] {
   const seen = new Set<string>();
-  return suggestions
+  const unique = suggestions
     .filter((s) => {
       const key = `${s.installment_id || ""}:${s.invoice_id || ""}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     })
-    .sort((a, b) => b.match_score - a.match_score)
-    .slice(0, maxResults);
+    .sort((a, b) => b.match_score - a.match_score);
+  return smartRank(unique);
+}
+
+/* ─── smartRank: reduce suggestions to the clearest matches ─── */
+
+function smartRank(suggestions: Suggestion[]): Suggestion[] {
+  if (suggestions.length <= 1) return suggestions;
+
+  // Cumulative groups: return all unmodified (they form a set)
+  if (suggestions.some(s => s.suggestion_data?.level === "cumulative")) return suggestions;
+
+  const sorted = [...suggestions].sort((a, b) => b.match_score - a.match_score);
+  const best = sorted[0].match_score;
+  const second = sorted.length > 1 ? sorted[1].match_score : 0;
+
+  // Clear winner → 1 result
+  if (best >= 85 && best - second >= 10) return [sorted[0]];
+  // Strong match → top 2
+  if (best >= 80) return sorted.slice(0, 2);
+  // Uncertain → top 3
+  return sorted.slice(0, 3);
 }
 
 /* ─── Miglioria 1: Cumulative payments (1 TX → N invoices) ─── */
@@ -693,11 +779,12 @@ async function matchCumulativePayment(
 
   const expectedDirection = getExpectedInvoiceDirection(Number(tx.amount));
 
-  // Fetch all open installments for this counterparty
+  // Fetch all open installments for this counterparty (invoice date <= payment date)
   const openInst = await sql.unsafe(
     `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
             ii.amount_due, ii.paid_amount,
             inv.number as invoice_number,
+            inv.date as invoice_date,
             inv.counterparty->>'denom' as counterparty_name,
             abs(ii.amount_due - ii.paid_amount) as remaining
      FROM invoice_installments ii
@@ -707,9 +794,10 @@ async function matchCumulativePayment(
        AND ii.status IN ('pending','overdue','partial')
        AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
        AND abs(ii.amount_due - ii.paid_amount) > 0.01
+       AND ($4::date IS NULL OR inv.date <= $4::date)
      ORDER BY ii.due_date ASC
      LIMIT 10`,
-    [companyId, expectedDirection, cpWord],
+    [companyId, expectedDirection, cpWord, tx.date || null],
   );
 
   if (openInst.length < 2) return []; // Need at least 2 invoices for cumulative
