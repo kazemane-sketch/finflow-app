@@ -46,6 +46,7 @@ import {
 import { toast } from 'sonner';
 import { createRuleFromConfirmation, findMatchingRules } from '@/lib/classificationRulesService';
 import ExportDialog from '@/components/ExportDialog';
+import SearchableSelect from '@/components/SearchableSelect';
 
 // ============================================================
 // LOOKUPS
@@ -561,6 +562,18 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [originalLineClassifs, setOriginalLineClassifs] = useState<Record<string, LineClassification>>({});
   const [originalLineArticleMap, setOriginalLineArticleMap] = useState<Record<string, LineArticleInfo>>({});
   const [confirmChangesSaving, setConfirmChangesSaving] = useState(false);
+  // Clipboard for copy/paste classification between lines
+  const [copiedClassif, setCopiedClassif] = useState<{
+    category_id: string | null;
+    account_id: string | null;
+    projects: { project_id: string; percentage: number }[];
+  } | null>(null);
+  // Clear all classification dialog
+  const [showClearDialog, setShowClearDialog] = useState(false);
+  // Original line CdC snapshot for dirty-state tracking
+  const [originalLineProjects, setOriginalLineProjects] = useState<Record<string, LineProjectAssignment[]>>({});
+  // Hide zero-amount lines toggle
+  const [showZeroLines, setShowZeroLines] = useState(false);
   const isConfirmed = invoice.classification_status === 'confirmed';
 
   // Post-confirmation dirty state: any line classification or article assignment changed
@@ -582,9 +595,16 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       if (!curr || !orig) return true;
       if (curr.article_id !== orig.article_id || curr.phase_id !== orig.phase_id) return true;
     }
+    // Check line-level CdC changed
+    const projKeys = new Set([...Object.keys(lineProjects), ...Object.keys(originalLineProjects)]);
+    for (const k of projKeys) {
+      const curr = (lineProjects[k] || []).map(p => `${p.project_id}:${p.percentage}`).sort().join(',');
+      const orig = (originalLineProjects[k] || []).map(p => `${p.project_id}:${p.percentage}`).sort().join(',');
+      if (curr !== orig) return true;
+    }
     // Also check invoice-level dirty (CdC etc.)
     return classifDirty;
-  }, [isConfirmed, lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap, classifDirty]);
+  }, [isConfirmed, lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap, lineProjects, originalLineProjects, classifDirty]);
 
   // Load articles + existing assignments when invoice changes
   useEffect(() => {
@@ -687,6 +707,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setLineClassifs(lineClf);
         setOriginalLineClassifs(lineClf);
         setLineProjects(lineProj);
+        setOriginalLineProjects(lineProj);
         // Initialize local CdC rows from DB assignments
         setCdcRows(iProjs.map(ip => ({
           project_id: ip.project_id,
@@ -727,6 +748,40 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       })));
       setClassifDirty(false);
 
+      // Save article assignments on lines
+      if (detail?.invoice_lines) {
+        for (const line of detail.invoice_lines) {
+          const curr = lineArticleMap[line.id];
+          const orig = originalLineArticleMap[line.id];
+          const changed = (!curr && orig) || (curr && !orig) ||
+            (curr && orig && (curr.article_id !== orig.article_id || curr.phase_id !== orig.phase_id));
+          if (!changed) continue;
+          if (!curr && orig) {
+            await removeLineAssignment(line.id).catch(() => {});
+          } else if (curr) {
+            await assignArticleToLine(
+              companyId, line.id, invoice.id, curr.article_id,
+              { quantity: line.quantity, unit_price: line.unit_price, total_price: line.total_price, vat_rate: line.vat_rate },
+              'manual', undefined, curr.location, curr.phase_id,
+            );
+          }
+        }
+        setOriginalLineArticleMap({ ...lineArticleMap });
+      }
+
+      // Save line-level CdC allocations that changed
+      if (detail?.invoice_lines) {
+        for (const line of detail.invoice_lines) {
+          const curr = (lineProjects[line.id] || []).map(p => `${p.project_id}:${p.percentage}`).sort().join(',');
+          const orig = (originalLineProjects[line.id] || []).map(p => `${p.project_id}:${p.percentage}`).sort().join(',');
+          if (curr !== orig) {
+            await saveLineProjects(companyId, invoice.id, line.id,
+              (lineProjects[line.id] || []).map(p => ({ project_id: p.project_id, percentage: p.percentage, amount: p.amount })));
+          }
+        }
+        setOriginalLineProjects({ ...lineProjects });
+      }
+
       // Create classification rules from confirmed line-level data (fire-and-forget)
       const cp = (invoice.counterparty || {}) as any;
       if (detail?.invoice_lines) {
@@ -747,7 +802,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       onRefreshBadges(invoice.id);
     } catch (e: any) { console.error('Save classification error:', e); }
     setClassifSaving(false);
-  }, [company?.id, invoice?.id, selCategoryId, selAccountId, cdcRows, cdcMode, detail?.invoice_lines, lineClassifs, lineArticleMap, invoice?.counterparty, invoice?.direction, onRefreshBadges]);
+  }, [company?.id, invoice?.id, selCategoryId, selAccountId, cdcRows, cdcMode, detail?.invoice_lines,
+    lineClassifs, lineArticleMap, originalLineArticleMap, lineProjects, originalLineProjects,
+    invoice?.counterparty, invoice?.direction, onRefreshBadges]);
 
   // Local CdC row management (no DB calls)
   const handleAddCdc = useCallback(() => {
@@ -854,7 +911,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       );
 
       const coveredLineIds = new Set(ruleSuggestions.map(s => s.line_id));
-      const uncoveredLines = lines.filter(l => !coveredLineIds.has(l.id));
+      const uncoveredLines = lines
+        .filter(l => !coveredLineIds.has(l.id))
+        .filter(l => (l.total_price ?? 0) !== 0 || (l.unit_price ?? 0) !== 0); // skip /D metadata lines
 
       // Step 2: For uncovered lines, call unified classifier (Sonnet)
       let aiResult: any = null;
@@ -1100,7 +1159,28 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const handleConfirmExistingClassification = useCallback(async () => {
     if (!invoice?.id || !company?.id) return;
     try {
-      // Just mark as confirmed — the classification data already exists
+      // Save article assignments that may have been set locally
+      if (detail?.invoice_lines) {
+        for (const line of detail.invoice_lines) {
+          const curr = lineArticleMap[line.id];
+          const orig = originalLineArticleMap[line.id];
+          const changed = (!curr && orig) || (curr && !orig) ||
+            (curr && orig && (curr.article_id !== orig.article_id || curr.phase_id !== orig.phase_id));
+          if (!changed) continue;
+          if (!curr && orig) {
+            await removeLineAssignment(line.id).catch(() => {});
+          } else if (curr) {
+            await assignArticleToLine(
+              company.id, line.id, invoice.id, curr.article_id,
+              { quantity: line.quantity, unit_price: line.unit_price, total_price: line.total_price, vat_rate: line.vat_rate },
+              'manual', undefined, curr.location, curr.phase_id,
+            );
+          }
+        }
+        setOriginalLineArticleMap({ ...lineArticleMap });
+      }
+
+      // Mark as confirmed
       await supabase.from('invoice_classifications').update({ verified: true, assigned_by: 'manual', updated_at: new Date().toISOString() }).eq('invoice_id', invoice.id);
       await supabase.from('invoices').update({ classification_status: 'confirmed' } as any).eq('id', invoice.id);
       const classif = await loadInvoiceClassification(invoice.id);
@@ -1127,7 +1207,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       // Refresh sidebar badges
       onRefreshBadges(invoice.id);
     } catch (e: any) { console.error('Confirm existing classification error:', e); }
-  }, [invoice?.id, company?.id, onPatchInvoice, onRefreshBadges, detail?.invoice_lines, lineClassifs, lineArticleMap, invoice?.counterparty, invoice?.direction]);
+  }, [invoice?.id, company?.id, onPatchInvoice, onRefreshBadges, detail?.invoice_lines, lineClassifs, lineArticleMap, originalLineArticleMap, invoice?.counterparty, invoice?.direction]);
 
   // Handle "Crea e usa" for AI-suggested new account/category
   const handleCreateSuggestion = useCallback(async (lineId: string) => {
@@ -1235,6 +1315,17 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         }
       }
 
+      // 3b. Save changed line-level CdC allocations
+      const projKeys = new Set([...Object.keys(lineProjects), ...Object.keys(originalLineProjects)]);
+      for (const k of projKeys) {
+        const curr = (lineProjects[k] || []).map(p => `${p.project_id}:${p.percentage}`).sort().join(',');
+        const orig = (originalLineProjects[k] || []).map(p => `${p.project_id}:${p.percentage}`).sort().join(',');
+        if (curr !== orig) {
+          await saveLineProjects(companyId, invoice.id, k,
+            (lineProjects[k] || []).map(p => ({ project_id: p.project_id, percentage: p.percentage, amount: p.amount })));
+        }
+      }
+
       // 4. Mark classification as confirmed (update timestamp)
       await supabase.from('invoice_classifications').update({ verified: true, assigned_by: 'manual', updated_at: new Date().toISOString() }).eq('invoice_id', invoice.id);
       await supabase.from('invoices').update({ classification_status: 'confirmed' } as any).eq('id', invoice.id);
@@ -1243,6 +1334,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       // 5. Update original snapshots so dirty state resets
       setOriginalLineClassifs({ ...lineClassifs });
       setOriginalLineArticleMap({ ...lineArticleMap });
+      setOriginalLineProjects({ ...lineProjects });
       setClassifDirty(false);
 
       // 6. Create classification rules from confirmed data (fire-and-forget)
@@ -1272,7 +1364,95 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   }, [company?.id, invoice?.id, invoice?.total_amount, invoice?.counterparty, invoice?.direction,
     classifDirty, selCategoryId, selAccountId, cdcRows, cdcMode,
     lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap,
+    lineProjects, originalLineProjects,
     detail?.invoice_lines, onPatchInvoice, onRefreshBadges]);
+
+  // Copy classification from a line
+  const handleCopyLineClassif = useCallback((lineId: string) => {
+    const lc = lineClassifs[lineId];
+    const lp = lineProjects[lineId] || [];
+    setCopiedClassif({
+      category_id: lc?.category_id ?? null,
+      account_id: lc?.account_id ?? null,
+      projects: lp.map(p => ({ project_id: p.project_id, percentage: p.percentage })),
+    });
+    toast.success('Classificazione copiata');
+  }, [lineClassifs, lineProjects]);
+
+  // Paste classification to a line
+  const handlePasteLineClassif = useCallback(async (lineId: string) => {
+    if (!copiedClassif || !company?.id || !invoice?.id) return;
+    // Apply category + account locally
+    setLineClassifs(prev => ({
+      ...prev,
+      [lineId]: {
+        ...prev[lineId],
+        invoice_line_id: lineId,
+        category_id: copiedClassif.category_id,
+        account_id: copiedClassif.account_id,
+      },
+    }));
+    // Apply CdC locally
+    if (copiedClassif.projects.length > 0) {
+      setLineProjects(prev => ({
+        ...prev,
+        [lineId]: copiedClassif.projects.map(p => ({
+          id: crypto.randomUUID(),
+          invoice_line_id: lineId,
+          project_id: p.project_id,
+          percentage: p.percentage,
+          amount: null,
+        })),
+      }));
+    }
+    // If not confirmed, save immediately
+    if (!isConfirmed) {
+      try {
+        await saveLineCategoryAndAccount(lineId, copiedClassif.category_id, copiedClassif.account_id);
+        if (copiedClassif.projects.length > 0) {
+          await saveLineProjects(company.id, invoice.id, lineId,
+            copiedClassif.projects.map(p => ({ ...p, amount: null })));
+        }
+        onRefreshBadges(invoice.id);
+      } catch (e) { console.error('Paste error:', e); }
+    }
+  }, [copiedClassif, company?.id, invoice?.id, isConfirmed, onRefreshBadges]);
+
+  // Clear all classification
+  const handleClearAllClassification = useCallback(async () => {
+    if (!invoice?.id || !company?.id) return;
+    try {
+      // 1. Delete invoice-level classification
+      await deleteInvoiceClassification(invoice.id);
+      // 2. Clear all line classifications
+      const lines = detail?.invoice_lines || [];
+      await Promise.all(lines.map(l => saveLineCategoryAndAccount(l.id, null, null)));
+      // 3. Clear line CdC allocations
+      await Promise.all(lines.map(l => saveLineProjects(company.id, invoice.id, l.id, [])));
+      // 4. Clear article assignments
+      await Promise.all(lines.map(l => removeLineAssignment(l.id).catch(() => {})));
+      // 5. Reset invoice status
+      await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
+      // 6. Reset local state
+      setClassification(null);
+      setSelCategoryId(null);
+      setSelAccountId(null);
+      setCdcRows([]);
+      setLineClassifs({});
+      setLineProjects({});
+      setLineArticleMap({});
+      setAiSuggestions({});
+      setClassifDirty(false);
+      setOriginalLineClassifs({});
+      setOriginalLineArticleMap({});
+      setOriginalLineProjects({});
+      // 7. Patch sidebar
+      onPatchInvoice(invoice.id, { classification_status: 'none' } as Partial<DBInvoice>);
+      onRefreshBadges(invoice.id);
+      toast.success('Classificazione cancellata');
+    } catch (e: any) { console.error('Clear classification error:', e); toast.error('Errore'); }
+    setShowClearDialog(false);
+  }, [invoice?.id, company?.id, detail?.invoice_lines, onPatchInvoice, onRefreshBadges]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }) => {
     const companyId = company?.id;
@@ -1493,8 +1673,37 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const cpStatus = String(invoice.counterparty_status_snapshot || '').toLowerCase();
   const showCounterpartyAlert = cpStatus === 'pending' || cpStatus === 'rejected' || !invoice.counterparty_id;
   const hasRefs = b?.contratti?.length > 0 || b?.ordini?.length > 0 || b?.convenzioni?.length > 0;
-  const lineCount = b?.linee?.length || detail?.invoice_lines?.length || 0;
-  const classifiedLineCount = Object.keys(lineClassifs).filter(lid => lineClassifs[lid]?.category_id || lineClassifs[lid]?.account_id).length;
+
+  // Filter zero-amount lines (metadata /D lines like IBAN, bank refs)
+  const visibleXmlLines = (() => {
+    const all = b?.linee || [];
+    if (showZeroLines) return all;
+    return all.filter((l: any) => {
+      const total = safeFloat(l.prezzoTotale);
+      const unit = safeFloat(l.prezzoUnitario);
+      return total !== 0 || unit !== 0;
+    });
+  })();
+  const visibleDbLines = (() => {
+    const all = detail?.invoice_lines || [];
+    if (showZeroLines) return all;
+    return all.filter(l => (l.total_price ?? 0) !== 0 || (l.unit_price ?? 0) !== 0);
+  })();
+  const totalLineCount = b?.linee?.length || detail?.invoice_lines?.length || 0;
+  const visibleLineCount = visibleXmlLines.length || visibleDbLines.length;
+  const hiddenLineCount = totalLineCount - visibleLineCount;
+
+  // Classified count — only count visible lines
+  const visibleLineIds = new Set(
+    (visibleXmlLines.length ? visibleXmlLines : visibleDbLines).map((l: any) => {
+      if (l.id) return l.id;
+      const dbLine = detail?.invoice_lines?.find(dl => dl.line_number === parseInt(l.numero || '0'));
+      return dbLine?.id;
+    }).filter(Boolean)
+  );
+  const classifiedLineCount = Object.keys(lineClassifs)
+    .filter(lid => visibleLineIds.has(lid) && (lineClassifs[lid]?.category_id || lineClassifs[lid]?.account_id))
+    .length;
 
   return (
     <div className="flex flex-col h-full" id="invoice-detail-print">
@@ -1777,8 +1986,16 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               <div className="flex items-center justify-between px-4 py-2.5 border-b bg-gray-50">
                 <h3 className="text-sm font-bold text-gray-800">Righe fattura</h3>
                 <div className="flex items-center gap-2">
-                  <span className="text-[11px] text-emerald-600 font-medium">{lineCount} righe</span>
-                  <span className="text-[11px] text-gray-400">{classifiedLineCount}/{lineCount} classificate</span>
+                  <span className="text-[11px] text-emerald-600 font-medium">
+                    {visibleLineCount} righe
+                    {hiddenLineCount > 0 && (
+                      <button onClick={() => setShowZeroLines(!showZeroLines)}
+                        className="ml-1 text-gray-400 hover:text-gray-600 underline">
+                        {showZeroLines ? 'nascondi' : `+${hiddenLineCount} a zero`}
+                      </button>
+                    )}
+                  </span>
+                  <span className="text-[11px] text-gray-400">{classifiedLineCount}/{visibleLineCount} classificate</span>
                 </div>
               </div>
               <div className="overflow-x-auto">
@@ -1789,19 +2006,20 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold w-16">P. Unit.</th>
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold w-14">IVA</th>
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold w-16">Totale</th>
-                    {allCategories.length > 0 && <th className="text-center px-1 py-2 text-gray-600 font-semibold w-24">Categoria</th>}
-                    {allProjects.length > 0 && <th className="text-center px-1 py-2 text-gray-600 font-semibold w-20">CdC</th>}
-                    {allAccounts.length > 0 && <th className="text-center px-1 py-2 text-gray-600 font-semibold w-20">Conto</th>}
+                    {allCategories.length > 0 && <th className="text-center px-1 py-2 text-gray-600 font-semibold w-32">Categoria</th>}
+                    {allProjects.length > 0 && <th className="text-center px-1 py-2 text-gray-600 font-semibold w-28">CdC</th>}
+                    {allAccounts.length > 0 && <th className="text-center px-1 py-2 text-gray-600 font-semibold w-36">Conto</th>}
+                    {(allCategories.length > 0 || allAccounts.length > 0) && <th className="text-center px-0.5 py-2 text-gray-400 font-normal w-12"></th>}
                   </tr></thead>
                   <tbody>
-                    {(b?.linee || []).map((l: any, i: number) => {
+                    {visibleXmlLines.map((l: any, i: number) => {
                       const dbLine = detail?.invoice_lines?.find(dl => dl.line_number === parseInt(l.numero || String(i + 1)));
                       const lineId = dbLine?.id;
                       const lineCat = lineId ? lineClassifs[lineId]?.category_id : null;
                       const lineAcc = lineId ? lineClassifs[lineId]?.account_id : null;
                       const ff = lineId ? lineFiscalFlags[lineId] : null;
                       const hasFiscalFlags = ff && (ff.ritenuta_acconto || ff.reverse_charge || ff.split_payment || ff.bene_strumentale || (ff.deducibilita_pct != null && ff.deducibilita_pct < 100) || (ff.iva_detraibilita_pct != null && ff.iva_detraibilita_pct < 100));
-                      const colCount = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0);
+                      const colCount = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0);
                       return (
                       <React.Fragment key={i}>
                       <tr className="border-b border-gray-50 hover:bg-gray-50/50">
@@ -1843,14 +2061,14 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                         <td className="text-right px-2 py-2 font-bold text-gray-800">{fmtNum(safeFloat(l.prezzoTotale))}</td>
                         {allCategories.length > 0 && <td className="text-center px-1 py-1">
                           {lineId ? (
-                            <select
-                              value={lineCat || ''}
-                              onChange={e => handleLineClassifChange(lineId, 'category_id', e.target.value || null)}
-                              className={`w-full px-1 py-1 text-[10px] border rounded-md outline-none cursor-pointer ${lineCat ? 'bg-blue-50 border-blue-200 text-blue-700 font-semibold' : 'border-gray-200 bg-white text-gray-500'}`}
-                            >
-                              <option value="">{selCategoryId ? '\u2190 Fatt.' : '\u2014'}</option>
-                              {allCategories.map(c => <option key={c.id} value={c.id}>{c.name.substring(0, 14)}</option>)}
-                            </select>
+                            <SearchableSelect
+                              value={lineCat || null}
+                              options={allCategories.map(c => ({ id: c.id, label: c.name }))}
+                              onChange={v => handleLineClassifChange(lineId, 'category_id', v)}
+                              placeholder={selCategoryId ? '\u2190 Fatt.' : '\u2014'}
+                              emptyLabel={selCategoryId ? '\u2190 Fatt.' : undefined}
+                              truncate={18}
+                            />
                           ) : <span className="text-[9px] text-gray-300">{'\u2014'}</span>}
                         </td>}
                         {allProjects.length > 0 && <td className="text-center px-1 py-1 relative">
@@ -1858,12 +2076,13 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                             <>
                               <button
                                 onClick={() => setCdcPopoverLineId(cdcPopoverLineId === lineId ? null : lineId)}
+                                title={lineProjects[lineId]?.length ? lineProjects[lineId].map(lp => { const p = allProjects.find(pp => pp.id === lp.project_id); return p ? `${p.code} ${p.name}` : ''; }).filter(Boolean).join(', ') : ''}
                                 className={`text-[10px] hover:underline cursor-pointer w-full text-center px-1 py-1 rounded-md border ${
                                   lineProjects[lineId]?.length ? 'bg-indigo-50 border-indigo-200 text-indigo-700 font-semibold' : 'border-gray-200 text-gray-500'
                                 }`}
                               >
                                 {lineProjects[lineId]?.length
-                                  ? lineProjects[lineId].map(lp => allProjects.find(p => p.id === lp.project_id)?.code).filter(Boolean).join(', ').substring(0, 12)
+                                  ? lineProjects[lineId].map(lp => { const p = allProjects.find(pp => pp.id === lp.project_id); return p ? `${p.code} ${p.name?.substring(0, 8) || ''}` : ''; }).filter(Boolean).join(', ').substring(0, 18)
                                   : (cdcRows.length > 0 ? '\u2190 Fatt.' : '\u2014')
                                 }
                               </button>
@@ -1899,14 +2118,37 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                                       </div>
                                     );
                                   })}
+                                  {(() => {
+                                    const lps = lineProjects[lineId] || [];
+                                    if (lps.length <= 1) return null;
+                                    const total = lps.reduce((s, p) => s + p.percentage, 0);
+                                    const isValid = Math.abs(total - 100) < 0.01;
+                                    return !isValid ? (
+                                      <div className="text-[9px] text-red-600 font-medium mt-1">
+                                        {'\u26A0'} Percentuali devono sommare a 100% (attuale: {Math.round(total)}%)
+                                      </div>
+                                    ) : null;
+                                  })()}
                                   <div className="flex items-center gap-1 mt-1">
                                     <select className="flex-1 text-[9px] border rounded px-1 py-0.5" value=""
                                       onChange={e => {
                                         if (!e.target.value) return;
-                                        setLineProjects(prev => ({
-                                          ...prev,
-                                          [lineId]: [...(prev[lineId] || []), { id: crypto.randomUUID(), invoice_line_id: lineId, project_id: e.target.value, percentage: 100, amount: null }],
-                                        }));
+                                        const existing = lineProjects[lineId] || [];
+                                        // Auto-default 50/50 when adding second CdC
+                                        if (existing.length === 1 && existing[0].percentage === 100) {
+                                          setLineProjects(prev => ({
+                                            ...prev,
+                                            [lineId]: [
+                                              { ...existing[0], percentage: 50 },
+                                              { id: crypto.randomUUID(), invoice_line_id: lineId, project_id: e.target.value, percentage: 50, amount: null },
+                                            ],
+                                          }));
+                                        } else {
+                                          setLineProjects(prev => ({
+                                            ...prev,
+                                            [lineId]: [...existing, { id: crypto.randomUUID(), invoice_line_id: lineId, project_id: e.target.value, percentage: 100, amount: null }],
+                                          }));
+                                        }
                                       }}
                                     >
                                       <option value="">+ Aggiungi CdC</option>
@@ -1916,6 +2158,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                                     </select>
                                   </div>
                                   <button
+                                    disabled={(() => {
+                                      const lps = lineProjects[lineId] || [];
+                                      if (lps.length <= 1) return false;
+                                      return Math.abs(lps.reduce((s, p) => s + p.percentage, 0) - 100) >= 0.01;
+                                    })()}
                                     onClick={async () => {
                                       if (!company?.id || !invoice?.id) return;
                                       try {
@@ -1928,7 +2175,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                                         setCdcPopoverLineId(null);
                                       } catch (e: any) { console.error('Save line CdC error:', e); }
                                     }}
-                                    className="mt-2 w-full text-[10px] font-semibold bg-sky-600 text-white rounded px-2 py-1 hover:bg-sky-700"
+                                    className="mt-2 w-full text-[10px] font-semibold bg-sky-600 text-white rounded px-2 py-1 hover:bg-sky-700 disabled:opacity-40 disabled:cursor-not-allowed"
                                   >
                                     Salva
                                   </button>
@@ -1939,15 +2186,36 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                         </td>}
                         {allAccounts.length > 0 && <td className="text-center px-1 py-1">
                           {lineId ? (
-                            <select
-                              value={lineAcc || ''}
-                              onChange={e => handleLineClassifChange(lineId, 'account_id', e.target.value || null)}
-                              className={`w-full px-1 py-1 text-[10px] border rounded-md outline-none cursor-pointer ${lineAcc ? 'bg-emerald-50 border-emerald-200 text-emerald-700 font-semibold' : 'border-gray-200 bg-white text-gray-500'}`}
-                            >
-                              <option value="">{selAccountId ? '\u2190 Fatt.' : '\u2014'}</option>
-                              {allAccounts.map(a => <option key={a.id} value={a.id}>{a.code}</option>)}
-                            </select>
+                            <SearchableSelect
+                              value={lineAcc || null}
+                              options={allAccounts.map(a => ({ id: a.id, label: `${a.code} \u2014 ${a.name}`, searchText: `${a.code} ${a.name}` }))}
+                              onChange={v => handleLineClassifChange(lineId, 'account_id', v)}
+                              placeholder={selAccountId ? '\u2190 Fatt.' : '\u2014'}
+                              emptyLabel={selAccountId ? '\u2190 Fatt.' : undefined}
+                              selectedClassName="bg-emerald-50 border-emerald-200 text-emerald-700 font-semibold"
+                              emptyClassName="border-gray-200 bg-white text-gray-500"
+                              truncate={20}
+                            />
                           ) : <span className="text-[9px] text-gray-300">{'\u2014'}</span>}
+                        </td>}
+                        {/* Copy/Paste column */}
+                        {(allCategories.length > 0 || allAccounts.length > 0) && <td className="text-center px-0.5 py-1 w-12">
+                          {lineId && (
+                            <div className="flex items-center gap-0.5 justify-center">
+                              <button onClick={() => handleCopyLineClassif(lineId)}
+                                title="Copia classificazione"
+                                className="w-5 h-5 flex items-center justify-center rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 text-[10px]">
+                                {'\uD83D\uDCCB'}
+                              </button>
+                              {copiedClassif && (
+                                <button onClick={() => handlePasteLineClassif(lineId)}
+                                  title="Incolla classificazione"
+                                  className="w-5 h-5 flex items-center justify-center rounded text-gray-400 hover:text-green-600 hover:bg-green-50 text-[10px]">
+                                  {'\uD83D\uDCCC'}
+                                </button>
+                              )}
+                            </div>
+                          )}
                         </td>}
                       </tr>
                       {hasFiscalFlags && (
@@ -2033,12 +2301,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                       );
                     })}
                     {/* Fallback: DB line items when XML not parsed */}
-                    {!b?.linee?.length && detail?.invoice_lines?.map((l, i) => {
+                    {!b?.linee?.length && visibleDbLines.map((l, i) => {
                       const lineCat = lineClassifs[l.id]?.category_id;
                       const lineAcc = lineClassifs[l.id]?.account_id;
                       const ff2 = lineFiscalFlags[l.id];
                       const hasFf2 = ff2 && (ff2.ritenuta_acconto || ff2.reverse_charge || ff2.split_payment || ff2.bene_strumentale || (ff2.deducibilita_pct != null && ff2.deducibilita_pct < 100) || (ff2.iva_detraibilita_pct != null && ff2.iva_detraibilita_pct < 100));
-                      const colCount2 = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0);
+                      const colCount2 = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0);
                       return (
                       <React.Fragment key={i}>
                       <tr className="border-b border-gray-50 hover:bg-gray-50/50">
@@ -2071,16 +2339,20 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                         <td className="text-right px-2 py-2 text-gray-600">{fmtNum(l.vat_rate)}%</td>
                         <td className="text-right px-2 py-2 font-bold text-gray-800">{fmtNum(l.total_price)}</td>
                         {allCategories.length > 0 && <td className="text-center px-1 py-1">
-                          <select value={lineCat || ''} onChange={e => handleLineClassifChange(l.id, 'category_id', e.target.value || null)}
-                            className={`w-full px-1 py-1 text-[10px] border rounded-md outline-none cursor-pointer ${lineCat ? 'bg-blue-50 border-blue-200 text-blue-700 font-semibold' : 'border-gray-200 bg-white text-gray-500'}`}>
-                            <option value="">{selCategoryId ? '\u2190 Fatt.' : '\u2014'}</option>
-                            {allCategories.map(c => <option key={c.id} value={c.id}>{c.name.substring(0, 14)}</option>)}
-                          </select>
+                          <SearchableSelect
+                            value={lineCat || null}
+                            options={allCategories.map(c => ({ id: c.id, label: c.name }))}
+                            onChange={v => handleLineClassifChange(l.id, 'category_id', v)}
+                            placeholder={selCategoryId ? '\u2190 Fatt.' : '\u2014'}
+                            emptyLabel={selCategoryId ? '\u2190 Fatt.' : undefined}
+                            truncate={18}
+                          />
                         </td>}
                         {allProjects.length > 0 && <td className="text-center px-1 py-1 relative">
                           <button onClick={() => setCdcPopoverLineId(cdcPopoverLineId === l.id ? null : l.id)}
+                            title={lineProjects[l.id]?.length ? lineProjects[l.id].map(lp => { const p = allProjects.find(pp => pp.id === lp.project_id); return p ? `${p.code} ${p.name}` : ''; }).filter(Boolean).join(', ') : ''}
                             className={`text-[10px] cursor-pointer w-full text-center px-1 py-1 rounded-md border ${lineProjects[l.id]?.length ? 'bg-indigo-50 border-indigo-200 text-indigo-700 font-semibold' : 'border-gray-200 text-gray-500'}`}>
-                            {lineProjects[l.id]?.length ? lineProjects[l.id].map(lp => allProjects.find(p => p.id === lp.project_id)?.code).filter(Boolean).join(', ').substring(0, 12) : (cdcRows.length > 0 ? '\u2190 Fatt.' : '\u2014')}
+                            {lineProjects[l.id]?.length ? lineProjects[l.id].map(lp => { const p = allProjects.find(pp => pp.id === lp.project_id); return p ? `${p.code} ${p.name?.substring(0, 8) || ''}` : ''; }).filter(Boolean).join(', ').substring(0, 18) : (cdcRows.length > 0 ? '\u2190 Fatt.' : '\u2014')}
                           </button>
                           {cdcPopoverLineId === l.id && (
                             <div className="absolute z-50 top-full right-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-xl p-3 w-64" onClick={e => e.stopPropagation()}>
@@ -2101,34 +2373,91 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                                   </div>
                                 );
                               })}
+                              {(() => {
+                                const lps = lineProjects[l.id] || [];
+                                if (lps.length <= 1) return null;
+                                const total = lps.reduce((s, p) => s + p.percentage, 0);
+                                const isValid = Math.abs(total - 100) < 0.01;
+                                return !isValid ? (
+                                  <div className="text-[9px] text-red-600 font-medium mt-1">
+                                    {'\u26A0'} Percentuali devono sommare a 100% (attuale: {Math.round(total)}%)
+                                  </div>
+                                ) : null;
+                              })()}
                               <div className="flex items-center gap-1 mt-1">
                                 <select className="flex-1 text-[9px] border rounded px-1 py-0.5" value=""
-                                  onChange={e => { if (!e.target.value) return; setLineProjects(prev => ({ ...prev, [l.id]: [...(prev[l.id] || []), { id: crypto.randomUUID(), invoice_line_id: l.id, project_id: e.target.value, percentage: 100, amount: null }] })); }}>
+                                  onChange={e => {
+                                    if (!e.target.value) return;
+                                    const existing = lineProjects[l.id] || [];
+                                    if (existing.length === 1 && existing[0].percentage === 100) {
+                                      setLineProjects(prev => ({
+                                        ...prev,
+                                        [l.id]: [
+                                          { ...existing[0], percentage: 50 },
+                                          { id: crypto.randomUUID(), invoice_line_id: l.id, project_id: e.target.value, percentage: 50, amount: null },
+                                        ],
+                                      }));
+                                    } else {
+                                      setLineProjects(prev => ({
+                                        ...prev,
+                                        [l.id]: [...existing, { id: crypto.randomUUID(), invoice_line_id: l.id, project_id: e.target.value, percentage: 100, amount: null }],
+                                      }));
+                                    }
+                                  }}>
                                   <option value="">+ Aggiungi CdC</option>
                                   {allProjects.filter(p => !(lineProjects[l.id] || []).some(lp => lp.project_id === p.id)).map(p => (
                                     <option key={p.id} value={p.id}>{p.code} - {p.name}</option>
                                   ))}
                                 </select>
                               </div>
-                              <button onClick={async () => {
-                                if (!company?.id || !invoice?.id) return;
-                                try {
-                                  const toSave = (lineProjects[l.id] || []).map(lp => ({ project_id: lp.project_id, percentage: lp.percentage, amount: lp.amount }));
-                                  await saveLineProjects(company.id, invoice.id, l.id, toSave);
-                                  const fresh = await loadLineProjects(invoice.id);
-                                  setLineProjects(fresh);
-                                  setCdcPopoverLineId(null);
-                                } catch (e: any) { console.error('Save line CdC error:', e); }
-                              }} className="mt-2 w-full text-[10px] font-semibold bg-sky-600 text-white rounded px-2 py-1 hover:bg-sky-700">Salva</button>
+                              <button
+                                disabled={(() => {
+                                  const lps = lineProjects[l.id] || [];
+                                  if (lps.length <= 1) return false;
+                                  return Math.abs(lps.reduce((s, p) => s + p.percentage, 0) - 100) >= 0.01;
+                                })()}
+                                onClick={async () => {
+                                  if (!company?.id || !invoice?.id) return;
+                                  try {
+                                    const toSave = (lineProjects[l.id] || []).map(lp => ({ project_id: lp.project_id, percentage: lp.percentage, amount: lp.amount }));
+                                    await saveLineProjects(company.id, invoice.id, l.id, toSave);
+                                    const fresh = await loadLineProjects(invoice.id);
+                                    setLineProjects(fresh);
+                                    setCdcPopoverLineId(null);
+                                  } catch (e: any) { console.error('Save line CdC error:', e); }
+                                }}
+                                className="mt-2 w-full text-[10px] font-semibold bg-sky-600 text-white rounded px-2 py-1 hover:bg-sky-700 disabled:opacity-40 disabled:cursor-not-allowed">Salva</button>
                             </div>
                           )}
                         </td>}
                         {allAccounts.length > 0 && <td className="text-center px-1 py-1">
-                          <select value={lineAcc || ''} onChange={e => handleLineClassifChange(l.id, 'account_id', e.target.value || null)}
-                            className={`w-full px-1 py-1 text-[10px] border rounded-md outline-none cursor-pointer ${lineAcc ? 'bg-emerald-50 border-emerald-200 text-emerald-700 font-semibold' : 'border-gray-200 bg-white text-gray-500'}`}>
-                            <option value="">{selAccountId ? '\u2190 Fatt.' : '\u2014'}</option>
-                            {allAccounts.map(a => <option key={a.id} value={a.id}>{a.code}</option>)}
-                          </select>
+                          <SearchableSelect
+                            value={lineAcc || null}
+                            options={allAccounts.map(a => ({ id: a.id, label: `${a.code} \u2014 ${a.name}`, searchText: `${a.code} ${a.name}` }))}
+                            onChange={v => handleLineClassifChange(l.id, 'account_id', v)}
+                            placeholder={selAccountId ? '\u2190 Fatt.' : '\u2014'}
+                            emptyLabel={selAccountId ? '\u2190 Fatt.' : undefined}
+                            selectedClassName="bg-emerald-50 border-emerald-200 text-emerald-700 font-semibold"
+                            emptyClassName="border-gray-200 bg-white text-gray-500"
+                            truncate={20}
+                          />
+                        </td>}
+                        {/* Copy/Paste column */}
+                        {(allCategories.length > 0 || allAccounts.length > 0) && <td className="text-center px-0.5 py-1 w-12">
+                          <div className="flex items-center gap-0.5 justify-center">
+                            <button onClick={() => handleCopyLineClassif(l.id)}
+                              title="Copia classificazione"
+                              className="w-5 h-5 flex items-center justify-center rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 text-[10px]">
+                              {'\uD83D\uDCCB'}
+                            </button>
+                            {copiedClassif && (
+                              <button onClick={() => handlePasteLineClassif(l.id)}
+                                title="Incolla classificazione"
+                                className="w-5 h-5 flex items-center justify-center rounded text-gray-400 hover:text-green-600 hover:bg-green-50 text-[10px]">
+                                {'\uD83D\uDCCC'}
+                              </button>
+                            )}
+                          </div>
                         </td>}
                       </tr>
                       {hasFf2 && (
@@ -2218,9 +2547,18 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               </div>
               {/* Footer */}
               <div className="flex items-center justify-between px-4 py-2.5 border-t bg-gray-50">
-                <span className="text-[11px] text-gray-400">
-                  {isPostConfirmDirty ? 'Modifiche non salvate' : 'Classificazione salvata automaticamente per riga'}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] text-gray-400">
+                    {isPostConfirmDirty ? 'Modifiche non salvate' : 'Classificazione salvata automaticamente per riga'}
+                  </span>
+                  {/* "Cancella tutto" — clears entire classification */}
+                  {(classification || Object.keys(lineClassifs).length > 0) && (
+                    <button onClick={() => setShowClearDialog(true)}
+                      className="px-2 py-1 text-[10px] font-semibold rounded-md border border-red-200 text-red-500 hover:bg-red-50 transition-colors">
+                      {'\uD83D\uDDD1'} Cancella tutto
+                    </button>
+                  )}
+                </div>
                 <div className="flex items-center gap-2">
                   {/* "Conferma modifica" — visible when confirmed invoice has unsaved changes */}
                   {isPostConfirmDirty && (
@@ -2240,6 +2578,29 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                     Ignora suggerimenti
                   </button>
                 </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Clear classification confirmation dialog */}
+        {showClearDialog && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+            <div className="bg-white rounded-xl shadow-xl p-6 max-w-sm w-full mx-4">
+              <p className="font-semibold text-gray-900 mb-2">Cancella classificazione</p>
+              <p className="text-sm text-gray-500 mb-4">
+                Vuoi cancellare tutta la classificazione di questa fattura?
+                Categoria, CdC, Conto e Articolo verranno rimossi da tutte le righe.
+              </p>
+              <div className="flex gap-3 justify-end">
+                <button onClick={() => setShowClearDialog(false)}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-100">
+                  Annulla
+                </button>
+                <button onClick={handleClearAllClassification}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-red-600 text-white hover:bg-red-700">
+                  Cancella tutto
+                </button>
               </div>
             </div>
           </div>

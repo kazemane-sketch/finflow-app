@@ -385,6 +385,16 @@ CONTABILITA SPECIFICA CAVE E INERTI:
 * I costi specifici includono: locazione cava (6090020), esplosivo (rimborsato come ricavo 7063001), trasporti su acquisti (60412) e vendite (60810)
 * Distingui SEMPRE tra "trasporto su acquisto" (60412 — il fornitore ci porta la merce) e "trasporto per vendita" (60810 — noi portiamo merce al cliente) e "spese di trasporto generiche" (60702)
 
+ASSEGNAZIONE CENTRO DI COSTO — RAGIONAMENTO INTELLIGENTE:
+Per scegliere il CdC corretto, NON indovinare. Ragiona usando TUTTE le informazioni disponibili:
+1. STORICO CONTROPARTE (PRIORITÀ MASSIMA): se la stessa controparte è stata classificata su un CdC specifico nelle classificazioni precedenti confermate dall'utente, SEGUI LO STORICO. È il segnale più forte.
+2. INDIRIZZO/LOCALITÀ CONTROPARTE: l'indirizzo della controparte indica dove avviene il servizio o da dove arriva la fornitura. Confronta la provincia/città della controparte con i nomi e codici dei CdC disponibili. Se un CdC ha nel nome una località che corrisponde alla zona della controparte, è probabilmente quello giusto.
+3. ATECO CONTROPARTE: il codice ATECO della controparte indica il tipo di attività. Usa questa informazione per capire il contesto: un fornitore edile probabilmente serve un cantiere, un fornitore di carburante serve i mezzi di un sito specifico.
+4. ARTICOLI DELLA FATTURA: se le righe fattura sono state associate a un articolo che è specifico di un sito/CdC (es. materiale estratto in un sito specifico), il CdC dovrebbe corrispondere a quel sito.
+5. DESCRIZIONE RIGHE: cerca riferimenti geografici nella descrizione delle righe fattura (nomi di cave, cantieri, sedi, città).
+6. COSTI GENERALI: per spese non legate a un sito specifico (assicurazioni generali, consulenze fiscali/legali, abbonamenti SaaS, servizi centralizzati), usa il CdC che rappresenta la sede principale/corporate dell'azienda.
+REGOLA CHIAVE: non assegnare il CdC "sede/corporate" per default quando ci sono indizi che il costo è legato a un sito specifico. Usa il ragionamento sopra per dedurre il CdC corretto.
+
 FATTURA: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
 
 RIGHE DA CLASSIFICARE:
