@@ -1,7 +1,8 @@
 // src/components/SearchableSelect.tsx
-// Lightweight combobox: button trigger + absolute dropdown + text filter
-// No external dependencies — replaces native <select> in tight table cells
+// Lightweight combobox: button trigger + Portal-based dropdown + text filter
+// Uses React Portal so the dropdown escapes overflow-hidden table containers
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 
 export interface SearchableSelectOption {
   id: string;
@@ -34,7 +35,9 @@ export default function SearchableSelect({
 }: SearchableSelectProps) {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState('');
-  const containerRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ top: number; left: number; flip: boolean }>({ top: 0, left: 0, flip: false });
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Find selected option
@@ -47,23 +50,62 @@ export default function SearchableSelect({
     return options.filter(o => (o.searchText || o.label).toLowerCase().includes(q));
   }, [options, search]);
 
-  // Close on outside click
+  // Measure trigger position for Portal dropdown
+  const measure = useCallback(() => {
+    if (!triggerRef.current) return;
+    const rect = triggerRef.current.getBoundingClientRect();
+    const dropH = 280; // approx max dropdown height
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const flip = spaceBelow < dropH && rect.top > spaceBelow;
+    setPos({
+      top: flip ? rect.top : rect.bottom + 2,
+      left: rect.left,
+      flip,
+    });
+  }, []);
+
+  // Open handler — measure then open
+  const handleOpen = useCallback(() => {
+    if (disabled) return;
+    if (open) { setOpen(false); setSearch(''); return; }
+    measure();
+    setOpen(true);
+    setSearch('');
+  }, [disabled, open, measure]);
+
+  // Close on outside click (check both trigger and dropdown)
   useEffect(() => {
     if (!open) return;
     const handler = (e: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setOpen(false);
-        setSearch('');
-      }
+      const target = e.target as Node;
+      if (
+        triggerRef.current?.contains(target) ||
+        dropdownRef.current?.contains(target)
+      ) return;
+      setOpen(false);
+      setSearch('');
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [open]);
 
+  // Reposition on scroll / resize while open
+  useEffect(() => {
+    if (!open) return;
+    const reposition = () => measure();
+    window.addEventListener('scroll', reposition, true); // capture phase for nested scrollable
+    window.addEventListener('resize', reposition);
+    return () => {
+      window.removeEventListener('scroll', reposition, true);
+      window.removeEventListener('resize', reposition);
+    };
+  }, [open, measure]);
+
   // Focus input when opening
   useEffect(() => {
     if (open && inputRef.current) {
-      inputRef.current.focus();
+      // Small timeout so portal is mounted first
+      requestAnimationFrame(() => inputRef.current?.focus());
     }
   }, [open]);
 
@@ -88,12 +130,74 @@ export default function SearchableSelect({
     ? (selected.label.length > truncate ? selected.label.substring(0, truncate) + '\u2026' : selected.label)
     : (emptyLabel || placeholder);
 
+  // Portal dropdown
+  const dropdown = open ? createPortal(
+    <div
+      ref={dropdownRef}
+      style={{
+        position: 'fixed',
+        top: pos.flip ? undefined : pos.top,
+        bottom: pos.flip ? (window.innerHeight - pos.top + 2) : undefined,
+        left: pos.left,
+        zIndex: 9999,
+        minWidth: 260,
+        maxWidth: 340,
+      }}
+      className="bg-white border border-gray-200 rounded-lg shadow-2xl overflow-hidden"
+    >
+      {/* Search input */}
+      <div className="p-1.5 border-b border-gray-100">
+        <input
+          ref={inputRef}
+          type="text"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Cerca..."
+          className="w-full px-2 py-1.5 text-[11px] border border-gray-200 rounded bg-gray-50 outline-none focus:ring-1 focus:ring-blue-300 focus:border-blue-300"
+        />
+      </div>
+
+      {/* Options list */}
+      <div className="max-h-[240px] overflow-y-auto">
+        {/* Clear / none option */}
+        <button
+          type="button"
+          onClick={() => handleSelect(null)}
+          className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-gray-50 transition-colors ${
+            !value ? 'bg-gray-50 font-semibold text-gray-700' : 'text-gray-400'
+          }`}
+        >
+          {placeholder}
+        </button>
+        {filtered.length === 0 ? (
+          <div className="px-3 py-3 text-[11px] text-gray-400 text-center">Nessun risultato</div>
+        ) : (
+          filtered.map(o => (
+            <button
+              key={o.id}
+              type="button"
+              onClick={() => handleSelect(o.id)}
+              className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-blue-50 transition-colors ${
+                o.id === value ? 'bg-blue-50 font-semibold text-blue-700' : 'text-gray-700'
+              }`}
+            >
+              {o.label}
+            </button>
+          ))
+        )}
+      </div>
+    </div>,
+    document.body,
+  ) : null;
+
   return (
-    <div ref={containerRef} className="relative w-full">
+    <div className="relative w-full">
       {/* Trigger button */}
       <button
+        ref={triggerRef}
         type="button"
-        onClick={() => { if (!disabled) { setOpen(!open); setSearch(''); } }}
+        onClick={handleOpen}
         disabled={disabled}
         title={selected?.label || ''}
         className={`w-full px-1 py-1 text-[10px] border rounded-md outline-none cursor-pointer text-left truncate ${
@@ -103,53 +207,8 @@ export default function SearchableSelect({
         {triggerLabel}
       </button>
 
-      {/* Dropdown panel */}
-      {open && (
-        <div className="absolute z-[60] top-full left-0 mt-1 bg-white border border-gray-200 rounded-lg shadow-xl w-[280px] overflow-hidden">
-          {/* Search input */}
-          <div className="p-1.5 border-b border-gray-100">
-            <input
-              ref={inputRef}
-              type="text"
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Cerca..."
-              className="w-full px-2 py-1.5 text-[11px] border border-gray-200 rounded bg-gray-50 outline-none focus:ring-1 focus:ring-blue-300 focus:border-blue-300"
-            />
-          </div>
-
-          {/* Options list */}
-          <div className="max-h-[220px] overflow-y-auto">
-            {/* Clear / none option */}
-            <button
-              type="button"
-              onClick={() => handleSelect(null)}
-              className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-gray-50 transition-colors ${
-                !value ? 'bg-gray-50 font-semibold text-gray-700' : 'text-gray-400'
-              }`}
-            >
-              {placeholder}
-            </button>
-            {filtered.length === 0 ? (
-              <div className="px-3 py-3 text-[11px] text-gray-400 text-center">Nessun risultato</div>
-            ) : (
-              filtered.map(o => (
-                <button
-                  key={o.id}
-                  type="button"
-                  onClick={() => handleSelect(o.id)}
-                  className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-blue-50 transition-colors ${
-                    o.id === value ? 'bg-blue-50 font-semibold text-blue-700' : 'text-gray-700'
-                  }`}
-                >
-                  {o.label}
-                </button>
-              ))
-            )}
-          </div>
-        </div>
-      )}
+      {/* Portal dropdown — rendered into document.body to escape overflow clipping */}
+      {dropdown}
     </div>
   );
 }

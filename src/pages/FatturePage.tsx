@@ -2549,7 +2549,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               <div className="flex items-center justify-between px-4 py-2.5 border-t bg-gray-50">
                 <div className="flex items-center gap-2">
                   <span className="text-[11px] text-gray-400">
-                    {isPostConfirmDirty ? 'Modifiche non salvate' : 'Classificazione salvata automaticamente per riga'}
+                    {isPostConfirmDirty
+                      ? 'Modifiche non salvate'
+                      : isConfirmed
+                        ? '\u2713 Classificazione confermata'
+                        : 'Classificazione salvata automaticamente per riga'}
                   </span>
                   {/* "Cancella tutto" — clears entire classification */}
                   {(classification || Object.keys(lineClassifs).length > 0) && (
@@ -2563,20 +2567,24 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                   {/* "Conferma modifica" — visible when confirmed invoice has unsaved changes */}
                   {isPostConfirmDirty && (
                     <button onClick={handleConfirmChanges} disabled={confirmChangesSaving || !cdcValidation.valid}
-                      className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-orange-500 text-white hover:bg-orange-600 disabled:opacity-50 transition-colors animate-pulse"
+                      className="px-4 py-2 text-sm font-bold rounded-lg bg-orange-500 text-white hover:bg-orange-600 disabled:opacity-50 transition-colors shadow-md"
                       title={!cdcValidation.valid ? cdcValidation.message : 'Salva tutte le modifiche'}>
                       {confirmChangesSaving ? 'Salvataggio...' : '\u2713 Conferma modifica'}
                     </button>
                   )}
-                  {/* "Conferma tutte" — only for ai_suggested status */}
-                  <button onClick={handleConfirmExistingClassification} disabled={invoice.classification_status !== 'ai_suggested'}
-                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
-                    {'\u2713'} Conferma tutte
-                  </button>
-                  <button onClick={handleRejectAiClassification} disabled={invoice.classification_status !== 'ai_suggested'}
-                    className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
-                    Ignora suggerimenti
-                  </button>
+                  {/* "Conferma tutte" + "Ignora" — only visible for ai_suggested */}
+                  {invoice.classification_status === 'ai_suggested' && (
+                    <>
+                      <button onClick={handleConfirmExistingClassification}
+                        className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 transition-colors">
+                        {'\u2713'} Conferma tutte
+                      </button>
+                      <button onClick={handleRejectAiClassification}
+                        className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-100 transition-colors">
+                        Ignora suggerimenti
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
