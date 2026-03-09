@@ -105,13 +105,21 @@ export default function SearchableSelect({
     };
   }, [open, measure]);
 
-  // Focus input when opening
+  // Focus input + scroll to selected value when opening
   useEffect(() => {
-    if (open && inputRef.current) {
-      // Small timeout so portal is mounted first
-      requestAnimationFrame(() => inputRef.current?.focus());
-    }
-  }, [open]);
+    if (!open) return;
+    requestAnimationFrame(() => {
+      // Focus the search input
+      inputRef.current?.focus();
+      // Scroll the selected option into view
+      if (value && dropdownRef.current) {
+        const selectedEl = dropdownRef.current.querySelector('[data-selected="true"]');
+        if (selectedEl) {
+          selectedEl.scrollIntoView({ block: 'center', behavior: 'instant' });
+        }
+      }
+    });
+  }, [open, value]);
 
   const handleSelect = useCallback((id: string | null) => {
     onChange(id);
@@ -182,9 +190,10 @@ export default function SearchableSelect({
             <button
               key={o.id}
               type="button"
+              data-selected={o.id === value ? 'true' : undefined}
               onClick={() => handleSelect(o.id)}
               className={`w-full text-left px-3 py-1.5 text-[11px] hover:bg-blue-50 transition-colors ${
-                o.id === value ? 'bg-blue-50 font-semibold text-blue-700' : 'text-gray-700'
+                o.id === value ? 'bg-blue-100 font-semibold text-blue-700 border-l-2 border-blue-500' : 'text-gray-700'
               }`}
             >
               {o.label}

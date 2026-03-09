@@ -84,6 +84,8 @@ interface HistoryRow {
   account_name: string | null;
   article_code: string | null;
   article_name: string | null;
+  phase_code: string | null;
+  phase_name: string | null;
   cost_center_allocations: unknown;
 }
 
@@ -263,7 +265,11 @@ function buildPrompt(
   if (history.length > 0) {
     const histLines = history.map((h) => {
       const parts: string[] = [`"${h.description}"`];
-      if (h.article_code) parts.push(`art: ${h.article_code} ${h.article_name || ""}`);
+      if (h.article_code) {
+        let artPart = `art: ${h.article_code} ${h.article_name || ""}`;
+        if (h.phase_code) artPart += ` → fase: ${h.phase_code} (${h.phase_name || ""})`;
+        parts.push(artPart);
+      }
       if (h.category_name) parts.push(`cat: ${h.category_name}`);
       if (h.account_code) parts.push(`conto: ${h.account_code} ${h.account_name || ""}`);
       return parts.join(" → ");
@@ -323,6 +329,17 @@ REGOLE:
 * article_code: assegna SOLO se la riga riguarda uno degli articoli configurati, altrimenti null
 * phase_code: se l'articolo ha fasi, assegna la fase più appropriata dal suo elenco. Se l'articolo non ha fasi, phase_code = null.
 * category_id e account_id: assegna SEMPRE
+
+FASI ARTICOLO — REGOLE:
+* Quando assegni un articolo che ha fasi, DEVI SEMPRE assegnare anche phase_code. Non lasciare phase_code = null per articoli con fasi.
+* Usa la DESCRIZIONE della riga fattura per capire la fase:
+  - "estrazione" / "scavo" / "coltivazione" → fase di estrazione/coltivazione
+  - "trasporto" / "carico" / "consegna" → fase di trasporto
+  - "ciclo completo" / "dalla cava al frantoio" → fase ciclo completo
+  - "fresatura" / "frantumazione" → fase di frantumazione/fresatura
+  - "vendita" / "fornitura" / "cessione" → fase di vendita diretta
+* Usa lo STORICO: se la stessa controparte con descrizione simile ha avuto una fase specifica, SEGUI LO STORICO
+* Se non riesci a determinare la fase dalla descrizione, scegli la fase più comune dallo storico per quella controparte/articolo
 * confidence 0-100
 
 EXPERTISE CONTABILE ITALIANA — REGOLE FISCALI DA APPLICARE:
@@ -713,13 +730,16 @@ Deno.serve(async (req) => {
       if (vatKey) {
         history = (await sql`
           SELECT il.description, c.name as category_name, a.code as account_code, a.name as account_name,
-                 art.code as article_code, art.name as article_name, null::jsonb as cost_center_allocations
+                 art.code as article_code, art.name as article_name,
+                 ap.code as phase_code, ap.name as phase_name,
+                 null::jsonb as cost_center_allocations
           FROM invoice_lines il
           JOIN invoices i ON il.invoice_id = i.id
           LEFT JOIN categories c ON il.category_id = c.id
           LEFT JOIN chart_of_accounts a ON il.account_id = a.id
           LEFT JOIN invoice_line_articles ila ON ila.invoice_line_id = il.id
           LEFT JOIN articles art ON ila.article_id = art.id
+          LEFT JOIN article_phases ap ON ila.phase_id = ap.id
           WHERE i.company_id = ${companyId}
             AND i.counterparty_id = (
               SELECT id FROM counterparties
@@ -871,6 +891,25 @@ Deno.serve(async (req) => {
       suggest_new_account: item.suggest_new_account || null,
       suggest_new_category: item.suggest_new_category || null,
     }));
+
+    // ─── Phase validation ─────────────────────────────
+    for (const lr of lineResults) {
+      if (lr.article_code) {
+        const article = articles.find((a) => a.code === lr.article_code);
+        if (article) {
+          const articlePhases = phases.filter((p) => p.article_id === article.id);
+          // Article has phases but AI returned no phase → warn
+          if (articlePhases.length > 0 && !lr.phase_code) {
+            console.warn(`[classify] Article ${lr.article_code} has ${articlePhases.length} phases but AI returned no phase_code for line ${lr.line_id}`);
+          }
+          // AI returned a phase that doesn't exist → nullify
+          if (lr.phase_code && !articlePhases.find((p) => p.code === lr.phase_code)) {
+            console.warn(`[classify] Invalid phase_code "${lr.phase_code}" for article ${lr.article_code} — nullifying`);
+            lr.phase_code = null;
+          }
+        }
+      }
+    }
 
     // ─── Compose invoice-level ─────────────────────────
     const invoiceLevel = composeInvoiceLevel(lineResults, inputLines);

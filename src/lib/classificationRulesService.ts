@@ -22,6 +22,7 @@ export interface ClassificationRule {
   description_pattern: string
   direction: string | null
   article_id: string | null
+  phase_id: string | null
   category_id: string | null
   account_id: string | null
   cost_center_allocations: { project_id: string; percentage: number }[] | null
@@ -205,6 +206,7 @@ export async function createRuleFromConfirmation(
   direction: 'in' | 'out',
   classification: {
     article_id?: string | null
+    phase_id?: string | null
     category_id?: string | null
     account_id?: string | null
     cost_center_allocations?: { project_id: string; percentage: number }[] | null
@@ -238,6 +240,7 @@ export async function createRuleFromConfirmation(
       .update({
         times_confirmed: (existing.times_confirmed || 0) + 1,
         article_id: classification.article_id ?? null,
+        phase_id: classification.phase_id ?? null,
         category_id: classification.category_id ?? null,
         account_id: classification.account_id ?? null,
         cost_center_allocations: classification.cost_center_allocations ?? null,
@@ -254,6 +257,7 @@ export async function createRuleFromConfirmation(
       description_pattern: normalizedDesc,
       direction,
       article_id: classification.article_id ?? null,
+      phase_id: classification.phase_id ?? null,
       category_id: classification.category_id ?? null,
       account_id: classification.account_id ?? null,
       cost_center_allocations: classification.cost_center_allocations ?? null,

@@ -805,7 +805,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               companyId, cp?.piva || null, cp?.denom || null,
               line.description, invoice.direction as 'in' | 'out',
               { category_id: lc.category_id, account_id: lc.account_id,
-                article_id: lineArticleMap[line.id]?.article_id || null },
+                article_id: lineArticleMap[line.id]?.article_id || null,
+                phase_id: lineArticleMap[line.id]?.phase_id || null },
             ).catch(err => console.warn('[rules] error:', err));
           }
         }
@@ -1129,7 +1130,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
             createRuleFromConfirmation(
               company.id, cp?.piva || null, cp?.denom || null,
               lineDesc, invoice.direction as 'in' | 'out',
-              { category_id: lr.category_id, account_id: lr.account_id, article_id: lr.article_id },
+              { category_id: lr.category_id, account_id: lr.account_id, article_id: lr.article_id, phase_id: lr.phase_id || null },
             ).catch(err => console.warn('[rules] error:', err));
           }
         }
@@ -1199,7 +1200,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               company.id, cp?.piva || null, cp?.denom || null,
               line.description, invoice.direction as 'in' | 'out',
               { category_id: lc.category_id, account_id: lc.account_id,
-                article_id: lineArticleMap[line.id]?.article_id || null },
+                article_id: lineArticleMap[line.id]?.article_id || null,
+                phase_id: lineArticleMap[line.id]?.phase_id || null },
             ).catch(err => console.warn('[rules] error:', err));
           }
         }
@@ -1361,7 +1363,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               companyId, cp?.piva || null, cp?.denom || null,
               line.description, invoice.direction as 'in' | 'out',
               { category_id: lc.category_id, account_id: lc.account_id,
-                article_id: lineArticleMap[line.id]?.article_id || null },
+                article_id: lineArticleMap[line.id]?.article_id || null,
+                phase_id: lineArticleMap[line.id]?.phase_id || null },
             ).catch(err => console.warn('[rules] error:', err));
           }
         }
