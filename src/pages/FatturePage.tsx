@@ -34,7 +34,7 @@ import {
   loadCategories, loadProjects, loadChartOfAccounts,
   loadInvoiceClassification, saveInvoiceClassification, deleteInvoiceClassification,
   loadInvoiceProjects, saveInvoiceProjects,
-  loadLineClassifications, saveLineCategoryAndAccount,
+  loadLineClassifications, saveLineCategoryAndAccount, clearAllLineClassifications,
   loadLineProjects, saveLineProjects,
   CATEGORY_TYPE_LABELS, SECTION_LABELS,
   createAccountFromSuggestion, createCategoryFromSuggestion,
@@ -1487,10 +1487,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   }, [copiedClassif, company?.id, invoice?.id]);
 
   // Clear all classification
-  const handleClearAllClassification = useCallback(() => {
+  const handleClearAllClassification = useCallback(async () => {
     if (!invoice?.id) return;
-    // LOCAL ONLY — clears all fields without touching DB.
-    // The user must press "Salva" to persist the clearing.
+    // Clear all local state
     setClassification(null);
     setSelCategoryId(null);
     setSelAccountId(null);
@@ -1498,6 +1497,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     setLineClassifs({});
     setLineProjects({});
     setLineArticleMap({});
+    setLineFiscalFlags({});
     setAiSuggestions({});
     setDismissedArticleLineIds(new Set());
     setAiClassifResult(null);
@@ -1506,6 +1506,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     setClassifDirty(true);
     // NOTE: Do NOT reset originals — we want isPostConfirmDirty = true → Save appears
     setShowClearDialog(false);
+    // Also clear fiscal_flags from DB immediately (they live on invoice_lines)
+    try {
+      await clearAllLineClassifications(invoice.id);
+    } catch (e) {
+      console.warn('[clear] Error clearing fiscal_flags from DB:', e);
+    }
   }, [invoice?.id]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }, suggestedPhaseId?: string | null) => {

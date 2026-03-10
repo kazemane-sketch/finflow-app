@@ -528,6 +528,16 @@ export async function loadLineClassifications(invoiceId: string): Promise<{
   return { classifs, fiscalFlags };
 }
 
+/** Clear category, account, and fiscal_flags on ALL lines of an invoice.
+ *  Used by "Cancella tutto" to wipe line-level classification data. */
+export async function clearAllLineClassifications(invoiceId: string): Promise<void> {
+  const { error } = await supabase
+    .from('invoice_lines')
+    .update({ category_id: null, account_id: null, fiscal_flags: null } as any)
+    .eq('invoice_id', invoiceId);
+  if (error) throw error;
+}
+
 /** Save category and/or account on a single invoice line.
  *  Works independently of article assignment (updates invoice_lines directly). */
 export async function saveLineCategoryAndAccount(
