@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 import { SECTION_LABELS, type CoaSection } from '@/lib/classificationService'
 import { deriveLevel } from '@/lib/coaTemplateService'
+import { triggerEntityEmbedding } from '@/lib/companyMemoryService'
 import { toast } from 'sonner'
 
 // ─── Types ────────────────────────────────────────────────
@@ -181,6 +182,9 @@ export default function ImportCOADialog({ companyId, existingCodes, open, onClos
         .upsert(insertRows, { onConflict: 'company_id,code', ignoreDuplicates: true })
 
       if (upsertErr) throw upsertErr
+
+      // Fire-and-forget: generate embeddings for imported accounts (backfill mode)
+      triggerEntityEmbedding(companyId, ['chart_of_accounts']).catch(() => {})
 
       setImportedCount(selected.length)
       setState('done')

@@ -129,44 +129,77 @@ async function processEntityType(
   companyId: string,
   entityType: EntityType,
   batchSize: number,
+  entityIds: string[] | null = null,
 ): Promise<{ processed: number; errors: number; remaining: number }> {
   let rows: EntityRow[];
 
+  // When entityIds are provided, embed specific entities (re-embed even if already embedded)
+  // When null, backfill mode (only embed rows where embedding IS NULL)
+  const useIds = entityIds && entityIds.length > 0;
+
   switch (entityType) {
     case "chart_of_accounts":
-      rows = (await sql`
-        SELECT id, code, name, section FROM public.chart_of_accounts
-        WHERE company_id = ${companyId} AND active = true AND is_header = false
-          AND embedding IS NULL AND length(name) > 1
-        ORDER BY code LIMIT ${batchSize}
-      `).map((r) => ({ id: r.id, embed_text: buildAccountText(r as any) }));
+      rows = useIds
+        ? (await sql`
+            SELECT id, code, name, section FROM public.chart_of_accounts
+            WHERE company_id = ${companyId} AND id = ANY(${entityIds}::uuid[])
+              AND active = true AND is_header = false AND length(name) > 1
+            ORDER BY code
+          `).map((r) => ({ id: r.id, embed_text: buildAccountText(r as any) }))
+        : (await sql`
+            SELECT id, code, name, section FROM public.chart_of_accounts
+            WHERE company_id = ${companyId} AND active = true AND is_header = false
+              AND embedding IS NULL AND length(name) > 1
+            ORDER BY code LIMIT ${batchSize}
+          `).map((r) => ({ id: r.id, embed_text: buildAccountText(r as any) }));
       break;
 
     case "categories":
-      rows = (await sql`
-        SELECT id, name, type FROM public.categories
-        WHERE company_id = ${companyId} AND active = true
-          AND embedding IS NULL AND length(name) > 1
-        ORDER BY sort_order, name LIMIT ${batchSize}
-      `).map((r) => ({ id: r.id, embed_text: buildCategoryText(r as any) }));
+      rows = useIds
+        ? (await sql`
+            SELECT id, name, type FROM public.categories
+            WHERE company_id = ${companyId} AND id = ANY(${entityIds}::uuid[])
+              AND active = true AND length(name) > 1
+            ORDER BY sort_order, name
+          `).map((r) => ({ id: r.id, embed_text: buildCategoryText(r as any) }))
+        : (await sql`
+            SELECT id, name, type FROM public.categories
+            WHERE company_id = ${companyId} AND active = true
+              AND embedding IS NULL AND length(name) > 1
+            ORDER BY sort_order, name LIMIT ${batchSize}
+          `).map((r) => ({ id: r.id, embed_text: buildCategoryText(r as any) }));
       break;
 
     case "articles":
-      rows = (await sql`
-        SELECT id, code, name, description, keywords FROM public.articles
-        WHERE company_id = ${companyId} AND active = true
-          AND embedding IS NULL AND length(name) > 1
-        ORDER BY code LIMIT ${batchSize}
-      `).map((r) => ({ id: r.id, embed_text: buildArticleText(r as any) }));
+      rows = useIds
+        ? (await sql`
+            SELECT id, code, name, description, keywords FROM public.articles
+            WHERE company_id = ${companyId} AND id = ANY(${entityIds}::uuid[])
+              AND active = true AND length(name) > 1
+            ORDER BY code
+          `).map((r) => ({ id: r.id, embed_text: buildArticleText(r as any) }))
+        : (await sql`
+            SELECT id, code, name, description, keywords FROM public.articles
+            WHERE company_id = ${companyId} AND active = true
+              AND embedding IS NULL AND length(name) > 1
+            ORDER BY code LIMIT ${batchSize}
+          `).map((r) => ({ id: r.id, embed_text: buildArticleText(r as any) }));
       break;
 
     case "projects":
-      rows = (await sql`
-        SELECT id, code, name FROM public.projects
-        WHERE company_id = ${companyId} AND status = 'active'
-          AND embedding IS NULL AND length(name) > 1
-        ORDER BY code LIMIT ${batchSize}
-      `).map((r) => ({ id: r.id, embed_text: buildProjectText(r as any) }));
+      rows = useIds
+        ? (await sql`
+            SELECT id, code, name FROM public.projects
+            WHERE company_id = ${companyId} AND id = ANY(${entityIds}::uuid[])
+              AND status = 'active' AND length(name) > 1
+            ORDER BY code
+          `).map((r) => ({ id: r.id, embed_text: buildProjectText(r as any) }))
+        : (await sql`
+            SELECT id, code, name FROM public.projects
+            WHERE company_id = ${companyId} AND status = 'active'
+              AND embedding IS NULL AND length(name) > 1
+            ORDER BY code LIMIT ${batchSize}
+          `).map((r) => ({ id: r.id, embed_text: buildProjectText(r as any) }));
       break;
 
     default:
@@ -256,6 +289,7 @@ Deno.serve(async (req) => {
   const body = await req.json().catch(() => ({})) as {
     company_id?: string;
     entity_types?: string[];
+    entity_ids?: string[];      // If provided, only embed these specific entities (for incremental updates)
     batch_size?: number;
   };
 
@@ -268,6 +302,9 @@ Deno.serve(async (req) => {
 
   if (entityTypes.length === 0) return json({ error: "entity_types non validi" }, 400);
 
+  const entityIds = Array.isArray(body.entity_ids)
+    ? body.entity_ids.filter((id): id is string => typeof id === "string" && id.length > 0)
+    : null;
   const batchSize = Math.max(1, Math.min(body.batch_size || MAX_BATCH, MAX_BATCH));
 
   const sql = postgres(dbUrl, { max: 1 });
@@ -278,8 +315,9 @@ Deno.serve(async (req) => {
     let totalErrors = 0;
 
     for (const entityType of entityTypes) {
-      console.log(`[precompute-embeddings] Processing ${entityType} for company ${companyId}...`);
-      const result = await processEntityType(sql, geminiKey, companyId, entityType, batchSize);
+      const mode = entityIds ? `incremental (${entityIds.length} IDs)` : "backfill";
+      console.log(`[precompute-embeddings] Processing ${entityType} [${mode}] for company ${companyId}...`);
+      const result = await processEntityType(sql, geminiKey, companyId, entityType, batchSize, entityIds);
       results[entityType] = result;
       totalProcessed += result.processed;
       totalErrors += result.errors;

@@ -93,13 +93,21 @@ export async function triggerMemoryEmbed(memoryIds: string[], companyId: string)
  * Triggers precompute-embeddings for entity tables (chart_of_accounts,
  * categories, articles, projects). Use after creating/updating entities.
  * Non-blocking (fire-and-forget).
+ *
+ * @param entityIds — Optional: embed only these specific entity UUIDs
+ *   (for incremental updates after create/edit). Omit for full backfill.
  */
 export async function triggerEntityEmbedding(
   companyId: string,
   entityTypes?: ('chart_of_accounts' | 'categories' | 'articles' | 'projects')[],
+  entityIds?: string[],
 ): Promise<void> {
   try {
     const token = await getValidAccessToken()
+    const payload: Record<string, unknown> = { company_id: companyId }
+    if (entityTypes) payload.entity_types = entityTypes
+    if (entityIds && entityIds.length > 0) payload.entity_ids = entityIds
+
     fetch(`${SUPABASE_URL}/functions/v1/precompute-embeddings`, {
       method: 'POST',
       headers: {
@@ -107,14 +115,73 @@ export async function triggerEntityEmbedding(
         'apikey': SUPABASE_ANON_KEY,
         'Authorization': `Bearer ${token}`,
       },
-      body: JSON.stringify({
-        company_id: companyId,
-        ...(entityTypes ? { entity_types: entityTypes } : {}),
-      }),
+      body: JSON.stringify(payload),
     }).catch(err => console.warn('[companyMemory] triggerEntityEmbedding fetch error:', err))
   } catch (err) {
     console.warn('[companyMemory] triggerEntityEmbedding token error:', err)
   }
+}
+
+/* ─── Full backfill: Brain AI activation ─────────── */
+
+export interface BrainBackfillResult {
+  entities: Record<string, { processed: number; errors: number; remaining: number }>
+  memory: { processed: number; errors: number; remaining: number }
+}
+
+/**
+ * Triggers a FULL backfill of all entity embeddings + company_memory embeddings.
+ * Unlike the fire-and-forget helpers, this **awaits** both responses so the UI
+ * can show progress/results. Used by the "Attiva Brain AI" button.
+ */
+export async function triggerFullBrainBackfill(companyId: string): Promise<BrainBackfillResult> {
+  const token = await getValidAccessToken()
+  const headers = {
+    'Content-Type': 'application/json',
+    'apikey': SUPABASE_ANON_KEY,
+    'Authorization': `Bearer ${token}`,
+  }
+
+  // Launch both in parallel
+  const [entitiesRes, memoryRes] = await Promise.allSettled([
+    fetch(`${SUPABASE_URL}/functions/v1/precompute-embeddings`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ company_id: companyId }),
+    }),
+    fetch(`${SUPABASE_URL}/functions/v1/memory-embed`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ company_id: companyId, mode: 'backfill' }),
+    }),
+  ])
+
+  const result: BrainBackfillResult = {
+    entities: {},
+    memory: { processed: 0, errors: 0, remaining: 0 },
+  }
+
+  // Parse entity results
+  if (entitiesRes.status === 'fulfilled' && entitiesRes.value.ok) {
+    try {
+      const data = await entitiesRes.value.json()
+      result.entities = data.processed_by_type || {}
+    } catch { /* ignore parse error */ }
+  } else {
+    console.warn('[brainBackfill] entities call failed:', entitiesRes.status === 'rejected' ? entitiesRes.reason : 'HTTP error')
+  }
+
+  // Parse memory results
+  if (memoryRes.status === 'fulfilled' && memoryRes.value.ok) {
+    try {
+      const data = await memoryRes.value.json()
+      result.memory = { processed: data.processed || 0, errors: data.errors || 0, remaining: data.remaining || 0 }
+    } catch { /* ignore parse error */ }
+  } else {
+    console.warn('[brainBackfill] memory call failed:', memoryRes.status === 'rejected' ? memoryRes.reason : 'HTTP error')
+  }
+
+  return result
 }
 
 /* ─── Domain helpers ────────────────────────────── */

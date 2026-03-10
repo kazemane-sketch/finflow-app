@@ -244,7 +244,7 @@ export default function ArticoliPage() {
     setSaving(true)
     try {
       if (draft.id) {
-        await updateArticle(draft.id, draft)
+        await updateArticle(draft.id, draft, companyId)
         toast.success('Articolo aggiornato')
       } else {
         const created = await createArticle(companyId, draft)

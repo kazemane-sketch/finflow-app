@@ -282,7 +282,7 @@ function ProjectFormModal({ project, companyId, availableParents, onSave, onClos
     setError('');
     try {
       if (project?.id) {
-        await updateProject(project.id, form);
+        await updateProject(project.id, form, companyId);
       } else {
         await createProject(companyId, form);
       }

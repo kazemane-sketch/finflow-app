@@ -23,7 +23,7 @@ const corsHeaders = {
 };
 
 /* ─── Model constants ────────────────────── */
-const MODEL_HAIKU = "claude-haiku-4-5-20250315";
+const MODEL_HAIKU = "claude-haiku-4-5-20251001";
 const MODEL_SONNET = "claude-sonnet-4-6";
 const ESCALATION_THRESHOLD = 60;  // Lines below this confidence get escalated to Sonnet
 const EMBEDDING_MODEL = "gemini-embedding-001";
@@ -1329,29 +1329,39 @@ Deno.serve(async (req) => {
       );
 
       if (preflight) {
-        // Use pre-flight results if sufficient
-        if (preflight.accounts.length >= 5) {
-          preflightAccounts = preflight.accounts;
+        // Cold-start detection: if ALL embedding queries returned empty, use full lists
+        const totalPfResults = preflight.accounts.length + preflight.categories.length + preflight.articles.length;
+        if (totalPfResults === 0) {
+          console.log(`[classify] ❄ Cold-start: no embeddings found — using full entity lists`);
+          // Keep defaults (full lists already assigned above)
         } else {
-          // Cold-start fallback: supplement with primary accounts
-          console.log(`[classify] Pre-flight returned only ${preflight.accounts.length} accounts, supplementing with primary accounts`);
-          const pfIds = new Set(preflight.accounts.map(a => a.id));
-          preflightAccounts = [
-            ...preflight.accounts,
-            ...primaryAccounts.filter(a => !pfIds.has(a.id)).slice(0, 15 - preflight.accounts.length),
-          ];
+          // Use pre-flight results if sufficient
+          if (preflight.accounts.length >= 5) {
+            preflightAccounts = preflight.accounts;
+          } else {
+            // Supplement with primary accounts
+            console.log(`[classify] Pre-flight returned only ${preflight.accounts.length} accounts, supplementing with primary accounts`);
+            const pfIds = new Set(preflight.accounts.map(a => a.id));
+            preflightAccounts = [
+              ...preflight.accounts,
+              ...primaryAccounts.filter(a => !pfIds.has(a.id)).slice(0, 15 - preflight.accounts.length),
+            ];
+          }
+          if (preflight.categories.length >= 3) {
+            preflightCategories = preflight.categories;
+          }
+          if (preflight.articles.length > 0) {
+            preflightArticles = preflight.articles;
+          }
+          if (preflight.projects.length > 0) {
+            preflightProjects = preflight.projects;
+          }
         }
-        if (preflight.categories.length >= 3) {
-          preflightCategories = preflight.categories;
-        }
-        if (preflight.articles.length > 0) {
-          preflightArticles = preflight.articles;
-        }
-        if (preflight.projects.length > 0) {
-          preflightProjects = preflight.projects;
-        }
+        // Always use memory facts if available
         memoryFacts = preflight.memoryFacts;
       }
+    } else if (!geminiKey) {
+      console.warn(`[classify] No GEMINI_API_KEY — skipping embedding pre-flight, using full lists`);
     }
 
     // Build memory block for prompt
@@ -1391,58 +1401,73 @@ Deno.serve(async (req) => {
       }),
     });
 
-    if (!haikuResponse.ok) {
-      const errText = await haikuResponse.text();
-      console.error(
-        "[classify-invoice-lines] Haiku API error:",
-        haikuResponse.status,
-        errText.slice(0, 300),
-      );
-      return json(
-        { error: `Haiku HTTP ${haikuResponse.status}: ${errText.slice(0, 200)}` },
-        502,
-      );
-    }
+    // Helper: call an AI model and parse the response
+    async function callClassificationModel(model: string, prompt: string, label: string): Promise<{
+      lineResults: SonnetLineResult[];
+      keywords: string[];
+    } | null> {
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 8192,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
 
-    const haikuData = await haikuResponse.json();
-    const haikuText = (haikuData as any)?.content?.[0]?.text || "";
-    console.log(
-      `[classify-invoice-lines] Haiku response length: ${haikuText.length} chars`,
-    );
+      if (!resp.ok) {
+        const errText = await resp.text();
+        console.error(`[classify-invoice-lines] ${label} API error:`, resp.status, errText.slice(0, 300));
+        return null;
+      }
 
-    // ─── Parse Haiku response ───────────────────────────
-    let classificationsJson: string;
-    let keywords: string[] = [];
+      const data = await resp.json();
+      const text = (data as any)?.content?.[0]?.text || "";
+      console.log(`[classify-invoice-lines] ${label} response: ${text.length} chars`);
 
-    const keywordsSplit = haikuText.split("---KEYWORDS---");
-    classificationsJson = keywordsSplit[0].trim();
-    if (keywordsSplit.length > 1) {
+      let keywords: string[] = [];
+      const keywordsSplit = text.split("---KEYWORDS---");
+      const classJson = keywordsSplit[0].trim();
+      if (keywordsSplit.length > 1) {
+        try {
+          const kwMatch = keywordsSplit[1].match(/\[[\s\S]*?\]/);
+          if (kwMatch) keywords = JSON.parse(kwMatch[0]);
+        } catch { /* ignore */ }
+      }
+
       try {
-        const kwMatch = keywordsSplit[1].match(/\[[\s\S]*?\]/);
-        if (kwMatch) keywords = JSON.parse(kwMatch[0]);
-      } catch {
-        console.warn("[classify-invoice-lines] Could not parse keywords");
+        const jsonMatch = classJson.match(/\[[\s\S]*\]/);
+        const parsed: SonnetLineResult[] = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+        return { lineResults: parsed, keywords };
+      } catch (e) {
+        console.error(`[classify-invoice-lines] ${label} parse error:`, e, classJson.slice(0, 300));
+        return null;
       }
     }
 
-    let haikuParsed: SonnetLineResult[];
-    try {
-      const jsonMatch = classificationsJson.match(/\[[\s\S]*\]/);
-      haikuParsed = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
-    } catch (e) {
-      console.error(
-        "[classify-invoice-lines] Failed to parse Haiku response:",
-        e,
-        classificationsJson.slice(0, 500),
-      );
-      return json(
-        { error: `Parse error: ${classificationsJson.slice(0, 200)}` },
-        502,
-      );
+    // Try Haiku first, fall back to Sonnet on failure
+    let classResult = await callClassificationModel(MODEL_HAIKU, focusedPrompt, "Haiku");
+    let actualModel = MODEL_HAIKU;
+
+    if (!classResult) {
+      console.warn("[classify-invoice-lines] Haiku failed, falling back to Sonnet with focused prompt");
+      classResult = await callClassificationModel(MODEL_SONNET, focusedPrompt, "Sonnet-fallback");
+      actualModel = MODEL_SONNET;
     }
 
-    // Normalize Haiku results
-    let lineResults: SonnetLineResult[] = haikuParsed.map((item) => ({
+    if (!classResult) {
+      return json({ error: "Both Haiku and Sonnet calls failed" }, 502);
+    }
+
+    let keywords = classResult.keywords;
+
+    // Normalize results
+    let lineResults: SonnetLineResult[] = classResult.lineResults.map((item) => ({
       line_id: item.line_id,
       article_code: item.article_code || null,
       phase_code: item.phase_code || null,
@@ -1745,7 +1770,7 @@ Deno.serve(async (req) => {
         history_count: history.length,
         memory_facts_count: memoryFacts.length,
         escalated_to_sonnet: lowConfLines.length,
-        model_primary: MODEL_HAIKU,
+        model_primary: actualModel,
         model_escalation: lowConfLines.length > 0 ? MODEL_SONNET : null,
       },
     });

@@ -441,7 +441,7 @@ function AccountFormModal({ account, companyId, accounts, onSave, onClose }: {
     setError('');
     try {
       if (account?.id) {
-        await updateChartAccount(account.id, { ...form, active });
+        await updateChartAccount(account.id, { ...form, active }, companyId);
       } else {
         await createChartAccount(companyId, form);
       }

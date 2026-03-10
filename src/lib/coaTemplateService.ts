@@ -1,6 +1,7 @@
 // src/lib/coaTemplateService.ts — Template-based chart of accounts for onboarding
 import { supabase } from '@/integrations/supabase/client'
 import type { CoaSection } from '@/lib/classificationService'
+import { triggerEntityEmbedding } from '@/lib/companyMemoryService'
 
 // ─── Types ────────────────────────────────────────────────
 
@@ -124,6 +125,9 @@ export async function applyTemplate(companyId: string, sector: CoaSector): Promi
     .upsert(rows, { onConflict: 'company_id,code', ignoreDuplicates: true })
 
   if (error) throw error
+
+  // Fire-and-forget: generate embeddings for all template accounts (backfill mode)
+  triggerEntityEmbedding(companyId, ['chart_of_accounts']).catch(() => {})
 
   return rows.length
 }

@@ -176,12 +176,16 @@ export async function createCategory(companyId: string, data: CategoryCreate): P
     .select()
     .single();
   if (error) throw error;
+  // Fire-and-forget: generate embedding for new category
+  if (row?.id) triggerEntityEmbedding(companyId, ['categories'], [row.id]).catch(() => {});
   return row as Category;
 }
 
-export async function updateCategory(id: string, data: Partial<CategoryCreate> & { active?: boolean }): Promise<void> {
+export async function updateCategory(id: string, data: Partial<CategoryCreate> & { active?: boolean }, companyId?: string): Promise<void> {
   const { error } = await supabase.from('categories').update(data).eq('id', id);
   if (error) throw error;
+  // Fire-and-forget: re-embed updated category
+  if (companyId) triggerEntityEmbedding(companyId, ['categories'], [id]).catch(() => {});
 }
 
 export async function deleteCategory(id: string): Promise<void> {
@@ -210,12 +214,16 @@ export async function createProject(companyId: string, data: ProjectCreate): Pro
     .select()
     .single();
   if (error) throw error;
+  // Fire-and-forget: generate embedding for new project
+  if (row?.id) triggerEntityEmbedding(companyId, ['projects'], [row.id]).catch(() => {});
   return row as Project;
 }
 
-export async function updateProject(id: string, data: Partial<ProjectCreate>): Promise<void> {
+export async function updateProject(id: string, data: Partial<ProjectCreate>, companyId?: string): Promise<void> {
   const { error } = await supabase.from('projects').update({ ...data, updated_at: new Date().toISOString() }).eq('id', id);
   if (error) throw error;
+  // Fire-and-forget: re-embed updated project
+  if (companyId) triggerEntityEmbedding(companyId, ['projects'], [id]).catch(() => {});
 }
 
 export async function deleteProject(id: string): Promise<void> {
@@ -242,12 +250,16 @@ export async function createChartAccount(companyId: string, data: ChartAccountCr
     .select()
     .single();
   if (error) throw error;
+  // Fire-and-forget: generate embedding for new account
+  if (row?.id) triggerEntityEmbedding(companyId, ['chart_of_accounts'], [row.id]).catch(() => {});
   return row as ChartAccount;
 }
 
-export async function updateChartAccount(id: string, data: Partial<ChartAccountCreate> & { active?: boolean }): Promise<void> {
+export async function updateChartAccount(id: string, data: Partial<ChartAccountCreate> & { active?: boolean }, companyId?: string): Promise<void> {
   const { error } = await supabase.from('chart_of_accounts').update(data).eq('id', id);
   if (error) throw error;
+  // Fire-and-forget: re-embed updated account
+  if (companyId) triggerEntityEmbedding(companyId, ['chart_of_accounts'], [id]).catch(() => {});
 }
 
 export async function deleteChartAccount(id: string): Promise<void> {
@@ -654,7 +666,9 @@ export async function createAccountFromSuggestion(
     is_header: false,
   });
   // Fire-and-forget: generate embedding for the new account
-  triggerEntityEmbedding(companyId, ['chart_of_accounts']).catch(() => {});
+  if (account?.id) {
+    triggerEntityEmbedding(companyId, ['chart_of_accounts'], [account.id]).catch(() => {});
+  }
   return account;
 }
 
@@ -694,6 +708,8 @@ export async function createCategoryFromSuggestion(
     color,
   });
   // Fire-and-forget: generate embedding for the new category
-  triggerEntityEmbedding(companyId, ['categories']).catch(() => {});
+  if (category?.id) {
+    triggerEntityEmbedding(companyId, ['categories'], [category.id]).catch(() => {});
+  }
   return { category, wasExisting: false };
 }

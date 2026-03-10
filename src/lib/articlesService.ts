@@ -8,6 +8,7 @@
  */
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 import { createArticleExample } from '@/lib/learningService'
+import { triggerEntityEmbedding } from '@/lib/companyMemoryService'
 
 // Re-export matching functions from the shared utility
 export {
@@ -225,12 +226,15 @@ export async function createArticle(
     .select()
     .single()
   if (error) throw error
+  // Fire-and-forget: generate embedding for new article
+  if (row?.id) triggerEntityEmbedding(companyId, ['articles'], [row.id]).catch(() => {})
   return row as Article
 }
 
 export async function updateArticle(
   articleId: string,
   data: ArticleUpdate,
+  companyId?: string,
 ): Promise<void> {
   const updates: Record<string, unknown> = { updated_at: new Date().toISOString() }
   if (data.code !== undefined) updates.code = data.code.trim()
@@ -244,6 +248,8 @@ export async function updateArticle(
 
   const { error } = await supabase.from('articles').update(updates).eq('id', articleId)
   if (error) throw error
+  // Fire-and-forget: re-embed updated article
+  if (companyId) triggerEntityEmbedding(companyId, ['articles'], [articleId]).catch(() => {})
 }
 
 export async function deleteArticle(articleId: string): Promise<void> {

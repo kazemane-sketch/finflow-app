@@ -12,6 +12,7 @@ import { saveOpeningBalance } from '@/lib/bankParser'
 import CategoriesTab from '@/components/settings/CategoriesTab'
 import ProjectsTab from '@/components/settings/ProjectsTab'
 import ChartOfAccountsTab from '@/components/settings/ChartOfAccountsTab'
+import { triggerFullBrainBackfill, type BrainBackfillResult } from '@/lib/companyMemoryService'
 
 type SettingsTab = 'generale' | 'categorie' | 'progetti' | 'piano-conti' | 'istruzioni-ai'
 
@@ -318,6 +319,118 @@ function InstructionsTab({ companyId }: { companyId: string }) {
 }
 
 // ============================================================
+// BRAIN AI ACTIVATION CARD
+// ============================================================
+function BrainActivationCard({ companyId }: { companyId: string }) {
+  const [running, setRunning] = useState(false)
+  const [result, setResult] = useState<BrainBackfillResult | null>(null)
+  const [error, setError] = useState('')
+
+  const handleActivate = async () => {
+    setRunning(true)
+    setError('')
+    setResult(null)
+    try {
+      const res = await triggerFullBrainBackfill(companyId)
+      setResult(res)
+    } catch (err: any) {
+      setError(err.message || 'Errore durante il backfill')
+    }
+    setRunning(false)
+  }
+
+  // Compute totals from result
+  const entityTotal = result
+    ? Object.values(result.entities).reduce((sum, r) => sum + r.processed, 0)
+    : 0
+  const entityErrors = result
+    ? Object.values(result.entities).reduce((sum, r) => sum + r.errors, 0)
+    : 0
+  const entityRemaining = result
+    ? Object.values(result.entities).reduce((sum, r) => sum + r.remaining, 0)
+    : 0
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base flex items-center gap-2">
+          <Brain className="h-4 w-4 text-violet-600" />
+          Brain AI — Embeddings
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-xs text-gray-500">
+          Calcola gli embeddings vettoriali per tutti i conti, categorie, articoli, centri di costo
+          e la memoria aziendale. Necessario per la classificazione AI intelligente (Haiku pre-flight).
+          Gli embeddings vengono aggiornati automaticamente ad ogni modifica, ma puoi forzare un ricalcolo completo.
+        </p>
+
+        <Button
+          onClick={handleActivate}
+          disabled={running}
+          className="bg-violet-600 hover:bg-violet-700"
+        >
+          {running ? (
+            <>
+              <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+              Calcolo in corso...
+            </>
+          ) : (
+            <>
+              <Brain className="h-3.5 w-3.5 mr-1.5" />
+              Attiva Brain AI
+            </>
+          )}
+        </Button>
+
+        {error && (
+          <div className="flex items-center gap-2 text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">
+            <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+            {error}
+          </div>
+        )}
+
+        {result && (
+          <div className="bg-violet-50 rounded-lg px-3 py-2.5 space-y-1.5">
+            <div className="flex items-center gap-2 text-xs font-semibold text-violet-800">
+              <CheckCircle className="h-3.5 w-3.5 text-emerald-600" />
+              Backfill completato
+            </div>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-600">
+              <span>Entità processate:</span>
+              <span className="font-medium text-gray-900">{entityTotal}</span>
+              <span>Memoria processata:</span>
+              <span className="font-medium text-gray-900">{result.memory.processed}</span>
+              {(entityErrors + result.memory.errors) > 0 && (
+                <>
+                  <span className="text-amber-600">Errori:</span>
+                  <span className="font-medium text-amber-700">{entityErrors + result.memory.errors}</span>
+                </>
+              )}
+              {(entityRemaining + result.memory.remaining) > 0 && (
+                <>
+                  <span>Rimanenti:</span>
+                  <span className="font-medium text-gray-700">{entityRemaining + result.memory.remaining}</span>
+                </>
+              )}
+            </div>
+            {Object.entries(result.entities).length > 0 && (
+              <div className="text-[10px] text-gray-400 pt-1 border-t border-violet-100">
+                {Object.entries(result.entities).map(([type, r]) => (
+                  <span key={type} className="mr-3">
+                    {type.replace(/_/g, ' ')}: {r.processed}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// ============================================================
 // MAIN PAGE
 // ============================================================
 export default function ImpostazioniPage() {
@@ -463,7 +576,12 @@ export default function ImpostazioniPage() {
       {activeTab === 'categorie' && companyId && <CategoriesTab companyId={companyId} />}
       {activeTab === 'progetti' && companyId && <ProjectsTab companyId={companyId} />}
       {activeTab === 'piano-conti' && companyId && <ChartOfAccountsTab companyId={companyId} />}
-      {activeTab === 'istruzioni-ai' && companyId && <InstructionsTab companyId={companyId} />}
+      {activeTab === 'istruzioni-ai' && companyId && (
+        <>
+          <BrainActivationCard companyId={companyId} />
+          <InstructionsTab companyId={companyId} />
+        </>
+      )}
       {(activeTab === 'categorie' || activeTab === 'progetti' || activeTab === 'piano-conti' || activeTab === 'istruzioni-ai') && !companyId && (
         <p className="text-sm text-gray-400 text-center py-8">Importa almeno una fattura per configurare le classificazioni</p>
       )}

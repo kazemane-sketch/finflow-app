@@ -126,7 +126,7 @@ function CategoryFormModal({ category, companyId, onSave, onClose }: {
     setError('');
     try {
       if (category?.id) {
-        await updateCategory(category.id, { ...form, active });
+        await updateCategory(category.id, { ...form, active }, companyId);
       } else {
         await createCategory(companyId, form);
       }
