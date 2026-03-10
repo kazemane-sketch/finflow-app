@@ -3250,7 +3250,7 @@ export default function FatturePage() {
       if (unclassified.length === 0) return;
 
       updateProgress(0, unclassified.length);
-      const token = await getValidAccessToken();
+      let token = await getValidAccessToken();
       let successCount = 0;
       let failedCount = 0;
       const classifiedIds: string[] = [];
