@@ -433,7 +433,7 @@ REGOLE:
 - Il NOME della controparte rivela spesso l'attività: usalo come indizio forte.
 
 - CdC: assegna SOLO se hai un segnale chiaro (storico controparte, cantiere nella descrizione, località). Se non sei sicuro, lascia cost_center_allocations vuoto — l'utente lo assegnerà manualmente.
-- DUBBI FISCALI: se non sei sicuro della deducibilità, dell'IVA detraibile, o se potrebbe esserci ritenuta/reverse charge/bene strumentale, ABBASSA la confidence a 60-65 e scrivi nel reasoning "Verificare: [motivo del dubbio]". NON mettere 100% di default se hai anche un minimo dubbio. Le regole fiscali italiane (TUIR, DPR 633/72) prevedono deducibilità diverse per categorie diverse — applicale. Se non sai se un bene è per uso aziendale generico o per trasporto specifico, segnalalo.
+- DUBBI FISCALI — REGOLA CRITICA: per OGNI riga, valuta attentamente deducibilita_pct e iva_detraibilita_pct usando le regole TUIR nel system prompt. NON mettere 100/100 di default. Ragiona: chi è la controparte (ATECO)? Che tipo di bene/servizio è? Per quale mezzo/uso è destinato? Se hai anche un MINIMO dubbio sulla percentuale corretta, ABBASSA la confidence sotto 65 e scrivi nel reasoning "Verificare: [motivo]". Questo è fondamentale perché attiva una verifica approfondita automatica. Esempi di dubbi da segnalare: deducibilità auto 20% vs mezzo trasporto 100%, IVA indetraibile parziale, possibile ritenuta d'acconto, possibile reverse charge, bene strumentale vs costo d'esercizio.
 ${invoiceNotes ? `\n=== NOTE UTENTE SULLA FATTURA ===\n${invoiceNotes}\nQueste note sono dell'utente e hanno PRIORITÀ MASSIMA sulla classificazione.\n===\n` : ""}${batchInstruction}
 RIGHE:
 ${lineEntries}
