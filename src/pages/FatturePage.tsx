@@ -529,6 +529,81 @@ const DETAIL_TABS: { key: DetailTab; label: string; icon: string }[] = [
   { key: 'note', label: 'Note', icon: '\uD83D\uDCDD' },
 ];
 
+/* ─── Aggregate fiscal notes from Sonnet + Haiku fiscal_flags ─── */
+function buildAggregatedNotes(
+  sonnetNotes: FiscalAlert[],
+  fiscalFlags: Record<string, any>,
+): FiscalAlert[] {
+  const alerts: FiscalAlert[] = [...sonnetNotes];
+
+  // Group Haiku fiscal_flags.note by similar text
+  const noteGroups = new Map<string, { note: string; lineIds: string[]; deducPct: number; ivaPct: number; ff: any }>();
+  for (const [lineId, ff] of Object.entries(fiscalFlags)) {
+    if (!ff?.note || typeof ff.note !== 'string') continue;
+    // Only notes suggesting user action
+    if (!/verificar|controllare|richiedere|attenzione|possibil/i.test(ff.note)) continue;
+    const key = ff.note.slice(0, 80).toLowerCase();
+    if (noteGroups.has(key)) {
+      noteGroups.get(key)!.lineIds.push(lineId);
+    } else {
+      noteGroups.set(key, {
+        note: ff.note,
+        lineIds: [lineId],
+        deducPct: ff.deducibilita_pct ?? 100,
+        ivaPct: ff.iva_detraibilita_pct ?? 100,
+        ff,
+      });
+    }
+  }
+
+  for (const [, group] of noteGroups) {
+    let type: FiscalAlert['type'] = 'general';
+    if (/deducibil|auto|mezzo|trasporto|veicol/i.test(group.note)) type = 'deducibilita';
+    if (/ritenuta/i.test(group.note)) type = 'ritenuta';
+    if (/reverse/i.test(group.note)) type = 'reverse_charge';
+    if (/strumentale|ammortizz/i.test(group.note)) type = 'bene_strumentale';
+
+    const options: FiscalAlertOption[] = [];
+    if (type === 'deducibilita') {
+      options.push(
+        { label: `Conservativo (${group.deducPct}% deduc., ${group.ivaPct}% IVA)`, fiscal_override: { deducibilita_pct: group.deducPct, iva_detraibilita_pct: group.ivaPct }, is_default: true },
+        { label: 'Mezzo da trasporto (100%/100%)', fiscal_override: { deducibilita_pct: 100, iva_detraibilita_pct: 100 }, is_default: false },
+      );
+    } else if (type === 'bene_strumentale') {
+      options.push(
+        { label: 'Costo d\'esercizio (deduzione immediata)', fiscal_override: { bene_strumentale: false }, is_default: true },
+        { label: 'Bene strumentale (ammortamento)', fiscal_override: { bene_strumentale: true }, is_default: false },
+      );
+    } else if (type === 'ritenuta') {
+      options.push(
+        { label: 'Con ritenuta d\'acconto', fiscal_override: { ritenuta_acconto: true }, is_default: true },
+        { label: 'Senza ritenuta', fiscal_override: { ritenuta_acconto: false }, is_default: false },
+      );
+    }
+
+    // Skip if already covered by Sonnet
+    const alreadyCovered = alerts.some(a =>
+      a.type === type && a.affected_lines.some(id => group.lineIds.includes(id))
+    );
+    if (alreadyCovered || options.length === 0) continue;
+
+    alerts.push({
+      type,
+      severity: 'warning',
+      title: type === 'deducibilita' ? 'Deducibilit\u00E0 da verificare'
+        : type === 'bene_strumentale' ? 'Possibile bene strumentale'
+        : type === 'ritenuta' ? 'Ritenuta d\'acconto'
+        : 'Nota fiscale',
+      description: group.note,
+      current_choice: options[0].label,
+      options,
+      affected_lines: group.lineIds,
+    });
+  }
+
+  return alerts;
+}
+
 function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, onDelete, onReload, onPatchInvoice, onRefreshBadges, onOpenCounterparty, onOpenScadenzario, onNavigateCounterparty }: {
   invoice: DBInvoice; detail: DBInvoiceDetail | null; installments: InvoiceInstallment[]; loadingDetail: boolean;
   onEdit: (u: InvoiceUpdate) => Promise<void>; onDelete: () => void; onReload: () => void;
@@ -812,7 +887,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setAllAccounts(accs.filter(a => !a.is_header && a.active));
         setClassification(classif);
         setInvProjects(iProjs);
-        setInvoiceNotes(fiscalAlerts);
+        setInvoiceNotes(buildAggregatedNotes(fiscalAlerts, lineClfResult.fiscalFlags));
         setLineClassifs(lineClfResult.classifs);
         setOriginalLineClassifs(lineClfResult.classifs);
         setLineProjects(lineProj);
@@ -1167,11 +1242,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       }
       setLineFiscalFlags(flags);
 
-      // Extract fiscal review alerts from Sonnet escalation
+      // Extract fiscal review alerts from Sonnet escalation + Haiku fiscal_flags
       const aiInvoiceNotes = ((aiResult as any)?.invoice_notes || (result as any)?.invoice_notes || []) as FiscalAlert[];
-      if (aiInvoiceNotes.length > 0) {
-        setInvoiceNotes(aiInvoiceNotes);
-      }
+      setInvoiceNotes(buildAggregatedNotes(aiInvoiceNotes, flags));
 
       // Extract AI suggestions for new accounts/categories
       const suggestions: Record<string, { suggest_new_account?: AccountSuggestion | null; suggest_new_category?: CategorySuggestion | null }> = {};
