@@ -218,12 +218,18 @@ async function embeddingPreflight(
   geminiKey: string,
   dirSections: { primary: string[]; allowed: string[] },
   allowedCatTypes: string[],
+  counterpartyAteco?: string,
+  invoiceNotes?: string,
 ): Promise<PreflightResult | null> {
   try {
-    // Build query text from all line descriptions + counterparty
+    // Build query text from all line descriptions + counterparty + ATECO + notes
+    // ATECO dramatically improves semantic matching (e.g. "49.41 Trasporto merci" shifts
+    // the embedding vector toward transport/logistics instead of generic construction)
     const queryText =
       lines.map((l) => l.description).filter(Boolean).join(" | ") +
-      ` | ${counterpartyName || "N/D"}`;
+      ` | ${counterpartyName || "N/D"}` +
+      (counterpartyAteco ? ` | ATECO: ${counterpartyAteco}` : "") +
+      (invoiceNotes ? ` | Note: ${invoiceNotes.slice(0, 200)}` : "");
 
     // 1. Compute single Gemini embedding
     const queryVec = await callGeminiEmbedding(geminiKey, queryText);
@@ -319,6 +325,7 @@ function buildFocusedPrompt(
   systemPrompt: string,
   userInstructionsBlock: string,
   classifyOnlyLineIds?: Set<string>,
+  invoiceNotes?: string,
 ): string {
   // Build phases-by-article map
   const phasesByArticle = new Map<string, ArticlePhaseRow[]>();
@@ -430,7 +437,7 @@ REGOLE:
 - Il NOME della controparte rivela spesso l'attività: usalo come indizio forte.
 
 - CdC: assegna SOLO se hai un segnale chiaro (storico controparte, cantiere nella descrizione, località). Se non sei sicuro, lascia cost_center_allocations vuoto — l'utente lo assegnerà manualmente.
-${batchInstruction}
+${invoiceNotes ? `\n=== NOTE UTENTE SULLA FATTURA ===\n${invoiceNotes}\nQueste note sono dell'utente e hanno PRIORITÀ MASSIMA sulla classificazione.\n===\n` : ""}${batchInstruction}
 RIGHE:
 ${lineEntries}
 
@@ -668,6 +675,7 @@ async function sonnetEscalate(
   systemPrompt: string,
   userInstructionsBlock: string,
   apiKey: string,
+  invoiceNotes?: string,
 ): Promise<{ lineResults: SonnetLineResult[]; error?: string }> {
   // Build a Sonnet prompt with full context + Haiku's attempt as reference
   const lineIds = new Set(escalationLines.map(l => l.line_id));
@@ -736,7 +744,7 @@ ${counterpartyInfo}
 === VINCOLO DIREZIONE (${direction === "in" ? "PASSIVA" : "ATTIVA"}) ===
 ${direction === "in" ? "Conti di COSTO. VIETATO: conti revenue." : "Conti di RICAVO. VIETATO: conti costo."}
 ===
-
+${invoiceNotes ? `\n=== NOTE UTENTE SULLA FATTURA ===\n${invoiceNotes}\nQueste note sono dell'utente e hanno PRIORITÀ MASSIMA sulla classificazione.\n===\n` : ""}
 REGOLE ESCALATION:
 - Riclassifica SOLO le righe [DA RICLASSIFICARE].
 - Analizza APPROFONDITAMENTE la fiscalità: ritenuta d'acconto (aliquota, base imponibile), reverse charge, split payment, beni strumentali (ammortamento), deducibilità %, IVA detraibilità %.
@@ -1065,6 +1073,7 @@ Deno.serve(async (req) => {
 
     // ─── Counterparty ATECO info ────────────────────────
     let counterpartyInfo = counterpartyName || "N.D.";
+    let counterpartyAtecoFull = "";  // For embedding enrichment
     if (counterpartyVatKey) {
       const vatKey = counterpartyVatKey
         .toUpperCase()
@@ -1082,6 +1091,8 @@ Deno.serve(async (req) => {
             parts.push(`Codice ATECO: ${atecoRow.ateco_code}`);
             if (atecoRow.ateco_description)
               parts.push(atecoRow.ateco_description);
+            // Save for embedding query enrichment
+            counterpartyAtecoFull = `${atecoRow.ateco_code} ${atecoRow.ateco_description || ""}`.trim();
           }
           if (atecoRow.business_sector)
             parts.push(`Settore: ${atecoRow.business_sector}`);
@@ -1092,6 +1103,11 @@ Deno.serve(async (req) => {
         }
       }
     }
+
+    // ─── Invoice notes (user annotations for classification hints) ──
+    const [invoiceRow] = await sql`SELECT notes FROM invoices WHERE id = ${invoiceId} LIMIT 1`;
+    const invoiceNotes = (invoiceRow?.notes || "").trim();
+    if (invoiceNotes) console.log(`[classify] Invoice notes: "${invoiceNotes.slice(0, 80)}…"`);
 
     // ─── Counterparty classification history (direction-filtered) ──
     let history: HistoryRow[] = [];
@@ -1203,6 +1219,8 @@ Deno.serve(async (req) => {
       const preflight = await embeddingPreflight(
         sql, companyId, inputLines, counterpartyName, counterpartyId,
         direction, geminiKey, dirSections, allowedCatTypes,
+        counterpartyAtecoFull || undefined,
+        invoiceNotes || undefined,
       );
 
       if (preflight) {
@@ -1264,6 +1282,7 @@ Deno.serve(async (req) => {
         systemPrompt,
         userInstructionsBlock,
         batchLineIds,   // which ones to classify
+        invoiceNotes || undefined,
       );
 
     // For small invoices (no batching), no context markers needed
@@ -1281,6 +1300,8 @@ Deno.serve(async (req) => {
         lines,
         systemPrompt,
         userInstructionsBlock,
+        undefined,      // no batch filter
+        invoiceNotes || undefined,
       );
 
     let allLineResults: SonnetLineResult[] = [];
@@ -1597,6 +1618,7 @@ Deno.serve(async (req) => {
           systemPrompt,
           userInstructionsBlock,
           apiKey,
+          invoiceNotes || undefined,
         );
 
         if (sonnetResult.error) {
