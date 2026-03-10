@@ -2134,51 +2134,90 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               )}
             </div>
 
-            {/* Fiscal Review Box — interactive alerts from Sonnet */}
-            {invoiceNotes.length > 0 && (
-              <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 mb-3">
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="text-amber-600 text-sm">{'\u26A0\uFE0F'}</span>
-                  <span className="text-xs font-bold text-amber-800">
-                    Review Fiscale — {invoiceNotes.length} {invoiceNotes.length === 1 ? 'alert' : 'alert'} da verificare
-                  </span>
-                </div>
-                <div className="space-y-2">
-                  {invoiceNotes.map((alert, idx) => (
-                    <div key={idx} className="bg-white border border-amber-200 rounded-lg px-3 py-2">
-                      <div className="flex items-start gap-2">
-                        <span className="text-amber-500 text-xs mt-0.5">{alert.severity === 'warning' ? '\u26A0\uFE0F' : '\u2139\uFE0F'}</span>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-xs font-semibold text-gray-800">{alert.title}</p>
-                          <p className="text-[10px] text-gray-500 mt-0.5">{alert.description}</p>
-                          <div className="flex flex-wrap gap-1.5 mt-2">
-                            {alert.options.map((opt, optIdx) => (
-                              <button
-                                key={optIdx}
-                                onClick={() => handleFiscalChoice(idx, opt)}
-                                className={`text-[10px] px-2.5 py-1 rounded-md font-medium transition-colors ${
-                                  opt.is_default
-                                    ? 'bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200'
-                                    : 'bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200'
-                                }`}
-                              >
-                                {opt.label}
-                              </button>
-                            ))}
-                            <button
-                              onClick={() => handleFiscalChoice(idx, null)}
-                              className="text-[10px] px-2 py-1 text-gray-400 hover:text-gray-600 transition-colors"
-                            >
-                              Salta
-                            </button>
+            {/* AI Assistant Box — always visible, 3 states */}
+            {(() => {
+              const hasAlerts = invoiceNotes.length > 0;
+              const isClassified = invoice.classification_status === 'ai_suggested' || invoice.classification_status === 'confirmed';
+              const boxStyle = hasAlerts
+                ? 'border-amber-200 bg-amber-50'
+                : isClassified
+                  ? 'border-green-200 bg-green-50'
+                  : 'border-gray-200 bg-gray-50';
+              return (
+                <div className={`border rounded-xl px-4 py-3 mb-3 ${boxStyle}`}>
+                  {/* Header */}
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-base">{'\uD83E\uDDE0'}</span>
+                      <span className="text-xs font-bold text-gray-700">Assistente AI</span>
+                    </div>
+                    {isClassified && !hasAlerts && (
+                      <span className="text-green-500 text-sm">{'\u2705'}</span>
+                    )}
+                    {hasAlerts && (
+                      <span className="text-amber-500 text-sm">{'\u26A0\uFE0F'}</span>
+                    )}
+                  </div>
+
+                  {/* State 1: No classification yet */}
+                  {!isClassified && !hasAlerts && (
+                    <p className="text-[11px] text-gray-500">
+                      Clicca "Suggerisci AI" per classificare questa fattura.
+                    </p>
+                  )}
+
+                  {/* State 2: Classified, no alerts */}
+                  {isClassified && !hasAlerts && (
+                    <p className="text-[11px] text-gray-500">
+                      {invoice.classification_status === 'confirmed'
+                        ? 'Classificazione confermata.'
+                        : 'Classificazione completata. Nessuna nota fiscale particolare.'}
+                    </p>
+                  )}
+
+                  {/* State 3: Classified with alerts */}
+                  {hasAlerts && (
+                    <div className="mt-1 space-y-2">
+                      <p className="text-[11px] text-amber-700 font-medium">
+                        {invoiceNotes.length} {invoiceNotes.length === 1 ? 'alert' : 'alert'} da verificare
+                      </p>
+                      {invoiceNotes.map((alert, idx) => (
+                        <div key={idx} className="bg-white border border-amber-200 rounded-lg px-3 py-2">
+                          <div className="flex items-start gap-2">
+                            <span className="text-amber-500 text-xs mt-0.5">{alert.severity === 'warning' ? '\u26A0\uFE0F' : '\u2139\uFE0F'}</span>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs font-semibold text-gray-800">{alert.title}</p>
+                              <p className="text-[10px] text-gray-500 mt-0.5">{alert.description}</p>
+                              <div className="flex flex-wrap gap-1.5 mt-2">
+                                {alert.options.map((opt, optIdx) => (
+                                  <button
+                                    key={optIdx}
+                                    onClick={() => handleFiscalChoice(idx, opt)}
+                                    className={`text-[10px] px-2.5 py-1 rounded-md font-medium transition-colors ${
+                                      opt.is_default
+                                        ? 'bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200'
+                                        : 'bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200'
+                                    }`}
+                                  >
+                                    {opt.label}
+                                  </button>
+                                ))}
+                                <button
+                                  onClick={() => handleFiscalChoice(idx, null)}
+                                  className="text-[10px] px-2 py-1 text-gray-400 hover:text-gray-600 transition-colors"
+                                >
+                                  Salta
+                                </button>
+                              </div>
+                            </div>
                           </div>
                         </div>
-                      </div>
+                      ))}
                     </div>
-                  ))}
+                  )}
                 </div>
-              </div>
-            )}
+              );
+            })()}
 
             {/* Invoice lines table with classification */}
             <div className="bg-white border rounded-xl overflow-hidden">
