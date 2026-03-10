@@ -34,12 +34,8 @@ const MAX_PARALLEL_BATCHES = 3;      // max concurrent API calls
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_DIMS = 3072;
 const MIN_CONFIDENCE = 60;
-const FISCAL_ESCALATION_TRIGGERS = [
-  "ritenuta_acconto",
-  "reverse_charge",
-  "bene_strumentale",
-  "suggest_new_account",
-] as const;
+// Escalation triggers are handled generically in needsSonnetEscalation()
+// — no hardcoded ATECO codes or predefined trigger lists.
 
 /* ─── Direction enforcement constants ────── */
 // Which CoA sections are valid for each invoice direction
@@ -437,6 +433,7 @@ REGOLE:
 - Il NOME della controparte rivela spesso l'attività: usalo come indizio forte.
 
 - CdC: assegna SOLO se hai un segnale chiaro (storico controparte, cantiere nella descrizione, località). Se non sei sicuro, lascia cost_center_allocations vuoto — l'utente lo assegnerà manualmente.
+- DUBBI FISCALI: se non sei sicuro della deducibilità, dell'IVA detraibile, o se potrebbe esserci ritenuta/reverse charge/bene strumentale, ABBASSA la confidence a 60-65 e scrivi nel reasoning "Verificare: [motivo del dubbio]". NON mettere 100% di default se hai anche un minimo dubbio. Le regole fiscali italiane (TUIR, DPR 633/72) prevedono deducibilità diverse per categorie diverse — applicale. Se non sai se un bene è per uso aziendale generico o per trasporto specifico, segnalalo.
 ${invoiceNotes ? `\n=== NOTE UTENTE SULLA FATTURA ===\n${invoiceNotes}\nQueste note sono dell'utente e hanno PRIORITÀ MASSIMA sulla classificazione.\n===\n` : ""}${batchInstruction}
 RIGHE:
 ${lineEntries}
@@ -645,18 +642,30 @@ async function persistResults(
 }
 
 /* ─── Sonnet escalation: detect lines needing fiscal expert ──── */
+// Generalist approach — no hardcoded ATECO codes.
+// Escalation triggers on Haiku's OWN signals: flags, confidence, doubt words, suggestions.
+
+const DOUBT_PATTERN = /verificar|dubbio|potrebbe|incert|controllare|attenzione|non chiaro|ambiguo|da valutare|possibile|eventuale/i;
 
 function needsSonnetEscalation(lr: SonnetLineResult): boolean {
-  // Low confidence → escalate
-  if (lr.confidence < MIN_CONFIDENCE) return true;
-  // Complex fiscal flags → escalate for expert review
+  // Low confidence → escalate (raised threshold from 60 to 65)
+  if (lr.confidence < 65) return true;
+
+  // Non-standard fiscal flags → escalate for expert review
   const ff = lr.fiscal_flags;
-  if (!ff) return false;
-  if (ff.ritenuta_acconto) return true;
-  if (ff.reverse_charge) return true;
-  if (ff.bene_strumentale) return true;
-  // Suggest new account = AI unsure about CoA → escalate
+  if (ff) {
+    if (ff.ritenuta_acconto) return true;
+    if (ff.reverse_charge) return true;
+    if (ff.bene_strumentale) return true;
+  }
+
+  // Haiku signals doubt in reasoning → escalate
+  if (lr.reasoning && DOUBT_PATTERN.test(lr.reasoning)) return true;
+
+  // Suggest new account or category = Haiku unsure about CoA → escalate
   if (lr.suggest_new_account) return true;
+  if (lr.suggest_new_category) return true;
+
   return false;
 }
 
