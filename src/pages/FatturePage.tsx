@@ -1155,6 +1155,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setAiClassifResult(result);
       setAiClassifStatus('done');
 
+      // Update local invoice object so the AI box reflects 'ai_suggested' immediately
+      onPatchInvoice(invoice.id, { classification_status: 'ai_suggested' } as Partial<DBInvoice>);
+
       // Extract fiscal flags from AI results
       const flags: Record<string, any> = {};
       for (const lr of (aiResult?.lines || [])) {
@@ -1299,7 +1302,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       console.error('AI classification error:', e);
       setAiClassifStatus('error');
     }
-  }, [invoice?.id, company?.id, invoice?.counterparty, invoice?.direction, detail?.invoice_lines, selCategoryId, selAccountId]);
+  }, [invoice?.id, company?.id, invoice?.counterparty, invoice?.direction, detail?.invoice_lines, selCategoryId, selAccountId, onPatchInvoice]);
 
   // Confirm AI suggestion — set verified=true on invoice_classifications + line-level records
   // NOTE: handleConfirmAiClassification, handleRejectAiClassification, handleConfirmExistingClassification
