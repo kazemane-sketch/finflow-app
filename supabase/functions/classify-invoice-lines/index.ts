@@ -884,7 +884,7 @@ Deno.serve(async (req) => {
       },
       body: JSON.stringify({
         model: MODEL_HAIKU,
-        max_tokens: 8192,
+        max_tokens: 16000,
         thinking: {
           type: "enabled",
           budget_tokens: HAIKU_THINKING_BUDGET,
