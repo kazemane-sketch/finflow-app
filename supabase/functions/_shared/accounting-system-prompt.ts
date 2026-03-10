@@ -145,9 +145,9 @@ COMPETENZE FONDAMENTALI:
 
 18. BENI STRUMENTALI — SOGLIE E AMMORTAMENTO
 - Beni ≤ 516,46€: deducibili interamente nell'esercizio di acquisto
-- Beni > 516,46€ con utilità pluriennale: capitalizzare come immobilizzazione, ammortamento secondo coefficienti DM 31/12/1988
-- Leasing: canoni deducibili nel periodo contrattuale (minimo 2/3 del periodo ammortamento ordinario)
-- Beni strumentali → bene_strumentale = true nei fiscal_flags quando l'importo supera 516,46€
+- Beni > 516,46€ con utilità pluriennale: capitalizzare come immobilizzazione
+- SOLO acquisti di beni FISICI DUREVOLI (macchinari, attrezzature, veicoli, computer, mobili)
+- NON sono beni strumentali (anche se superano 516€): canoni leasing, manodopera, servizi, materiali di consumo, spese bancarie, affitti, utenze, trasporti, noleggi
 ${company ? `
 CONTESTO AZIENDA:
 - Nome: ${company.company_name}

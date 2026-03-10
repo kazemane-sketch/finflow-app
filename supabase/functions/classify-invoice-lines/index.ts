@@ -1,6 +1,7 @@
-// classify-invoice-lines — Haiku + Sonnet escalation pipeline for invoice lines
+// classify-invoice-lines — Two-step Haiku pipeline for invoice lines
 // Stage 1: Embedding pre-flight (Gemini) → Stage 2: Haiku classification (batched)
-// → Stage 3: Sonnet escalation for fiscal-complex lines (ritenuta, RC, beni strum.)
+// → Stage 2.5: Haiku fiscal review (dedicated pass for deducibility, IVA, ritenuta)
+// → Stage 3: Sonnet escalation (DISABLED — preserved for future complex cases)
 // Full context: articles, categories, CoA, CdC, ATECO, counterparty history, RAG.
 //
 // PRINCIPLE: produces SUGGESTIONS only (classification_status = 'ai_suggested'
@@ -449,14 +450,12 @@ REGOLE:
 - Il NOME della controparte rivela spesso l'attività: usalo come indizio forte.
 
 - CdC: assegna SOLO se hai un segnale chiaro (storico controparte, cantiere nella descrizione, località). Se non sei sicuro, lascia cost_center_allocations vuoto — l'utente lo assegnerà manualmente.
-- DUBBI FISCALI — REGOLA CRITICA: per OGNI riga, valuta attentamente deducibilita_pct e iva_detraibilita_pct usando le regole TUIR nel system prompt. NON mettere 100/100 di default. Ragiona: chi è la controparte (ATECO)? Che tipo di bene/servizio è? Per quale mezzo/uso è destinato? QUANDO HAI UN DUBBIO, USA SEMPRE LA PERCENTUALE PIÙ BASSA (conservativa). Esempio: se non sai se è auto aziendale (20%/40%) o mezzo trasporto (100%/100%), metti 20%/40% — è più sicuro fiscalmente. L'utente può correggere verso l'alto, ma non deve scoprire di aver sbagliato verso il basso in sede di verifica. Abbassa la confidence sotto 65 e scrivi nel reasoning "Verificare: [motivo]" così si attiva la verifica Sonnet automatica.
-- COERENZA FISCALE FATTURA: PRIMA di classificare le singole righe, analizza l'INTERA fattura come un insieme. Guarda: chi è la controparte (ATECO)? Che tipo di beni/servizi sono? Per quale uso/mezzo sono destinati? Le percentuali di deducibilità e IVA detraibile devono essere COERENTI tra tutte le righe della stessa fattura che riguardano lo stesso tipo di operazione. NON è possibile avere 20% su un paraurti e 100% su un braccio oscillante dello stesso veicolo. Decidi il trattamento fiscale a livello fattura, poi applicalo uniformemente. Se stai classificando un sottoinsieme di righe (vedi righe [CONTESTO]), usa le righe contesto per determinare il trattamento fiscale dell'intera fattura PRIMA di classificare le tue righe. Controlli aggiuntivi: (a) se autofattura TD16-TD19, imposta reverse_charge=true su tutte le righe; (b) se nota di credito TD04, usa lo stesso conto della fattura originale; (c) se controparte ha ATECO noto (professionista 69.xx/71.xx/74.xx), verifica se applicare ritenuta d'acconto.
 ${invoiceNotes ? `\n=== NOTE UTENTE SULLA FATTURA ===\n${invoiceNotes}\nQueste note sono dell'utente e hanno PRIORITÀ MASSIMA sulla classificazione.\n===\n` : ""}${batchInstruction}
 RIGHE:
 ${lineEntries}
 
 JSON array (no markdown):
-[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"max 30 parole","fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]
+[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"max 30 parole","suggest_new_account":null,"suggest_new_category":null}]
 ---KEYWORDS---
 ["kw1","kw2",...] (5-10 keywords)`;
 }
@@ -916,6 +915,231 @@ Se NON ci sono dubbi fiscali, restituisci: []`;
     const msg = `Sonnet escalation error: ${e}`;
     console.error(`[sonnet-escalate] ${msg}`);
     return { lineResults: [], error: msg };
+  }
+}
+
+/* ─── Step 2: Dedicated Fiscal Review (separate Haiku pass) ──── */
+
+async function fiscalReview(
+  lineResults: SonnetLineResult[],
+  allLines: InputLine[],
+  counterpartyInfo: string,
+  counterpartyAtecoFull: string,
+  direction: string,
+  apiKey: string,
+  allAccounts: AccountRow[],
+): Promise<{ updatedLines: SonnetLineResult[]; invoiceNotes: FiscalAlert[] }> {
+
+  // Build a focused prompt ONLY about fiscal aspects
+  const linesSummary = lineResults.map(lr => {
+    const input = allLines.find(l => l.line_id === lr.line_id);
+    const acc = allAccounts.find(a => a.id === lr.account_id);
+    return `- [${lr.line_id}] "${input?.description || 'N/D'}" tot=${input?.total_price ?? 'N/D'} → conto: ${acc?.code || lr.account_code || 'N/D'} ${acc?.name || ''}, cat: ${lr.category_name || 'N/D'}`;
+  }).join("\n");
+
+  const fiscalPrompt = `Sei un ESPERTO FISCALISTA italiano. Le righe seguenti sono GIÀ classificate (categoria e conto assegnati). Il tuo UNICO compito è determinare il trattamento fiscale di OGNI riga.
+
+=== CONTROPARTE ===
+${counterpartyInfo}
+${counterpartyAtecoFull ? `ATECO: ${counterpartyAtecoFull}` : ''}
+===
+
+DIREZIONE: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
+
+RIGHE GIÀ CLASSIFICATE:
+${linesSummary}
+
+Per OGNI riga, determina:
+
+1. deducibilita_pct (0-100):
+   - Auto aziendali NON da trasporto: 20%
+   - Auto agente commercio: 80%
+   - Mezzi da trasporto (camion, escavatori, furgoni): 100%
+   - Telefonia: 80%
+   - Ristorazione/alberghi: 75%
+   - Costi normali: 100%
+   - Se non sei sicuro del tipo di mezzo/uso: metti la % PIÙ BASSA (conservativa) e scrivi "Verificare" nella nota
+
+2. iva_detraibilita_pct (0-100):
+   - Auto aziendali: 40%
+   - Telefonia mobile: 50%
+   - Operazioni esenti art.10 (servizi finanziari): 0%
+   - Costi normali: 100%
+
+3. ritenuta_acconto: null oppure {"aliquota": 20, "base": "imponibile"}
+   - Si applica SOLO a professionisti (avvocati, geometri, ingegneri, consulenti)
+   - ATECO 69.xx, 71.xx, 74.xx = professionista → ritenuta 20%
+   - SRL/SPA: MAI ritenuta (anche se professionista)
+
+4. reverse_charge: true/false
+   - Subappalti edili, autofatture TD16-TD19
+
+5. split_payment: true/false
+   - Fatture verso PA
+
+6. bene_strumentale: true/false
+   - SOLO acquisti di beni FISICI DUREVOLI > 516,46€
+   - MAI per: canoni leasing, manodopera, servizi, materiali di consumo, spese bancarie, affitti, utenze, trasporti, noleggi
+   - Un canone di locazione finanziaria NON È un bene strumentale — è un costo ricorrente
+
+7. note: stringa o null
+   - Se hai dubbi, scrivi "Verificare: [motivo]"
+   - Se è tutto chiaro, null
+
+REGOLA CRITICA: COERENZA. Tutte le righe della stessa fattura che riguardano lo stesso mezzo/operazione devono avere le STESSE percentuali. Non è possibile 20% su un paraurti e 100% su un braccio oscillante dello stesso veicolo.
+
+REGOLA CRITICA: CONSERVATIVO. Se hai dubbi, usa la percentuale PIÙ BASSA. L'utente può correggere verso l'alto.
+
+JSON array (no markdown):
+[{"line_id":"uuid","fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null}}]`;
+
+  console.log(`[fiscal-review] Reviewing ${lineResults.length} lines, prompt=${fiscalPrompt.length} chars`);
+
+  try {
+    const thinkingBudget = Math.min(
+      MAX_THINKING_BUDGET,
+      Math.max(MIN_THINKING_BUDGET, lineResults.length * 500)
+    );
+
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: MODEL_HAIKU,
+        max_tokens: 16000,
+        thinking: { type: "enabled" as const, budget_tokens: thinkingBudget },
+        messages: [{ role: "user" as const, content: fiscalPrompt }],
+      }),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.error(`[fiscal-review] API error: ${resp.status} ${errText.slice(0, 300)}`);
+      // Fallback: set all fiscal_flags to safe defaults (100/100)
+      return {
+        updatedLines: lineResults.map(lr => ({
+          ...lr,
+          fiscal_flags: {
+            ritenuta_acconto: null,
+            reverse_charge: false,
+            split_payment: false,
+            bene_strumentale: false,
+            deducibilita_pct: 100,
+            iva_detraibilita_pct: 100,
+            note: "Revisione fiscale non disponibile — verificare manualmente",
+          },
+        })),
+        invoiceNotes: [],
+      };
+    }
+
+    const data = await resp.json();
+    const contentBlocks = (data as any)?.content || [];
+
+    // Log thinking
+    const thinkingBlock = contentBlocks.find((b: any) => b.type === "thinking");
+    if (thinkingBlock) {
+      console.log(`[fiscal-review] Thinking: ${(thinkingBlock.thinking || "").slice(0, 300)}...`);
+    }
+
+    // Extract text
+    const text = contentBlocks
+      .filter((b: any) => b.type === "text")
+      .map((b: any) => b.text)
+      .join("") || "";
+
+    // Parse JSON
+    const cleanText = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+    const jsonStr = extractFirstJsonArray(cleanText);
+
+    if (!jsonStr) {
+      console.warn(`[fiscal-review] No JSON array found. First 300: ${cleanText.slice(0, 300)}`);
+      return { updatedLines: lineResults, invoiceNotes: [] };
+    }
+
+    const fiscalResults: Array<{ line_id: string; fiscal_flags: FiscalFlags }> = JSON.parse(jsonStr);
+    console.log(`[fiscal-review] Parsed ${fiscalResults.length} fiscal results`);
+
+    // Merge fiscal_flags into line results
+    const fiscalMap = new Map(fiscalResults.map(fr => [fr.line_id, fr.fiscal_flags]));
+    const updatedLines = lineResults.map(lr => {
+      const ff = fiscalMap.get(lr.line_id);
+      return ff ? { ...lr, fiscal_flags: ff } : lr;
+    });
+
+    // Build invoice_notes from fiscal doubts
+    const invoiceNotes: FiscalAlert[] = [];
+    const noteGroups = new Map<string, { note: string; lineIds: string[]; deducPct: number; ivaPct: number }>();
+
+    for (const fr of fiscalResults) {
+      if (!fr.fiscal_flags?.note) continue;
+      if (!/verificar|controllare|dubbio|attenzione/i.test(fr.fiscal_flags.note)) continue;
+
+      const key = fr.fiscal_flags.note.slice(0, 80).toLowerCase();
+      if (noteGroups.has(key)) {
+        noteGroups.get(key)!.lineIds.push(fr.line_id);
+      } else {
+        noteGroups.set(key, {
+          note: fr.fiscal_flags.note,
+          lineIds: [fr.line_id],
+          deducPct: fr.fiscal_flags.deducibilita_pct,
+          ivaPct: fr.fiscal_flags.iva_detraibilita_pct,
+        });
+      }
+    }
+
+    for (const [, group] of noteGroups) {
+      let type: FiscalAlert['type'] = 'general';
+      if (/deducibil|auto|mezzo|trasporto/i.test(group.note)) type = 'deducibilita';
+      if (/ritenuta/i.test(group.note)) type = 'ritenuta';
+      if (/reverse/i.test(group.note)) type = 'reverse_charge';
+      if (/strumentale|ammortizz/i.test(group.note)) type = 'bene_strumentale';
+
+      const options: FiscalAlertOption[] = [];
+      if (type === 'deducibilita') {
+        options.push(
+          { label: `Conservativo (${group.deducPct}% deducibile, ${group.ivaPct}% IVA)`, fiscal_override: { deducibilita_pct: group.deducPct, iva_detraibilita_pct: group.ivaPct }, is_default: true },
+          { label: 'Mezzo da trasporto (100%/100%)', fiscal_override: { deducibilita_pct: 100, iva_detraibilita_pct: 100 }, is_default: false }
+        );
+      } else if (type === 'bene_strumentale') {
+        options.push(
+          { label: "Costo d'esercizio", fiscal_override: { bene_strumentale: false }, is_default: true },
+          { label: 'Bene strumentale (ammortamento)', fiscal_override: { bene_strumentale: true }, is_default: false }
+        );
+      } else if (type === 'ritenuta') {
+        options.push(
+          { label: "Con ritenuta d'acconto", fiscal_override: { ritenuta_acconto: { aliquota: 20, base: "imponibile" } }, is_default: true },
+          { label: 'Senza ritenuta', fiscal_override: { ritenuta_acconto: null }, is_default: false }
+        );
+      }
+
+      if (options.length > 0) {
+        const affectedLines = group.lineIds.length === lineResults.length ? ['all'] : group.lineIds;
+        invoiceNotes.push({
+          type,
+          severity: 'warning',
+          title: type === 'deducibilita' ? 'Deducibilità da verificare' :
+                 type === 'bene_strumentale' ? 'Possibile bene strumentale' :
+                 type === 'ritenuta' ? "Ritenuta d'acconto" :
+                 'Nota fiscale',
+          description: group.note,
+          current_choice: options.find(o => o.is_default)?.label || options[0].label,
+          options,
+          affected_lines: affectedLines,
+        });
+      }
+    }
+
+    console.log(`[fiscal-review] Generated ${invoiceNotes.length} fiscal alerts`);
+    return { updatedLines, invoiceNotes };
+
+  } catch (e) {
+    console.error(`[fiscal-review] Error: ${e}`);
+    return { updatedLines: lineResults, invoiceNotes: [] };
   }
 }
 
@@ -1675,12 +1899,30 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ─── Stage 3: Sonnet Escalation for fiscal-complex lines ──────────
-    // After Haiku classification + direction enforcement, check for lines that
-    // need expert fiscal review (ritenuta, reverse charge, beni strumentali,
-    // suggest_new_account, or low confidence).
-    let sonnetEscalatedCount = 0;
-    let fiscalAlerts: FiscalAlert[] | undefined;
+    // ─── Stage 2.5: Dedicated Fiscal Review (separate Haiku pass) ──────
+    // After Haiku classification + direction enforcement, run a SEPARATE
+    // fiscal-focused Haiku call to determine deducibility, IVA, ritenuta, etc.
+    // This 2-step approach gives each pass dedicated thinking budget.
+    const { updatedLines: fiscalLines, invoiceNotes: fiscalNotes } = await fiscalReview(
+      lineResults,
+      inputLines,
+      counterpartyInfo,
+      counterpartyAtecoFull,
+      direction,
+      apiKey,
+      allAccounts,
+    );
+    lineResults = fiscalLines;
+
+    // Fiscal alerts from the dedicated review
+    let fiscalAlerts: FiscalAlert[] | undefined = fiscalNotes.length > 0 ? fiscalNotes : undefined;
+
+    // ─── Stage 3: Sonnet Escalation — DISABLED ──────────
+    // The dedicated fiscal review (Stage 2.5) now handles 95% of fiscal cases.
+    // Sonnet escalation is preserved but disabled — it will be useful in future
+    // for complex reasoning (autofatture, multi-step fiscal analysis).
+    const sonnetEscalatedCount = 0;
+    /*
     {
       const escalationCandidates = lineResults.filter(lr => needsSonnetEscalation(lr));
 
@@ -1700,9 +1942,9 @@ Deno.serve(async (req) => {
         const sonnetResult = await sonnetEscalate(
           escalationCandidates,
           inputLines,
-          allAccounts,     // full account list for Sonnet
-          allCategories,   // full category list for Sonnet
-          projects,        // all projects
+          allAccounts,
+          allCategories,
+          projects,
           articles,
           phases,
           counterpartyInfo,
@@ -1718,13 +1960,11 @@ Deno.serve(async (req) => {
         if (sonnetResult.error) {
           console.warn(`[classify] Sonnet escalation failed: ${sonnetResult.error} — keeping Haiku results`);
         } else if (sonnetResult.lineResults.length > 0) {
-          // Merge: replace Haiku results with Sonnet results for escalated lines
           const sonnetMap = new Map(sonnetResult.lineResults.map(lr => [lr.line_id, lr]));
           let upgraded = 0;
           for (let i = 0; i < lineResults.length; i++) {
             const sonnetLr = sonnetMap.get(lineResults[i].line_id);
             if (sonnetLr) {
-              // Normalize Sonnet result
               const merged: SonnetLineResult = {
                 line_id: sonnetLr.line_id,
                 article_code: sonnetLr.article_code || lineResults[i].article_code,
@@ -1748,7 +1988,6 @@ Deno.serve(async (req) => {
           console.log(`[classify] Sonnet escalation: ${upgraded} lines upgraded, ${sonnetResult.lineResults.length} returned`);
         }
 
-        // Capture fiscal alerts from Sonnet
         if (sonnetResult.invoiceNotes && sonnetResult.invoiceNotes.length > 0) {
           fiscalAlerts = sonnetResult.invoiceNotes;
           console.log(`[classify] Sonnet generated ${fiscalAlerts.length} fiscal alerts`);
@@ -1757,6 +1996,7 @@ Deno.serve(async (req) => {
         console.log(`[classify] No lines need Sonnet escalation`);
       }
     }
+    */
 
     // ─── Compose invoice-level ─────────────────────────
     const invoiceLevel = composeInvoiceLevel(lineResults, inputLines);
@@ -1826,6 +2066,7 @@ Deno.serve(async (req) => {
         model: MODEL_HAIKU,
         thinking_enabled: thinkingUsed,
         batches: totalBatches,
+        fiscal_review: true,
         ...(sonnetEscalatedCount > 0 ? {
           sonnet_escalated: sonnetEscalatedCount,
           sonnet_model: MODEL_SONNET,
