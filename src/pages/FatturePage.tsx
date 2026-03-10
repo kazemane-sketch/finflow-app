@@ -1062,29 +1062,48 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       // Step 2: For uncovered/incomplete lines, call unified classifier (Sonnet)
       let aiResult: any = null;
       if (linesToClassify.length > 0) {
-        const token = await getValidAccessToken();
-        const res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
+        const classifyBody = JSON.stringify({
+          company_id: company.id,
+          invoice_id: invoice.id,
+          lines: linesToClassify.map(l => ({
+            line_id: l.id,
+            description: l.description,
+            quantity: l.quantity,
+            unit_price: l.unit_price,
+            total_price: l.total_price,
+          })),
+          direction: invoice.direction,
+          counterparty_vat_key: cp?.piva || null,
+          counterparty_name: cp?.denom || null,
+        });
+
+        // Call with auto-retry on 401 (expired JWT)
+        let token = await getValidAccessToken();
+        let res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${token}`,
             'apikey': SUPABASE_ANON_KEY,
           },
-          body: JSON.stringify({
-            company_id: company.id,
-            invoice_id: invoice.id,
-            lines: linesToClassify.map(l => ({
-              line_id: l.id,
-              description: l.description,
-              quantity: l.quantity,
-              unit_price: l.unit_price,
-              total_price: l.total_price,
-            })),
-            direction: invoice.direction,
-            counterparty_vat_key: cp?.piva || null,
-            counterparty_name: cp?.denom || null,
-          }),
+          body: classifyBody,
         });
+
+        // 401 = JWT expired at gateway → force refresh and retry once
+        if (res.status === 401) {
+          console.warn('[classif] 401 → forcing token refresh and retrying');
+          token = await getValidAccessToken({ forceRefresh: true });
+          res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`,
+              'apikey': SUPABASE_ANON_KEY,
+            },
+            body: classifyBody,
+          });
+        }
+
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Errore AI');
         aiResult = data;
@@ -3277,29 +3296,44 @@ export default function FatturePage() {
               const uncoveredLines = lines.filter(l => !coveredIds.has(l.id));
 
               if (uncoveredLines.length > 0) {
-                const res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
+                const classifBody = JSON.stringify({
+                  company_id: companyId,
+                  invoice_id: inv.id,
+                  lines: uncoveredLines.map(l => ({
+                    line_id: l.id,
+                    description: l.description,
+                    quantity: l.quantity,
+                    unit_price: l.unit_price,
+                    total_price: l.total_price,
+                  })),
+                  direction: inv.direction,
+                  counterparty_vat_key: cp?.piva || null,
+                  counterparty_name: cp?.denom || null,
+                });
+                let res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
                   method: 'POST',
                   headers: {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${token}`,
                     'apikey': SUPABASE_ANON_KEY,
                   },
-                  body: JSON.stringify({
-                    company_id: companyId,
-                    invoice_id: inv.id,
-                    lines: uncoveredLines.map(l => ({
-                      line_id: l.id,
-                      description: l.description,
-                      quantity: l.quantity,
-                      unit_price: l.unit_price,
-                      total_price: l.total_price,
-                    })),
-                    direction: inv.direction,
-                    counterparty_vat_key: cp?.piva || null,
-                    counterparty_name: cp?.denom || null,
-                  }),
+                  body: classifBody,
                   signal,
                 });
+                // 401 = JWT expired → force refresh and retry once
+                if (res.status === 401) {
+                  token = await getValidAccessToken({ forceRefresh: true });
+                  res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'Authorization': `Bearer ${token}`,
+                      'apikey': SUPABASE_ANON_KEY,
+                    },
+                    body: classifBody,
+                    signal,
+                  });
+                }
                 if (!res.ok) {
                   console.error(`Classification error for ${inv.id}: HTTP ${res.status}`);
                   return { ok: false };
@@ -3360,7 +3394,7 @@ export default function FatturePage() {
     if (!companyId) return;
     extractionStartOrStop(async (signal, updateProgress) => {
       let totalProcessed = 0;
-      const token = await getValidAccessToken();
+      let token = await getValidAccessToken();
       const BATCH = 10;
       while (!signal.aborted) {
         // Fetch batch of unclassified invoices
@@ -3373,6 +3407,9 @@ export default function FatturePage() {
         if (fetchErr) throw new Error(fetchErr.message);
         if (!pending || pending.length === 0) break;
 
+        // Refresh token at each batch to avoid expiry during long runs
+        token = await getValidAccessToken();
+
         for (const inv of pending) {
           if (signal.aborted) break;
           const { data: lines } = await supabase
@@ -3381,16 +3418,27 @@ export default function FatturePage() {
             .eq('invoice_id', inv.id);
           if (!lines || lines.length === 0) { totalProcessed++; continue; }
           const cp = inv.counterparty as Record<string, string> | null;
-          await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
+          const classifBody = JSON.stringify({
+            company_id: companyId, invoice_id: inv.id,
+            lines: lines.map(l => ({ line_id: l.id, description: l.description || '', quantity: l.quantity, unit_price: l.unit_price, total_price: l.total_price })),
+            direction: inv.direction || 'in', counterparty_name: cp?.denom || '',
+          });
+          let res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
-            body: JSON.stringify({
-              company_id: companyId, invoice_id: inv.id,
-              lines: lines.map(l => ({ line_id: l.id, description: l.description || '', quantity: l.quantity, unit_price: l.unit_price, total_price: l.total_price })),
-              direction: inv.direction || 'in', counterparty_name: cp?.denom || '',
-            }),
+            body: classifBody,
             signal,
           });
+          // 401 = JWT expired → force refresh and retry once
+          if (res.status === 401) {
+            token = await getValidAccessToken({ forceRefresh: true });
+            res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
+              body: classifBody,
+              signal,
+            });
+          }
           totalProcessed++;
           updateProgress(totalProcessed, totalProcessed + Math.max(0, pending.length - 1));
         }
