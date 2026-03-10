@@ -25,7 +25,7 @@ const corsHeaders = {
 /* ─── Model constants ────────────────────── */
 const MODEL_HAIKU = "claude-haiku-4-5-20251001";
 const MODEL_SONNET = "claude-sonnet-4-6";
-const ESCALATION_THRESHOLD = 60;  // Lines below this confidence get escalated to Sonnet
+const ESCALATION_THRESHOLD = 70;  // Lines below this confidence get escalated to Sonnet
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_DIMS = 3072;
 const MIN_CONFIDENCE = 60;
@@ -424,7 +424,10 @@ ${accSection}
 CDC:
 ${cdcSection}
 
-CONTROPARTE: ${counterpartyInfo}
+=== CONTROPARTE FORNITORE/CLIENTE ===
+${counterpartyInfo}
+REGOLA: Il NOME della controparte spesso rivela la sua attività principale (es. "FRANTOI MERIDIONALI" = frantumazione inerti, "AUTOTRASPORTI ROSSI" = trasporto). Usa il nome come indizio forte per guidare la classificazione quando la descrizione riga è generica.
+===
 
 ${historySection}
 
@@ -438,6 +441,9 @@ REGOLE:
 - category_id e account_id: assegna SEMPRE (UUID esatti dalla lista sopra).
 - Coerenza: trasporto→conti trasporto, noleggio→conti noleggio.
 - confidence 0-100. Se dubbio, confidence bassa.
+- Righe con importo zero (tot=0): sono righe INFORMATIVE/CONTESTO (cantiere, contratto, commessa). Usale per classificare meglio le altre righe. Per la riga zero stessa: confidence 30-50, reasoning "Riga informativa/contesto".
+- Se NESSUNA categoria nella lista corrisponde bene alla riga, NON forzare una categoria sbagliata con confidence alta. Scegli la più vicina MA con confidence <70 per attivare l'escalation.
+- Il NOME della controparte rivela spesso l'attività: usalo come indizio forte.
 
 RIGHE:
 ${lineEntries}
@@ -539,7 +545,10 @@ ${accSection}
 CDC COMPLETI:
 ${cdcSection}
 
-CONTROPARTE: ${counterpartyInfo}
+=== CONTROPARTE FORNITORE/CLIENTE ===
+${counterpartyInfo}
+REGOLA: Il NOME della controparte spesso rivela la sua attività principale. Usa il nome come indizio forte per guidare la classificazione quando la descrizione riga è generica.
+===
 
 ${historySection}
 
@@ -747,7 +756,10 @@ ${coaSecondarySection}` : ""}
 CENTRI DI COSTO:
 ${cdcSection}
 
-CONTROPARTE: ${counterpartyInfo}
+=== CONTROPARTE FORNITORE/CLIENTE ===
+${counterpartyInfo}
+REGOLA: Il NOME della controparte spesso rivela la sua attività principale (es. "FRANTOI MERIDIONALI" = frantumazione inerti, "AUTOTRASPORTI ROSSI" = trasporto). Usa il nome come indizio forte per guidare la classificazione quando la descrizione riga è generica.
+===
 
 ${historySection}
 ${ragSection}
@@ -782,6 +794,17 @@ UTILIZZO DELLO STORICO CONTROPARTE:
 * article_code: assegna SOLO se la riga riguarda uno degli articoli configurati, altrimenti null
 * phase_code: se l'articolo ha fasi, assegna la fase più appropriata dal suo elenco. Se l'articolo non ha fasi, phase_code = null.
 * category_id e account_id: assegna SEMPRE
+
+RIGHE CON IMPORTO ZERO (CONTESTO):
+* Le righe con total_price=0 e unit_price=0 sono righe informative/di contesto, NON righe da classificare come costo/ricavo
+* Queste righe spesso contengono riferimenti importanti: numero cantiere, contratto, commessa, materiale oggetto della fornitura
+* USA le informazioni di queste righe per classificare meglio le righe con importo > 0
+* Per le righe zero stesse: assegna category_id e account_id coerenti con il contesto, confidence bassa (30-50), reasoning: "Riga informativa/contesto"
+
+CATEGORY MATCHING — ABBASSA CONFIDENCE SE NESSUNA CATEGORIA CORRISPONDE:
+* Se NESSUNA delle categorie nella lista filtrata corrisponde bene alla riga, NON forzare una categoria sbagliata con confidence alta
+* Invece: scegli la categoria più vicina disponibile MA abbassa la confidence sotto 70 per attivare l'escalation, dove il classificatore avanzato ha la lista COMPLETA delle categorie
+* Esempio: se la riga è "servizio di facchinaggio" ma nessuna categoria è specifica per facchinaggio → assegna la più vicina (es. "Servizi generali") ma con confidence 55-65 e reasoning: "Nessuna categoria specifica trovata"
 
 ATTENZIONE — ERRORE FREQUENTE DA EVITARE (SERVIZI vs MATERIALI):
 * PRIMA analizza la DESCRIZIONE della riga. Solo DOPO controlla lo storico.
