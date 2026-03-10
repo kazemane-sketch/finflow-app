@@ -1670,6 +1670,78 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     }
   }, [detail?.invoice_lines, selCategoryId, selAccountId, cdcRows, bulkArticleId, bulkPhaseId, articles, lineClassifs, lineProjects]);
 
+  // Header dropdown apply — applies selected value ONLY to empty cells
+  const handleHeaderApplyCategory = useCallback((categoryId: string) => {
+    const lines = detail?.invoice_lines;
+    if (!lines?.length || !categoryId) return;
+    const newLineClf = { ...lineClassifs };
+    let count = 0;
+    for (const l of lines) {
+      const prev = newLineClf[l.id];
+      if (!prev?.category_id) {
+        newLineClf[l.id] = { ...prev, invoice_line_id: l.id, category_id: categoryId, account_id: prev?.account_id ?? null };
+        count++;
+      }
+    }
+    if (count > 0) {
+      setLineClassifs(newLineClf);
+      setClassifDirty(true);
+      toast.info(`Categoria applicata a ${count} righe vuote`);
+    }
+  }, [detail?.invoice_lines, lineClassifs]);
+
+  const handleHeaderApplyAccount = useCallback((accountId: string) => {
+    const lines = detail?.invoice_lines;
+    if (!lines?.length || !accountId) return;
+    const newLineClf = { ...lineClassifs };
+    let count = 0;
+    for (const l of lines) {
+      const prev = newLineClf[l.id];
+      if (!prev?.account_id) {
+        newLineClf[l.id] = { ...prev, invoice_line_id: l.id, category_id: prev?.category_id ?? null, account_id: accountId };
+        count++;
+      }
+    }
+    if (count > 0) {
+      setLineClassifs(newLineClf);
+      setClassifDirty(true);
+      toast.info(`Conto applicato a ${count} righe vuote`);
+    }
+  }, [detail?.invoice_lines, lineClassifs]);
+
+  const handleHeaderApplyCdc = useCallback((projectId: string) => {
+    const lines = detail?.invoice_lines;
+    if (!lines?.length || !projectId) return;
+    const newLineProj = { ...lineProjects };
+    let count = 0;
+    for (const l of lines) {
+      if (!newLineProj[l.id]?.length) {
+        newLineProj[l.id] = [{ id: '', invoice_line_id: l.id, project_id: projectId, percentage: 100, amount: null }];
+        count++;
+      }
+    }
+    if (count > 0) {
+      setLineProjects(newLineProj);
+      setClassifDirty(true);
+      toast.info(`CdC applicato a ${count} righe vuote`);
+    }
+  }, [detail?.invoice_lines, lineProjects]);
+
+  // State for header dropdown popovers
+  const [headerDropdown, setHeaderDropdown] = useState<'category' | 'account' | 'cdc' | null>(null);
+
+  // Close header dropdown on outside click
+  useEffect(() => {
+    if (!headerDropdown) return;
+    const handler = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (target.closest('th[class*="relative"]')) return;
+      setHeaderDropdown(null);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [headerDropdown]);
+
   // Reset notes when invoice changes
   useEffect(() => { setNotesText(invoice.notes || ''); }, [invoice.id, invoice.notes]);
 
@@ -1862,200 +1934,60 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         {/* ═══ TAB: CLASSIFICAZIONE ═══ */}
         {activeTab === 'classificazione' && (
           <div className="p-4 space-y-4">
-            {/* Apply to all rows section */}
-            {(allCategories.length > 0 || allAccounts.length > 0 || allProjects.length > 0) && (
-              <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-xl p-4">
-                <div className="flex items-center justify-between mb-1">
-                  <div>
-                    <h3 className="text-sm font-bold text-gray-800">Applica a tutte le righe</h3>
-                    <p className="text-[11px] text-gray-500">Scegli qui per compilare tutte le righe in blocco. Puoi poi modificarle singolarmente.</p>
-                  </div>
-                  {/* AI Suggest button */}
-                  {aiClassifStatus === 'idle' && !aiClassifResult && (
-                    <button onClick={handleRequestAiClassification}
-                      className="flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-700 hover:to-indigo-700 shadow-md transition-all">
-                      <span>{'\u2728'}</span> Suggerisci AI
-                    </button>
-                  )}
-                  {aiClassifStatus === 'loading' && (
-                    <div className="flex items-center gap-2 text-xs text-purple-600">
-                      <span className="animate-spin">{'\u21BB'}</span> Classificazione AI...
-                    </div>
-                  )}
+            {/* AI classification controls — compact bar */}
+            <div className="flex items-center gap-3 flex-wrap">
+              {/* AI Suggest button */}
+              {aiClassifStatus === 'idle' && !aiClassifResult && (
+                <button onClick={handleRequestAiClassification}
+                  className="flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-700 hover:to-indigo-700 shadow-md transition-all">
+                  <span>{'\u2728'}</span> Suggerisci AI
+                </button>
+              )}
+              {aiClassifStatus === 'loading' && (
+                <div className="flex items-center gap-2 text-xs text-purple-600">
+                  <span className="animate-spin">{'\u21BB'}</span> Classificazione AI...
                 </div>
-
-                {/* AI Suggestion Banner — info only, user saves with universal Save button */}
-                {invoice.classification_status === 'ai_suggested' && (
-                  <div className="flex items-center gap-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3">
-                    <span className="text-amber-500 text-sm flex-shrink-0">{'\u26A1'}</span>
-                    <span className="text-xs text-amber-800 flex-1">Classificazione suggerita dall'AI {'\u2014'} verifica i campi e premi Salva</span>
-                  </div>
-                )}
-
-                {/* AI result info (no Conferma/Ignora — user saves with universal Save button) */}
-                {aiClassifResult && (
-                  <div className="bg-purple-50 border border-purple-200 rounded-lg px-2.5 py-1.5 mb-3">
-                    <div className="flex items-center gap-2">
-                      <span className="text-purple-600 text-sm">{'\u2728'}</span>
-                      <span className="text-[10px] text-purple-700">
-                        {aiClassifResult.invoice_level?.reasoning || 'Suggerimento AI applicato'}
-                      </span>
-                      <span className="text-[10px] text-purple-500 ml-auto">
-                        {aiClassifResult.invoice_level?.confidence ?? 0}%
-                      </span>
-                    </div>
-                  </div>
-                )}
-
-                {aiClassifStatus === 'error' && (
-                  <div className="flex items-center gap-2 mb-3">
-                    <span className="text-xs text-red-600">Errore classificazione AI</span>
-                    <button onClick={() => setAiClassifStatus('idle')} className="text-xs text-sky-600 hover:underline">Riprova</button>
-                  </div>
-                )}
-
-                {/* Three dropdowns: Categoria | Piano conti | Centro di costo */}
-                <div className="grid grid-cols-3 gap-3 mt-3">
-                  <div>
-                    <label className="block text-[10px] font-medium text-gray-500 mb-1">
-                      Categoria
-                      {isCategoryMismatch(selCategoryId) && <span className="ml-1 text-amber-500" title="Categoria non coerente con direzione fattura">⚠</span>}
-                    </label>
-                    <select
-                      value={selCategoryId || ''}
-                      onChange={e => { setSelCategoryId(e.target.value || null); setClassifDirty(true); }}
-                      className={`w-full px-2 py-1.5 text-xs border rounded-lg bg-white focus:ring-2 focus:ring-blue-400 outline-none ${isCategoryMismatch(selCategoryId) ? 'border-amber-400' : 'border-gray-200'}`}>
-                      <option value="">{'\u2014'} Nessuna {'\u2014'}</option>
-                      {dirCategories.map(c => (
-                        <option key={c.id} value={c.id}>{c.name} ({CATEGORY_TYPE_LABELS[c.type]})</option>
-                      ))}
-                      {otherCategories.length > 0 && <option disabled>{'─── Altre ───'}</option>}
-                      {otherCategories.map(c => (
-                        <option key={c.id} value={c.id}>{c.name} ({CATEGORY_TYPE_LABELS[c.type]})</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-medium text-gray-500 mb-1">
-                      Piano conti
-                      {isAccountMismatch(selAccountId) && <span className="ml-1 text-amber-500" title="Conto non coerente con direzione fattura">⚠</span>}
-                    </label>
-                    <select
-                      value={selAccountId || ''}
-                      onChange={e => { setSelAccountId(e.target.value || null); setClassifDirty(true); }}
-                      className={`w-full px-2 py-1.5 text-xs border rounded-lg bg-white focus:ring-2 focus:ring-blue-400 outline-none ${isAccountMismatch(selAccountId) ? 'border-amber-400' : 'border-gray-200'}`}>
-                      <option value="">{'\u2014'} Nessuno {'\u2014'}</option>
-                      {dirPrimaryAccounts.map(a => (
-                        <option key={a.id} value={a.id}>{a.code} {'\u2014'} {a.name}</option>
-                      ))}
-                      {dirSecondaryAccounts.length > 0 && <option disabled>{'─── Speciali ───'}</option>}
-                      {dirSecondaryAccounts.map(a => (
-                        <option key={a.id} value={a.id}>{a.code} {'\u2014'} {a.name}</option>
-                      ))}
-                      {dirOtherAccounts.length > 0 && <option disabled>{'─── Altra direzione ───'}</option>}
-                      {dirOtherAccounts.map(a => (
-                        <option key={a.id} value={a.id}>{a.code} {'\u2014'} {a.name}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-medium text-gray-500 mb-1">Centro di costo</label>
-                    <select
-                      value={cdcRows.length === 1 ? cdcRows[0].project_id : ''}
-                      onChange={e => {
-                        const val = e.target.value;
-                        if (val) {
-                          const total = Math.abs(invoice?.total_amount || 0);
-                          setCdcRows([{ project_id: val, percentage: 100, amount: total > 0 ? total : null }]);
-                        } else {
-                          setCdcRows([]);
-                        }
-                        setClassifDirty(true);
-                      }}
-                      className="w-full px-2 py-1.5 text-xs border border-gray-200 rounded-lg bg-white focus:ring-2 focus:ring-blue-400 outline-none">
-                      <option value="">{'\u2014'} Nessuno {'\u2014'}</option>
-                      {allProjects.map(p => (
-                        <option key={p.id} value={p.id}>{p.code} {'\u2014'} {p.name}</option>
-                      ))}
-                    </select>
-                  </div>
+              )}
+              {aiClassifStatus === 'error' && (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-red-600">Errore AI</span>
+                  <button onClick={() => setAiClassifStatus('idle')} className="text-xs text-sky-600 hover:underline">Riprova</button>
                 </div>
+              )}
 
-                {/* Bulk article + phase assignment */}
-                {articles.length > 0 && (
-                  <div className="flex items-end gap-2 mt-3">
-                    <div className="flex-1">
-                      <label className="block text-[10px] font-medium text-gray-500 mb-1">Articolo</label>
-                      <select
-                        value={bulkArticleId || ''}
-                        onChange={e => { setBulkArticleId(e.target.value || null); setBulkPhaseId(null); }}
-                        className="w-full px-2 py-1.5 text-xs border border-gray-200 rounded-lg bg-white focus:ring-2 focus:ring-blue-400 outline-none">
-                        <option value="">{'\u2014'} Nessuno {'\u2014'}</option>
-                        {articles.map(a => (
-                          <option key={a.id} value={a.id}>{a.code} {'\u2014'} {a.name}</option>
-                        ))}
-                      </select>
-                    </div>
-                    {/* Cascading phase dropdown — only when bulk article has phases */}
-                    {(() => {
-                      const bulkArt = bulkArticleId ? articles.find(a => a.id === bulkArticleId) : null;
-                      if (!bulkArt?.phases?.length) return null;
-                      const sorted = [...bulkArt.phases].sort((a, b) => a.sort_order - b.sort_order);
-                      return (
-                        <div className="flex-1">
-                          <label className="block text-[10px] font-medium text-gray-500 mb-1">Fase</label>
-                          <select
-                            value={bulkPhaseId || ''}
-                            onChange={e => setBulkPhaseId(e.target.value || null)}
-                            className={`w-full px-2 py-1.5 text-xs border rounded-lg bg-white focus:ring-2 focus:ring-blue-400 outline-none ${
-                              !bulkPhaseId ? 'border-orange-300 bg-orange-50' : 'border-gray-200'
-                            }`}>
-                            <option value="">{'\u2014'} Seleziona fase {'\u2014'}</option>
-                            {sorted.map(p => (
-                              <option key={p.id} value={p.id}>
-                                {p.is_counting_point ? '\u25CF ' : ''}{p.code} {'\u2014'} {p.name}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      );
-                    })()}
-                  </div>
-                )}
-
-                {/* Unified "Applica a tutte" button — active if ANY field selected */}
-                {(() => {
-                  const hasAnySelection = !!(selCategoryId || selAccountId || cdcRows.length > 0 || bulkArticleId);
-                  const selectedCount = [selCategoryId, selAccountId, cdcRows.length > 0 ? 'cdc' : null, bulkArticleId].filter(Boolean).length;
-                  return hasAnySelection ? (
-                    <div className="flex items-center justify-between mt-3 pt-3 border-t border-blue-100">
-                      <span className="text-[10px] text-gray-500">
-                        {selectedCount} {selectedCount === 1 ? 'campo selezionato' : 'campi selezionati'} {'\u2014'} verranno applicati a tutte le righe
-                        {bulkArticleId && (() => {
-                          const art = articles.find(a => a.id === bulkArticleId);
-                          const hasPhases = (art as ArticleWithPhases)?.phases?.length > 0;
-                          return hasPhases && !bulkPhaseId ? ' (fase: auto)' : '';
-                        })()}
-                      </span>
-                      <button
-                        onClick={handleBulkApplyAll}
-                        className="px-4 py-1.5 text-xs font-semibold text-white bg-teal-600 rounded-lg hover:bg-teal-700 shadow-sm transition-colors whitespace-nowrap">
-                        {'\u2714'} Applica a tutte le righe
-                      </button>
-                    </div>
-                  ) : null;
-                })()}
-
-                {/* All saves deferred to footer "Salva" button */}
-                {classifDirty && (
-                  <div className="flex justify-end pt-2">
-                    <span className="text-[10px] text-amber-600 italic flex items-center gap-1">
-                      <span>⚠</span> Modifiche non salvate — premi &ldquo;Salva&rdquo; in basso
+              {/* AI result info */}
+              {aiClassifResult && (
+                <div className="flex items-center gap-2 bg-purple-50 border border-purple-200 rounded-lg px-2.5 py-1.5">
+                  <span className="text-purple-600 text-sm">{'\u2728'}</span>
+                  <span className="text-[10px] text-purple-700">
+                    {aiClassifResult.invoice_level?.reasoning || 'AI applicata'}
+                  </span>
+                  <span className="text-[10px] text-purple-500">
+                    {aiClassifResult.invoice_level?.confidence ?? 0}%
+                  </span>
+                  {aiClassifResult.stats?.sonnet_escalated > 0 && (
+                    <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">
+                      {aiClassifResult.stats.sonnet_escalated} Sonnet
                     </span>
-                  </div>
-                )}
-              </div>
-            )}
+                  )}
+                </div>
+              )}
+
+              {/* AI suggested banner */}
+              {invoice.classification_status === 'ai_suggested' && !aiClassifResult && (
+                <div className="flex items-center gap-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5">
+                  <span className="text-amber-500 text-sm">{'\u26A1'}</span>
+                  <span className="text-[10px] text-amber-800">Suggerimento AI {'\u2014'} verifica e Salva</span>
+                </div>
+              )}
+
+              {/* Dirty indicator */}
+              {classifDirty && (
+                <span className="text-[10px] text-amber-600 italic flex items-center gap-1 ml-auto">
+                  <span>{'\u26A0'}</span> Non salvato
+                </span>
+              )}
+            </div>
 
             {/* Invoice lines table with classification */}
             <div className="bg-white border rounded-xl overflow-hidden">
@@ -2082,9 +2014,75 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold w-16">P. Unit.</th>
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold w-14">IVA</th>
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold w-16">Totale</th>
-                    {allCategories.length > 0 && <th className="text-center px-1 py-2 text-gray-600 font-semibold w-32">Categoria</th>}
-                    {allProjects.length > 0 && <th className="text-center px-1 py-2 text-gray-600 font-semibold w-28">CdC</th>}
-                    {allAccounts.length > 0 && <th className="text-center px-1 py-2 text-gray-600 font-semibold w-36">Conto</th>}
+                    {allCategories.length > 0 && (
+                      <th className="text-center px-1 py-2 text-gray-600 font-semibold w-32 relative">
+                        <button onClick={() => setHeaderDropdown(headerDropdown === 'category' ? null : 'category')}
+                          className="hover:text-purple-600 transition-colors cursor-pointer inline-flex items-center gap-0.5"
+                          title="Clicca per applicare a tutte le righe vuote">
+                          Categoria <span className="text-[8px] text-gray-400">{'\u25BC'}</span>
+                        </button>
+                        {headerDropdown === 'category' && (
+                          <div className="absolute top-full left-0 z-50 mt-1 w-56 bg-white border border-gray-200 rounded-lg shadow-xl max-h-64 overflow-y-auto">
+                            <div className="px-2 py-1.5 text-[9px] text-gray-400 border-b bg-gray-50">Applica a righe vuote</div>
+                            {dirCategories.map(c => (
+                              <button key={c.id} onClick={() => { handleHeaderApplyCategory(c.id); setHeaderDropdown(null); }}
+                                className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
+                                {c.name}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </th>
+                    )}
+                    {allProjects.length > 0 && (
+                      <th className="text-center px-1 py-2 text-gray-600 font-semibold w-28 relative">
+                        <button onClick={() => setHeaderDropdown(headerDropdown === 'cdc' ? null : 'cdc')}
+                          className="hover:text-purple-600 transition-colors cursor-pointer inline-flex items-center gap-0.5"
+                          title="Clicca per applicare a tutte le righe vuote">
+                          CdC <span className="text-[8px] text-gray-400">{'\u25BC'}</span>
+                        </button>
+                        {headerDropdown === 'cdc' && (
+                          <div className="absolute top-full left-0 z-50 mt-1 w-56 bg-white border border-gray-200 rounded-lg shadow-xl max-h-64 overflow-y-auto">
+                            <div className="px-2 py-1.5 text-[9px] text-gray-400 border-b bg-gray-50">Applica a righe vuote</div>
+                            {allProjects.map(p => (
+                              <button key={p.id} onClick={() => { handleHeaderApplyCdc(p.id); setHeaderDropdown(null); }}
+                                className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
+                                {p.code} {'\u2014'} {p.name}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </th>
+                    )}
+                    {allAccounts.length > 0 && (
+                      <th className="text-center px-1 py-2 text-gray-600 font-semibold w-36 relative">
+                        <button onClick={() => setHeaderDropdown(headerDropdown === 'account' ? null : 'account')}
+                          className="hover:text-purple-600 transition-colors cursor-pointer inline-flex items-center gap-0.5"
+                          title="Clicca per applicare a tutte le righe vuote">
+                          Conto <span className="text-[8px] text-gray-400">{'\u25BC'}</span>
+                        </button>
+                        {headerDropdown === 'account' && (
+                          <div className="absolute top-full right-0 z-50 mt-1 w-64 bg-white border border-gray-200 rounded-lg shadow-xl max-h-64 overflow-y-auto">
+                            <div className="px-2 py-1.5 text-[9px] text-gray-400 border-b bg-gray-50">Applica a righe vuote</div>
+                            {dirPrimaryAccounts.map(a => (
+                              <button key={a.id} onClick={() => { handleHeaderApplyAccount(a.id); setHeaderDropdown(null); }}
+                                className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
+                                {a.code} {'\u2014'} {a.name}
+                              </button>
+                            ))}
+                            {dirSecondaryAccounts.length > 0 && (
+                              <div className="px-2 py-1 text-[9px] text-gray-400 border-t bg-gray-50">Speciali</div>
+                            )}
+                            {dirSecondaryAccounts.map(a => (
+                              <button key={a.id} onClick={() => { handleHeaderApplyAccount(a.id); setHeaderDropdown(null); }}
+                                className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
+                                {a.code} {'\u2014'} {a.name}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </th>
+                    )}
                     {(allCategories.length > 0 || allAccounts.length > 0) && <th className="text-center px-0.5 py-2 text-gray-400 font-normal w-12"></th>}
                   </tr></thead>
                   <tbody>

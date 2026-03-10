@@ -1,5 +1,6 @@
-// classify-invoice-lines — Haiku + Extended Thinking classifier for invoice lines
-// Single Haiku call with thinking budget for all classification. No escalation.
+// classify-invoice-lines — Haiku + Sonnet escalation pipeline for invoice lines
+// Stage 1: Embedding pre-flight (Gemini) → Stage 2: Haiku classification (batched)
+// → Stage 3: Sonnet escalation for fiscal-complex lines (ritenuta, RC, beni strum.)
 // Full context: articles, categories, CoA, CdC, ATECO, counterparty history, RAG.
 //
 // PRINCIPLE: produces SUGGESTIONS only (classification_status = 'ai_suggested'
@@ -23,14 +24,22 @@ const corsHeaders = {
 
 /* ─── Model constants ────────────────────── */
 const MODEL_HAIKU = "claude-haiku-4-5-20251001";
+const MODEL_SONNET = "claude-sonnet-4-6-20250514";
 const THINKING_PER_LINE = 400;       // thinking budget per line
 const MIN_THINKING_BUDGET = 2048;    // minimum thinking budget
 const MAX_THINKING_BUDGET = 16000;   // maximum thinking budget
+const SONNET_THINKING_BUDGET = 10000; // fixed thinking budget for Sonnet escalation
 const MAX_LINES_PER_BATCH = 15;      // max lines per Haiku call
 const MAX_PARALLEL_BATCHES = 3;      // max concurrent API calls
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_DIMS = 3072;
 const MIN_CONFIDENCE = 60;
+const FISCAL_ESCALATION_TRIGGERS = [
+  "ritenuta_acconto",
+  "reverse_charge",
+  "bene_strumentale",
+  "suggest_new_account",
+] as const;
 
 /* ─── Direction enforcement constants ────── */
 // Which CoA sections are valid for each invoice direction
@@ -309,6 +318,7 @@ function buildFocusedPrompt(
   lines: InputLine[],
   systemPrompt: string,
   userInstructionsBlock: string,
+  classifyOnlyLineIds?: Set<string>,
 ): string {
   // Build phases-by-article map
   const phasesByArticle = new Map<string, ArticlePhaseRow[]>();
@@ -370,10 +380,20 @@ function buildFocusedPrompt(
     historySection = `STORICO (usa SOLO se la descrizione corrisponde):\n${histLines.join("\n")}`;
   }
 
-  // Lines
+  // Lines — with context markers when batching
+  const hasBatchFilter = classifyOnlyLineIds && classifyOnlyLineIds.size > 0;
   const lineEntries = lines
-    .map((l, i) => `${i + 1}. [${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} tot=${l.total_price ?? "N/D"}`)
+    .map((l, i) => {
+      const isContext = hasBatchFilter && !classifyOnlyLineIds!.has(l.line_id);
+      const marker = isContext ? "[CONTESTO] " : (hasBatchFilter ? "[DA CLASSIFICARE] " : "");
+      return `${i + 1}. ${marker}[${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} tot=${l.total_price ?? "N/D"}`;
+    })
     .join("\n");
+
+  // Batch instruction when using context markers
+  const batchInstruction = hasBatchFilter
+    ? `\nIMPORTANTE: Classifica SOLO le righe marcate [DA CLASSIFICARE]. Le righe [CONTESTO] sono informative — usale per capire il contesto (cantiere, commessa, tipologia lavoro) ma NON includerle nel JSON output.\n`
+    : "";
 
   return `${systemPrompt}
 ${userInstructionsBlock}
@@ -410,7 +430,7 @@ REGOLE:
 - Il NOME della controparte rivela spesso l'attività: usalo come indizio forte.
 
 - CdC: assegna SOLO se hai un segnale chiaro (storico controparte, cantiere nella descrizione, località). Se non sei sicuro, lascia cost_center_allocations vuoto — l'utente lo assegnerà manualmente.
-
+${batchInstruction}
 RIGHE:
 ${lineEntries}
 
@@ -539,13 +559,15 @@ async function persistResults(
       if (match) phaseId = match.id;
     }
 
-    // Save line-level category/account + mark as ai_suggested
+    // Save line-level category/account/fiscal_flags + mark as ai_suggested
     if (lr.category_id || lr.account_id) {
       try {
+        const fiscalJson = lr.fiscal_flags ? JSON.stringify(lr.fiscal_flags) : null;
         await sql`
           UPDATE invoice_lines
           SET category_id = COALESCE(${lr.category_id}, category_id),
               account_id = COALESCE(${lr.account_id}, account_id),
+              fiscal_flags = COALESCE(${fiscalJson}::jsonb, fiscal_flags),
               classification_status = 'ai_suggested'
           WHERE id = ${lr.line_id}
             AND (category_id IS NULL OR account_id IS NULL)`;
@@ -612,6 +634,187 @@ async function persistResults(
     } catch (e: unknown) {
       console.error(`[persist] INSERT invoice_projects failed:`, (e as Error).message);
     }
+  }
+}
+
+/* ─── Sonnet escalation: detect lines needing fiscal expert ──── */
+
+function needsSonnetEscalation(lr: SonnetLineResult): boolean {
+  // Low confidence → escalate
+  if (lr.confidence < MIN_CONFIDENCE) return true;
+  // Complex fiscal flags → escalate for expert review
+  const ff = lr.fiscal_flags;
+  if (!ff) return false;
+  if (ff.ritenuta_acconto) return true;
+  if (ff.reverse_charge) return true;
+  if (ff.bene_strumentale) return true;
+  // Suggest new account = AI unsure about CoA → escalate
+  if (lr.suggest_new_account) return true;
+  return false;
+}
+
+async function sonnetEscalate(
+  escalationLines: SonnetLineResult[],
+  allLines: InputLine[],
+  accounts: AccountRow[],
+  categories: CategoryRow[],
+  projects: ProjectRow[],
+  articles: ArticleRow[],
+  phases: ArticlePhaseRow[],
+  counterpartyInfo: string,
+  history: HistoryRow[],
+  memoryBlock: string,
+  direction: string,
+  systemPrompt: string,
+  userInstructionsBlock: string,
+  apiKey: string,
+): Promise<{ lineResults: SonnetLineResult[]; error?: string }> {
+  // Build a Sonnet prompt with full context + Haiku's attempt as reference
+  const lineIds = new Set(escalationLines.map(l => l.line_id));
+
+  // Haiku attempt summary for Sonnet to review
+  const haikuAttempts = escalationLines.map(lr => {
+    const input = allLines.find(l => l.line_id === lr.line_id);
+    return `- [${lr.line_id}] "${input?.description || 'N/D'}" → Haiku: conto=${lr.account_code || 'N/D'}, cat=${lr.category_name || 'N/D'}, confidence=${lr.confidence}, reasoning="${lr.reasoning}"${lr.fiscal_flags?.ritenuta_acconto ? ', RITENUTA ACCONTO' : ''}${lr.fiscal_flags?.reverse_charge ? ', REVERSE CHARGE' : ''}${lr.fiscal_flags?.bene_strumentale ? ', BENE STRUMENTALE' : ''}`;
+  }).join("\n");
+
+  // Full account/category lists for Sonnet (not pre-filtered — give it everything)
+  const accSection = accounts.map(a => `- ${a.id}: ${a.code} ${a.name} (${a.section})`).join("\n");
+  const catSection = categories.map(c => `- ${c.id}: ${c.name} (${c.type})`).join("\n");
+  const cdcSection = projects.length > 0
+    ? projects.map(p => `- ${p.id}: ${p.code} ${p.name}`).join("\n")
+    : "Nessun CdC.";
+
+  // Articles section
+  const phasesByArticle = new Map<string, ArticlePhaseRow[]>();
+  for (const p of phases) {
+    if (!phasesByArticle.has(p.article_id)) phasesByArticle.set(p.article_id, []);
+    phasesByArticle.get(p.article_id)!.push(p);
+  }
+  let artSection = "";
+  for (const a of articles) {
+    const aPhases = phasesByArticle.get(a.id) || [];
+    const kwPart = a.keywords?.length ? ` [${a.keywords.join(", ")}]` : "";
+    if (aPhases.length > 0) {
+      artSection += `- ${a.code} (${a.name})${kwPart}: ${aPhases.map(p => `${p.code}:${p.name}`).join(", ")}\n`;
+    } else {
+      artSection += `- ${a.code} (${a.name})${kwPart}\n`;
+    }
+  }
+
+  // All line descriptions for context
+  const lineContext = allLines.map((l, i) => {
+    const isTarget = lineIds.has(l.line_id);
+    return `${i + 1}. ${isTarget ? "[DA RICLASSIFICARE] " : "[CONTESTO] "}[${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} tot=${l.total_price ?? "N/D"}`;
+  }).join("\n");
+
+  const sonnetPrompt = `${systemPrompt}
+${userInstructionsBlock}
+${memoryBlock}
+
+Sei un ESPERTO FISCALE ITALIANO chiamato per riclassificare righe complesse che Haiku non ha gestito con sufficiente confidenza.
+
+=== TENTATIVO HAIKU (da rivedere) ===
+${haikuAttempts}
+===
+
+ARTICOLI:
+${artSection}
+CATEGORIE:
+${catSection}
+
+CONTI (COMPLETI):
+${accSection}
+
+CDC:
+${cdcSection}
+
+=== CONTROPARTE ===
+${counterpartyInfo}
+===
+
+=== VINCOLO DIREZIONE (${direction === "in" ? "PASSIVA" : "ATTIVA"}) ===
+${direction === "in" ? "Conti di COSTO. VIETATO: conti revenue." : "Conti di RICAVO. VIETATO: conti costo."}
+===
+
+REGOLE ESCALATION:
+- Riclassifica SOLO le righe [DA RICLASSIFICARE].
+- Analizza APPROFONDITAMENTE la fiscalità: ritenuta d'acconto (aliquota, base imponibile), reverse charge, split payment, beni strumentali (ammortamento), deducibilità %, IVA detraibilità %.
+- Se il tentativo Haiku era corretto, CONFERMALO con confidence più alta.
+- Se era sbagliato, CORREGGILO con reasoning dettagliato.
+- fiscal_flags OBBLIGATORI e dettagliati per ogni riga.
+
+RIGHE FATTURA (contesto completo):
+${lineContext}
+
+JSON array (no markdown, SOLO righe [DA RICLASSIFICARE]):
+[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"dettagliato","fiscal_flags":{"ritenuta_acconto":{"aliquota":20,"base":"100%"}|null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]`;
+
+  console.log(`[sonnet-escalate] Escalating ${escalationLines.length} lines to Sonnet, prompt=${sonnetPrompt.length} chars`);
+
+  try {
+    // Note: Extended Thinking requires system prompt in user message (API requirement)
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: MODEL_SONNET,
+        max_tokens: 16000,
+        thinking: { type: "enabled" as const, budget_tokens: SONNET_THINKING_BUDGET },
+        messages: [{ role: "user" as const, content: sonnetPrompt }],
+      }),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      const msg = `Sonnet escalation API ${resp.status}: ${errText.slice(0, 300)}`;
+      console.error(`[sonnet-escalate] ${msg}`);
+      return { lineResults: [], error: msg };
+    }
+
+    const data = await resp.json();
+    const contentBlocks = (data as any)?.content || [];
+
+    // Log thinking
+    const thinkingBlock = contentBlocks.find((b: any) => b.type === "thinking");
+    if (thinkingBlock) {
+      console.log(`[sonnet-escalate] Thinking: ${(thinkingBlock.thinking || "").slice(0, 200)}...`);
+    }
+
+    // Extract text
+    const text = contentBlocks
+      .filter((b: any) => b.type === "text")
+      .map((b: any) => b.text)
+      .join("") || "";
+
+    const stopReason = (data as any)?.stop_reason;
+    console.log(`[sonnet-escalate] Response: ${text.length} chars, stop=${stopReason}`);
+
+    if (!text) {
+      return { lineResults: [], error: "Sonnet returned empty text" };
+    }
+
+    // Parse JSON
+    let classJson = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+    let jsonStr = extractFirstJsonArray(classJson);
+
+    if (!jsonStr) {
+      const msg = `Sonnet escalation: no JSON array. First 300: ${classJson.slice(0, 300)}`;
+      console.warn(`[sonnet-escalate] ${msg}`);
+      return { lineResults: [], error: msg };
+    }
+
+    const parsed: SonnetLineResult[] = JSON.parse(jsonStr);
+    console.log(`[sonnet-escalate] Parsed ${parsed.length} lines from Sonnet`);
+    return { lineResults: parsed };
+  } catch (e) {
+    const msg = `Sonnet escalation error: ${e}`;
+    console.error(`[sonnet-escalate] ${msg}`);
+    return { lineResults: [], error: msg };
   }
 }
 
@@ -1041,10 +1244,12 @@ Deno.serve(async (req) => {
     // Build memory block for prompt
     const memoryBlock = getCompanyMemoryBlock(memoryFacts);
 
-    // ─── Stage 2: Haiku Classification (with batching) ──────────
+    // ─── Stage 2: Haiku Classification (with context-aware batching) ──────────
 
-    // Build prompt function — context is shared across batches, only RIGHE changes
-    const buildBatchPrompt = (batchLines: InputLine[]) =>
+    // Build prompt function — for batching, ALL lines are sent but only a subset
+    // is marked [DA CLASSIFICARE]. This preserves context (e.g., "cantiere Via X"
+    // in batch 1 helps classify materials in batch 2).
+    const buildBatchPromptWithContext = (batchLineIds: Set<string>) =>
       buildFocusedPrompt(
         preflightArticles,
         preflightCategories,
@@ -1055,7 +1260,25 @@ Deno.serve(async (req) => {
         history,
         memoryBlock,
         direction,
-        batchLines,
+        inputLines,     // ALL lines always
+        systemPrompt,
+        userInstructionsBlock,
+        batchLineIds,   // which ones to classify
+      );
+
+    // For small invoices (no batching), no context markers needed
+    const buildSinglePrompt = (lines: InputLine[]) =>
+      buildFocusedPrompt(
+        preflightArticles,
+        preflightCategories,
+        preflightAccounts,
+        preflightProjects,
+        phases,
+        counterpartyInfo,
+        history,
+        memoryBlock,
+        direction,
+        lines,
         systemPrompt,
         userInstructionsBlock,
       );
@@ -1071,36 +1294,47 @@ Deno.serve(async (req) => {
     );
 
     if (inputLines.length <= MAX_LINES_PER_BATCH) {
-      // Small invoice: single call
+      // Small invoice: single call, no context markers
       const result = await classifyBatch(
         inputLines,
         0,
         1,
         apiKey,
-        buildBatchPrompt,
+        buildSinglePrompt,
       );
       allLineResults = result.lineResults;
       allKeywords = result.keywords;
       if (result.error) batchErrors.push(result.error);
       thinkingUsed = true;
     } else {
-      // Large invoice: split into parallel batches
-      const batches: InputLine[][] = [];
+      // Large invoice: split line IDs into batches, each batch sees ALL lines with context markers
+      const lineIdBatches: string[][] = [];
       for (let i = 0; i < inputLines.length; i += MAX_LINES_PER_BATCH) {
-        batches.push(inputLines.slice(i, i + MAX_LINES_PER_BATCH));
+        lineIdBatches.push(
+          inputLines.slice(i, i + MAX_LINES_PER_BATCH).map(l => l.line_id)
+        );
       }
 
       console.log(
-        `[classify] Large invoice: ${inputLines.length} lines → ${batches.length} batches of max ${MAX_LINES_PER_BATCH}`,
+        `[classify] Large invoice: ${inputLines.length} lines → ${lineIdBatches.length} batches of max ${MAX_LINES_PER_BATCH} (context-aware: all lines sent per batch)`,
       );
 
       // Run batches in parallel (max MAX_PARALLEL_BATCHES concurrently)
-      for (let i = 0; i < batches.length; i += MAX_PARALLEL_BATCHES) {
-        const parallelBatches = batches.slice(i, i + MAX_PARALLEL_BATCHES);
+      for (let i = 0; i < lineIdBatches.length; i += MAX_PARALLEL_BATCHES) {
+        const parallelBatchIds = lineIdBatches.slice(i, i + MAX_PARALLEL_BATCHES);
         const results = await Promise.all(
-          parallelBatches.map((batch, j) =>
-            classifyBatch(batch, i + j, batches.length, apiKey, buildBatchPrompt),
-          ),
+          parallelBatchIds.map((batchIds, j) => {
+            const batchIdSet = new Set(batchIds);
+            // Only the batch lines count for thinking budget
+            const batchLines = inputLines.filter(l => batchIdSet.has(l.line_id));
+            return classifyBatch(
+              batchLines,
+              i + j,
+              lineIdBatches.length,
+              apiKey,
+              () => buildBatchPromptWithContext(batchIdSet),
+            );
+          }),
         );
         for (const r of results) {
           allLineResults.push(...r.lineResults);
@@ -1327,6 +1561,81 @@ Deno.serve(async (req) => {
       }
     }
 
+    // ─── Stage 3: Sonnet Escalation for fiscal-complex lines ──────────
+    // After Haiku classification + direction enforcement, check for lines that
+    // need expert fiscal review (ritenuta, reverse charge, beni strumentali,
+    // suggest_new_account, or low confidence).
+    let sonnetEscalatedCount = 0;
+    {
+      const escalationCandidates = lineResults.filter(lr => needsSonnetEscalation(lr));
+
+      if (escalationCandidates.length > 0) {
+        console.log(
+          `[classify] Sonnet escalation: ${escalationCandidates.length}/${lineResults.length} lines need expert review:`,
+          escalationCandidates.map(lr => ({
+            line_id: lr.line_id,
+            confidence: lr.confidence,
+            ritenuta: !!lr.fiscal_flags?.ritenuta_acconto,
+            reverse_charge: !!lr.fiscal_flags?.reverse_charge,
+            bene_strumentale: !!lr.fiscal_flags?.bene_strumentale,
+            suggest_new: !!lr.suggest_new_account,
+          })),
+        );
+
+        const sonnetResult = await sonnetEscalate(
+          escalationCandidates,
+          inputLines,
+          allAccounts,     // full account list for Sonnet
+          allCategories,   // full category list for Sonnet
+          projects,        // all projects
+          articles,
+          phases,
+          counterpartyInfo,
+          history,
+          memoryBlock,
+          direction,
+          systemPrompt,
+          userInstructionsBlock,
+          apiKey,
+        );
+
+        if (sonnetResult.error) {
+          console.warn(`[classify] Sonnet escalation failed: ${sonnetResult.error} — keeping Haiku results`);
+        } else if (sonnetResult.lineResults.length > 0) {
+          // Merge: replace Haiku results with Sonnet results for escalated lines
+          const sonnetMap = new Map(sonnetResult.lineResults.map(lr => [lr.line_id, lr]));
+          let upgraded = 0;
+          for (let i = 0; i < lineResults.length; i++) {
+            const sonnetLr = sonnetMap.get(lineResults[i].line_id);
+            if (sonnetLr) {
+              // Normalize Sonnet result
+              const merged: SonnetLineResult = {
+                line_id: sonnetLr.line_id,
+                article_code: sonnetLr.article_code || lineResults[i].article_code,
+                phase_code: sonnetLr.phase_code || lineResults[i].phase_code,
+                category_id: sonnetLr.category_id || lineResults[i].category_id,
+                category_name: sonnetLr.category_name || lineResults[i].category_name,
+                account_id: sonnetLr.account_id || lineResults[i].account_id,
+                account_code: sonnetLr.account_code || lineResults[i].account_code,
+                cost_center_allocations: sonnetLr.cost_center_allocations || lineResults[i].cost_center_allocations,
+                confidence: Math.min(Math.max(Number(sonnetLr.confidence) || 50, 0), 100),
+                reasoning: `[SONNET] ${sonnetLr.reasoning || lineResults[i].reasoning}`,
+                fiscal_flags: sonnetLr.fiscal_flags || lineResults[i].fiscal_flags,
+                suggest_new_account: sonnetLr.suggest_new_account || null,
+                suggest_new_category: sonnetLr.suggest_new_category || null,
+              };
+              lineResults[i] = merged;
+              upgraded++;
+            }
+          }
+          sonnetEscalatedCount = upgraded;
+          console.log(`[classify] Sonnet escalation: ${upgraded} lines upgraded, ${sonnetResult.lineResults.length} returned`);
+        }
+      } else {
+        console.log(`[classify] No lines need Sonnet escalation`);
+      }
+    }
+
     // ─── Compose invoice-level ─────────────────────────
     const invoiceLevel = composeInvoiceLevel(lineResults, inputLines);
 
@@ -1393,6 +1702,10 @@ Deno.serve(async (req) => {
         model: MODEL_HAIKU,
         thinking_enabled: thinkingUsed,
         batches: totalBatches,
+        ...(sonnetEscalatedCount > 0 ? {
+          sonnet_escalated: sonnetEscalatedCount,
+          sonnet_model: MODEL_SONNET,
+        } : {}),
         ...(batchErrors.length > 0 ? { batch_errors: batchErrors } : {}),
       },
     });
