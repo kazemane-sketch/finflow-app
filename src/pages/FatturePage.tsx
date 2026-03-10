@@ -788,7 +788,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     let cancelled = false;
     (async () => {
       try {
-        const [cats, projs, accs, classif, iProjs, lineClf, lineProj] = await Promise.all([
+        const [cats, projs, accs, classif, iProjs, lineClfResult, lineProj] = await Promise.all([
           loadCategories(companyId, true),
           loadProjects(companyId, true),
           loadChartOfAccounts(companyId),
@@ -803,10 +803,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setAllAccounts(accs.filter(a => !a.is_header && a.active));
         setClassification(classif);
         setInvProjects(iProjs);
-        setLineClassifs(lineClf);
-        setOriginalLineClassifs(lineClf);
+        setLineClassifs(lineClfResult.classifs);
+        setOriginalLineClassifs(lineClfResult.classifs);
         setLineProjects(lineProj);
         setOriginalLineProjects(lineProj);
+        // Load fiscal flags from DB (persisted by AI classification)
+        setLineFiscalFlags(lineClfResult.fiscalFlags);
         // Initialize local CdC rows from DB assignments
         setCdcRows(iProjs.map(ip => ({
           project_id: ip.project_id,
@@ -819,7 +821,6 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         // Reset transient AI state from previous invoice
         setAiClassifResult(null);
         setAiClassifStatus('idle');
-        setLineFiscalFlags({});
         setLineSuggestions({});
         setDismissedSuggestions(new Set());
       } catch (e) { console.error('Classification load error:', e); }
@@ -1118,7 +1119,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setDismissedSuggestions(new Set());
 
       // Reload classification data + article assignments to reflect persisted suggestions (incl. phase_id)
-      const [classif, lineClf, lineProj, freshInvProjs, freshAssignments] = await Promise.all([
+      const [classif, lineClfResult, lineProj, freshInvProjs, freshAssignments] = await Promise.all([
         loadInvoiceClassification(invoice.id),
         loadLineClassifications(invoice.id),
         loadLineProjects(invoice.id),
@@ -1127,6 +1128,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           .select('invoice_line_id, article_id, phase_id, assigned_by, verified, location, confidence, article:articles!inner(id, code, name, unit, keywords)')
           .eq('invoice_id', invoice.id).then(r => r.data || []),
       ]);
+      const lineClf = lineClfResult.classifs;
+      // Merge persisted fiscal flags with fresh AI flags (AI takes priority)
+      setLineFiscalFlags(prev => ({ ...lineClfResult.fiscalFlags, ...prev }));
 
       // Rebuild lineArticleMap + aiSuggestions with fresh DB data (includes phase_id)
       const freshMap: Record<string, LineArticleInfo> = {};
@@ -1266,12 +1270,13 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         );
         // Reload line classifications + refresh accounts/categories lists
         const companyId = company.id;
-        const [lineClf, freshCats, freshAccs] = await Promise.all([
+        const [lineClfResult, freshCats, freshAccs] = await Promise.all([
           loadLineClassifications(invoice!.id),
           loadCategories(companyId, true),
           loadChartOfAccounts(companyId),
         ]);
-        setLineClassifs(lineClf);
+        setLineClassifs(lineClfResult.classifs);
+        setLineFiscalFlags(prev => ({ ...prev, ...lineClfResult.fiscalFlags }));
         setAllCategories(freshCats);
         setAllAccounts(freshAccs.filter(a => !a.is_header && a.active));
         // Refresh sidebar badges

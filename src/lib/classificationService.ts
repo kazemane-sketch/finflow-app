@@ -500,25 +500,32 @@ export interface LineClassification {
   account_id: string | null;
 }
 
-/** Load line-level category/account for all lines in an invoice.
+/** Load line-level category/account + fiscal_flags for all lines in an invoice.
  *  Reads directly from invoice_lines — works independently of article assignment. */
-export async function loadLineClassifications(invoiceId: string): Promise<Record<string, LineClassification>> {
+export async function loadLineClassifications(invoiceId: string): Promise<{
+  classifs: Record<string, LineClassification>;
+  fiscalFlags: Record<string, any>;
+}> {
   const { data, error } = await supabase
     .from('invoice_lines')
-    .select('id, category_id, account_id')
+    .select('id, category_id, account_id, fiscal_flags')
     .eq('invoice_id', invoiceId);
   if (error) throw error;
-  const map: Record<string, LineClassification> = {};
-  for (const row of (data || []) as { id: string; category_id: string | null; account_id: string | null }[]) {
+  const classifs: Record<string, LineClassification> = {};
+  const fiscalFlags: Record<string, any> = {};
+  for (const row of (data || []) as { id: string; category_id: string | null; account_id: string | null; fiscal_flags: any }[]) {
     if (row.category_id || row.account_id) {
-      map[row.id] = {
+      classifs[row.id] = {
         invoice_line_id: row.id,
         category_id: row.category_id,
         account_id: row.account_id,
       };
     }
+    if (row.fiscal_flags) {
+      fiscalFlags[row.id] = row.fiscal_flags;
+    }
   }
-  return map;
+  return { classifs, fiscalFlags };
 }
 
 /** Save category and/or account on a single invoice line.
