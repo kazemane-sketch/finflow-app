@@ -1727,19 +1727,34 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     }
   }, [detail?.invoice_lines, lineProjects]);
 
-  // State for header dropdown popovers
+  // State for header dropdown popovers — portal-based to escape overflow container
   const [headerDropdown, setHeaderDropdown] = useState<'category' | 'account' | 'cdc' | null>(null);
+  const [headerDropdownRect, setHeaderDropdownRect] = useState<DOMRect | null>(null);
+  const headerDropdownRef = useRef<HTMLDivElement>(null);
 
-  // Close header dropdown on outside click
+  const openHeaderDropdown = useCallback((type: 'category' | 'account' | 'cdc', e: React.MouseEvent) => {
+    if (headerDropdown === type) { setHeaderDropdown(null); return; }
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setHeaderDropdownRect(rect);
+    setHeaderDropdown(type);
+  }, [headerDropdown]);
+
+  // Close header dropdown on outside click or scroll (portal-aware)
   useEffect(() => {
     if (!headerDropdown) return;
-    const handler = (e: MouseEvent) => {
+    const clickHandler = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
-      if (target.closest('th[class*="relative"]')) return;
+      if (target.closest('[data-header-dropdown-trigger]')) return;
+      if (headerDropdownRef.current?.contains(target)) return;
       setHeaderDropdown(null);
     };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
+    const scrollHandler = () => setHeaderDropdown(null);
+    document.addEventListener('mousedown', clickHandler);
+    window.addEventListener('scroll', scrollHandler, true);
+    return () => {
+      document.removeEventListener('mousedown', clickHandler);
+      window.removeEventListener('scroll', scrollHandler, true);
+    };
   }, [headerDropdown]);
 
   // Reset notes when invoice changes
@@ -2015,72 +2030,30 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold w-14">IVA</th>
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold w-16">Totale</th>
                     {allCategories.length > 0 && (
-                      <th className="text-center px-1 py-2 text-gray-600 font-semibold w-32 relative">
-                        <button onClick={() => setHeaderDropdown(headerDropdown === 'category' ? null : 'category')}
+                      <th className="text-center px-1 py-2 text-gray-600 font-semibold w-32">
+                        <button data-header-dropdown-trigger onClick={(e) => openHeaderDropdown('category', e)}
                           className="hover:text-purple-600 transition-colors cursor-pointer inline-flex items-center gap-0.5"
                           title="Clicca per applicare a tutte le righe vuote">
                           Categoria <span className="text-[8px] text-gray-400">{'\u25BC'}</span>
                         </button>
-                        {headerDropdown === 'category' && (
-                          <div className="absolute top-full left-0 z-50 mt-1 w-56 bg-white border border-gray-200 rounded-lg shadow-xl max-h-64 overflow-y-auto">
-                            <div className="px-2 py-1.5 text-[9px] text-gray-400 border-b bg-gray-50">Applica a righe vuote</div>
-                            {dirCategories.map(c => (
-                              <button key={c.id} onClick={() => { handleHeaderApplyCategory(c.id); setHeaderDropdown(null); }}
-                                className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
-                                {c.name}
-                              </button>
-                            ))}
-                          </div>
-                        )}
                       </th>
                     )}
                     {allProjects.length > 0 && (
-                      <th className="text-center px-1 py-2 text-gray-600 font-semibold w-28 relative">
-                        <button onClick={() => setHeaderDropdown(headerDropdown === 'cdc' ? null : 'cdc')}
+                      <th className="text-center px-1 py-2 text-gray-600 font-semibold w-28">
+                        <button data-header-dropdown-trigger onClick={(e) => openHeaderDropdown('cdc', e)}
                           className="hover:text-purple-600 transition-colors cursor-pointer inline-flex items-center gap-0.5"
                           title="Clicca per applicare a tutte le righe vuote">
                           CdC <span className="text-[8px] text-gray-400">{'\u25BC'}</span>
                         </button>
-                        {headerDropdown === 'cdc' && (
-                          <div className="absolute top-full left-0 z-50 mt-1 w-56 bg-white border border-gray-200 rounded-lg shadow-xl max-h-64 overflow-y-auto">
-                            <div className="px-2 py-1.5 text-[9px] text-gray-400 border-b bg-gray-50">Applica a righe vuote</div>
-                            {allProjects.map(p => (
-                              <button key={p.id} onClick={() => { handleHeaderApplyCdc(p.id); setHeaderDropdown(null); }}
-                                className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
-                                {p.code} {'\u2014'} {p.name}
-                              </button>
-                            ))}
-                          </div>
-                        )}
                       </th>
                     )}
                     {allAccounts.length > 0 && (
-                      <th className="text-center px-1 py-2 text-gray-600 font-semibold w-36 relative">
-                        <button onClick={() => setHeaderDropdown(headerDropdown === 'account' ? null : 'account')}
+                      <th className="text-center px-1 py-2 text-gray-600 font-semibold w-36">
+                        <button data-header-dropdown-trigger onClick={(e) => openHeaderDropdown('account', e)}
                           className="hover:text-purple-600 transition-colors cursor-pointer inline-flex items-center gap-0.5"
                           title="Clicca per applicare a tutte le righe vuote">
                           Conto <span className="text-[8px] text-gray-400">{'\u25BC'}</span>
                         </button>
-                        {headerDropdown === 'account' && (
-                          <div className="absolute top-full right-0 z-50 mt-1 w-64 bg-white border border-gray-200 rounded-lg shadow-xl max-h-64 overflow-y-auto">
-                            <div className="px-2 py-1.5 text-[9px] text-gray-400 border-b bg-gray-50">Applica a righe vuote</div>
-                            {dirPrimaryAccounts.map(a => (
-                              <button key={a.id} onClick={() => { handleHeaderApplyAccount(a.id); setHeaderDropdown(null); }}
-                                className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
-                                {a.code} {'\u2014'} {a.name}
-                              </button>
-                            ))}
-                            {dirSecondaryAccounts.length > 0 && (
-                              <div className="px-2 py-1 text-[9px] text-gray-400 border-t bg-gray-50">Speciali</div>
-                            )}
-                            {dirSecondaryAccounts.map(a => (
-                              <button key={a.id} onClick={() => { handleHeaderApplyAccount(a.id); setHeaderDropdown(null); }}
-                                className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
-                                {a.code} {'\u2014'} {a.name}
-                              </button>
-                            ))}
-                          </div>
-                        )}
                       </th>
                     )}
                     {(allCategories.length > 0 || allAccounts.length > 0) && <th className="text-center px-0.5 py-2 text-gray-400 font-normal w-12"></th>}
@@ -2481,6 +2454,49 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                   </tbody>
                 </table>
               </div>
+              {/* Portal dropdown for header column popovers — escapes overflow container */}
+              {headerDropdown && headerDropdownRect && createPortal(
+                <div ref={headerDropdownRef}
+                  className="fixed z-[9999] w-60 bg-white border border-gray-200 rounded-lg shadow-xl max-h-64 overflow-y-auto"
+                  style={{
+                    top: headerDropdownRect.bottom + 4,
+                    left: headerDropdown === 'account'
+                      ? Math.max(8, headerDropdownRect.right - 256)
+                      : headerDropdownRect.left,
+                  }}>
+                  <div className="px-2 py-1.5 text-[9px] text-gray-400 border-b bg-gray-50 sticky top-0">Applica a righe vuote</div>
+                  {headerDropdown === 'category' && dirCategories.map(c => (
+                    <button key={c.id} onClick={() => { handleHeaderApplyCategory(c.id); setHeaderDropdown(null); }}
+                      className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
+                      {c.name}
+                    </button>
+                  ))}
+                  {headerDropdown === 'cdc' && allProjects.map(p => (
+                    <button key={p.id} onClick={() => { handleHeaderApplyCdc(p.id); setHeaderDropdown(null); }}
+                      className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
+                      {p.code} {'\u2014'} {p.name}
+                    </button>
+                  ))}
+                  {headerDropdown === 'account' && (<>
+                    {dirPrimaryAccounts.map(a => (
+                      <button key={a.id} onClick={() => { handleHeaderApplyAccount(a.id); setHeaderDropdown(null); }}
+                        className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
+                        {a.code} {'\u2014'} {a.name}
+                      </button>
+                    ))}
+                    {dirSecondaryAccounts.length > 0 && (
+                      <div className="px-2 py-1 text-[9px] text-gray-400 border-t bg-gray-50 sticky">Speciali</div>
+                    )}
+                    {dirSecondaryAccounts.map(a => (
+                      <button key={a.id} onClick={() => { handleHeaderApplyAccount(a.id); setHeaderDropdown(null); }}
+                        className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
+                        {a.code} {'\u2014'} {a.name}
+                      </button>
+                    ))}
+                  </>)}
+                </div>,
+                document.body
+              )}
               {/* Footer */}
               <div className="flex items-center justify-between px-4 py-2.5 border-t bg-gray-50">
                 <div className="flex items-center gap-2">
