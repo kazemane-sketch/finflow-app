@@ -874,22 +874,16 @@ Deno.serve(async (req) => {
       `[classify-invoice-lines] Calling Haiku for ${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}`,
     );
 
-    // ─── Stage 2: Haiku Classification ──────────
-    const haikuBody: Record<string, unknown> = {
+    // ─── Stage 2: Haiku Classification with Extended Thinking ──────────
+    const haikuBody = {
       model: MODEL_HAIKU,
-      max_tokens: 8192,
+      max_tokens: 16000,  // total budget: thinking + output
+      thinking: {
+        type: "enabled" as const,
+        budget_tokens: HAIKU_THINKING_BUDGET,
+      },
       messages: [{ role: "user", content: focusedPrompt }],
     };
-
-    // Extended Thinking: try with thinking, fallback to plain if it fails
-    const useThinking = HAIKU_THINKING_BUDGET > 0;
-    if (useThinking) {
-      haikuBody.max_tokens = 16000; // thinking + output budget
-      haikuBody.thinking = {
-        type: "enabled",
-        budget_tokens: HAIKU_THINKING_BUDGET,
-      };
-    }
 
     let responseText = "";
     let thinkingUsed = false;
@@ -906,57 +900,35 @@ Deno.serve(async (req) => {
 
     if (!haikuResp.ok) {
       const errText = await haikuResp.text();
-      console.error(`[classify] Haiku API error (thinking=${useThinking}):`, haikuResp.status, errText.slice(0, 500));
+      console.error(`[classify] Haiku API error:`, haikuResp.status, errText.slice(0, 500));
+      return json({ error: `Haiku ${haikuResp.status}`, detail: errText.slice(0, 300) }, 502);
+    }
 
-      // Fallback: retry WITHOUT thinking if thinking was enabled
-      if (useThinking) {
-        console.log(`[classify] Retrying WITHOUT Extended Thinking...`);
-        const fallbackBody = {
-          model: MODEL_HAIKU,
-          max_tokens: 8192,
-          messages: [{ role: "user", content: focusedPrompt }],
-        };
-        const fallbackResp = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKey,
-            "anthropic-version": "2023-06-01",
-          },
-          body: JSON.stringify(fallbackBody),
-        });
-        if (!fallbackResp.ok) {
-          const errText2 = await fallbackResp.text();
-          console.error(`[classify] Haiku fallback also failed:`, fallbackResp.status, errText2.slice(0, 300));
-          return json({ error: `Classification failed: Haiku ${fallbackResp.status}`, detail: errText2.slice(0, 200) }, 502);
-        }
-        const fallbackData = await fallbackResp.json();
-        responseText = (fallbackData as any)?.content?.[0]?.text || "";
-        console.log(`[classify] Fallback (no thinking) response: ${responseText.length} chars`);
-      } else {
-        return json({ error: `Classification failed: Haiku ${haikuResp.status}`, detail: errText.slice(0, 200) }, 502);
-      }
-    } else {
-      const haikuData = await haikuResp.json();
-      const contentBlocks = (haikuData as any)?.content || [];
+    const haikuData = await haikuResp.json();
+    const contentBlocks = (haikuData as any)?.content || [];
 
-      // Log thinking for debug (truncated)
-      const thinkingBlock = contentBlocks.find((b: any) => b.type === "thinking");
-      if (thinkingBlock) {
-        thinkingUsed = true;
-        console.log(`[classify] Haiku thinking: ${(thinkingBlock.thinking || "").slice(0, 200)}...`);
-      }
+    // Log response structure for debug
+    console.log(`[classify] Haiku raw response structure:`, contentBlocks.map((b: any) => ({
+      type: b.type,
+      length: (b.text || b.thinking || '').length,
+    })));
 
-      // Extract text from response (Extended Thinking returns thinking + text blocks)
-      const textBlocks = contentBlocks.filter((b: any) => b.type === "text");
-      responseText = textBlocks.map((b: any) => b.text).join("") || "";
-      console.log(`[classify] Haiku response: ${responseText.length} chars, thinking=${thinkingUsed}`);
+    // Log thinking for debug (truncated)
+    const thinkingBlock = contentBlocks.find((b: any) => b.type === "thinking");
+    if (thinkingBlock) {
+      thinkingUsed = true;
+      console.log(`[classify] Haiku thinking: ${(thinkingBlock.thinking || "").slice(0, 200)}...`);
+    }
 
-      // Safety: if response is empty, try extracting from first content block
-      if (!responseText && contentBlocks.length > 0) {
-        responseText = contentBlocks[0]?.text || "";
-        console.warn(`[classify] Empty textBlocks, using first content block: ${responseText.length} chars`);
-      }
+    // Extract text from response (Extended Thinking returns thinking + text blocks)
+    const textBlocks = contentBlocks.filter((b: any) => b.type === "text");
+    responseText = textBlocks.map((b: any) => b.text).join("") || "";
+    console.log(`[classify] Haiku response: ${responseText.length} chars, thinking=${thinkingUsed}, stop_reason=${(haikuData as any)?.stop_reason}`);
+
+    // Safety: if response is empty, try extracting from first content block
+    if (!responseText && contentBlocks.length > 0) {
+      responseText = contentBlocks[0]?.text || "";
+      console.warn(`[classify] Empty textBlocks, using first content block: ${responseText.length} chars`);
     }
 
     // Parse keywords
@@ -965,7 +937,9 @@ Deno.serve(async (req) => {
     const classJson = keywordsSplit[0].trim();
     if (keywordsSplit.length > 1) {
       try {
-        const kwMatch = keywordsSplit[1].match(/\[[\s\S]*?\]/);
+        let kwSection = keywordsSplit[1];
+        kwSection = kwSection.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+        const kwMatch = kwSection.match(/\[[\s\S]*?\]/);
         if (kwMatch) keywords = JSON.parse(kwMatch[0]);
       } catch { /* ignore */ }
     }
@@ -973,13 +947,21 @@ Deno.serve(async (req) => {
     // Parse classification JSON
     let parsedResults: SonnetLineResult[] = [];
     try {
-      const jsonMatch = classJson.match(/\[[\s\S]*\]/);
+      // Strip markdown code fences if present (Haiku with thinking may wrap in ```json...```)
+      let cleanJson = classJson;
+      cleanJson = cleanJson.replace(/```json\s*/g, '').replace(/```\s*/g, '');
+      cleanJson = cleanJson.trim();
+
+      const jsonMatch = cleanJson.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) {
+        console.warn(`[classify] No JSON array found in response. First 300 chars: ${cleanJson.slice(0, 300)}`);
+      }
       parsedResults = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
     } catch (e) {
       console.error(`[classify-invoice-lines] Haiku parse error:`, e, `responseLen=${responseText.length}, classJson=${classJson.slice(0, 500)}`);
       return json({
         error: "Classification parse failed",
-        detail: `Response ${responseText.length} chars, thinking=${thinkingUsed}. First 200: ${classJson.slice(0, 200)}`,
+        detail: `Response ${responseText.length} chars, thinking=${thinkingUsed}. First 300: ${classJson.slice(0, 300)}`,
       }, 502);
     }
 
