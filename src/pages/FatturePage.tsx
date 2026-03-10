@@ -1579,6 +1579,85 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     toast.info(`Articolo ${art?.code} assegnato a ${lines.length} righe — clicca Salva per confermare`);
   }, [company?.id, invoice?.id, bulkArticleId, bulkPhaseId, articles, detail?.invoice_lines, lineArticleMap]);
 
+  // Unified bulk apply — pushes ANY selected fields to all lines
+  const handleBulkApplyAll = useCallback(() => {
+    const lines = detail?.invoice_lines;
+    if (!lines?.length) return;
+    const applied: string[] = [];
+
+    // 1) Push category + account to all line-level overrides
+    if (selCategoryId || selAccountId) {
+      const newLineClf = { ...lineClassifs };
+      for (const l of lines) {
+        const prev = newLineClf[l.id] || { invoice_line_id: l.id, category_id: null, account_id: null };
+        newLineClf[l.id] = {
+          ...prev,
+          invoice_line_id: l.id,
+          category_id: selCategoryId || prev.category_id,
+          account_id: selAccountId || prev.account_id,
+        };
+      }
+      setLineClassifs(newLineClf);
+      if (selCategoryId) applied.push('Categoria');
+      if (selAccountId) applied.push('Conto');
+    }
+
+    // 2) Push CdC to all line-level projects
+    if (cdcRows.length > 0) {
+      const newLineProj = { ...lineProjects };
+      for (const l of lines) {
+        newLineProj[l.id] = cdcRows.map(r => ({
+          id: '', // placeholder — will be assigned by DB on save
+          invoice_line_id: l.id,
+          project_id: r.project_id,
+          percentage: r.percentage,
+          amount: r.amount ?? null,
+        }));
+      }
+      setLineProjects(newLineProj);
+      applied.push('CdC');
+    }
+
+    // 3) Push article + phase to all lines (auto-select default phase if needed)
+    if (bulkArticleId) {
+      const art = articles.find(a => a.id === bulkArticleId);
+      const hasPhases = (art as ArticleWithPhases)?.phases?.length > 0;
+      let effectivePhaseId = bulkPhaseId;
+      let effectivePhase: { code: string; name: string } | null = null;
+
+      if (hasPhases && !effectivePhaseId) {
+        // Auto-select default phase: first counting point or first phase
+        const sorted = [...((art as ArticleWithPhases)?.phases || [])].sort((a, b) => a.sort_order - b.sort_order);
+        const defaultPhase = sorted.find(p => p.is_counting_point) || sorted[0];
+        if (defaultPhase) {
+          effectivePhaseId = defaultPhase.id;
+          effectivePhase = { code: defaultPhase.code, name: defaultPhase.name };
+          setBulkPhaseId(defaultPhase.id); // Update the dropdown too
+        }
+      } else if (effectivePhaseId) {
+        const ph = (art as ArticleWithPhases)?.phases?.find(p => p.id === effectivePhaseId);
+        effectivePhase = ph ? { code: ph.code, name: ph.name } : null;
+      }
+
+      const newMap: Record<string, LineArticleInfo> = {};
+      for (const l of lines) {
+        newMap[l.id] = {
+          article_id: bulkArticleId, code: art?.code || '', name: art?.name || '',
+          assigned_by: 'manual', verified: true, location: null,
+          phase_id: effectivePhaseId, phase_code: effectivePhase?.code || null, phase_name: effectivePhase?.name || null,
+        };
+      }
+      setLineArticleMap(newMap);
+      setAiSuggestions({});
+      applied.push(`Art. ${art?.code}${effectivePhase ? ` → ${effectivePhase.code}` : ''}`);
+    }
+
+    if (applied.length > 0) {
+      setClassifDirty(true);
+      toast.info(`Applicato ${applied.join(', ')} a ${lines.length} righe — clicca Salva per confermare`);
+    }
+  }, [detail?.invoice_lines, selCategoryId, selAccountId, cdcRows, bulkArticleId, bulkPhaseId, articles, lineClassifs, lineProjects]);
+
   // Reset notes when invoice changes
   useEffect(() => { setNotesText(invoice.notes || ''); }, [invoice.id, invoice.notes]);
 
@@ -1894,7 +1973,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 {articles.length > 0 && (
                   <div className="flex items-end gap-2 mt-3">
                     <div className="flex-1">
-                      <label className="block text-[10px] font-medium text-gray-500 mb-1">Articolo (tutte le righe)</label>
+                      <label className="block text-[10px] font-medium text-gray-500 mb-1">Articolo</label>
                       <select
                         value={bulkArticleId || ''}
                         onChange={e => { setBulkArticleId(e.target.value || null); setBulkPhaseId(null); }}
@@ -1929,15 +2008,31 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                         </div>
                       );
                     })()}
-                    <button
-                      onClick={handleBulkAssignArticle}
-                      disabled={!bulkArticleId || (articles.find(a => a.id === bulkArticleId)?.phases?.length ? !bulkPhaseId : false)}
-                      className="px-3 py-1.5 text-xs font-semibold text-white bg-teal-600 rounded-lg hover:bg-teal-700 disabled:opacity-40 transition-colors whitespace-nowrap"
-                      title={bulkArticleId && articles.find(a => a.id === bulkArticleId)?.phases?.length && !bulkPhaseId ? 'Seleziona la fase per questo articolo' : ''}>
-                      Applica articolo
-                    </button>
                   </div>
                 )}
+
+                {/* Unified "Applica a tutte" button — active if ANY field selected */}
+                {(() => {
+                  const hasAnySelection = !!(selCategoryId || selAccountId || cdcRows.length > 0 || bulkArticleId);
+                  const selectedCount = [selCategoryId, selAccountId, cdcRows.length > 0 ? 'cdc' : null, bulkArticleId].filter(Boolean).length;
+                  return hasAnySelection ? (
+                    <div className="flex items-center justify-between mt-3 pt-3 border-t border-blue-100">
+                      <span className="text-[10px] text-gray-500">
+                        {selectedCount} {selectedCount === 1 ? 'campo selezionato' : 'campi selezionati'} {'\u2014'} verranno applicati a tutte le righe
+                        {bulkArticleId && (() => {
+                          const art = articles.find(a => a.id === bulkArticleId);
+                          const hasPhases = (art as ArticleWithPhases)?.phases?.length > 0;
+                          return hasPhases && !bulkPhaseId ? ' (fase: auto)' : '';
+                        })()}
+                      </span>
+                      <button
+                        onClick={handleBulkApplyAll}
+                        className="px-4 py-1.5 text-xs font-semibold text-white bg-teal-600 rounded-lg hover:bg-teal-700 shadow-sm transition-colors whitespace-nowrap">
+                        {'\u2714'} Applica a tutte le righe
+                      </button>
+                    </div>
+                  ) : null;
+                })()}
 
                 {/* All saves deferred to footer "Salva" button */}
                 {classifDirty && (
