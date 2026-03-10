@@ -212,6 +212,25 @@ const tools = [
     },
   },
   {
+    name: "search_company_memory",
+    description:
+      "Cerca nella memoria aziendale: pattern controparte (es. 'fornitore X sempre classificato su conto Y'), mappature conti specifiche, correzioni utente precedenti, regole fiscali aziendali. Usa ricerca semantica. Utile per capire come l'azienda classifica normalmente una spesa/ricavo, oppure per recuperare regole contabili specifiche dell'azienda.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        query: { type: "string", description: "Testo da cercare nella memoria (es. 'classificazione carburanti', 'controparte ENEL', 'regole leasing')" },
+        fact_types: {
+          type: "array",
+          items: { type: "string", enum: ["counterparty_pattern", "account_mapping", "user_correction", "fiscal_rule", "general"] },
+          description: "Filtra per tipo di fatto (opzionale). counterparty_pattern = pattern controparte, account_mapping = mappature conti, user_correction = correzioni utente, fiscal_rule = regole fiscali, general = regole generiche",
+        },
+        counterparty_name: { type: "string", description: "Nome controparte per filtrare i risultati (opzionale)" },
+        limit: { type: "number", description: "Numero max di risultati (default 15, max 50)" },
+      },
+      required: ["query"],
+    },
+  },
+  {
     name: "get_invoices_with_lines",
     description:
       "Ritorna fatture CON le righe dettaglio (descrizione, quantità, prezzo unitario, totale) in un'unica query. Usa questo al posto di get_invoices + get_invoice_detail quando devi analizzare articoli, quantità o tonnellate di molte fatture. Max 50 fatture per chiamata.",
@@ -1013,6 +1032,65 @@ async function handleSearchKnowledgeBase(sql: SqlClient, companyId: string, args
   };
 }
 
+async function handleSearchCompanyMemory(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const query = String(args.query || "").trim();
+  if (!query) return { error: "Query vuota" };
+
+  const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
+  if (!geminiKey) return { error: "GEMINI_API_KEY non configurata per company memory search" };
+
+  const limit = Math.min(Number(args.limit) || 15, 50);
+  const factTypes = Array.isArray(args.fact_types) ? args.fact_types : null;
+
+  // Resolve counterparty_id from name if provided
+  let counterpartyId: string | null = null;
+  if (args.counterparty_name) {
+    const cpName = String(args.counterparty_name).trim();
+    if (cpName) {
+      const [cp] = await sql.unsafe(
+        `SELECT id FROM counterparties WHERE company_id = $1 AND denom ILIKE '%' || $2 || '%' LIMIT 1`,
+        [companyId, cpName],
+      );
+      counterpartyId = cp?.id || null;
+    }
+  }
+
+  // Generate query embedding
+  const vectorLiteral = await embedQueryText(geminiKey, query);
+
+  // Search using pgvector via the search_company_memory function
+  const results = await sql.unsafe(
+    `SELECT id, fact_type, fact_text, metadata, counterparty_id,
+            (1 - (embedding <=> $2::halfvec(3072)))::numeric AS similarity
+     FROM company_memory
+     WHERE company_id = $1
+       AND active = true
+       AND embedding IS NOT NULL
+       ${factTypes ? `AND fact_type = ANY($4::text[])` : ''}
+       ${counterpartyId ? `AND (counterparty_id IS NULL OR counterparty_id = $${factTypes ? 5 : 4}::uuid)` : ''}
+     ORDER BY embedding <=> $2::halfvec(3072)
+     LIMIT $3`,
+    [
+      companyId,
+      vectorLiteral,
+      limit,
+      ...(factTypes ? [factTypes] : []),
+      ...(counterpartyId ? [counterpartyId] : []),
+    ],
+  );
+
+  return {
+    query,
+    results: results.map((r: Record<string, unknown>) => ({
+      fact_type: r.fact_type,
+      fact_text: String(r.fact_text || "").slice(0, 1000),
+      metadata: r.metadata,
+      similarity: Number(r.similarity || 0).toFixed(4),
+    })),
+    total: results.length,
+  };
+}
+
 async function handleGetInvoicesWithLines(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
   const conditions = ["i.company_id = $1"];
   const params: unknown[] = [companyId];
@@ -1506,6 +1584,8 @@ async function executeToolHandler(
       return handleSuggestReconciliation(sql, companyId, toolInput);
     case "search_knowledge_base":
       return handleSearchKnowledgeBase(sql, companyId, toolInput);
+    case "search_company_memory":
+      return handleSearchCompanyMemory(sql, companyId, toolInput);
     case "get_invoices_with_lines":
       return handleGetInvoicesWithLines(sql, companyId, toolInput);
     case "aggregate_invoice_lines":
@@ -1586,6 +1666,12 @@ CONTROPARTI: get_counterparties supporta ordinamento per fatturato, credito o de
 STATISTICHE: get_company_stats ora include saldo_banca e top 5 clienti/fornitori per fatturato. Supporta filtri date per periodo specifico.
 
 Hai anche accesso alla Knowledge Base aziendale tramite search_knowledge_base. Se l'utente chiede informazioni su documenti caricati (contratti, regolamenti, procedure, manuali), cerca prima nella knowledge base.
+
+MEMORIA AZIENDALE (search_company_memory):
+- Contiene pattern appresi dalle classificazioni confermate, correzioni utente, regole fiscali specifiche dell'azienda
+- Usa per rispondere a domande come "come classifichiamo le fatture di X?", "quale conto usiamo per il carburante?", "regole fiscali della nostra azienda"
+- Filtra per fact_type: counterparty_pattern (pattern controparte), account_mapping (mappature conti), user_correction (correzioni), fiscal_rule (regole fiscali)
+- Filtra per counterparty_name per risultati piu mirati su una specifica controparte
 
 CLASSIFICAZIONE FATTURE:
 - get_classification_stats: per statistiche su quante fatture sono classificate, breakdown per categoria/CdC/conto. Usa per domande tipo "quante fatture sono classificate?", "distribuzione per categoria", "stato classificazione".

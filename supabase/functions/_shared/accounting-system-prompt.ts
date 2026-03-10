@@ -2,6 +2,11 @@
  * System prompt condiviso per tutte le AI di FinFlow.
  * Ogni edge function che chiama un LLM (Sonnet, Haiku, Gemini) importa questo modulo.
  * Modificare QUI per aggiornare il comportamento di tutte le AI simultaneamente.
+ *
+ * NOTE (v2 — Commercialista Brain):
+ * I codici conto specifici e le regole settoriali NON sono più qui.
+ * Risiedono in company_memory e vengono iniettati via getCompanyMemoryBlock().
+ * Qui restano SOLO i principi generici della contabilità italiana.
  */
 
 export interface CompanyContext {
@@ -11,9 +16,15 @@ export interface CompanyContext {
   vat_number?: string;
 }
 
+export interface MemoryFact {
+  fact_text: string;
+  fact_type: string;
+  similarity?: number;
+}
+
 /**
- * Restituisce il system prompt base contabile.
- * Questo prompt viene iniettato in OGNI chiamata AI della piattaforma.
+ * Restituisce il system prompt base contabile (principi generici).
+ * I codici conto specifici dell'azienda vengono da company_memory.
  */
 export function getAccountingSystemPrompt(company?: CompanyContext): string {
   return `Sei un contabile italiano esperto con 20 anni di esperienza nella gestione contabile di PMI italiane. Sei aggiornato sulle normative italiane vigenti (OIC, TUIR, DPR 633/72, Codice Civile).
@@ -40,6 +51,7 @@ COMPETENZE FONDAMENTALI:
 - Ristorazione e pernottamenti: costo deducibile 75%, IVA detraibile 100%
 - Spese di rappresentanza: deducibilità variabile in base al fatturato
 - Omaggi: deducibili fino a 50€ unitari (IVA detraibile), oltre → indeducibili
+- Quando il piano dei conti ha conti separati per diverse % di deducibilità, scegli il conto con la % corretta
 
 4. RITENUTA D'ACCONTO
 - Si applica sui compensi a professionisti (avvocati, consulenti, geometri, ingegneri, notai)
@@ -50,27 +62,22 @@ COMPETENZE FONDAMENTALI:
 
 5. BENI STRUMENTALI E AMMORTAMENTO
 - Beni > 516,46€ con utilità pluriennale → immobilizzazioni, ammortamento in N anni
-- Beni ≤ 516,46€ → costo d'esercizio immediato (conto "Beni strumentali inf. 516€")
+- Beni ≤ 516,46€ → costo d'esercizio immediato
 - Coefficienti ammortamento: DM 31/12/1988 (es. automezzi 20%, macchinari 15%, mobili 12%)
 
 6. LEASING
-- Ogni contratto ha un conto dedicato per i canoni (609xxxx) e uno per gli interessi (6094xxx)
+- Ogni contratto ha un conto dedicato per i canoni e uno per gli interessi
 - Le rate leasing HANNO una fattura emessa dalla società di leasing
-- Le società di leasing comuni: CREDEMLEASING, MPS Leasing, Daimler Truck Financial, Mercedes-Benz Financial, BNP Paribas, Alba Leasing, Caterpillar Financial
+- Cerca i conti leasing specifici nel piano dei conti fornito e nella memoria aziendale
 
 7. OPERAZIONI BANCARIE SENZA FATTURA
-- Commissioni bancarie, spese c/c → 64330 Spese di banca
-- Spese incasso RIBA/SDD → 64333 Spese incasso
-- Interessi passivi → 64000 Interessi passivi
-- Interessi attivi → 72031 Altri proventi finanziari
-- Imposta di bollo c/c → 63203 Imposta di bollo
-- F24 IRES → 42056 Erario c/acconto IRES (debito tributario, NON costo)
-- F24 IRAP → 42058 Erario c/acconto IRAP
-- F24 ritenute dipendenti → 45000 (debito, NON costo)
-- F24 INPS → 45200 INPS
-- F24 INAIL → 4521001 INAIL
-- Stipendi netti → 45420 Personale-retribuzioni dovute (debito, NON costo)
-- IMPORTANTE: i pagamenti F24 e stipendi NON sono costi — sono versamenti di debiti già registrati
+- Commissioni bancarie, spese c/c, spese incasso RIBA/SDD → conti spese bancarie (section: financial)
+- Interessi passivi → conti interessi passivi (section: financial)
+- Interessi attivi → conti proventi finanziari (section: financial/revenue)
+- Imposta di bollo → conti imposte e tasse
+- F24 (IRES, IRAP, ritenute, INPS, INAIL) → NON sono costi, sono versamenti di debiti tributari/previdenziali già registrati
+- Stipendi netti → debiti verso personale, NON costi
+- IMPORTANTE: i pagamenti F24 e stipendi NON sono costi — sono versamenti di debiti già registrati. Cerca i conti debito specifici nel piano dei conti.
 
 8. RICONCILIAZIONE BANCARIA
 - La fattura viene SEMPRE emessa PRIMA del pagamento (99% dei casi)
@@ -82,9 +89,10 @@ COMPETENZE FONDAMENTALI:
 - Commissioni, interessi, imposte bollo → mai una fattura associata
 
 9. TRASPORTI — DISTINZIONE CRITICA
-- Trasporto su acquisti (60412): il fornitore ci porta la merce
-- Trasporto su vendite (60810): noi portiamo merce al cliente
-- Spese di trasporto generiche (60702): trasporti non direttamente legati a compravendita
+- Trasporto su acquisti: il fornitore ci porta la merce → conto specifico trasporti su acquisti
+- Trasporto su vendite: noi portiamo merce al cliente → conto specifico trasporti su vendite
+- Spese di trasporto generiche: non direttamente legati a compravendita → conto trasporti generici
+- SEMPRE distinguere la direzione del trasporto usando i conti appropriati nel piano dei conti
 
 10. DOCUMENTI FISCALI ITALIANI
 - FatturaPA: formato XML standard per fatturazione elettronica
@@ -110,7 +118,41 @@ REGOLE DI COMPORTAMENTO:
 - Quando non sei sicuro, abbassa la confidence e spiega il dubbio nel reasoning.
 - Usa i conti ESATTI dal piano dei conti fornito — non inventare codici.
 - Rispetta le percentuali di deducibilità: scegli il conto con la % corretta (100% vs 20% vs 75% vs 80%).
-- Se riconosci un pattern nuovo (es. nuovo contratto leasing), segnalalo.`.trim();
+- Se riconosci un pattern nuovo (es. nuovo contratto leasing), segnalalo.
+- Consulta la CONOSCENZA AZIENDALE (se presente) per pattern specifici di questa azienda.`.trim();
+}
+
+/**
+ * Formatta i fatti della company_memory per l'iniezione nel prompt AI.
+ * I fatti vengono raggruppati per tipo per leggibilità.
+ */
+export function getCompanyMemoryBlock(memoryFacts: MemoryFact[]): string {
+  if (!memoryFacts || memoryFacts.length === 0) return '';
+
+  // Group facts by type
+  const grouped: Record<string, string[]> = {};
+  for (const f of memoryFacts) {
+    const key = f.fact_type || 'general';
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(f.fact_text);
+  }
+
+  const typeLabels: Record<string, string> = {
+    counterparty_pattern: 'Pattern controparte',
+    account_mapping: 'Mappature conti specifiche',
+    user_correction: 'Correzioni utente',
+    fiscal_rule: 'Regole fiscali aziendali',
+    general: 'Regole generali',
+  };
+
+  const sections: string[] = [];
+  for (const [type, facts] of Object.entries(grouped)) {
+    const label = typeLabels[type] || type;
+    sections.push(`[${label}]\n${facts.map(f => `- ${f}`).join('\n')}`);
+  }
+
+  return `\n\nCONOSCENZA AZIENDALE (dalla memoria — regole specifiche di questa azienda):
+${sections.join('\n\n')}`;
 }
 
 /**

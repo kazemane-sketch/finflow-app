@@ -2,6 +2,7 @@
 // and invoice-level / line-level classification assignments.
 import { supabase } from '@/integrations/supabase/client';
 import { createClassificationExample } from '@/lib/learningService';
+import { triggerEntityEmbedding } from '@/lib/companyMemoryService';
 
 // ─── Types ────────────────────────────────────────────────
 
@@ -334,6 +335,8 @@ export async function importDefaultChartOfAccounts(companyId: string): Promise<n
 
   const { error } = await supabase.from('chart_of_accounts').insert(rows);
   if (error) throw error;
+  // Fire-and-forget: generate embeddings for all imported accounts
+  triggerEntityEmbedding(companyId, ['chart_of_accounts']).catch(() => {});
   return rows.length;
 }
 
@@ -642,7 +645,7 @@ export async function createAccountFromSuggestion(
     attempts++;
   }
 
-  return createChartAccount(companyId, {
+  const account = await createChartAccount(companyId, {
     code,
     name: suggestion.name,
     section,
@@ -650,6 +653,9 @@ export async function createAccountFromSuggestion(
     level: 3,
     is_header: false,
   });
+  // Fire-and-forget: generate embedding for the new account
+  triggerEntityEmbedding(companyId, ['chart_of_accounts']).catch(() => {});
+  return account;
 }
 
 /**
@@ -687,5 +693,7 @@ export async function createCategoryFromSuggestion(
     type: catType,
     color,
   });
+  // Fire-and-forget: generate embedding for the new category
+  triggerEntityEmbedding(companyId, ['categories']).catch(() => {});
   return { category, wasExisting: false };
 }

@@ -9,8 +9,10 @@
 import postgres from "npm:postgres@3.4.5";
 import {
   getAccountingSystemPrompt,
+  getCompanyMemoryBlock,
   getUserInstructionsBlock,
   type CompanyContext,
+  type MemoryFact,
 } from "../_shared/accounting-system-prompt.ts";
 
 const corsHeaders = {
@@ -20,10 +22,16 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const MODEL = "claude-sonnet-4-6";
+/* ─── Model constants ────────────────────── */
+const MODEL_HAIKU = "claude-haiku-4-5-20250315";
+const MODEL_SONNET = "claude-sonnet-4-6";
+const ESCALATION_THRESHOLD = 60;  // Lines below this confidence get escalated to Sonnet
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_DIMS = 3072;
 const MIN_CONFIDENCE = 60;
+
+// Backward compat: keep MODEL for stats reporting
+const MODEL = MODEL_HAIKU;
 
 /* ─── Direction enforcement constants ────── */
 // Which CoA sections are valid for each invoice direction
@@ -216,7 +224,398 @@ async function loadRagExamples(
   }
 }
 
-/* ─── Build Sonnet prompt ───────────────── */
+/* ─── Embedding pre-flight: find relevant entities ── */
+
+interface PreflightResult {
+  accounts: AccountRow[];
+  categories: CategoryRow[];
+  articles: (ArticleRow & { similarity: number })[];
+  projects: ProjectRow[];
+  memoryFacts: MemoryFact[];
+  queryVec: number[];
+}
+
+async function embeddingPreflight(
+  sql: SqlClient,
+  companyId: string,
+  lines: InputLine[],
+  counterpartyName: string,
+  counterpartyId: string | null,
+  direction: string,
+  geminiKey: string,
+  dirSections: { primary: string[]; allowed: string[] },
+  allowedCatTypes: string[],
+): Promise<PreflightResult | null> {
+  try {
+    // Build query text from all line descriptions + counterparty
+    const queryText =
+      lines.map((l) => l.description).filter(Boolean).join(" | ") +
+      ` | ${counterpartyName || "N/D"}`;
+
+    // 1. Compute single Gemini embedding
+    const queryVec = await callGeminiEmbedding(geminiKey, queryText);
+    const vecLiteral = toVectorLiteral(queryVec);
+
+    // 2. Run 5 parallel pgvector queries
+    const [pfAccounts, pfCategories, pfArticles, pfProjects, pfMemory] =
+      await Promise.all([
+        sql.unsafe(
+          `SELECT id, code, name, section, (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
+           FROM chart_of_accounts
+           WHERE company_id = $2 AND active = true AND is_header = false AND embedding IS NOT NULL
+             AND section = ANY($3::text[])
+           ORDER BY embedding <=> $1::halfvec(3072) LIMIT 20`,
+          [vecLiteral, companyId, dirSections.allowed],
+        ),
+        sql.unsafe(
+          `SELECT id, name, type, (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
+           FROM categories
+           WHERE company_id = $2 AND active = true AND embedding IS NOT NULL
+             AND type = ANY($3::text[])
+           ORDER BY embedding <=> $1::halfvec(3072) LIMIT 10`,
+          [vecLiteral, companyId, allowedCatTypes],
+        ),
+        sql.unsafe(
+          `SELECT id, code, name, keywords, (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
+           FROM articles
+           WHERE company_id = $2 AND active = true AND embedding IS NOT NULL
+           ORDER BY embedding <=> $1::halfvec(3072) LIMIT 10`,
+          [vecLiteral, companyId],
+        ),
+        sql.unsafe(
+          `SELECT id, code, name, (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
+           FROM projects
+           WHERE company_id = $2 AND status = 'active' AND embedding IS NOT NULL
+           ORDER BY embedding <=> $1::halfvec(3072) LIMIT 8`,
+          [vecLiteral, companyId],
+        ),
+        counterpartyId
+          ? sql.unsafe(
+              `SELECT id, fact_type, fact_text, metadata, counterparty_id,
+                      (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
+               FROM company_memory
+               WHERE company_id = $2 AND active = true AND embedding IS NOT NULL
+                 AND (counterparty_id IS NULL OR counterparty_id = $3)
+               ORDER BY embedding <=> $1::halfvec(3072) LIMIT 15`,
+              [vecLiteral, companyId, counterpartyId],
+            )
+          : sql.unsafe(
+              `SELECT id, fact_type, fact_text, metadata, counterparty_id,
+                      (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
+               FROM company_memory
+               WHERE company_id = $2 AND active = true AND embedding IS NOT NULL
+               ORDER BY embedding <=> $1::halfvec(3072) LIMIT 15`,
+              [vecLiteral, companyId],
+            ),
+      ]);
+
+    // Filter by similarity thresholds
+    const accounts = (pfAccounts as (AccountRow & { similarity: number })[])
+      .filter((a) => a.similarity >= 0.35);
+    const categories = (pfCategories as (CategoryRow & { similarity: number })[])
+      .filter((c) => c.similarity >= 0.35);
+    const articles = (pfArticles as (ArticleRow & { similarity: number })[])
+      .filter((a) => a.similarity >= 0.40);
+    const projects = (pfProjects as (ProjectRow & { similarity: number })[]);
+    const memoryFacts = (pfMemory as (MemoryFact & { similarity: number; id: string })[])
+      .filter((m) => m.similarity >= 0.40)
+      .map((m) => ({ fact_text: m.fact_text, fact_type: m.fact_type, similarity: m.similarity }));
+
+    console.log(`[classify-preflight] accounts=${accounts.length}, cats=${categories.length}, arts=${articles.length}, projects=${projects.length}, memory=${memoryFacts.length}`);
+
+    return { accounts, categories, articles, projects, memoryFacts, queryVec };
+  } catch (err) {
+    console.warn("[classify-preflight] Embedding pre-flight failed, will use full lists:", err);
+    return null;
+  }
+}
+
+/* ─── Build focused prompt for Haiku ─────── */
+
+function buildFocusedPrompt(
+  articles: ArticleRow[],
+  categories: CategoryRow[],
+  accounts: AccountRow[],
+  projects: ProjectRow[],
+  phases: ArticlePhaseRow[],
+  counterpartyInfo: string,
+  history: HistoryRow[],
+  memoryBlock: string,
+  direction: string,
+  lines: InputLine[],
+  systemPrompt: string,
+  userInstructionsBlock: string,
+): string {
+  // Build phases-by-article map
+  const phasesByArticle = new Map<string, ArticlePhaseRow[]>();
+  for (const p of phases) {
+    if (!phasesByArticle.has(p.article_id)) phasesByArticle.set(p.article_id, []);
+    phasesByArticle.get(p.article_id)!.push(p);
+  }
+
+  // Articles section — only relevant articles from pre-flight
+  const articleIds = new Set(articles.map(a => a.id));
+  const relevantPhases = phases.filter(p => articleIds.has(p.article_id));
+  const multiStep = articles.filter(a => phasesByArticle.has(a.id) && phasesByArticle.get(a.id)!.length > 0);
+  const singleStep = articles.filter(a => !phasesByArticle.has(a.id) || phasesByArticle.get(a.id)!.length === 0);
+
+  let artSection = "";
+  if (multiStep.length > 0) {
+    artSection += `ARTICOLI CON FASI:\n`;
+    artSection += multiStep.map(a => {
+      const aPhases = phasesByArticle.get(a.id)!;
+      const kwPart = a.keywords?.length ? ` [${a.keywords.join(", ")}]` : "";
+      let line = `- ${a.code} (${a.name})${kwPart}:\n`;
+      line += aPhases.map(p =>
+        `  ${p.code}: ${p.name}${p.is_counting_point ? " (COUNTING)" : ""}`
+      ).join("\n");
+      return line;
+    }).join("\n");
+  }
+  if (singleStep.length > 0) {
+    if (artSection) artSection += "\n";
+    artSection += `ARTICOLI SENZA FASI:\n`;
+    artSection += singleStep.map(a => {
+      const kwPart = a.keywords?.length ? ` [${a.keywords.join(", ")}]` : "";
+      return `- ${a.code} (${a.name})${kwPart}`;
+    }).join("\n");
+  }
+
+  // Categories (compact)
+  const catSection = categories.map(c => `- ${c.id}: ${c.name} (${c.type})`).join("\n");
+
+  // Accounts (compact)
+  const accSection = accounts.map(a => `- ${a.id}: ${a.code} ${a.name} (${a.section})`).join("\n");
+
+  // Projects (compact)
+  const cdcSection = projects.length > 0
+    ? projects.map(p => `- ${p.id}: ${p.code} ${p.name}`).join("\n")
+    : "Nessun CdC.";
+
+  // History (limited to 15 for focused prompt)
+  const historyLimited = history.slice(0, 15);
+  let historySection = "";
+  if (historyLimited.length > 0) {
+    const histLines = historyLimited.map(h => {
+      const parts: string[] = [`"${h.description}"`];
+      if (h.article_code) parts.push(`art:${h.article_code}`);
+      if (h.category_name) parts.push(`cat:${h.category_name}`);
+      if (h.account_code) parts.push(`conto:${h.account_code}`);
+      return parts.join(" → ");
+    });
+    historySection = `STORICO (usa SOLO se la descrizione corrisponde):\n${histLines.join("\n")}`;
+  }
+
+  // Lines
+  const lineEntries = lines
+    .map((l, i) => `${i + 1}. [${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} tot=${l.total_price ?? "N/D"}`)
+    .join("\n");
+
+  return `${systemPrompt}
+${userInstructionsBlock}
+${memoryBlock}
+
+${artSection ? `ARTICOLI:\n${artSection}\n` : ""}CATEGORIE:
+${catSection}
+
+CONTI:
+${accSection}
+
+CDC:
+${cdcSection}
+
+CONTROPARTE: ${counterpartyInfo}
+
+${historySection}
+
+=== VINCOLO DIREZIONE (${direction === "in" ? "PASSIVA" : "ATTIVA"}) ===
+${direction === "in" ? "Conti di COSTO. category.type: expense/both. VIETATO: conti revenue." : "Conti di RICAVO. category.type: revenue/both. VIETATO: conti costo."}
+===
+
+REGOLE:
+- Usa storico SOLO se la descrizione corrisponde.
+- article_code + phase_code solo se il materiale/prodotto corrisponde.
+- category_id e account_id: assegna SEMPRE (UUID esatti dalla lista sopra).
+- Coerenza: trasporto→conti trasporto, noleggio→conti noleggio.
+- confidence 0-100. Se dubbio, confidence bassa.
+
+RIGHE:
+${lineEntries}
+
+JSON array (no markdown):
+[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"max 30 parole","fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]
+---KEYWORDS---
+["kw1","kw2",...] (5-10 keywords)`;
+}
+
+/* ─── Sonnet escalation with Extended Thinking ── */
+
+async function callSonnetEscalation(
+  apiKey: string,
+  lowConfLines: SonnetLineResult[],
+  haikuAttempt: SonnetLineResult[],
+  inputLines: InputLine[],
+  allAccounts: AccountRow[],
+  allCategories: CategoryRow[],
+  allArticles: ArticleRow[],
+  phases: ArticlePhaseRow[],
+  projects: ProjectRow[],
+  counterpartyInfo: string,
+  history: HistoryRow[],
+  memoryBlock: string,
+  direction: string,
+  systemPrompt: string,
+  userInstructionsBlock: string,
+): Promise<SonnetLineResult[]> {
+  // Only send the low-confidence lines
+  const lowLineIds = new Set(lowConfLines.map(l => l.line_id));
+  const lowInputLines = inputLines.filter(l => lowLineIds.has(l.line_id));
+
+  // Build phases-by-article map for article section
+  const phasesByArticle = new Map<string, ArticlePhaseRow[]>();
+  for (const p of phases) {
+    if (!phasesByArticle.has(p.article_id)) phasesByArticle.set(p.article_id, []);
+    phasesByArticle.get(p.article_id)!.push(p);
+  }
+
+  // Full article section
+  let artSection = allArticles.map(a => {
+    const aPhases = phasesByArticle.get(a.id) || [];
+    const kwPart = a.keywords?.length ? ` [${a.keywords.join(", ")}]` : "";
+    if (aPhases.length > 0) {
+      return `- ${a.code} (${a.name})${kwPart}:\n${aPhases.map(p => `  ${p.code}: ${p.name}`).join("\n")}`;
+    }
+    return `- ${a.code} (${a.name})${kwPart}`;
+  }).join("\n");
+
+  // Full accounts + categories
+  const catSection = allCategories.map(c => `- ${c.id}: ${c.name} (${c.type})`).join("\n");
+  const accSection = allAccounts.map(a => `- ${a.id}: ${a.code} ${a.name} (${a.section})`).join("\n");
+  const cdcSection = projects.map(p => `- ${p.id}: ${p.code} ${p.name}`).join("\n") || "Nessun CdC.";
+
+  // History section
+  let historySection = "";
+  if (history.length > 0) {
+    const histLines = history.map(h => {
+      const parts: string[] = [`"${h.description}"`];
+      if (h.article_code) parts.push(`art:${h.article_code}`);
+      if (h.category_name) parts.push(`cat:${h.category_name}`);
+      if (h.account_code) parts.push(`conto:${h.account_code}`);
+      return parts.join(" → ");
+    });
+    historySection = `STORICO:\n${histLines.join("\n")}`;
+  }
+
+  // Haiku attempt section — show what Haiku tried
+  const haikuSection = lowConfLines.map(lr => {
+    return `- Riga ${lr.line_id}: Haiku ha tentato category="${lr.category_name}" account="${lr.account_code}" confidence=${lr.confidence} reasoning="${lr.reasoning}"`;
+  }).join("\n");
+
+  // Lines to re-classify
+  const lineEntries = lowInputLines.map((l, i) =>
+    `${i + 1}. [${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} prezzo_unit=${l.unit_price ?? "N/D"} totale=${l.total_price ?? "N/D"}`
+  ).join("\n");
+
+  // Extended Thinking requires system prompt in user message
+  const fullPrompt = `${systemPrompt}
+${userInstructionsBlock}
+${memoryBlock}
+
+Sei stato chiamato come ESCALATION per righe che il classificatore iniziale (Haiku) non è riuscito a classificare con sicurezza.
+Analizza attentamente usando il CONTESTO COMPLETO sotto.
+
+TENTATIVO PRECEDENTE (Haiku — bassa confidenza):
+${haikuSection}
+
+ARTICOLI COMPLETI:
+${artSection}
+
+CATEGORIE COMPLETE:
+${catSection}
+
+PIANO DEI CONTI COMPLETO:
+${accSection}
+
+CDC COMPLETI:
+${cdcSection}
+
+CONTROPARTE: ${counterpartyInfo}
+
+${historySection}
+
+=== VINCOLO DIREZIONE (${direction === "in" ? "PASSIVA" : "ATTIVA"}) ===
+${direction === "in" ? "Conti di COSTO. category.type: expense/both. VIETATO: conti revenue." : "Conti di RICAVO. category.type: revenue/both. VIETATO: conti costo."}
+===
+
+RIGHE DA RI-CLASSIFICARE:
+${lineEntries}
+
+JSON array (no markdown):
+[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"spiegazione breve","fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]`;
+
+  console.log(`[classify-escalation] Calling Sonnet with Extended Thinking for ${lowConfLines.length} lines`);
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: MODEL_SONNET,
+      max_tokens: 16000,
+      thinking: {
+        type: "enabled",
+        budget_tokens: 10000,
+      },
+      messages: [{ role: "user", content: fullPrompt }],
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    console.error("[classify-escalation] Sonnet API error:", response.status, errText.slice(0, 300));
+    // Return Haiku results as fallback (don't fail the whole pipeline)
+    return lowConfLines;
+  }
+
+  const data = await response.json();
+  // Extended Thinking returns thinking blocks + text blocks
+  const textBlocks = ((data as any)?.content || []).filter((b: any) => b.type === "text");
+  const text = textBlocks.map((b: any) => b.text).join("") || "";
+  console.log(`[classify-escalation] Sonnet response: ${text.length} chars`);
+
+  // Parse JSON from response
+  try {
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) {
+      console.error("[classify-escalation] No JSON array in Sonnet response");
+      return lowConfLines;
+    }
+    const parsed: SonnetLineResult[] = JSON.parse(jsonMatch[0]);
+    return parsed.map(item => ({
+      line_id: item.line_id,
+      article_code: item.article_code || null,
+      phase_code: item.phase_code || null,
+      category_id: item.category_id || null,
+      category_name: item.category_name || null,
+      account_id: item.account_id || null,
+      account_code: item.account_code || null,
+      cost_center_allocations: item.cost_center_allocations || [],
+      confidence: Math.min(Math.max(Number(item.confidence) || 50, 0), 100),
+      reasoning: `[SONNET] ${item.reasoning || ""}`,
+      fiscal_flags: item.fiscal_flags || null,
+      suggest_new_account: item.suggest_new_account || null,
+      suggest_new_category: item.suggest_new_category || null,
+    }));
+  } catch (e) {
+    console.error("[classify-escalation] Parse error:", e);
+    return lowConfLines;
+  }
+}
+
+/* ─── Build full prompt (legacy, for Sonnet escalation fallback) ── */
 
 function buildPrompt(
   articles: ArticleRow[],
@@ -884,24 +1283,8 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ─── RAG examples ──────────────────────────────────
-    const geminiKey = (Deno.env.get("GEMINI_API_KEY") || "").trim();
-    let ragExamples: RagExample[] = [];
-    if (geminiKey && inputLines.length > 0) {
-      // Build a query from all line descriptions + counterparty name
-      const queryText =
-        inputLines
-          .map((l) => l.description)
-          .filter(Boolean)
-          .join(" | ") +
-        ` | ${counterpartyName || "N/D"}`;
-      ragExamples = await loadRagExamples(sql, companyId, queryText, geminiKey);
-      console.log(
-        `[classify-invoice-lines] RAG found ${ragExamples.length} examples`,
-      );
-    }
-
     // ─── Load shared system prompt + user instructions ──
+    const geminiKey = (Deno.env.get("GEMINI_API_KEY") || "").trim();
     const companyRow = await sql`
       SELECT name, vat_number FROM companies WHERE id = ${companyId} LIMIT 1
     `;
@@ -919,17 +1302,71 @@ Deno.serve(async (req) => {
       console.log(`[classify-invoice-lines] Loaded user instructions`);
     }
 
-    // ─── Build prompt and call Sonnet ──────────────────
-    const prompt = buildPrompt(
-      articles,
-      categories,
-      primaryAccounts,
-      secondaryAccounts,
-      projects,
+    // ─── Stage 1: Embedding Pre-flight ──────────────────
+    // Find relevant entities via semantic search instead of sending ALL
+    let preflightAccounts: AccountRow[] = [...primaryAccounts, ...secondaryAccounts];
+    let preflightCategories: CategoryRow[] = categories;
+    let preflightArticles: ArticleRow[] = articles;
+    let preflightProjects: ProjectRow[] = projects;
+    let memoryFacts: MemoryFact[] = [];
+
+    // Resolve counterparty_id for memory search
+    let counterpartyId: string | null = null;
+    if (counterpartyVatKey) {
+      const vatKey = counterpartyVatKey.toUpperCase().replace(/^IT/i, "").replace(/[^A-Z0-9]/gi, "");
+      if (vatKey) {
+        const [cpRow] = await sql`
+          SELECT id FROM counterparties WHERE vat_key = ${vatKey} AND company_id = ${companyId} LIMIT 1
+        `;
+        if (cpRow) counterpartyId = cpRow.id;
+      }
+    }
+
+    if (geminiKey && inputLines.length > 0) {
+      const preflight = await embeddingPreflight(
+        sql, companyId, inputLines, counterpartyName, counterpartyId,
+        direction, geminiKey, dirSections, allowedCatTypes,
+      );
+
+      if (preflight) {
+        // Use pre-flight results if sufficient
+        if (preflight.accounts.length >= 5) {
+          preflightAccounts = preflight.accounts;
+        } else {
+          // Cold-start fallback: supplement with primary accounts
+          console.log(`[classify] Pre-flight returned only ${preflight.accounts.length} accounts, supplementing with primary accounts`);
+          const pfIds = new Set(preflight.accounts.map(a => a.id));
+          preflightAccounts = [
+            ...preflight.accounts,
+            ...primaryAccounts.filter(a => !pfIds.has(a.id)).slice(0, 15 - preflight.accounts.length),
+          ];
+        }
+        if (preflight.categories.length >= 3) {
+          preflightCategories = preflight.categories;
+        }
+        if (preflight.articles.length > 0) {
+          preflightArticles = preflight.articles;
+        }
+        if (preflight.projects.length > 0) {
+          preflightProjects = preflight.projects;
+        }
+        memoryFacts = preflight.memoryFacts;
+      }
+    }
+
+    // Build memory block for prompt
+    const memoryBlock = getCompanyMemoryBlock(memoryFacts);
+
+    // ─── Stage 2: Haiku Classification ──────────────────
+    const focusedPrompt = buildFocusedPrompt(
+      preflightArticles,
+      preflightCategories,
+      preflightAccounts,
+      preflightProjects,
       phases,
       counterpartyInfo,
       history,
-      ragExamples,
+      memoryBlock,
       direction,
       inputLines,
       systemPrompt,
@@ -937,10 +1374,10 @@ Deno.serve(async (req) => {
     );
 
     console.log(
-      `[classify-invoice-lines] Calling Sonnet for ${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}`,
+      `[classify-invoice-lines] Calling Haiku for ${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}`,
     );
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const haikuResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -948,38 +1385,36 @@ Deno.serve(async (req) => {
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 16384,
-        messages: [{ role: "user", content: prompt }],
+        model: MODEL_HAIKU,
+        max_tokens: 8192,
+        messages: [{ role: "user", content: focusedPrompt }],
       }),
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
+    if (!haikuResponse.ok) {
+      const errText = await haikuResponse.text();
       console.error(
-        "[classify-invoice-lines] Sonnet API error:",
-        response.status,
+        "[classify-invoice-lines] Haiku API error:",
+        haikuResponse.status,
         errText.slice(0, 300),
       );
       return json(
-        {
-          error: `Sonnet HTTP ${response.status}: ${errText.slice(0, 200)}`,
-        },
+        { error: `Haiku HTTP ${haikuResponse.status}: ${errText.slice(0, 200)}` },
         502,
       );
     }
 
-    const data = await response.json();
-    const text = (data as any)?.content?.[0]?.text || "";
+    const haikuData = await haikuResponse.json();
+    const haikuText = (haikuData as any)?.content?.[0]?.text || "";
     console.log(
-      `[classify-invoice-lines] Sonnet response length: ${text.length} chars`,
+      `[classify-invoice-lines] Haiku response length: ${haikuText.length} chars`,
     );
 
-    // ─── Parse response: classifications + keywords ────
+    // ─── Parse Haiku response ───────────────────────────
     let classificationsJson: string;
     let keywords: string[] = [];
 
-    const keywordsSplit = text.split("---KEYWORDS---");
+    const keywordsSplit = haikuText.split("---KEYWORDS---");
     classificationsJson = keywordsSplit[0].trim();
     if (keywordsSplit.length > 1) {
       try {
@@ -990,13 +1425,13 @@ Deno.serve(async (req) => {
       }
     }
 
-    let parsed: SonnetLineResult[];
+    let haikuParsed: SonnetLineResult[];
     try {
       const jsonMatch = classificationsJson.match(/\[[\s\S]*\]/);
-      parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+      haikuParsed = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
     } catch (e) {
       console.error(
-        "[classify-invoice-lines] Failed to parse Sonnet response:",
+        "[classify-invoice-lines] Failed to parse Haiku response:",
         e,
         classificationsJson.slice(0, 500),
       );
@@ -1006,8 +1441,8 @@ Deno.serve(async (req) => {
       );
     }
 
-    // Normalize parsed results
-    const lineResults: SonnetLineResult[] = parsed.map((item) => ({
+    // Normalize Haiku results
+    let lineResults: SonnetLineResult[] = haikuParsed.map((item) => ({
       line_id: item.line_id,
       article_code: item.article_code || null,
       phase_code: item.phase_code || null,
@@ -1025,6 +1460,44 @@ Deno.serve(async (req) => {
       suggest_new_account: item.suggest_new_account || null,
       suggest_new_category: item.suggest_new_category || null,
     }));
+
+    // ─── Stage 3: Sonnet Escalation for low-confidence lines ──
+    const lowConfLines = lineResults.filter(lr => lr.confidence < ESCALATION_THRESHOLD);
+    const highConfLines = lineResults.filter(lr => lr.confidence >= ESCALATION_THRESHOLD);
+
+    if (lowConfLines.length > 0) {
+      console.log(`[classify-invoice-lines] ${lowConfLines.length}/${lineResults.length} lines below threshold (${ESCALATION_THRESHOLD}), escalating to Sonnet`);
+
+      const escalatedResults = await callSonnetEscalation(
+        apiKey,
+        lowConfLines,
+        lineResults,
+        inputLines,
+        allAccounts,
+        allCategories,
+        articles,
+        phases,
+        projects,
+        counterpartyInfo,
+        history,
+        memoryBlock,
+        direction,
+        systemPrompt,
+        userInstructionsBlock,
+      );
+
+      // Merge: keep high-confidence Haiku results + escalated Sonnet results
+      const escalatedMap = new Map(escalatedResults.map(r => [r.line_id, r]));
+      lineResults = highConfLines.map(lr => lr);
+      for (const lowLr of lowConfLines) {
+        const escalated = escalatedMap.get(lowLr.line_id);
+        lineResults.push(escalated || lowLr);
+      }
+
+      console.log(`[classify-invoice-lines] Merged: ${highConfLines.length} Haiku + ${escalatedResults.length} Sonnet`);
+    } else {
+      console.log(`[classify-invoice-lines] All ${lineResults.length} lines above threshold — no escalation needed`);
+    }
 
     // ─── Phase validation ─────────────────────────────
     for (const lr of lineResults) {
@@ -1270,8 +1743,10 @@ Deno.serve(async (req) => {
           (r) => r.confidence >= MIN_CONFIDENCE,
         ).length,
         history_count: history.length,
-        rag_count: ragExamples.length,
-        model: MODEL,
+        memory_facts_count: memoryFacts.length,
+        escalated_to_sonnet: lowConfLines.length,
+        model_primary: MODEL_HAIKU,
+        model_escalation: lowConfLines.length > 0 ? MODEL_SONNET : null,
       },
     });
   } catch (e: unknown) {

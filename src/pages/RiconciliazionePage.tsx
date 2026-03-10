@@ -16,6 +16,7 @@ import { mpLabel, tpLabel } from '@/lib/invoiceParser'
 import BankTxDetail, { txTypeLabel, txTypeBadge, txDirection } from '@/components/BankTxDetail'
 import { askInvoiceAiSearch, type InvoiceAiResult } from '@/lib/invoiceAiSearch'
 import { createReconciliationExample } from '@/lib/learningService'
+import { createMemoryFromReconciliation } from '@/lib/companyMemoryService'
 import { useAIJob } from '@/hooks/useAIJob'
 
 /* ─── types ──────────────────────────────────── */
@@ -682,7 +683,7 @@ export default function RiconciliazionePage() {
         match_reason: suggestion.match_reason,
       })
 
-      // 5b. RAG: create learning example (fire-and-forget)
+      // 5b. RAG: create learning example + company memory (fire-and-forget)
       if (tx && suggestion.invoice_id) {
         const inv = suggestion.invoice
         createReconciliationExample(
@@ -692,6 +693,18 @@ export default function RiconciliazionePage() {
           tx.id, suggestion.invoice_id, suggestion.installment_id || null,
           suggestion.match_score,
         ).catch(err => console.warn('[confirmSuggestion] learning example error:', err))
+
+        // Company memory: counterparty payment pattern
+        const invCp = inv?.counterparty as Record<string, unknown> | null
+        createMemoryFromReconciliation(
+          companyId,
+          (invCp?.id as string) || null,
+          tx.counterparty_name || (invCp?.denom as string) || null,
+          tx.description || '',
+          inv?.number || null,
+          Number(tx.amount),
+          suggestion.match_score,
+        ).catch(err => console.warn('[confirmSuggestion] memory error:', err))
       }
 
       // 5c. Miglioria 3: Upsert reconciliation rule from confirmed match

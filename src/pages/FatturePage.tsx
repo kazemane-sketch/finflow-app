@@ -45,6 +45,7 @@ import {
 } from '@/lib/classificationService';
 import { toast } from 'sonner';
 import { createRuleFromConfirmation, findMatchingRules } from '@/lib/classificationRulesService';
+import { createMemoryFromClassification } from '@/lib/companyMemoryService';
 import ExportDialog from '@/components/ExportDialog';
 import SearchableSelect from '@/components/SearchableSelect';
 
@@ -1392,7 +1393,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setDismissedArticleLineIds(new Set());
       setClassifDirty(false);
 
-      // 6. Create classification rules from confirmed data (fire-and-forget)
+      // 6. Create classification rules + company memory from confirmed data (fire-and-forget)
       const cp = (invoice.counterparty || {}) as any;
       if (detail?.invoice_lines) {
         for (const line of detail.invoice_lines) {
@@ -1409,6 +1410,18 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 phase_id: lineArticleMap[line.id]?.phase_id || null,
                 cost_center_allocations: lineCdc },
             ).catch(err => console.warn('[rules] error:', err));
+
+            // Company memory: create counterparty_pattern fact
+            const memAcc = lc.account_id ? allAccounts.find(a => a.id === lc.account_id) : null;
+            const memCat = lc.category_id ? allCategories.find(c => c.id === lc.category_id) : null;
+            const memArt = lineArticleMap[line.id];
+            createMemoryFromClassification(
+              companyId, cp?.id || null, cp?.denom || null,
+              line.description, memCat?.name || null,
+              memAcc?.code || null, memAcc?.name || null,
+              invoice.direction as 'in' | 'out',
+              memArt?.code || null, memArt?.name || null,
+            ).catch(err => console.warn('[memory] error:', err));
           }
         }
       }
@@ -1425,7 +1438,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     isConfirmed, classification, classifDirty, selCategoryId, selAccountId, cdcRows, cdcMode,
     lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap,
     lineProjects, originalLineProjects, dismissedArticleLineIds,
-    detail?.invoice_lines, onPatchInvoice, onRefreshBadges]);
+    detail?.invoice_lines, onPatchInvoice, onRefreshBadges, allAccounts, allCategories]);
 
   // Copy classification from a line
   const handleCopyLineClassif = useCallback((lineId: string) => {

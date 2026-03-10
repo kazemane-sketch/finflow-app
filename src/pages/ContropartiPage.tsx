@@ -25,6 +25,8 @@ import {
 import { useAIJob } from '@/hooks/useAIJob'
 import { fmtDate, fmtEur } from '@/lib/utils'
 import { supabase } from '@/integrations/supabase/client'
+import { resetCounterpartyMemory } from '@/lib/companyMemoryService'
+import { toast } from 'sonner'
 import {
   Users,
   Plus,
@@ -39,6 +41,7 @@ import {
   Loader2,
   Brain,
   Trash2,
+  RotateCcw,
 } from 'lucide-react'
 import {
   ResponsiveContainer,
@@ -636,6 +639,21 @@ export default function ContropartiPage() {
     await supabase.from('user_instructions').update({ active: false }).eq('id', id)
     loadCpInstructions()
   }, [loadCpInstructions])
+
+  const [resettingMemory, setResettingMemory] = useState(false)
+  const handleResetMemory = useCallback(async () => {
+    if (!companyId || !focusedId || !focused) return
+    if (!window.confirm(`Sei sicuro di voler resettare le regole apprese per "${focused.name}"?\n\nQuesto disattiverà tutti i pattern di classificazione e le regole automatiche per questa controparte.`)) return
+    setResettingMemory(true)
+    try {
+      const result = await resetCounterpartyMemory(companyId, focusedId, focused.vat_number)
+      toast.success(`Regole resettate: ${result.memoryDeactivated} pattern memoria + ${result.rulesDeactivated} regole classificazione disattivate`)
+    } catch (err) {
+      toast.error('Errore nel reset delle regole')
+      console.error('[ContropartiPage] resetMemory error:', err)
+    }
+    setResettingMemory(false)
+  }, [companyId, focusedId, focused])
 
   const analyticsSourceRows = useMemo(() => {
     if (analyticsDateMode === 'payment_date') {
@@ -1399,6 +1417,10 @@ export default function ContropartiPage() {
                   </Button>
                   <Button size="sm" variant="outline" onClick={rejectFocused} disabled={saving}>
                     <XCircle className="h-3.5 w-3.5 mr-1.5" />Rifiuta
+                  </Button>
+                  <Button size="sm" variant="ghost" className="text-orange-600 hover:text-orange-700 hover:bg-orange-50" onClick={handleResetMemory} disabled={resettingMemory}>
+                    <RotateCcw className={`h-3.5 w-3.5 mr-1.5 ${resettingMemory ? 'animate-spin' : ''}`} />
+                    {resettingMemory ? 'Reset...' : 'Resetta regole'}
                   </Button>
                   <p className="text-xs text-gray-500 ml-auto">Creata il {fmtDate(focused.created_at)}</p>
                 </div>
