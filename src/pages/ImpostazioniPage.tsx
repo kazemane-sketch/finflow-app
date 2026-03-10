@@ -321,6 +321,13 @@ function InstructionsTab({ companyId }: { companyId: string }) {
 // ============================================================
 // BRAIN AI ACTIVATION CARD
 // ============================================================
+const ENTITY_TYPE_LABELS: Record<string, string> = {
+  chart_of_accounts: 'Conti',
+  categories: 'Categorie',
+  articles: 'Articoli',
+  projects: 'CdC',
+}
+
 function BrainActivationCard({ companyId }: { companyId: string }) {
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState<BrainBackfillResult | null>(null)
@@ -332,7 +339,6 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
     setResult(null)
     try {
       const res = await triggerFullBrainBackfill(companyId, (partial) => {
-        // Live progress updates from each batch round
         setResult({ ...partial })
       })
       setResult(res)
@@ -342,7 +348,6 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
     setRunning(false)
   }
 
-  // Compute totals from result
   const show = result
   const entityTotal = show
     ? Object.values(show.entities).reduce((sum, r) => sum + r.processed, 0)
@@ -350,9 +355,7 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
   const entityErrors = show
     ? Object.values(show.entities).reduce((sum, r) => sum + r.errors, 0)
     : 0
-  const entityRemaining = show
-    ? Object.values(show.entities).reduce((sum, r) => sum + r.remaining, 0)
-    : 0
+  const grandTotal = entityTotal + (show?.memory.processed || 0)
 
   return (
     <Card>
@@ -377,7 +380,7 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
           {running ? (
             <>
               <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
-              Calcolo in corso{entityTotal > 0 ? ` (${entityTotal + (show?.memory.processed || 0)} processati)` : ''}...
+              {show?.currentStep || 'Avvio...'}
             </>
           ) : (
             <>
@@ -395,41 +398,70 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
         )}
 
         {show && (
-          <div className={`rounded-lg px-3 py-2.5 space-y-1.5 ${running ? 'bg-violet-50/60 border border-violet-200' : 'bg-violet-50'}`}>
+          <div className={`rounded-lg px-3 py-2.5 space-y-2 ${running ? 'bg-violet-50/60 border border-violet-200' : 'bg-violet-50'}`}>
+            {/* Header */}
             <div className="flex items-center gap-2 text-xs font-semibold text-violet-800">
               {running ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-violet-500" />
               ) : (
                 <CheckCircle className="h-3.5 w-3.5 text-emerald-600" />
               )}
-              {running ? 'Embedding in corso...' : 'Backfill completato'}
+              {running ? 'Embedding in corso...' : `Brain AI attivato — ${grandTotal} embeddings totali`}
             </div>
-            <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-600">
-              <span>Entità processate:</span>
-              <span className="font-medium text-gray-900">{entityTotal}</span>
-              <span>Memoria processata:</span>
-              <span className="font-medium text-gray-900">{show.memory.processed}</span>
-              {(entityErrors + show.memory.errors) > 0 && (
-                <>
-                  <span className="text-amber-600">Errori:</span>
-                  <span className="font-medium text-amber-700">{entityErrors + show.memory.errors}</span>
-                </>
-              )}
-              {(entityRemaining + show.memory.remaining) > 0 && (
-                <>
-                  <span>Rimanenti:</span>
-                  <span className="font-medium text-gray-700">{entityRemaining + show.memory.remaining}</span>
-                </>
+
+            {/* Per-type progress rows */}
+            <div className="space-y-1">
+              {Object.entries(show.entities).map(([type, r]) => {
+                const label = ENTITY_TYPE_LABELS[type] || type
+                const done = r.remaining === 0 && r.processed > 0
+                return (
+                  <div key={type} className="flex items-center gap-2 text-xs">
+                    {done ? (
+                      <CheckCircle className="h-3 w-3 text-emerald-500 flex-shrink-0" />
+                    ) : running ? (
+                      <Loader2 className="h-3 w-3 animate-spin text-violet-400 flex-shrink-0" />
+                    ) : (
+                      <span className="h-3 w-3 flex-shrink-0" />
+                    )}
+                    <span className={`${done ? 'text-gray-600' : 'text-gray-400'}`}>{label}</span>
+                    <span className="font-medium text-gray-900">{r.processed}</span>
+                    {r.remaining > 0 && (
+                      <span className="text-gray-400">({r.remaining} rimanenti)</span>
+                    )}
+                    {r.errors > 0 && (
+                      <span className="text-amber-600">({r.errors} errori)</span>
+                    )}
+                  </div>
+                )
+              })}
+
+              {/* Memory row */}
+              {(show.memory.processed > 0 || running) && (
+                <div className="flex items-center gap-2 text-xs">
+                  {show.memory.remaining === 0 && show.memory.processed > 0 ? (
+                    <CheckCircle className="h-3 w-3 text-emerald-500 flex-shrink-0" />
+                  ) : running ? (
+                    <Loader2 className="h-3 w-3 animate-spin text-violet-400 flex-shrink-0" />
+                  ) : (
+                    <span className="h-3 w-3 flex-shrink-0" />
+                  )}
+                  <span className={`${show.memory.processed > 0 ? 'text-gray-600' : 'text-gray-400'}`}>Memoria</span>
+                  <span className="font-medium text-gray-900">{show.memory.processed}</span>
+                  {show.memory.remaining > 0 && (
+                    <span className="text-gray-400">({show.memory.remaining} rimanenti)</span>
+                  )}
+                  {show.memory.errors > 0 && (
+                    <span className="text-amber-600">({show.memory.errors} errori)</span>
+                  )}
+                </div>
               )}
             </div>
-            {Object.entries(show.entities).length > 0 && (
-              <div className="text-[10px] text-gray-400 pt-1 border-t border-violet-100">
-                {Object.entries(show.entities).map(([type, r]) => (
-                  <span key={type} className="mr-3">
-                    {type.replace(/_/g, ' ')}: {r.processed}
-                  </span>
-                ))}
-              </div>
+
+            {/* Error summary */}
+            {(entityErrors + show.memory.errors) > 0 && !running && (
+              <p className="text-[10px] text-amber-600 pt-1 border-t border-violet-100">
+                {entityErrors + show.memory.errors} errori totali — riprova per ritentare i falliti
+              </p>
             )}
           </div>
         )}

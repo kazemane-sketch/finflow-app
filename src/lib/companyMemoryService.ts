@@ -127,13 +127,24 @@ export async function triggerEntityEmbedding(
 export interface BrainBackfillResult {
   entities: Record<string, { processed: number; errors: number; remaining: number }>
   memory: { processed: number; errors: number; remaining: number }
+  /** Current step label for live UI updates */
+  currentStep?: string
+}
+
+const ENTITY_TYPES = ['chart_of_accounts', 'categories', 'articles', 'projects'] as const
+const ENTITY_LABELS: Record<string, string> = {
+  chart_of_accounts: 'Conti',
+  categories: 'Categorie',
+  articles: 'Articoli',
+  projects: 'CdC',
 }
 
 /**
  * Triggers a FULL backfill of all entity embeddings + company_memory embeddings.
- * Loops until all items are embedded (max 20 rounds per type, 50 items/round).
- * Unlike the fire-and-forget helpers, this **awaits** responses so the UI
- * can show progress/results. Used by the "Attiva Brain AI" button.
+ *
+ * **Key design**: calls precompute-embeddings with ONE entity_type at a time
+ * to avoid the 60s edge function timeout. Each type loops until remaining = 0
+ * (max 20 rounds × 50 items/round = 1000 per type).
  *
  * @param onProgress — called after each batch so the UI can update live
  */
@@ -155,42 +166,58 @@ export async function triggerFullBrainBackfill(
 
   const MAX_ROUNDS = 20
 
-  // ── Entity embeddings: loop until remaining = 0 ──
-  for (let round = 0; round < MAX_ROUNDS; round++) {
-    try {
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/precompute-embeddings`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ company_id: companyId }),
-      })
-      if (!res.ok) {
-        console.warn(`[brainBackfill] entities round ${round} HTTP ${res.status}`)
+  // ── Entity embeddings: one type at a time, each loops until done ──
+  for (const entityType of ENTITY_TYPES) {
+    const label = ENTITY_LABELS[entityType] || entityType
+    result.currentStep = `${label}...`
+    onProgress?.({ ...result, entities: { ...result.entities }, memory: { ...result.memory } })
+
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      try {
+        const res = await fetch(`${SUPABASE_URL}/functions/v1/precompute-embeddings`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            company_id: companyId,
+            entity_types: [entityType],
+          }),
+        })
+        if (!res.ok) {
+          console.warn(`[brainBackfill] ${entityType} round ${round} HTTP ${res.status}`)
+          break
+        }
+        const data = await res.json()
+        const typeResult = data.processed_by_type?.[entityType] as
+          { processed: number; errors: number; remaining: number } | undefined
+
+        if (!typeResult) break
+
+        // Accumulate
+        if (!result.entities[entityType]) {
+          result.entities[entityType] = { processed: 0, errors: 0, remaining: 0 }
+        }
+        result.entities[entityType].processed += typeResult.processed
+        result.entities[entityType].errors += typeResult.errors
+        result.entities[entityType].remaining = typeResult.remaining
+
+        // Update step label with counts
+        const e = result.entities[entityType]
+        result.currentStep = `${label}: ${e.processed}${typeResult.remaining > 0 ? ` (${typeResult.remaining} rimanenti)` : ' ✓'}`
+        onProgress?.({ ...result, entities: { ...result.entities }, memory: { ...result.memory } })
+
+        // Done with this type?
+        if (typeResult.remaining === 0 || typeResult.processed === 0) break
+      } catch (err) {
+        console.warn(`[brainBackfill] ${entityType} round ${round} error:`, err)
         break
       }
-      const data = await res.json()
-      const byType = (data.processed_by_type || {}) as Record<string, { processed: number; errors: number; remaining: number }>
-
-      // Accumulate into result
-      for (const [type, r] of Object.entries(byType)) {
-        if (!result.entities[type]) result.entities[type] = { processed: 0, errors: 0, remaining: 0 }
-        result.entities[type].processed += r.processed
-        result.entities[type].errors += r.errors
-        result.entities[type].remaining = r.remaining
-      }
-
-      // Check if done
-      const totalProcessed = data.total_processed ?? 0
-      const totalRemaining = Object.values(byType).reduce((sum, r) => sum + r.remaining, 0)
-      if (totalRemaining === 0 || totalProcessed === 0) break
-
-      onProgress?.({ ...result, entities: { ...result.entities }, memory: { ...result.memory } })
-    } catch (err) {
-      console.warn('[brainBackfill] entities round error:', err)
-      break
     }
   }
 
   // ── Memory embeddings: loop until remaining = 0 ──
+  result.currentStep = 'Memoria...'
+  onProgress?.({ ...result, entities: { ...result.entities }, memory: { ...result.memory } })
+
   for (let round = 0; round < MAX_ROUNDS; round++) {
     try {
       const res = await fetch(`${SUPABASE_URL}/functions/v1/memory-embed`, {
@@ -207,15 +234,17 @@ export async function triggerFullBrainBackfill(
       result.memory.errors += data.errors || 0
       result.memory.remaining = data.remaining || 0
 
-      if (data.remaining === 0 || (data.processed || 0) === 0) break
-
+      result.currentStep = `Memoria: ${result.memory.processed}${data.remaining > 0 ? ` (${data.remaining} rimanenti)` : ' ✓'}`
       onProgress?.({ ...result, entities: { ...result.entities }, memory: { ...result.memory } })
+
+      if (data.remaining === 0 || (data.processed || 0) === 0) break
     } catch (err) {
       console.warn('[brainBackfill] memory round error:', err)
       break
     }
   }
 
+  result.currentStep = undefined
   return result
 }
 
