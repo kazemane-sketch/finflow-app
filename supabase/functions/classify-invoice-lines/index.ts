@@ -1,7 +1,6 @@
-// classify-invoice-lines — Unified Sonnet classifier for invoice lines
-// Replaces both classification-ai-suggest and article-ai-match with a single
-// Sonnet call that has full context: articles, categories, CoA, CdC, ATECO,
-// counterparty history, RAG examples.
+// classify-invoice-lines — Haiku + Extended Thinking classifier for invoice lines
+// Single Haiku call with thinking budget for all classification. No escalation.
+// Full context: articles, categories, CoA, CdC, ATECO, counterparty history, RAG.
 //
 // PRINCIPLE: produces SUGGESTIONS only (classification_status = 'ai_suggested'
 // on invoices table). NEVER 'confirmed'. User must always confirm.
@@ -24,14 +23,10 @@ const corsHeaders = {
 
 /* ─── Model constants ────────────────────── */
 const MODEL_HAIKU = "claude-haiku-4-5-20251001";
-const MODEL_SONNET = "claude-sonnet-4-6";
-const ESCALATION_THRESHOLD = 70;  // Lines below this confidence get escalated to Sonnet
+const HAIKU_THINKING_BUDGET = 5000;  // Extended Thinking token budget for Haiku
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_DIMS = 3072;
 const MIN_CONFIDENCE = 60;
-
-// Backward compat: keep MODEL for stats reporting
-const MODEL = MODEL_HAIKU;
 
 /* ─── Direction enforcement constants ────── */
 // Which CoA sections are valid for each invoice direction
@@ -187,41 +182,6 @@ async function callGeminiEmbedding(
   if (!Array.isArray(values) || values.length !== EXPECTED_DIMS)
     throw new Error("Bad embedding dims");
   return values.map((v: unknown) => Number(v));
-}
-
-/* ─── Load RAG examples ─────────────────── */
-
-interface RagExample {
-  output_label: string;
-  metadata: Record<string, unknown>;
-  similarity: number;
-}
-
-async function loadRagExamples(
-  sql: SqlClient,
-  companyId: string,
-  queryText: string,
-  geminiKey: string,
-): Promise<RagExample[]> {
-  try {
-    const vec = await callGeminiEmbedding(geminiKey, queryText);
-    const vecLiteral = toVectorLiteral(vec);
-    const matches = await sql.unsafe(
-      `SELECT output_label, metadata,
-              (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
-       FROM learning_examples
-       WHERE company_id = $2
-         AND domain IN ('classification', 'article_assignment')
-         AND embedding IS NOT NULL
-       ORDER BY embedding <=> $1::halfvec(3072)
-       LIMIT 10`,
-      [vecLiteral, companyId],
-    );
-    return (matches as RagExample[]).filter((m) => m.similarity >= 0.65);
-  } catch (err) {
-    console.warn("[classify-invoice-lines] RAG error:", err);
-    return [];
-  }
 }
 
 /* ─── Embedding pre-flight: find relevant entities ── */
@@ -442,7 +402,7 @@ REGOLE:
 - Coerenza: trasporto→conti trasporto, noleggio→conti noleggio.
 - confidence 0-100. Se dubbio, confidence bassa.
 - Righe con importo zero (tot=0): sono righe INFORMATIVE/CONTESTO (cantiere, contratto, commessa). Usale per classificare meglio le altre righe. Per la riga zero stessa: confidence 30-50, reasoning "Riga informativa/contesto".
-- Se NESSUNA categoria nella lista corrisponde bene alla riga, NON forzare una categoria sbagliata con confidence alta. Scegli la più vicina MA con confidence <70 per attivare l'escalation.
+- Se NESSUNA categoria nella lista corrisponde bene alla riga, NON forzare una categoria sbagliata con confidence alta. Scegli la più vicina MA con confidence bassa (50-65).
 - Il NOME della controparte rivela spesso l'attività: usalo come indizio forte.
 
 RIGHE:
@@ -452,502 +412,6 @@ JSON array (no markdown):
 [{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"max 30 parole","fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]
 ---KEYWORDS---
 ["kw1","kw2",...] (5-10 keywords)`;
-}
-
-/* ─── Sonnet escalation with Extended Thinking ── */
-
-async function callSonnetEscalation(
-  apiKey: string,
-  lowConfLines: SonnetLineResult[],
-  haikuAttempt: SonnetLineResult[],
-  inputLines: InputLine[],
-  allAccounts: AccountRow[],
-  allCategories: CategoryRow[],
-  allArticles: ArticleRow[],
-  phases: ArticlePhaseRow[],
-  projects: ProjectRow[],
-  counterpartyInfo: string,
-  history: HistoryRow[],
-  memoryBlock: string,
-  direction: string,
-  systemPrompt: string,
-  userInstructionsBlock: string,
-): Promise<SonnetLineResult[]> {
-  // Only send the low-confidence lines
-  const lowLineIds = new Set(lowConfLines.map(l => l.line_id));
-  const lowInputLines = inputLines.filter(l => lowLineIds.has(l.line_id));
-
-  // Build phases-by-article map for article section
-  const phasesByArticle = new Map<string, ArticlePhaseRow[]>();
-  for (const p of phases) {
-    if (!phasesByArticle.has(p.article_id)) phasesByArticle.set(p.article_id, []);
-    phasesByArticle.get(p.article_id)!.push(p);
-  }
-
-  // Full article section
-  let artSection = allArticles.map(a => {
-    const aPhases = phasesByArticle.get(a.id) || [];
-    const kwPart = a.keywords?.length ? ` [${a.keywords.join(", ")}]` : "";
-    if (aPhases.length > 0) {
-      return `- ${a.code} (${a.name})${kwPart}:\n${aPhases.map(p => `  ${p.code}: ${p.name}`).join("\n")}`;
-    }
-    return `- ${a.code} (${a.name})${kwPart}`;
-  }).join("\n");
-
-  // Full accounts + categories
-  const catSection = allCategories.map(c => `- ${c.id}: ${c.name} (${c.type})`).join("\n");
-  const accSection = allAccounts.map(a => `- ${a.id}: ${a.code} ${a.name} (${a.section})`).join("\n");
-  const cdcSection = projects.map(p => `- ${p.id}: ${p.code} ${p.name}`).join("\n") || "Nessun CdC.";
-
-  // History section
-  let historySection = "";
-  if (history.length > 0) {
-    const histLines = history.map(h => {
-      const parts: string[] = [`"${h.description}"`];
-      if (h.article_code) parts.push(`art:${h.article_code}`);
-      if (h.category_name) parts.push(`cat:${h.category_name}`);
-      if (h.account_code) parts.push(`conto:${h.account_code}`);
-      return parts.join(" → ");
-    });
-    historySection = `STORICO:\n${histLines.join("\n")}`;
-  }
-
-  // Haiku attempt section — show what Haiku tried
-  const haikuSection = lowConfLines.map(lr => {
-    return `- Riga ${lr.line_id}: Haiku ha tentato category="${lr.category_name}" account="${lr.account_code}" confidence=${lr.confidence} reasoning="${lr.reasoning}"`;
-  }).join("\n");
-
-  // Lines to re-classify
-  const lineEntries = lowInputLines.map((l, i) =>
-    `${i + 1}. [${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} prezzo_unit=${l.unit_price ?? "N/D"} totale=${l.total_price ?? "N/D"}`
-  ).join("\n");
-
-  // Extended Thinking requires system prompt in user message
-  const fullPrompt = `${systemPrompt}
-${userInstructionsBlock}
-${memoryBlock}
-
-Sei stato chiamato come ESCALATION per righe che il classificatore iniziale (Haiku) non è riuscito a classificare con sicurezza.
-Analizza attentamente usando il CONTESTO COMPLETO sotto.
-
-TENTATIVO PRECEDENTE (Haiku — bassa confidenza):
-${haikuSection}
-
-ARTICOLI COMPLETI:
-${artSection}
-
-CATEGORIE COMPLETE:
-${catSection}
-
-PIANO DEI CONTI COMPLETO:
-${accSection}
-
-CDC COMPLETI:
-${cdcSection}
-
-=== CONTROPARTE FORNITORE/CLIENTE ===
-${counterpartyInfo}
-REGOLA: Il NOME della controparte spesso rivela la sua attività principale. Usa il nome come indizio forte per guidare la classificazione quando la descrizione riga è generica.
-===
-
-${historySection}
-
-=== VINCOLO DIREZIONE (${direction === "in" ? "PASSIVA" : "ATTIVA"}) ===
-${direction === "in" ? "Conti di COSTO. category.type: expense/both. VIETATO: conti revenue." : "Conti di RICAVO. category.type: revenue/both. VIETATO: conti costo."}
-===
-
-RIGHE DA RI-CLASSIFICARE:
-${lineEntries}
-
-JSON array (no markdown):
-[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"spiegazione breve","fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]`;
-
-  console.log(`[classify-escalation] Calling Sonnet with Extended Thinking for ${lowConfLines.length} lines`);
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: MODEL_SONNET,
-      max_tokens: 16000,
-      thinking: {
-        type: "enabled",
-        budget_tokens: 10000,
-      },
-      messages: [{ role: "user", content: fullPrompt }],
-    }),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    console.error("[classify-escalation] Sonnet API error:", response.status, errText.slice(0, 300));
-    // Return Haiku results as fallback (don't fail the whole pipeline)
-    return lowConfLines;
-  }
-
-  const data = await response.json();
-  // Extended Thinking returns thinking blocks + text blocks
-  const textBlocks = ((data as any)?.content || []).filter((b: any) => b.type === "text");
-  const text = textBlocks.map((b: any) => b.text).join("") || "";
-  console.log(`[classify-escalation] Sonnet response: ${text.length} chars`);
-
-  // Parse JSON from response
-  try {
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) {
-      console.error("[classify-escalation] No JSON array in Sonnet response");
-      return lowConfLines;
-    }
-    const parsed: SonnetLineResult[] = JSON.parse(jsonMatch[0]);
-    return parsed.map(item => ({
-      line_id: item.line_id,
-      article_code: item.article_code || null,
-      phase_code: item.phase_code || null,
-      category_id: item.category_id || null,
-      category_name: item.category_name || null,
-      account_id: item.account_id || null,
-      account_code: item.account_code || null,
-      cost_center_allocations: item.cost_center_allocations || [],
-      confidence: Math.min(Math.max(Number(item.confidence) || 50, 0), 100),
-      reasoning: `[SONNET] ${item.reasoning || ""}`,
-      fiscal_flags: item.fiscal_flags || null,
-      suggest_new_account: item.suggest_new_account || null,
-      suggest_new_category: item.suggest_new_category || null,
-    }));
-  } catch (e) {
-    console.error("[classify-escalation] Parse error:", e);
-    return lowConfLines;
-  }
-}
-
-/* ─── Build full prompt (legacy, for Sonnet escalation fallback) ── */
-
-function buildPrompt(
-  articles: ArticleRow[],
-  categories: CategoryRow[],
-  primaryAccounts: AccountRow[],
-  secondaryAccounts: AccountRow[],
-  projects: ProjectRow[],
-  phases: ArticlePhaseRow[],
-  counterpartyInfo: string,
-  history: HistoryRow[],
-  ragExamples: RagExample[],
-  direction: string,
-  lines: InputLine[],
-  systemPrompt: string,
-  userInstructionsBlock: string,
-): string {
-  // Build phases-by-article map
-  const phasesByArticle = new Map<string, ArticlePhaseRow[]>();
-  for (const p of phases) {
-    if (!phasesByArticle.has(p.article_id)) phasesByArticle.set(p.article_id, []);
-    phasesByArticle.get(p.article_id)!.push(p);
-  }
-
-  // Articles section — split multi-step (with phases) vs single-step (no phases)
-  const multiStep = articles.filter(a => phasesByArticle.has(a.id) && phasesByArticle.get(a.id)!.length > 0);
-  const singleStep = articles.filter(a => !phasesByArticle.has(a.id) || phasesByArticle.get(a.id)!.length === 0);
-
-  let artSection = "";
-  if (multiStep.length > 0) {
-    artSection += `ARTICOLI CON FASI — assegna article_code + phase_code:\n`;
-    artSection += multiStep.slice(0, 50).map(a => {
-      const phases = phasesByArticle.get(a.id)!;
-      const kwPart = a.keywords?.length ? ` [${a.keywords.join(", ")}]` : "";
-      let line = `- ${a.code} (${a.name})${kwPart}:\n`;
-      line += phases.map(p =>
-        `  • ${p.code}: ${p.name}${p.is_counting_point ? " (COUNTING)" : ""}`
-      ).join("\n");
-      return line;
-    }).join("\n");
-  }
-  if (singleStep.length > 0) {
-    if (artSection) artSection += "\n\n";
-    artSection += `ARTICOLI SENZA FASI — assegna solo article_code, phase_code = null:\n`;
-    artSection += singleStep.slice(0, 50).map(a => {
-      const kwPart = a.keywords?.length ? ` [${a.keywords.join(", ")}]` : "";
-      return `- ${a.code} (${a.name})${kwPart}`;
-    }).join("\n");
-  }
-  if (multiStep.length > 0 || singleStep.length > 0) {
-    artSection += `\n\nSe la fattura riguarda uno di questi materiali, assegna article_code e phase_code (se ha fasi). Se la fattura copre l'intero ciclo (dalla coltivazione al frantoio), usa la fase "ciclo completo". Per articoli senza fasi, imposta phase_code = null. Se non riesci a identificare il materiale, non assegnare nessun articolo.`;
-  }
-
-  // Categories (already direction-filtered)
-  const catSection = categories
-    .map((c) => `- ${c.id}: ${c.name} (${c.type})`)
-    .join("\n");
-
-  // Chart of accounts — split into primary (recommended) and secondary (edge cases)
-  const coaPrimarySection = primaryAccounts
-    .map((a) => `- ${a.id}: ${a.code} ${a.name} (${a.section})`)
-    .join("\n");
-  const coaSecondarySection = secondaryAccounts.length > 0
-    ? secondaryAccounts
-        .map((a) => `- ${a.id}: ${a.code} ${a.name} (${a.section})`)
-        .join("\n")
-    : "";
-
-  // Cost centers
-  const cdcSection =
-    projects.length > 0
-      ? projects.map((p) => `- ${p.id}: ${p.code} ${p.name}`).join("\n")
-      : "Nessun centro di costo configurato.";
-
-  // Counterparty classification history
-  let historySection: string;
-  if (history.length > 0) {
-    const histLines = history.map((h) => {
-      const parts: string[] = [`"${h.description}"`];
-      if (h.article_code) {
-        let artPart = `art: ${h.article_code} ${h.article_name || ""}`;
-        if (h.phase_code) artPart += ` → fase: ${h.phase_code} (${h.phase_name || ""})`;
-        parts.push(artPart);
-      }
-      if (h.category_name) parts.push(`cat: ${h.category_name}`);
-      if (h.account_code) parts.push(`conto: ${h.account_code} ${h.account_name || ""}`);
-      return parts.join(" → ");
-    });
-    historySection = `STORICO CLASSIFICAZIONI DI QUESTA CONTROPARTE (ultime confermate dall'utente):
-ATTENZIONE: lo storico mostra classificazioni di righe PRECEDENTI. Usalo SOLO se la riga attuale descrive lo STESSO tipo di bene/servizio. Se la riga attuale è diversa (es. "opere edili" vs storico di "calcare"), classifica dalla descrizione attuale, NON dallo storico.
-${histLines.join("\n")}`;
-  } else {
-    historySection =
-      "Nessuno storico di classificazione per questa controparte.";
-  }
-
-  // RAG examples from other counterparties
-  let ragSection = "";
-  if (ragExamples.length > 0) {
-    const ragLines = ragExamples.map(
-      (r) =>
-        `- "${r.output_label}" (similarità: ${(r.similarity * 100).toFixed(0)}%) meta: ${JSON.stringify(r.metadata)}`,
-    );
-    ragSection = `\nESEMPI SIMILI DA ALTRE CONTROPARTI (RAG):\n${ragLines.join("\n")}`;
-  }
-
-  // Lines
-  const lineEntries = lines
-    .map(
-      (l, i) =>
-        `${i + 1}. [line_id: ${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} prezzo_unit=${l.unit_price ?? "N/D"} totale=${l.total_price ?? "N/D"}`,
-    )
-    .join("\n");
-
-  return `${systemPrompt}
-${userInstructionsBlock}
-
-## ARTICOLI DISPONIBILI
-${artSection || "Nessun articolo configurato."}
-
-CATEGORIE DISPONIBILI (filtrate per direzione fattura):
-${catSection}
-
-PIANO DEI CONTI — CONTI PRINCIPALI (USA QUESTI):
-${coaPrimarySection}
-${coaSecondarySection ? `
-PIANO DEI CONTI — CONTI SPECIALI (usa SOLO per casi particolari: interessi, immobilizzazioni, straordinari):
-${coaSecondarySection}` : ""}
-
-CENTRI DI COSTO:
-${cdcSection}
-
-=== CONTROPARTE FORNITORE/CLIENTE ===
-${counterpartyInfo}
-REGOLA: Il NOME della controparte spesso rivela la sua attività principale (es. "FRANTOI MERIDIONALI" = frantumazione inerti, "AUTOTRASPORTI ROSSI" = trasporto). Usa il nome come indizio forte per guidare la classificazione quando la descrizione riga è generica.
-===
-
-${historySection}
-${ragSection}
-
-=== VINCOLO DIREZIONE FATTURA (OBBLIGATORIO — VIOLAZIONI = ERRORE GRAVE) ===
-Questa fattura è: ${direction === "in" ? "PASSIVA (acquisto/costo)" : "ATTIVA (vendita/ricavo)"}
-${direction === "in" ? `FATTURA PASSIVA → CONTI DI COSTO:
-- category.type DEVE essere "expense" o "both" — MAI "revenue"
-- account.section DEVE essere cost_production, cost_personnel, depreciation, other_costs
-- Eccezionalmente ammessi: financial (interessi passivi 64xxx), assets (immobilizzazioni 21xxx)
-- VIETATO assegnare conti con section "revenue" (70xxx) — ERRORE FATALE` : `FATTURA ATTIVA → CONTI DI RICAVO:
-- category.type DEVE essere "revenue" o "both" — MAI "expense"
-- account.section DEVE essere "revenue" (70xxx+)
-- Eccezionalmente ammessi: financial (proventi finanziari 72xxx)
-- VIETATO assegnare conti con section cost_production/cost_personnel/depreciation/other_costs (60xxx-69xxx) — ERRORE FATALE
-- Ricavi tipici: 70000-70009 (vendita materiali), 70005 (servizi), 70006 (trasporto), 70007 (noleggio)`}
-DOPO AVER CLASSIFICATO OGNI RIGA → VERIFICA che conto e categoria siano coerenti con la direzione.
-===
-
-REGOLE:
-UTILIZZO DELLO STORICO CONTROPARTE:
-  - Lo storico mostra classificazioni di righe precedenti. NON copiarlo ciecamente.
-  - Per OGNI riga attuale, confronta la DESCRIZIONE con le descrizioni nello storico.
-  - Se la descrizione attuale corrisponde semanticamente a una riga storica (stesso tipo di bene/servizio) → usa la stessa classificazione con confidence 85-95
-  - Se la descrizione attuale è DIVERSA (es. storico: "calcare", riga: "trasporto") → classifica dalla descrizione attuale, ignora lo storico per quella riga
-  - Se la controparte ha storico misto (più categorie/conti diversi), NON scegliere la più frequente — scegli quella che corrisponde alla DESCRIZIONE ATTUALE
-  - Se hai dubbi, classifica dalla descrizione. È meglio una classificazione corretta con confidence 70 che una copiata dallo storico con confidence 90 ma sbagliata
-* Se ATECO disponibile → usalo per guidare categoria e conto
-* TRASPORTO/TRASPORTI nella descrizione → servizio di trasporto, NON il materiale
-* NOLO/NOLEGGIO → è noleggio, non acquisto
-* FORNITURA/VENDITA → è il materiale/prodotto
-* article_code: assegna SOLO se la riga riguarda uno degli articoli configurati, altrimenti null
-* phase_code: se l'articolo ha fasi, assegna la fase più appropriata dal suo elenco. Se l'articolo non ha fasi, phase_code = null.
-* category_id e account_id: assegna SEMPRE
-
-RIGHE CON IMPORTO ZERO (CONTESTO):
-* Le righe con total_price=0 e unit_price=0 sono righe informative/di contesto, NON righe da classificare come costo/ricavo
-* Queste righe spesso contengono riferimenti importanti: numero cantiere, contratto, commessa, materiale oggetto della fornitura
-* USA le informazioni di queste righe per classificare meglio le righe con importo > 0
-* Per le righe zero stesse: assegna category_id e account_id coerenti con il contesto, confidence bassa (30-50), reasoning: "Riga informativa/contesto"
-
-CATEGORY MATCHING — ABBASSA CONFIDENCE SE NESSUNA CATEGORIA CORRISPONDE:
-* Se NESSUNA delle categorie nella lista filtrata corrisponde bene alla riga, NON forzare una categoria sbagliata con confidence alta
-* Invece: scegli la categoria più vicina disponibile MA abbassa la confidence sotto 70 per attivare l'escalation, dove il classificatore avanzato ha la lista COMPLETA delle categorie
-* Esempio: se la riga è "servizio di facchinaggio" ma nessuna categoria è specifica per facchinaggio → assegna la più vicina (es. "Servizi generali") ma con confidence 55-65 e reasoning: "Nessuna categoria specifica trovata"
-
-ATTENZIONE — ERRORE FREQUENTE DA EVITARE (SERVIZI vs MATERIALI):
-* PRIMA analizza la DESCRIZIONE della riga. Solo DOPO controlla lo storico.
-* Se la descrizione contiene "opere edili", "lavori", "manutenzione", "installazione", "realizzazione", "ripristino", "costruzione", "demolizione" → è un SERVIZIO/LAVORO, NON un materiale
-* NON assegnare articoli di materiale (calcare, pozzolana, inerti, pietrisco, ghiaia, sabbia) a righe che descrivono servizi/lavori/opere
-* Esempio SBAGLIATO: riga "OPERE EDILI PER REALIZZAZIONE CABINA" → article_code: "calcare" ← ERRORE GRAVE!
-* Esempio CORRETTO: riga "OPERE EDILI PER REALIZZAZIONE CABINA" → article_code: null, categoria: servizi/lavori edili
-* Anche se lo STORICO della controparte mostra quasi sempre "calcare", se la riga attuale parla di SERVIZI → article_code = null
-
-FASI ARTICOLO — REGOLE:
-* Quando assegni un articolo che ha fasi, DEVI SEMPRE assegnare anche phase_code. Non lasciare phase_code = null per articoli con fasi.
-* Usa la DESCRIZIONE della riga fattura per capire la fase:
-  - "estrazione" / "scavo" / "coltivazione" → fase di estrazione/coltivazione
-  - "trasporto" / "carico" / "consegna" → fase di trasporto
-  - "ciclo completo" / "dalla cava al frantoio" → fase ciclo completo
-  - "fresatura" / "frantumazione" → fase di frantumazione/fresatura
-  - "vendita" / "fornitura" / "cessione" → fase di vendita diretta
-* Usa lo STORICO: se la stessa controparte con descrizione simile ha avuto una fase specifica, SEGUI LO STORICO
-* Se non riesci a determinare la fase dalla descrizione, scegli la fase più comune dallo storico per quella controparte/articolo
-* confidence 0-100
-
-EXPERTISE CONTABILE ITALIANA — REGOLE FISCALI DA APPLICARE:
-
-DEDUCIBILITA DIFFERENZIATA (CRITICO — scegli il conto giusto in base alla percentuale):
-Questa azienda ha conti separati per diverse percentuali di deducibilità. DEVI scegliere il conto con la percentuale corretta:
-* Carburanti automezzi da trasporto (camion, escavatori, pale) → 60812 "Carburanti 100%"
-* Carburanti auto aziendali (autovetture, SUV) → 608124 "Carburanti 20%"
-* Manutenzione automezzi da trasporto → 60720 "Manutenzione automezzi 100%"
-* Manutenzione auto aziendali → 607204 "Manutenzione automezzi 20%"
-* Assicurazione automezzi da trasporto → 60822 "Assicurazioni automezzi 100%"
-* Assicurazione auto aziendali → 608224 "Assicurazioni automezzi 20%"
-* Tassa possesso automezzi da trasporto → 63207 "Tassa possesso 100%"
-* Tassa possesso auto aziendali → 632074 "Tassa possesso 20%"
-* Spese telefoniche → 608530 "Spese telefoniche 80%" (sempre 80%)
-* Ristorazione e pernottamenti → 608150 "Spese ristoranti/pernott. 75%" (sempre 75%)
-* Spese di rappresentanza → 60892 (deducibilità variabile in base al fatturato)
-Come distinguere 100% da 20%:
-* Se la controparte ha ATECO nel settore trasporti (49.xx) o commercio carburanti (47.30) e l'azienda è di autotrasporto/cave → 100%
-* Se la fattura riguarda un'autovettura specifica (targa auto, non camion) → 20%
-* Se non è chiaro, usa 100% per automezzi specifici/da lavoro e 20% per auto generiche
-* I mezzi specifici della cava (escavatori, pale, mezzi di sollevamento) sono SEMPRE 100%
-
-RITENUTA D'ACCONTO:
-* Fatture da professionisti (avvocati, consulenti, geometri, ingegneri, notai — ATECO 69.xx, 71.xx, 74.xx) → segnala "Ritenuta acconto 20% su imponibile"
-* Il costo va sul conto appropriato (60730 consulenza amm/fiscale, 6073201 consulenze legali, 607320 consulenze tecniche, 6073202 consulenze notarili)
-* Non serve un conto separato per la ritenuta nella classificazione (sarà gestito in prima nota)
-
-LEASING:
-* Ogni contratto di leasing ha il suo conto dedicato (609xxxx) e il suo conto interessi (6094xxx)
-* Se la fattura è di CREDEMLEASING, MPS Leasing, Daimler Truck Financial, BNP, Alba Leasing, Mercedes-Benz Financial → cerca il numero contratto nella descrizione e abbina al conto leasing corrispondente
-* Se non trovi il numero contratto, usa il conto leasing generico 6093 "Canoni Leasing"
-* Gli interessi su leasing vanno sempre su 6094xxx (section: financial), MAI sullo stesso conto del canone
-
-REVERSE CHARGE (art. 17 c.6 DPR 633/72):
-* Fatture per servizi edili tra imprese (subappalti) — controparte con ATECO 41.xx, 42.xx, 43.xx
-* Se la fattura NON ha IVA esposta ma il fornitore è un'impresa edile → possibile reverse charge
-* Segnala nel reasoning: "Possibile reverse charge art.17 c.6 — verificare registrazione IVA"
-
-SPLIT PAYMENT (art. 17-ter DPR 633/72):
-* Fatture ATTIVE verso la Pubblica Amministrazione (controparte con legal_type = 'pa')
-* L'IVA non viene incassata dal fornitore → segnala nel reasoning
-
-BENI STRUMENTALI vs COSTI D'ESERCIZIO:
-* Acquisto di macchinari, automezzi, attrezzature, mobili con importo significativo (> 516,46 euro) → NON è un costo d'esercizio, va su un conto immobilizzazioni (21xxx)
-* Acquisti sotto 516,46 euro → conto 21360 "Beni strumentali inferiore unità minima" oppure direttamente a costo
-* Se il bene è chiaramente un immobilizzazione (camion, escavatore, computer) → segnala nel reasoning anche se non puoi assegnare il conto patrimoniale in questa fase
-
-UTENZE E SERVIZI:
-* Bollette energia → 60830
-* Bollette gas → 60831
-* Acquedotto → 60836
-* Telefonia → 608530 (80%)
-* Internet/provider → 6085301
-* Smaltimento rifiuti → 60872
-
-CONTABILITA SPECIFICA CAVE E INERTI:
-* Questa è un'azienda di cave e inerti (ATECO 089909)
-* I ricavi principali sono: vendita pozzolana (70000), calcare frantumato (70002), minerale calcare (70003), materiale da estrazione (70004), servizi (70005), trasporto (70006), noleggio (70007), manutenzione mezzi (70008), scopertura cave (70009)
-* I costi specifici includono: locazione cava (6090020), esplosivo (rimborsato come ricavo 7063001), trasporti su acquisti (60412) e vendite (60810)
-* Distingui SEMPRE tra "trasporto su acquisto" (60412 — il fornitore ci porta la merce) e "trasporto per vendita" (60810 — noi portiamo merce al cliente) e "spese di trasporto generiche" (60702)
-
-ASSEGNAZIONE CENTRO DI COSTO — RAGIONAMENTO INTELLIGENTE:
-Per scegliere il CdC corretto, NON indovinare. Ragiona usando TUTTE le informazioni disponibili:
-1. STORICO CONTROPARTE (PRIORITÀ MASSIMA): se la stessa controparte è stata classificata su un CdC specifico nelle classificazioni precedenti confermate dall'utente, SEGUI LO STORICO. È il segnale più forte.
-2. INDIRIZZO/LOCALITÀ CONTROPARTE: l'indirizzo della controparte indica dove avviene il servizio o da dove arriva la fornitura. Confronta la provincia/città della controparte con i nomi e codici dei CdC disponibili. Se un CdC ha nel nome una località che corrisponde alla zona della controparte, è probabilmente quello giusto.
-3. ATECO CONTROPARTE: il codice ATECO della controparte indica il tipo di attività. Usa questa informazione per capire il contesto: un fornitore edile probabilmente serve un cantiere, un fornitore di carburante serve i mezzi di un sito specifico.
-4. ARTICOLI DELLA FATTURA: se le righe fattura sono state associate a un articolo che è specifico di un sito/CdC (es. materiale estratto in un sito specifico), il CdC dovrebbe corrispondere a quel sito.
-5. DESCRIZIONE RIGHE: cerca riferimenti geografici nella descrizione delle righe fattura (nomi di cave, cantieri, sedi, città).
-6. COSTI GENERALI: per spese non legate a un sito specifico (assicurazioni generali, consulenze fiscali/legali, abbonamenti SaaS, servizi centralizzati), usa il CdC che rappresenta la sede principale/corporate dell'azienda.
-REGOLA CHIAVE: non assegnare il CdC "sede/corporate" per default quando ci sono indizi che il costo è legato a un sito specifico. Usa il ragionamento sopra per dedurre il CdC corretto.
-
-RIGHE SCONTO / ABBUONO / AGGIUSTAMENTO PREZZO:
-* Le righe con importo negativo o con descrizione che contiene "sconto", "abbuono", "superamento quantitativi", "riduzione prezzo", "aggiustamento", "rettifica" sono aggiustamenti commerciali, NON produzione.
-* Se la riga sconto è chiaramente relativa a un articolo (es. "sconto su trasporto travertino"), assegna lo stesso articolo e la stessa fase della riga di produzione corrispondente. Questo serve per calcolare il prezzo medio netto per unità.
-* Se la riga sconto è generica (es. "sconto commerciale" senza riferimento a un materiale specifico), NON assegnare articolo.
-* La categoria e il conto possono essere quelli dell'articolo principale OPPURE un conto sconti specifico se presente nel piano dei conti (es. "Sconti su vendite", "Abbuoni attivi").
-* Nel reasoning, segnala: "Riga sconto/abbuono — esclusa dal conteggio quantità nel report"
-
-COERENZA CLASSIFICAZIONE:
-* Se assegni un article_code, DEVI anche assegnare category_id e account_id coerenti. Se sai che è un certo materiale (hai assegnato l'articolo), hai sicuramente abbastanza contesto per assegnare anche categoria e conto.
-* NON lasciare category_id o account_id null a meno che non abbia davvero nessun indizio. Se hai assegnato articolo e CdC, hai le informazioni per classificare completamente.
-* Copia gli UUID ESATTAMENTE dalla lista. Come backup, compila SEMPRE anche category_name e account_code.
-
-SANITY CHECK — VERIFICA COERENZA PRIMA DI RISPONDERE:
-Prima di finalizzare ogni riga, verifica:
-1. La DESCRIZIONE della riga parla di X (es. "trasporto", "calcare", "opere edili", "noleggio")
-2. La CATEGORIA/CONTO che hai assegnato è coerente con X? Se la riga dice "trasporto" ma hai assegnato conto "acquisto materie prime" → ERRORE, correggi.
-3. L'ARTICOLO che hai assegnato è coerente con la descrizione? Se la riga dice "noleggio escavatore" ma hai assegnato articolo "Calcare" → ERRORE, correggi.
-4. Se la riga NON corrisponde a nessun articolo configurato, lascia article_code = null. Non forzare un articolo sbagliato.
-5. Se lo storico suggerisce una classificazione diversa dalla descrizione attuale, SEGUI LA DESCRIZIONE.
-Nel reasoning, spiega BREVEMENTE perché la classificazione è coerente con la descrizione (max 30 parole).
-
-FATTURA: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
-
-RIGHE DA CLASSIFICARE:
-${lineEntries}
-
-Rispondi con un array JSON (senza markdown):
-[{
-  "line_id": "uuid",
-  "article_code": "CODICE" o null,
-  "phase_code": "extraction" o null,
-  "category_id": "uuid",
-  "category_name": "nome esatto della categoria come scritto nella lista (fallback)",
-  "account_id": "uuid",
-  "account_code": "codice numerico del conto come scritto nella lista (fallback)",
-  "cost_center_allocations": [{"project_id": "uuid", "percentage": 100}],
-  "confidence": 0-100,
-  "reasoning": "spiegazione breve max 30 parole",
-  "fiscal_flags": {
-    "ritenuta_acconto": null oppure {"aliquota": 20, "base": "imponibile"},
-    "reverse_charge": false,
-    "split_payment": false,
-    "bene_strumentale": false,
-    "deducibilita_pct": 100,
-    "iva_detraibilita_pct": 100,
-    "note": null oppure "eventuale nota fiscale"
-  },
-  "suggest_new_account": null oppure {"code": "180.50", "name": "Canoni leasing escavatore", "section": "cost_production", "parent_code": "180", "reason": "motivo in italiano"},
-  "suggest_new_category": null oppure {"name": "Noleggio attrezzature", "type": "expense", "reason": "motivo in italiano"}
-}]
----KEYWORDS---
-["keyword1", "keyword2", ...] (5-10 keywords di ricerca per questa fattura)`;
 }
 
 /* ─── Compose invoice-level from line results ── */
@@ -1410,7 +874,8 @@ Deno.serve(async (req) => {
       `[classify-invoice-lines] Calling Haiku for ${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}`,
     );
 
-    const haikuResponse = await fetch("https://api.anthropic.com/v1/messages", {
+    // ─── Stage 2: Haiku with Extended Thinking ──────────
+    const haikuResp = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1420,77 +885,57 @@ Deno.serve(async (req) => {
       body: JSON.stringify({
         model: MODEL_HAIKU,
         max_tokens: 8192,
+        thinking: {
+          type: "enabled",
+          budget_tokens: HAIKU_THINKING_BUDGET,
+        },
         messages: [{ role: "user", content: focusedPrompt }],
       }),
     });
 
-    // Helper: call an AI model and parse the response
-    async function callClassificationModel(model: string, prompt: string, label: string): Promise<{
-      lineResults: SonnetLineResult[];
-      keywords: string[];
-    } | null> {
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model,
-          max_tokens: 8192,
-          messages: [{ role: "user", content: prompt }],
-        }),
-      });
+    if (!haikuResp.ok) {
+      const errText = await haikuResp.text();
+      console.error(`[classify-invoice-lines] Haiku API error:`, haikuResp.status, errText.slice(0, 300));
+      return json({ error: "Classification failed" }, 502);
+    }
 
-      if (!resp.ok) {
-        const errText = await resp.text();
-        console.error(`[classify-invoice-lines] ${label} API error:`, resp.status, errText.slice(0, 300));
-        return null;
-      }
+    const haikuData = await haikuResp.json();
+    const contentBlocks = (haikuData as any)?.content || [];
 
-      const data = await resp.json();
-      const text = (data as any)?.content?.[0]?.text || "";
-      console.log(`[classify-invoice-lines] ${label} response: ${text.length} chars`);
+    // Log thinking for debug (truncated)
+    const thinkingBlock = contentBlocks.find((b: any) => b.type === "thinking");
+    if (thinkingBlock) {
+      console.log(`[classify] Haiku thinking: ${(thinkingBlock.thinking || "").slice(0, 200)}...`);
+    }
 
-      let keywords: string[] = [];
-      const keywordsSplit = text.split("---KEYWORDS---");
-      const classJson = keywordsSplit[0].trim();
-      if (keywordsSplit.length > 1) {
-        try {
-          const kwMatch = keywordsSplit[1].match(/\[[\s\S]*?\]/);
-          if (kwMatch) keywords = JSON.parse(kwMatch[0]);
-        } catch { /* ignore */ }
-      }
+    // Extract text from response (Extended Thinking returns thinking + text blocks)
+    const textBlocks = contentBlocks.filter((b: any) => b.type === "text");
+    const responseText = textBlocks.map((b: any) => b.text).join("") || "";
+    console.log(`[classify-invoice-lines] Haiku+Thinking response: ${responseText.length} chars`);
 
+    // Parse keywords
+    let keywords: string[] = [];
+    const keywordsSplit = responseText.split("---KEYWORDS---");
+    const classJson = keywordsSplit[0].trim();
+    if (keywordsSplit.length > 1) {
       try {
-        const jsonMatch = classJson.match(/\[[\s\S]*\]/);
-        const parsed: SonnetLineResult[] = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
-        return { lineResults: parsed, keywords };
-      } catch (e) {
-        console.error(`[classify-invoice-lines] ${label} parse error:`, e, classJson.slice(0, 300));
-        return null;
-      }
+        const kwMatch = keywordsSplit[1].match(/\[[\s\S]*?\]/);
+        if (kwMatch) keywords = JSON.parse(kwMatch[0]);
+      } catch { /* ignore */ }
     }
 
-    // Try Haiku first, fall back to Sonnet on failure
-    let classResult = await callClassificationModel(MODEL_HAIKU, focusedPrompt, "Haiku");
-    let actualModel = MODEL_HAIKU;
-
-    if (!classResult) {
-      console.warn("[classify-invoice-lines] Haiku failed, falling back to Sonnet with focused prompt");
-      classResult = await callClassificationModel(MODEL_SONNET, focusedPrompt, "Sonnet-fallback");
-      actualModel = MODEL_SONNET;
+    // Parse classification JSON
+    let parsedResults: SonnetLineResult[] = [];
+    try {
+      const jsonMatch = classJson.match(/\[[\s\S]*\]/);
+      parsedResults = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+    } catch (e) {
+      console.error(`[classify-invoice-lines] Haiku parse error:`, e, classJson.slice(0, 300));
+      return json({ error: "Classification parse failed" }, 502);
     }
-
-    if (!classResult) {
-      return json({ error: "Both Haiku and Sonnet calls failed" }, 502);
-    }
-
-    let keywords = classResult.keywords;
 
     // Normalize results
-    let lineResults: SonnetLineResult[] = classResult.lineResults.map((item) => ({
+    let lineResults: SonnetLineResult[] = parsedResults.map((item) => ({
       line_id: item.line_id,
       article_code: item.article_code || null,
       phase_code: item.phase_code || null,
@@ -1509,43 +954,7 @@ Deno.serve(async (req) => {
       suggest_new_category: item.suggest_new_category || null,
     }));
 
-    // ─── Stage 3: Sonnet Escalation for low-confidence lines ──
-    const lowConfLines = lineResults.filter(lr => lr.confidence < ESCALATION_THRESHOLD);
-    const highConfLines = lineResults.filter(lr => lr.confidence >= ESCALATION_THRESHOLD);
-
-    if (lowConfLines.length > 0) {
-      console.log(`[classify-invoice-lines] ${lowConfLines.length}/${lineResults.length} lines below threshold (${ESCALATION_THRESHOLD}), escalating to Sonnet`);
-
-      const escalatedResults = await callSonnetEscalation(
-        apiKey,
-        lowConfLines,
-        lineResults,
-        inputLines,
-        allAccounts,
-        allCategories,
-        articles,
-        phases,
-        projects,
-        counterpartyInfo,
-        history,
-        memoryBlock,
-        direction,
-        systemPrompt,
-        userInstructionsBlock,
-      );
-
-      // Merge: keep high-confidence Haiku results + escalated Sonnet results
-      const escalatedMap = new Map(escalatedResults.map(r => [r.line_id, r]));
-      lineResults = highConfLines.map(lr => lr);
-      for (const lowLr of lowConfLines) {
-        const escalated = escalatedMap.get(lowLr.line_id);
-        lineResults.push(escalated || lowLr);
-      }
-
-      console.log(`[classify-invoice-lines] Merged: ${highConfLines.length} Haiku + ${escalatedResults.length} Sonnet`);
-    } else {
-      console.log(`[classify-invoice-lines] All ${lineResults.length} lines above threshold — no escalation needed`);
-    }
+    console.log(`[classify-invoice-lines] ${lineResults.length} lines classified by Haiku+Thinking`);
 
     // ─── Phase validation ─────────────────────────────
     for (const lr of lineResults) {
@@ -1792,9 +1201,9 @@ Deno.serve(async (req) => {
         ).length,
         history_count: history.length,
         memory_facts_count: memoryFacts.length,
-        escalated_to_sonnet: lowConfLines.length,
-        model_primary: actualModel,
-        model_escalation: lowConfLines.length > 0 ? MODEL_SONNET : null,
+        model: MODEL_HAIKU,
+        thinking_enabled: true,
+        thinking_budget: HAIKU_THINKING_BUDGET,
       },
     });
   } catch (e: unknown) {
