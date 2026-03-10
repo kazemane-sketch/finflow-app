@@ -1,15 +1,12 @@
-// classify-invoice-lines — Two-step Haiku pipeline for invoice lines
-// Stage 1: Embedding pre-flight (Gemini) → Stage 2: Haiku classification (batched)
-// → Stage 2.5: Haiku fiscal review (dedicated pass for deducibility, IVA, ritenuta)
-// → Stage 3: Sonnet escalation (DISABLED — preserved for future complex cases)
-// Full context: articles, categories, CoA, CdC, ATECO, counterparty history, RAG.
+// classify-invoice-lines — Single Gemini 3.1 Pro agent for invoice classification + fiscal review
+// Stage 1: Embedding pre-flight (Gemini) → Stage 2: Gemini 3.1 Pro (classification + fiscal flags)
+// RAG: fiscal_knowledge table for normative context.
 //
 // PRINCIPLE: produces SUGGESTIONS only (classification_status = 'ai_suggested'
 // on invoices table). NEVER 'confirmed'. User must always confirm.
 
 import postgres from "npm:postgres@3.4.5";
 import {
-  getAccountingSystemPrompt,
   getCompanyMemoryBlock,
   getUserInstructionsBlock,
   type CompanyContext,
@@ -24,19 +21,10 @@ const corsHeaders = {
 };
 
 /* ─── Model constants ────────────────────── */
-const MODEL_HAIKU = "claude-haiku-4-5-20251001";
-const MODEL_SONNET = "claude-sonnet-4-6-20250514";
-const THINKING_PER_LINE = 400;       // thinking budget per line
-const MIN_THINKING_BUDGET = 2048;    // minimum thinking budget
-const MAX_THINKING_BUDGET = 16000;   // maximum thinking budget
-const SONNET_THINKING_BUDGET = 10000; // fixed thinking budget for Sonnet escalation
-const MAX_LINES_PER_BATCH = 15;      // max lines per Haiku call
-const MAX_PARALLEL_BATCHES = 3;      // max concurrent API calls
+const GEMINI_MODEL = "gemini-3.1-pro-preview";
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_DIMS = 3072;
 const MIN_CONFIDENCE = 60;
-// Escalation triggers are handled generically in needsSonnetEscalation()
-// — no hardcoded ATECO codes or predefined trigger lists.
 
 /* ─── Direction enforcement constants ────── */
 // Which CoA sections are valid for each invoice direction
@@ -176,6 +164,15 @@ interface SonnetLineResult {
   } | null;
 }
 
+interface FiscalKBRule {
+  id: string;
+  title: string;
+  content: string;
+  category: string;
+  normativa: string[];
+  fiscal_values: Record<string, unknown> | null;
+}
+
 /* ─── Gemini embedding (for RAG) ────────── */
 
 function toVectorLiteral(values: number[]): string {
@@ -236,8 +233,6 @@ async function embeddingPreflight(
 ): Promise<PreflightResult | null> {
   try {
     // Build query text from all line descriptions + counterparty + ATECO + notes
-    // ATECO dramatically improves semantic matching (e.g. "49.41 Trasporto merci" shifts
-    // the embedding vector toward transport/logistics instead of generic construction)
     const queryText =
       lines.map((l) => l.description).filter(Boolean).join(" | ") +
       ` | ${counterpartyName || "N/D"}` +
@@ -322,9 +317,60 @@ async function embeddingPreflight(
   }
 }
 
-/* ─── Build focused prompt for Haiku ─────── */
+/* ─── Fiscal Knowledge Base RAG ──────────── */
 
-function buildFocusedPrompt(
+async function searchFiscalKB(
+  sql: SqlClient,
+  queryVec: number[],
+  counterpartyAteco: string,
+  counterpartyType: string,
+  accountCodes: string[],
+): Promise<FiscalKBRule[]> {
+  try {
+    const vecLiteral = toVectorLiteral(queryVec);
+    const atecoPrefix = counterpartyAteco ? counterpartyAteco.slice(0, 2) : "";
+    const accPrefixes = accountCodes.map(c => c.slice(0, 3));
+
+    // Semantic + keyword search on fiscal_knowledge
+    const rows = await sql.unsafe(
+      `SELECT id, title, content, category, normativa, fiscal_values,
+              (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
+       FROM fiscal_knowledge
+       WHERE active = true AND embedding IS NOT NULL
+         AND (
+           (1 - (embedding <=> $1::halfvec(3072))) >= 0.35
+           OR ($2 != '' AND $2 = ANY(trigger_ateco_prefixes))
+           OR ($3 != '' AND $3 = ANY(trigger_counterparty_types))
+           OR (trigger_account_prefixes && $4::text[])
+         )
+       ORDER BY
+         CASE WHEN ($2 != '' AND $2 = ANY(trigger_ateco_prefixes)) THEN 0 ELSE 1 END,
+         priority DESC,
+         embedding <=> $1::halfvec(3072)
+       LIMIT 8`,
+      [vecLiteral, atecoPrefix, counterpartyType, accPrefixes],
+    );
+
+    const rules = (rows as FiscalKBRule[]).map(r => ({
+      id: r.id,
+      title: r.title,
+      content: r.content,
+      category: r.category,
+      normativa: r.normativa || [],
+      fiscal_values: r.fiscal_values,
+    }));
+
+    console.log(`[fiscal-kb] Found ${rules.length} relevant fiscal rules`);
+    return rules;
+  } catch (err) {
+    console.warn("[fiscal-kb] Search failed:", err);
+    return [];
+  }
+}
+
+/* ─── Build Gemini prompt (classification + fiscal) ─── */
+
+function buildGeminiPrompt(
   articles: ArticleRow[],
   categories: CategoryRow[],
   accounts: AccountRow[],
@@ -335,9 +381,9 @@ function buildFocusedPrompt(
   memoryBlock: string,
   direction: string,
   lines: InputLine[],
-  systemPrompt: string,
   userInstructionsBlock: string,
-  classifyOnlyLineIds?: Set<string>,
+  kbRules: FiscalKBRule[],
+  company: CompanyContext | undefined,
   invoiceNotes?: string,
 ): string {
   // Build phases-by-article map
@@ -347,9 +393,7 @@ function buildFocusedPrompt(
     phasesByArticle.get(p.article_id)!.push(p);
   }
 
-  // Articles section — only relevant articles from pre-flight
-  const articleIds = new Set(articles.map(a => a.id));
-  const relevantPhases = phases.filter(p => articleIds.has(p.article_id));
+  // Articles section — with phases
   const multiStep = articles.filter(a => phasesByArticle.has(a.id) && phasesByArticle.get(a.id)!.length > 0);
   const singleStep = articles.filter(a => !phasesByArticle.has(a.id) || phasesByArticle.get(a.id)!.length === 0);
 
@@ -386,8 +430,8 @@ function buildFocusedPrompt(
     ? projects.map(p => `- ${p.id}: ${p.code} ${p.name}`).join("\n")
     : "Nessun CdC.";
 
-  // History (limited to 15 for focused prompt)
-  const historyLimited = history.slice(0, 15);
+  // History (limited to 20)
+  const historyLimited = history.slice(0, 20);
   let historySection = "";
   if (historyLimited.length > 0) {
     const histLines = historyLimited.map(h => {
@@ -400,24 +444,88 @@ function buildFocusedPrompt(
     historySection = `STORICO (usa SOLO se la descrizione corrisponde):\n${histLines.join("\n")}`;
   }
 
-  // Lines — with context markers when batching
-  const hasBatchFilter = classifyOnlyLineIds && classifyOnlyLineIds.size > 0;
+  // Fiscal KB rules
+  let kbSection = "";
+  if (kbRules.length > 0) {
+    kbSection = `\n=== NORMATIVA FISCALE RILEVANTE (dalla Knowledge Base) ===\n`;
+    kbSection += kbRules.map(r => {
+      let entry = `[${r.category}] ${r.title}\n${r.content}`;
+      if (r.normativa?.length) entry += `\nRif: ${r.normativa.join(", ")}`;
+      if (r.fiscal_values) entry += `\nValori: ${JSON.stringify(r.fiscal_values)}`;
+      return entry;
+    }).join("\n---\n");
+    kbSection += `\n===\n`;
+  }
+
+  // Lines
   const lineEntries = lines
-    .map((l, i) => {
-      const isContext = hasBatchFilter && !classifyOnlyLineIds!.has(l.line_id);
-      const marker = isContext ? "[CONTESTO] " : (hasBatchFilter ? "[DA CLASSIFICARE] " : "");
-      return `${i + 1}. ${marker}[${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} tot=${l.total_price ?? "N/D"}`;
-    })
+    .map((l, i) =>
+      `${i + 1}. [${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} tot=${l.total_price ?? "N/D"}`
+    )
     .join("\n");
 
-  // Batch instruction when using context markers
-  const batchInstruction = hasBatchFilter
-    ? `\nIMPORTANTE: Classifica SOLO le righe marcate [DA CLASSIFICARE]. Le righe [CONTESTO] sono informative — usale per capire il contesto (cantiere, commessa, tipologia lavoro) ma NON includerle nel JSON output.\n`
+  // Company context
+  const companySection = company
+    ? `AZIENDA: ${company.company_name}${company.vat_number ? ` (P.IVA: ${company.vat_number})` : ""}${company.sector ? ` — Settore: ${company.sector}` : ""}`
     : "";
 
-  return `${systemPrompt}
+  return `Sei un contabile italiano esperto con 20 anni di esperienza nella gestione contabile di PMI italiane. Sei aggiornato sulle normative italiane vigenti (OIC, TUIR, DPR 633/72, Codice Civile).
+
+${companySection}
 ${userInstructionsBlock}
 ${memoryBlock}
+${kbSection}
+
+COMPETENZE FONDAMENTALI:
+
+1. PARTITA DOPPIA E PIANO DEI CONTI
+- Ogni operazione ha DARE e AVERE bilanciati
+- Piano dei conti strutturato: patrimoniale (attivo/passivo) + economico (costi/ricavi)
+
+2. IVA (DPR 633/72)
+- Aliquote: 22% (ordinaria), 10% (ridotta), 4% (minima), esente (art. 10)
+- Reverse charge (art. 17 c.6): fatture edili tra imprese, subappalti
+- Split payment (art. 17-ter): fatture verso PA
+- IVA indetraibile parziale: auto 40%, telefonia 50%, rappresentanza variabile
+
+3. DEDUCIBILITÀ COSTI (TUIR)
+- Auto aziendali NON da trasporto: costo 20%, IVA 40%
+- Auto da trasporto (camion, escavatori, mezzi specifici): 100%/100%
+- Telefonia: costo 80%, IVA 50%
+- Ristorazione/pernottamenti: costo 75%, IVA 100%
+- Omaggi: deducibili fino a 50€ unitari
+
+4. RITENUTA D'ACCONTO
+- Professionisti (ATECO 69.xx/71.xx/74.xx): ritenuta 20% sull'imponibile
+- SRL/SPA: MAI ritenuta (anche se professionista)
+- Il committente trattiene 20% e versa con F24
+
+5. BENI STRUMENTALI E AMMORTAMENTO
+- Beni > 516,46€ con utilità pluriennale → immobilizzazioni
+- Beni ≤ 516,46€ → costo d'esercizio immediato
+- SOLO acquisti di beni FISICI DUREVOLI (macchinari, attrezzature, veicoli, computer, mobili)
+- NON sono beni strumentali (anche se superano 516€): canoni leasing, manodopera, servizi, materiali di consumo, spese bancarie, affitti, utenze, trasporti, noleggi
+
+6. LEASING
+- Canoni leasing HANNO fattura, vanno in conti dedicati per canoni e interessi
+- Un canone di locazione finanziaria NON È un bene strumentale — è un costo ricorrente
+
+7. TRASPORTI — DISTINZIONE CRITICA
+- Su acquisti: il fornitore porta merce → conto trasporti su acquisti
+- Su vendite: noi portiamo merce → conto trasporti su vendite
+- Generici → conto trasporti generici
+
+8. NOTE DI CREDITO (TD04)
+- Stornano il conto originale con importo negativo
+- Stessa categoria e conto della fattura originale
+
+9. AUTOFATTURE (TD16-TD19)
+- Reverse charge interno: impostare reverse_charge=true
+
+10. SUGGERIMENTO NUOVI CONTI
+- Se il miglior conto è troppo generico, aggiungi suggest_new_account
+- ANCHE con suggerimento, assegna SEMPRE il miglior conto ESISTENTE come fallback
+- Suggerisci solo quando c'è un VERO gap
 
 ${artSection ? `ARTICOLI:\n${artSection}\n` : ""}CATEGORIE:
 ${catSection}
@@ -430,7 +538,7 @@ ${cdcSection}
 
 === CONTROPARTE FORNITORE/CLIENTE ===
 ${counterpartyInfo}
-REGOLA: Il NOME della controparte spesso rivela la sua attività principale (es. "FRANTOI MERIDIONALI" = frantumazione inerti, "AUTOTRASPORTI ROSSI" = trasporto). Usa il nome come indizio forte per guidare la classificazione quando la descrizione riga è generica.
+REGOLA: Il NOME della controparte spesso rivela la sua attività principale. Usa il nome come indizio forte.
 ===
 
 ${historySection}
@@ -438,26 +546,103 @@ ${historySection}
 === VINCOLO DIREZIONE (${direction === "in" ? "PASSIVA" : "ATTIVA"}) ===
 ${direction === "in" ? "Conti di COSTO. category.type: expense/both. VIETATO: conti revenue." : "Conti di RICAVO. category.type: revenue/both. VIETATO: conti costo."}
 ===
-
-REGOLE:
+${invoiceNotes ? `\n=== NOTE UTENTE SULLA FATTURA ===\n${invoiceNotes}\nQueste note hanno PRIORITÀ MASSIMA sulla classificazione.\n===\n` : ""}
+REGOLE CLASSIFICAZIONE:
 - Usa storico SOLO se la descrizione corrisponde.
 - article_code + phase_code solo se il materiale/prodotto corrisponde.
 - category_id e account_id: assegna SEMPRE (UUID esatti dalla lista sopra).
 - Coerenza: trasporto→conti trasporto, noleggio→conti noleggio.
 - confidence 0-100. Se dubbio, confidence bassa.
-- Righe con importo zero (tot=0): sono righe INFORMATIVE/CONTESTO (cantiere, contratto, commessa). Usale per classificare meglio le altre righe. Per la riga zero stessa: confidence 30-50, reasoning "Riga informativa/contesto".
-- Se NESSUNA categoria nella lista corrisponde bene alla riga, NON forzare una categoria sbagliata con confidence alta. Scegli la più vicina MA con confidence bassa (50-65).
-- Il NOME della controparte rivela spesso l'attività: usalo come indizio forte.
+- Righe con importo zero (tot=0): sono INFORMATIVE/CONTESTO. Per la riga zero: confidence 30-50, reasoning "Riga informativa/contesto".
+- Se NESSUNA categoria corrisponde bene, scegli la più vicina con confidence bassa (50-65).
+- CdC: assegna SOLO con segnale chiaro. Se non sei sicuro, lascia vuoto.
 
-- CdC: assegna SOLO se hai un segnale chiaro (storico controparte, cantiere nella descrizione, località). Se non sei sicuro, lascia cost_center_allocations vuoto — l'utente lo assegnerà manualmente.
-${invoiceNotes ? `\n=== NOTE UTENTE SULLA FATTURA ===\n${invoiceNotes}\nQueste note sono dell'utente e hanno PRIORITÀ MASSIMA sulla classificazione.\n===\n` : ""}${batchInstruction}
+REGOLE FISCALI (per OGNI riga):
+- deducibilita_pct e iva_detraibilita_pct: determina per ogni riga secondo TUIR/DPR 633
+- Coerenza: tutte le righe della stessa fattura per lo stesso mezzo/operazione → STESSE percentuali
+- Se hai dubbi, usa la percentuale PIÙ BASSA (conservativa) e scrivi "Verificare: [motivo]" nella nota
+- ritenuta_acconto: solo per professionisti (verifica ATECO)
+- bene_strumentale: solo beni FISICI DUREVOLI > 516,46€ — MAI canoni, servizi, materiali
+
 RIGHE:
 ${lineEntries}
 
-JSON array (no markdown):
-[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"max 30 parole","suggest_new_account":null,"suggest_new_category":null}]
+FORMATO OUTPUT (2 sezioni separate):
+
+Sezione 1 — JSON array classificazione (no markdown):
+[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"max 30 parole","fiscal_flags":{"ritenuta_acconto":{"aliquota":20,"base":"imponibile"}|null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]
+
+---INVOICE_NOTES---
+Array JSON di alert fiscali per l'utente. Genera alert SOLO per dubbi che richiedono decisione umana.
+Ogni alert: {"type":"deducibilita"|"ritenuta"|"reverse_charge"|"split_payment"|"bene_strumentale"|"iva_indetraibile"|"general","severity":"warning"|"info","title":"titolo breve","description":"spiegazione per l'utente","current_choice":"scelta conservativa applicata","options":[{"label":"Opzione A","fiscal_override":{...},"is_default":false},{"label":"Opzione B","fiscal_override":{...},"is_default":true}],"affected_lines":["line_id1"]}
+Se NON ci sono dubbi fiscali: []
+
 ---KEYWORDS---
-["kw1","kw2",...] (5-10 keywords)`;
+["kw1","kw2",...] (5-10 keywords per search)`;
+}
+
+/* ─── Call Gemini 3.1 Pro ─────────────────── */
+
+async function callGemini(
+  apiKey: string,
+  prompt: string,
+  thinkingBudget: number,
+): Promise<{ text: string; thinkingText: string; error?: string }> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+
+  console.log(`[gemini] Calling ${GEMINI_MODEL}, prompt=${prompt.length} chars, thinking=${thinkingBudget}`);
+
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 16000,
+          thinkingConfig: { thinkingBudget },
+        },
+      }),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      const msg = `Gemini API ${resp.status}: ${errText.slice(0, 300)}`;
+      console.error(`[gemini] ${msg}`);
+      return { text: "", thinkingText: "", error: msg };
+    }
+
+    const data = await resp.json();
+    const candidates = (data as any)?.candidates || [];
+    if (candidates.length === 0) {
+      return { text: "", thinkingText: "", error: "No candidates in Gemini response" };
+    }
+
+    const parts = candidates[0]?.content?.parts || [];
+    let text = "";
+    let thinkingText = "";
+    for (const part of parts) {
+      if (part.thought) {
+        thinkingText += part.text || "";
+      } else if (part.text) {
+        text += part.text;
+      }
+    }
+
+    const finishReason = candidates[0]?.finishReason || "unknown";
+    console.log(`[gemini] Response: ${text.length} chars, thinking=${thinkingText.length} chars, finish=${finishReason}`);
+
+    if (thinkingText) {
+      console.log(`[gemini] Thinking: ${thinkingText.slice(0, 200)}...`);
+    }
+
+    return { text, thinkingText };
+  } catch (e) {
+    const msg = `Gemini fetch error: ${e}`;
+    console.error(`[gemini] ${msg}`);
+    return { text: "", thinkingText: "", error: msg };
+  }
 }
 
 /* ─── Compose invoice-level from line results ── */
@@ -660,7 +845,7 @@ async function persistResults(
     }
   }
 
-  // Save invoice_notes (fiscal alerts from Sonnet) + set has_fiscal_alerts flag
+  // Save invoice_notes (fiscal alerts) + set has_fiscal_alerts flag
   const hasAlerts = invoiceNotes && invoiceNotes.length > 0;
   try {
     if (hasAlerts) {
@@ -681,465 +866,6 @@ async function persistResults(
     }
   } catch (e: unknown) {
     console.error(`[persist] invoice_notes/has_fiscal_alerts failed:`, (e as Error).message);
-  }
-}
-
-/* ─── Sonnet escalation: detect lines needing fiscal expert ──── */
-// Generalist approach — no hardcoded ATECO codes.
-// Escalation triggers on Haiku's OWN signals: flags, confidence, doubt words, suggestions.
-
-const DOUBT_PATTERN = /verificar|dubbio|potrebbe|incert|controllare|attenzione|non chiaro|ambiguo|da valutare|possibile|eventuale/i;
-
-function needsSonnetEscalation(lr: SonnetLineResult): boolean {
-  // Low confidence → escalate (raised threshold from 60 to 65)
-  if (lr.confidence < 65) return true;
-
-  // Non-standard fiscal flags → escalate for expert review
-  const ff = lr.fiscal_flags;
-  if (ff) {
-    if (ff.ritenuta_acconto) return true;
-    if (ff.reverse_charge) return true;
-    if (ff.bene_strumentale) return true;
-    // Haiku wrote doubt in fiscal note → escalate
-    if (ff.note && DOUBT_PATTERN.test(ff.note)) return true;
-  }
-
-  // Haiku signals doubt in reasoning → escalate
-  if (lr.reasoning && DOUBT_PATTERN.test(lr.reasoning)) return true;
-
-  // Suggest new account or category = Haiku unsure about CoA → escalate
-  if (lr.suggest_new_account) return true;
-  if (lr.suggest_new_category) return true;
-
-  return false;
-}
-
-async function sonnetEscalate(
-  escalationLines: SonnetLineResult[],
-  allLines: InputLine[],
-  accounts: AccountRow[],
-  categories: CategoryRow[],
-  projects: ProjectRow[],
-  articles: ArticleRow[],
-  phases: ArticlePhaseRow[],
-  counterpartyInfo: string,
-  history: HistoryRow[],
-  memoryBlock: string,
-  direction: string,
-  systemPrompt: string,
-  userInstructionsBlock: string,
-  apiKey: string,
-  invoiceNotes?: string,
-): Promise<{ lineResults: SonnetLineResult[]; invoiceNotes?: FiscalAlert[]; error?: string }> {
-  // Build a Sonnet prompt with full context + Haiku's attempt as reference
-  const lineIds = new Set(escalationLines.map(l => l.line_id));
-
-  // Haiku attempt summary for Sonnet to review
-  const haikuAttempts = escalationLines.map(lr => {
-    const input = allLines.find(l => l.line_id === lr.line_id);
-    return `- [${lr.line_id}] "${input?.description || 'N/D'}" → Haiku: conto=${lr.account_code || 'N/D'}, cat=${lr.category_name || 'N/D'}, confidence=${lr.confidence}, reasoning="${lr.reasoning}"${lr.fiscal_flags?.ritenuta_acconto ? ', RITENUTA ACCONTO' : ''}${lr.fiscal_flags?.reverse_charge ? ', REVERSE CHARGE' : ''}${lr.fiscal_flags?.bene_strumentale ? ', BENE STRUMENTALE' : ''}`;
-  }).join("\n");
-
-  // Full account/category lists for Sonnet (not pre-filtered — give it everything)
-  const accSection = accounts.map(a => `- ${a.id}: ${a.code} ${a.name} (${a.section})`).join("\n");
-  const catSection = categories.map(c => `- ${c.id}: ${c.name} (${c.type})`).join("\n");
-  const cdcSection = projects.length > 0
-    ? projects.map(p => `- ${p.id}: ${p.code} ${p.name}`).join("\n")
-    : "Nessun CdC.";
-
-  // Articles section
-  const phasesByArticle = new Map<string, ArticlePhaseRow[]>();
-  for (const p of phases) {
-    if (!phasesByArticle.has(p.article_id)) phasesByArticle.set(p.article_id, []);
-    phasesByArticle.get(p.article_id)!.push(p);
-  }
-  let artSection = "";
-  for (const a of articles) {
-    const aPhases = phasesByArticle.get(a.id) || [];
-    const kwPart = a.keywords?.length ? ` [${a.keywords.join(", ")}]` : "";
-    if (aPhases.length > 0) {
-      artSection += `- ${a.code} (${a.name})${kwPart}: ${aPhases.map(p => `${p.code}:${p.name}`).join(", ")}\n`;
-    } else {
-      artSection += `- ${a.code} (${a.name})${kwPart}\n`;
-    }
-  }
-
-  // All line descriptions for context
-  const lineContext = allLines.map((l, i) => {
-    const isTarget = lineIds.has(l.line_id);
-    return `${i + 1}. ${isTarget ? "[DA RICLASSIFICARE] " : "[CONTESTO] "}[${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} tot=${l.total_price ?? "N/D"}`;
-  }).join("\n");
-
-  const sonnetPrompt = `${systemPrompt}
-${userInstructionsBlock}
-${memoryBlock}
-
-Sei un ESPERTO FISCALE ITALIANO chiamato per riclassificare righe complesse che Haiku non ha gestito con sufficiente confidenza.
-
-=== TENTATIVO HAIKU (da rivedere) ===
-${haikuAttempts}
-===
-
-ARTICOLI:
-${artSection}
-CATEGORIE:
-${catSection}
-
-CONTI (COMPLETI):
-${accSection}
-
-CDC:
-${cdcSection}
-
-=== CONTROPARTE ===
-${counterpartyInfo}
-===
-
-=== VINCOLO DIREZIONE (${direction === "in" ? "PASSIVA" : "ATTIVA"}) ===
-${direction === "in" ? "Conti di COSTO. VIETATO: conti revenue." : "Conti di RICAVO. VIETATO: conti costo."}
-===
-${invoiceNotes ? `\n=== NOTE UTENTE SULLA FATTURA ===\n${invoiceNotes}\nQueste note sono dell'utente e hanno PRIORITÀ MASSIMA sulla classificazione.\n===\n` : ""}
-REGOLE ESCALATION:
-- Riclassifica SOLO le righe [DA RICLASSIFICARE].
-- Analizza APPROFONDITAMENTE la fiscalità: ritenuta d'acconto (aliquota, base imponibile), reverse charge, split payment, beni strumentali (ammortamento), deducibilità %, IVA detraibilità %.
-- Se il tentativo Haiku era corretto, CONFERMALO con confidence più alta.
-- Se era sbagliato, CORREGGILO con reasoning dettagliato.
-- fiscal_flags OBBLIGATORI e dettagliati per ogni riga.
-- Autofatture TD16-TD19: imposta reverse_charge=true. Note credito TD04: storna conto originale.
-- Professionisti (ATECO 69.xx/71.xx/74.xx): verifica ritenuta d'acconto 20%.
-
-RIGHE FATTURA (contesto completo):
-${lineContext}
-
-FORMATO OUTPUT (3 sezioni separate):
-
-Sezione 1 — JSON array classificazione righe (no markdown, SOLO righe [DA RICLASSIFICARE]):
-[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"dettagliato","fiscal_flags":{"ritenuta_acconto":{"aliquota":20,"base":"100%"}|null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]
-
----INVOICE_NOTES---
-Array JSON di alert fiscali per l'utente. Genera alert SOLO quando ci sono dubbi fiscali che richiedono una decisione umana (es: deducibilità incerta, ritenuta da verificare, uso promiscuo vs aziendale).
-Ogni alert: {"type":"deducibilita"|"ritenuta"|"reverse_charge"|"split_payment"|"bene_strumentale"|"iva_indetraibile"|"general","severity":"warning"|"info","title":"titolo breve","description":"spiegazione per l'utente","current_choice":"scelta conservativa applicata","options":[{"label":"Opzione A (es: Trasporto 100%/100%)","fiscal_override":{"deducibilita_pct":100,"iva_detraibilita_pct":100},"is_default":false},{"label":"Opzione B (es: Auto 20%/40%)","fiscal_override":{"deducibilita_pct":20,"iva_detraibilita_pct":40},"is_default":true}],"affected_lines":["line_id1","line_id2"]}
-Se NON ci sono dubbi fiscali, restituisci: []`;
-
-  console.log(`[sonnet-escalate] Escalating ${escalationLines.length} lines to Sonnet, prompt=${sonnetPrompt.length} chars`);
-
-  try {
-    // Note: Extended Thinking requires system prompt in user message (API requirement)
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: MODEL_SONNET,
-        max_tokens: 16000,
-        thinking: { type: "enabled" as const, budget_tokens: SONNET_THINKING_BUDGET },
-        messages: [{ role: "user" as const, content: sonnetPrompt }],
-      }),
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      const msg = `Sonnet escalation API ${resp.status}: ${errText.slice(0, 300)}`;
-      console.error(`[sonnet-escalate] ${msg}`);
-      return { lineResults: [], error: msg };
-    }
-
-    const data = await resp.json();
-    const contentBlocks = (data as any)?.content || [];
-
-    // Log thinking
-    const thinkingBlock = contentBlocks.find((b: any) => b.type === "thinking");
-    if (thinkingBlock) {
-      console.log(`[sonnet-escalate] Thinking: ${(thinkingBlock.thinking || "").slice(0, 200)}...`);
-    }
-
-    // Extract text
-    const text = contentBlocks
-      .filter((b: any) => b.type === "text")
-      .map((b: any) => b.text)
-      .join("") || "";
-
-    const stopReason = (data as any)?.stop_reason;
-    console.log(`[sonnet-escalate] Response: ${text.length} chars, stop=${stopReason}`);
-
-    if (!text) {
-      return { lineResults: [], error: "Sonnet returned empty text" };
-    }
-
-    // Parse sectioned output: lines JSON + ---INVOICE_NOTES--- section
-    const cleanText = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-    const notesSeparator = "---INVOICE_NOTES---";
-    const notesIdx = cleanText.indexOf(notesSeparator);
-
-    let classificationText: string;
-    let invoiceNotesText: string | null = null;
-
-    if (notesIdx >= 0) {
-      classificationText = cleanText.slice(0, notesIdx).trim();
-      invoiceNotesText = cleanText.slice(notesIdx + notesSeparator.length).trim();
-    } else {
-      // Backward compat: entire text is classification JSON
-      classificationText = cleanText;
-    }
-
-    // Parse line classifications
-    const jsonStr = extractFirstJsonArray(classificationText);
-    if (!jsonStr) {
-      const msg = `Sonnet escalation: no JSON array. First 300: ${classificationText.slice(0, 300)}`;
-      console.warn(`[sonnet-escalate] ${msg}`);
-      return { lineResults: [], error: msg };
-    }
-
-    const parsed: SonnetLineResult[] = JSON.parse(jsonStr);
-    console.log(`[sonnet-escalate] Parsed ${parsed.length} lines from Sonnet`);
-
-    // Parse invoice notes (fiscal alerts)
-    let invoiceNotes: FiscalAlert[] = [];
-    if (invoiceNotesText) {
-      try {
-        const notesJson = extractFirstJsonArray(invoiceNotesText);
-        if (notesJson) {
-          invoiceNotes = JSON.parse(notesJson) as FiscalAlert[];
-          console.log(`[sonnet-escalate] Parsed ${invoiceNotes.length} fiscal alerts`);
-        }
-      } catch (e) {
-        console.warn(`[sonnet-escalate] Failed to parse invoice_notes: ${e}`);
-      }
-    }
-
-    return { lineResults: parsed, invoiceNotes: invoiceNotes.length > 0 ? invoiceNotes : undefined };
-  } catch (e) {
-    const msg = `Sonnet escalation error: ${e}`;
-    console.error(`[sonnet-escalate] ${msg}`);
-    return { lineResults: [], error: msg };
-  }
-}
-
-/* ─── Step 2: Dedicated Fiscal Review (separate Haiku pass) ──── */
-
-async function fiscalReview(
-  lineResults: SonnetLineResult[],
-  allLines: InputLine[],
-  counterpartyInfo: string,
-  counterpartyAtecoFull: string,
-  direction: string,
-  apiKey: string,
-  allAccounts: AccountRow[],
-): Promise<{ updatedLines: SonnetLineResult[]; invoiceNotes: FiscalAlert[] }> {
-
-  // Build a focused prompt ONLY about fiscal aspects
-  const linesSummary = lineResults.map(lr => {
-    const input = allLines.find(l => l.line_id === lr.line_id);
-    const acc = allAccounts.find(a => a.id === lr.account_id);
-    return `- [${lr.line_id}] "${input?.description || 'N/D'}" tot=${input?.total_price ?? 'N/D'} → conto: ${acc?.code || lr.account_code || 'N/D'} ${acc?.name || ''}, cat: ${lr.category_name || 'N/D'}`;
-  }).join("\n");
-
-  const fiscalPrompt = `Sei un ESPERTO FISCALISTA italiano. Le righe seguenti sono GIÀ classificate (categoria e conto assegnati). Il tuo UNICO compito è determinare il trattamento fiscale di OGNI riga.
-
-=== CONTROPARTE ===
-${counterpartyInfo}
-${counterpartyAtecoFull ? `ATECO: ${counterpartyAtecoFull}` : ''}
-===
-
-DIREZIONE: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
-
-RIGHE GIÀ CLASSIFICATE:
-${linesSummary}
-
-Per OGNI riga, determina:
-
-1. deducibilita_pct (0-100):
-   - Auto aziendali NON da trasporto: 20%
-   - Auto agente commercio: 80%
-   - Mezzi da trasporto (camion, escavatori, furgoni): 100%
-   - Telefonia: 80%
-   - Ristorazione/alberghi: 75%
-   - Costi normali: 100%
-   - Se non sei sicuro del tipo di mezzo/uso: metti la % PIÙ BASSA (conservativa) e scrivi "Verificare" nella nota
-
-2. iva_detraibilita_pct (0-100):
-   - Auto aziendali: 40%
-   - Telefonia mobile: 50%
-   - Operazioni esenti art.10 (servizi finanziari): 0%
-   - Costi normali: 100%
-
-3. ritenuta_acconto: null oppure {"aliquota": 20, "base": "imponibile"}
-   - Si applica SOLO a professionisti (avvocati, geometri, ingegneri, consulenti)
-   - ATECO 69.xx, 71.xx, 74.xx = professionista → ritenuta 20%
-   - SRL/SPA: MAI ritenuta (anche se professionista)
-
-4. reverse_charge: true/false
-   - Subappalti edili, autofatture TD16-TD19
-
-5. split_payment: true/false
-   - Fatture verso PA
-
-6. bene_strumentale: true/false
-   - SOLO acquisti di beni FISICI DUREVOLI > 516,46€
-   - MAI per: canoni leasing, manodopera, servizi, materiali di consumo, spese bancarie, affitti, utenze, trasporti, noleggi
-   - Un canone di locazione finanziaria NON È un bene strumentale — è un costo ricorrente
-
-7. note: stringa o null
-   - Se hai dubbi, scrivi "Verificare: [motivo]"
-   - Se è tutto chiaro, null
-
-REGOLA CRITICA: COERENZA. Tutte le righe della stessa fattura che riguardano lo stesso mezzo/operazione devono avere le STESSE percentuali. Non è possibile 20% su un paraurti e 100% su un braccio oscillante dello stesso veicolo.
-
-REGOLA CRITICA: CONSERVATIVO. Se hai dubbi, usa la percentuale PIÙ BASSA. L'utente può correggere verso l'alto.
-
-JSON array (no markdown):
-[{"line_id":"uuid","fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null}}]`;
-
-  console.log(`[fiscal-review] Reviewing ${lineResults.length} lines, prompt=${fiscalPrompt.length} chars`);
-
-  try {
-    const thinkingBudget = Math.min(
-      MAX_THINKING_BUDGET,
-      Math.max(MIN_THINKING_BUDGET, lineResults.length * 500)
-    );
-
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: MODEL_HAIKU,
-        max_tokens: 16000,
-        thinking: { type: "enabled" as const, budget_tokens: thinkingBudget },
-        messages: [{ role: "user" as const, content: fiscalPrompt }],
-      }),
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      console.error(`[fiscal-review] API error: ${resp.status} ${errText.slice(0, 300)}`);
-      // Fallback: set all fiscal_flags to safe defaults (100/100)
-      return {
-        updatedLines: lineResults.map(lr => ({
-          ...lr,
-          fiscal_flags: {
-            ritenuta_acconto: null,
-            reverse_charge: false,
-            split_payment: false,
-            bene_strumentale: false,
-            deducibilita_pct: 100,
-            iva_detraibilita_pct: 100,
-            note: "Revisione fiscale non disponibile — verificare manualmente",
-          },
-        })),
-        invoiceNotes: [],
-      };
-    }
-
-    const data = await resp.json();
-    const contentBlocks = (data as any)?.content || [];
-
-    // Log thinking
-    const thinkingBlock = contentBlocks.find((b: any) => b.type === "thinking");
-    if (thinkingBlock) {
-      console.log(`[fiscal-review] Thinking: ${(thinkingBlock.thinking || "").slice(0, 300)}...`);
-    }
-
-    // Extract text
-    const text = contentBlocks
-      .filter((b: any) => b.type === "text")
-      .map((b: any) => b.text)
-      .join("") || "";
-
-    // Parse JSON
-    const cleanText = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-    const jsonStr = extractFirstJsonArray(cleanText);
-
-    if (!jsonStr) {
-      console.warn(`[fiscal-review] No JSON array found. First 300: ${cleanText.slice(0, 300)}`);
-      return { updatedLines: lineResults, invoiceNotes: [] };
-    }
-
-    const fiscalResults: Array<{ line_id: string; fiscal_flags: FiscalFlags }> = JSON.parse(jsonStr);
-    console.log(`[fiscal-review] Parsed ${fiscalResults.length} fiscal results`);
-
-    // Merge fiscal_flags into line results
-    const fiscalMap = new Map(fiscalResults.map(fr => [fr.line_id, fr.fiscal_flags]));
-    const updatedLines = lineResults.map(lr => {
-      const ff = fiscalMap.get(lr.line_id);
-      return ff ? { ...lr, fiscal_flags: ff } : lr;
-    });
-
-    // Build invoice_notes from fiscal doubts
-    const invoiceNotes: FiscalAlert[] = [];
-    const noteGroups = new Map<string, { note: string; lineIds: string[]; deducPct: number; ivaPct: number }>();
-
-    for (const fr of fiscalResults) {
-      if (!fr.fiscal_flags?.note) continue;
-      if (!/verificar|controllare|dubbio|attenzione/i.test(fr.fiscal_flags.note)) continue;
-
-      const key = fr.fiscal_flags.note.slice(0, 80).toLowerCase();
-      if (noteGroups.has(key)) {
-        noteGroups.get(key)!.lineIds.push(fr.line_id);
-      } else {
-        noteGroups.set(key, {
-          note: fr.fiscal_flags.note,
-          lineIds: [fr.line_id],
-          deducPct: fr.fiscal_flags.deducibilita_pct,
-          ivaPct: fr.fiscal_flags.iva_detraibilita_pct,
-        });
-      }
-    }
-
-    for (const [, group] of noteGroups) {
-      let type: FiscalAlert['type'] = 'general';
-      if (/deducibil|auto|mezzo|trasporto/i.test(group.note)) type = 'deducibilita';
-      if (/ritenuta/i.test(group.note)) type = 'ritenuta';
-      if (/reverse/i.test(group.note)) type = 'reverse_charge';
-      if (/strumentale|ammortizz/i.test(group.note)) type = 'bene_strumentale';
-
-      const options: FiscalAlertOption[] = [];
-      if (type === 'deducibilita') {
-        options.push(
-          { label: `Conservativo (${group.deducPct}% deducibile, ${group.ivaPct}% IVA)`, fiscal_override: { deducibilita_pct: group.deducPct, iva_detraibilita_pct: group.ivaPct }, is_default: true },
-          { label: 'Mezzo da trasporto (100%/100%)', fiscal_override: { deducibilita_pct: 100, iva_detraibilita_pct: 100 }, is_default: false }
-        );
-      } else if (type === 'bene_strumentale') {
-        options.push(
-          { label: "Costo d'esercizio", fiscal_override: { bene_strumentale: false }, is_default: true },
-          { label: 'Bene strumentale (ammortamento)', fiscal_override: { bene_strumentale: true }, is_default: false }
-        );
-      } else if (type === 'ritenuta') {
-        options.push(
-          { label: "Con ritenuta d'acconto", fiscal_override: { ritenuta_acconto: { aliquota: 20, base: "imponibile" } }, is_default: true },
-          { label: 'Senza ritenuta', fiscal_override: { ritenuta_acconto: null }, is_default: false }
-        );
-      }
-
-      if (options.length > 0) {
-        const affectedLines = group.lineIds.length === lineResults.length ? ['all'] : group.lineIds;
-        invoiceNotes.push({
-          type,
-          severity: 'warning',
-          title: type === 'deducibilita' ? 'Deducibilità da verificare' :
-                 type === 'bene_strumentale' ? 'Possibile bene strumentale' :
-                 type === 'ritenuta' ? "Ritenuta d'acconto" :
-                 'Nota fiscale',
-          description: group.note,
-          current_choice: options.find(o => o.is_default)?.label || options[0].label,
-          options,
-          affected_lines: affectedLines,
-        });
-      }
-    }
-
-    console.log(`[fiscal-review] Generated ${invoiceNotes.length} fiscal alerts`);
-    return { updatedLines, invoiceNotes };
-
-  } catch (e) {
-    console.error(`[fiscal-review] Error: ${e}`);
-    return { updatedLines: lineResults, invoiceNotes: [] };
   }
 }
 
@@ -1175,155 +901,6 @@ function extractFirstJsonArray(text: string): string | null {
   return null;
 }
 
-/* ─── Classify a single batch of lines ──── */
-
-async function classifyBatch(
-  batchLines: InputLine[],
-  batchIndex: number,
-  totalBatches: number,
-  apiKey: string,
-  buildPromptForBatch: (lines: InputLine[]) => string,
-): Promise<{ lineResults: SonnetLineResult[]; keywords: string[]; error?: string }> {
-  const batchThinkingBudget = Math.min(
-    MAX_THINKING_BUDGET,
-    Math.max(MIN_THINKING_BUDGET, batchLines.length * THINKING_PER_LINE),
-  );
-
-  const prompt = buildPromptForBatch(batchLines);
-
-  console.log(
-    `[classify] Batch ${batchIndex + 1}/${totalBatches}: ${batchLines.length} lines, thinking=${batchThinkingBudget}, prompt=${prompt.length} chars`,
-  );
-
-  let resp: Response;
-  try {
-    resp = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: MODEL_HAIKU,
-        max_tokens: 16000,
-        thinking: { type: "enabled" as const, budget_tokens: batchThinkingBudget },
-        messages: [{ role: "user" as const, content: prompt }],
-      }),
-    });
-  } catch (fetchErr) {
-    const msg = `Batch ${batchIndex + 1} fetch error: ${fetchErr}`;
-    console.error(`[classify] ${msg}`);
-    return { lineResults: [], keywords: [], error: msg };
-  }
-
-  if (!resp.ok) {
-    const errText = await resp.text();
-    const msg = `Batch ${batchIndex + 1} API ${resp.status}: ${errText.slice(0, 300)}`;
-    console.error(`[classify] ${msg}`);
-    return { lineResults: [], keywords: [], error: msg };
-  }
-
-  const data = await resp.json();
-  const contentBlocks = (data as any)?.content || [];
-
-  // Log response structure
-  console.log(`[classify] Batch ${batchIndex + 1} blocks:`, contentBlocks.map((b: any) => ({
-    type: b.type,
-    len: (b.text || b.thinking || '').length,
-  })));
-
-  // Log thinking for debug (truncated)
-  const thinkingBlock = contentBlocks.find((b: any) => b.type === "thinking");
-  if (thinkingBlock) {
-    console.log(
-      `[classify] Batch ${batchIndex + 1} thinking: ${(thinkingBlock.thinking || "").slice(0, 150)}...`,
-    );
-  }
-
-  // Extract text
-  const textBlocks = contentBlocks.filter((b: any) => b.type === "text");
-  const text = textBlocks.map((b: any) => b.text).join("") || "";
-  const stopReason = (data as any)?.stop_reason;
-  console.log(
-    `[classify] Batch ${batchIndex + 1} response: ${text.length} chars, stop=${stopReason}`,
-  );
-
-  // Safety: if no text blocks, log warning
-  if (!text) {
-    const msg = `Batch ${batchIndex + 1}: empty text response. Blocks: ${JSON.stringify(contentBlocks.map((b: any) => b.type))}. stop=${stopReason}`;
-    console.error(`[classify] ${msg}`);
-    return { lineResults: [], keywords: [], error: msg };
-  }
-
-  // Parse keywords
-  let keywords: string[] = [];
-  const keywordsSplit = text.split("---KEYWORDS---");
-  let classJson = keywordsSplit[0].trim();
-  if (keywordsSplit.length > 1) {
-    try {
-      let kwSection = keywordsSplit[1];
-      kwSection = kwSection
-        .replace(/```json\s*/g, "")
-        .replace(/```\s*/g, "")
-        .trim();
-      const kwMatch = kwSection.match(/\[\s*[\s\S]*?\]/);
-      if (kwMatch) keywords = JSON.parse(kwMatch[0]);
-    } catch {
-      /* ignore */
-    }
-  }
-
-  // Parse classification JSON (with backtick stripping + bracket-counting extraction)
-  try {
-    classJson = classJson
-      .replace(/```json\s*/g, "")
-      .replace(/```\s*/g, "")
-      .trim();
-
-    // Use bracket-counting to extract first complete JSON array
-    // (avoids greedy regex matching past the array into keywords/notes)
-    let jsonStr = extractFirstJsonArray(classJson);
-
-    // Partial JSON recovery if truncated (no balanced array found)
-    if (!jsonStr && stopReason === "max_tokens") {
-      console.warn(
-        `[classify] Batch ${batchIndex + 1}: truncated output, attempting partial recovery...`,
-      );
-      const arrayStart = classJson.indexOf("[");
-      if (arrayStart >= 0) {
-        let partial = classJson.slice(arrayStart);
-        const lastCompleteObj = partial.lastIndexOf("},");
-        if (lastCompleteObj > 0) {
-          jsonStr = partial.slice(0, lastCompleteObj + 1) + "]";
-        } else {
-          const singleObj = partial.lastIndexOf("}");
-          if (singleObj > 0) {
-            jsonStr = partial.slice(0, singleObj + 1) + "]";
-          }
-        }
-        if (jsonStr)
-          console.log(
-            `[classify] Batch ${batchIndex + 1}: partial recovery succeeded`,
-          );
-      }
-    }
-
-    if (!jsonStr) {
-      const msg = `Batch ${batchIndex + 1}: no JSON array. First 300 chars: ${classJson.slice(0, 300)}`;
-      console.warn(`[classify] ${msg}`);
-      return { lineResults: [], keywords, error: msg };
-    }
-    const parsed: SonnetLineResult[] = JSON.parse(jsonStr);
-    console.log(`[classify] Batch ${batchIndex + 1}: parsed ${parsed.length} lines OK`);
-    return { lineResults: parsed, keywords };
-  } catch (e) {
-    const msg = `Batch ${batchIndex + 1} parse error: ${e}. First 300: ${classJson.slice(0, 300)}`;
-    console.error(`[classify] ${msg}`);
-    return { lineResults: [], keywords, error: msg };
-  }
-}
-
 /* ─── Main handler ──────────────────────── */
 
 Deno.serve(async (req) => {
@@ -1334,9 +911,9 @@ Deno.serve(async (req) => {
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL non configurato" }, 503);
 
-  const apiKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
-  if (!apiKey)
-    return json({ error: "ANTHROPIC_API_KEY non configurata" }, 503);
+  const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
+  if (!geminiKey)
+    return json({ error: "GEMINI_API_KEY non configurata" }, 503);
 
   let body: {
     company_id?: string;
@@ -1367,7 +944,7 @@ Deno.serve(async (req) => {
   const sql = postgres(dbUrl, { max: 1 });
 
   try {
-    // ─── Load all context in parallel ───────────────────
+    // ─── Step 1: Load all context in parallel ───────────────────
     const [articles, allCategories, allAccounts, projects, phases] = await Promise.all([
       sql<ArticleRow[]>`SELECT id, code, name, description, keywords FROM articles WHERE company_id = ${companyId} AND active = true ORDER BY code`,
       sql<CategoryRow[]>`SELECT id, name, type FROM categories WHERE company_id = ${companyId} AND active = true ORDER BY sort_order, name`,
@@ -1376,21 +953,20 @@ Deno.serve(async (req) => {
       sql<ArticlePhaseRow[]>`SELECT id, article_id, code, name, phase_type, is_counting_point, invoice_direction FROM article_phases WHERE company_id = ${companyId} AND active = true ORDER BY article_id, sort_order`,
     ]);
 
-    // ─── Filter categories and accounts by direction ────
+    // ─── Step 2: Filter categories and accounts by direction ────
     const dirSections = SECTIONS_FOR_DIRECTION[direction] || SECTIONS_FOR_DIRECTION["in"];
     const allowedCatTypes = CAT_TYPES_FOR_DIRECTION[direction] || CAT_TYPES_FOR_DIRECTION["in"];
-    // Direction-appropriate categories for prompt (allCategories kept for fallback resolution)
     const categories = allCategories.filter((c) => allowedCatTypes.includes(c.type));
-    // Split accounts: primary (recommended) vs secondary (allowed in edge cases)
     const primaryAccounts = allAccounts.filter((a) => dirSections.primary.includes(a.section));
     const secondaryAccounts = allAccounts.filter(
       (a) => dirSections.allowed.includes(a.section) && !dirSections.primary.includes(a.section),
     );
     console.log(`[classify] direction=${direction}: ${categories.length}/${allCategories.length} cats, ${primaryAccounts.length} primary + ${secondaryAccounts.length} secondary accounts`);
 
-    // ─── Counterparty ATECO info ────────────────────────
+    // ─── Step 3: Counterparty ATECO info ────────────────────────
     let counterpartyInfo = counterpartyName || "N.D.";
-    let counterpartyAtecoFull = "";  // For embedding enrichment
+    let counterpartyAtecoFull = "";
+    let counterpartyLegalType = "";
     if (counterpartyVatKey) {
       const vatKey = counterpartyVatKey
         .toUpperCase()
@@ -1408,12 +984,14 @@ Deno.serve(async (req) => {
             parts.push(`Codice ATECO: ${atecoRow.ateco_code}`);
             if (atecoRow.ateco_description)
               parts.push(atecoRow.ateco_description);
-            // Save for embedding query enrichment
             counterpartyAtecoFull = `${atecoRow.ateco_code} ${atecoRow.ateco_description || ""}`.trim();
           }
           if (atecoRow.business_sector)
             parts.push(`Settore: ${atecoRow.business_sector}`);
-          if (atecoRow.legal_type) parts.push(`Tipo: ${atecoRow.legal_type}`);
+          if (atecoRow.legal_type) {
+            parts.push(`Tipo: ${atecoRow.legal_type}`);
+            counterpartyLegalType = atecoRow.legal_type || "";
+          }
           if (atecoRow.address)
             parts.push(`Sede: ${atecoRow.address}`);
           counterpartyInfo += ` — ${parts.join(" — ")}`;
@@ -1421,12 +999,12 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ─── Invoice notes (user annotations for classification hints) ──
+    // ─── Step 4: Invoice notes ──────────────────────────────────
     const [invoiceRow] = await sql`SELECT notes FROM invoices WHERE id = ${invoiceId} LIMIT 1`;
     const invoiceNotes = (invoiceRow?.notes || "").trim();
     if (invoiceNotes) console.log(`[classify] Invoice notes: "${invoiceNotes.slice(0, 80)}…"`);
 
-    // ─── Counterparty classification history (direction-filtered) ──
+    // ─── Step 5: Counterparty classification history ────────────
     let history: HistoryRow[] = [];
     if (counterpartyVatKey) {
       const vatKey = counterpartyVatKey
@@ -1434,7 +1012,6 @@ Deno.serve(async (req) => {
         .replace(/^IT/i, "")
         .replace(/[^A-Z0-9]/gi, "");
       if (vatKey) {
-        // First: load history matching the SAME direction (prevents cost/revenue bias)
         history = (await sql`
           SELECT il.description, c.name as category_name, a.code as account_code, a.name as account_name,
                  art.code as article_code, art.name as article_name,
@@ -1458,8 +1035,7 @@ Deno.serve(async (req) => {
             AND (il.category_id IS NOT NULL OR il.account_id IS NOT NULL)
           ORDER BY i.date DESC
           LIMIT 30`) as HistoryRow[];
-        // Fallback: if sparse history for this direction (<3 rows), supplement with all directions
-        // This handles counterparties that are both suppliers and customers
+        // Fallback: if sparse history for this direction, supplement
         if (history.length < 3) {
           const allDirHistory = (await sql`
             SELECT il.description, c.name as category_name, a.code as account_code, a.name as account_name,
@@ -1485,7 +1061,6 @@ Deno.serve(async (req) => {
             ORDER BY i.date DESC
             LIMIT 10`) as HistoryRow[];
           if (allDirHistory.length > 0) {
-            // Mark other-direction entries so the prompt can warn about them
             history = [...history, ...allDirHistory];
             console.log(`[classify] Supplemented history: ${history.length - allDirHistory.length} same-dir + ${allDirHistory.length} other-dir entries`);
           }
@@ -1493,8 +1068,7 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ─── Load shared system prompt + user instructions ──
-    const geminiKey = (Deno.env.get("GEMINI_API_KEY") || "").trim();
+    // ─── Step 6: Load company context + user instructions ───────
     const companyRow = await sql`
       SELECT name, vat_number FROM companies WHERE id = ${companyId} LIMIT 1
     `;
@@ -1506,19 +1080,18 @@ Deno.serve(async (req) => {
         }
       : undefined;
 
-    const systemPrompt = getAccountingSystemPrompt(companyContext);
     const userInstructionsBlock = await getUserInstructionsBlock(sql, companyId);
     if (userInstructionsBlock) {
-      console.log(`[classify-invoice-lines] Loaded user instructions`);
+      console.log(`[classify] Loaded user instructions`);
     }
 
-    // ─── Stage 1: Embedding Pre-flight ──────────────────
-    // Find relevant entities via semantic search instead of sending ALL
+    // ─── Step 7: Embedding Pre-flight ──────────────────────────
     let preflightAccounts: AccountRow[] = [...primaryAccounts, ...secondaryAccounts];
     let preflightCategories: CategoryRow[] = categories;
     let preflightArticles: ArticleRow[] = articles;
     let preflightProjects: ProjectRow[] = projects;
     let memoryFacts: MemoryFact[] = [];
+    let queryVec: number[] | null = null;
 
     // Resolve counterparty_id for memory search
     let counterpartyId: string | null = null;
@@ -1532,7 +1105,7 @@ Deno.serve(async (req) => {
       }
     }
 
-    if (geminiKey && inputLines.length > 0) {
+    if (inputLines.length > 0) {
       const preflight = await embeddingPreflight(
         sql, companyId, inputLines, counterpartyName, counterpartyId,
         direction, geminiKey, dirSections, allowedCatTypes,
@@ -1541,17 +1114,14 @@ Deno.serve(async (req) => {
       );
 
       if (preflight) {
-        // Cold-start detection: if ALL embedding queries returned empty, use full lists
+        queryVec = preflight.queryVec;
         const totalPfResults = preflight.accounts.length + preflight.categories.length + preflight.articles.length;
         if (totalPfResults === 0) {
           console.log(`[classify] ❄ Cold-start: no embeddings found — using full entity lists`);
-          // Keep defaults (full lists already assigned above)
         } else {
-          // Use pre-flight results if sufficient
           if (preflight.accounts.length >= 5) {
             preflightAccounts = preflight.accounts;
           } else {
-            // Supplement with primary accounts
             console.log(`[classify] Pre-flight returned only ${preflight.accounts.length} accounts, supplementing with primary accounts`);
             const pfIds = new Set(preflight.accounts.map(a => a.id));
             preflightAccounts = [
@@ -1569,130 +1139,140 @@ Deno.serve(async (req) => {
             preflightProjects = preflight.projects;
           }
         }
-        // Always use memory facts if available
         memoryFacts = preflight.memoryFacts;
       }
-    } else if (!geminiKey) {
-      console.warn(`[classify] No GEMINI_API_KEY — skipping embedding pre-flight, using full lists`);
     }
 
     // Build memory block for prompt
     const memoryBlock = getCompanyMemoryBlock(memoryFacts);
 
-    // ─── Stage 2: Haiku Classification (with context-aware batching) ──────────
-
-    // Build prompt function — for batching, ALL lines are sent but only a subset
-    // is marked [DA CLASSIFICARE]. This preserves context (e.g., "cantiere Via X"
-    // in batch 1 helps classify materials in batch 2).
-    const buildBatchPromptWithContext = (batchLineIds: Set<string>) =>
-      buildFocusedPrompt(
-        preflightArticles,
-        preflightCategories,
-        preflightAccounts,
-        preflightProjects,
-        phases,
-        counterpartyInfo,
-        history,
-        memoryBlock,
-        direction,
-        inputLines,     // ALL lines always
-        systemPrompt,
-        userInstructionsBlock,
-        batchLineIds,   // which ones to classify
-        invoiceNotes || undefined,
+    // ─── Step 8: Fiscal KB RAG ─────────────────────────────────
+    let kbRules: FiscalKBRule[] = [];
+    if (queryVec) {
+      // Collect account codes from preflight for trigger matching
+      const accCodes = preflightAccounts.map(a => a.code);
+      kbRules = await searchFiscalKB(
+        sql,
+        queryVec,
+        counterpartyAtecoFull,
+        counterpartyLegalType,
+        accCodes,
       );
+    }
 
-    // For small invoices (no batching), no context markers needed
-    const buildSinglePrompt = (lines: InputLine[]) =>
-      buildFocusedPrompt(
-        preflightArticles,
-        preflightCategories,
-        preflightAccounts,
-        preflightProjects,
-        phases,
-        counterpartyInfo,
-        history,
-        memoryBlock,
-        direction,
-        lines,
-        systemPrompt,
-        userInstructionsBlock,
-        undefined,      // no batch filter
-        invoiceNotes || undefined,
-      );
-
-    let allLineResults: SonnetLineResult[] = [];
-    let allKeywords: string[] = [];
-    let thinkingUsed = false;
-    const batchErrors: string[] = [];
-    const totalBatches = Math.ceil(inputLines.length / MAX_LINES_PER_BATCH);
-
-    console.log(
-      `[classify-invoice-lines] Calling Haiku for ${inputLines.length} lines → ${totalBatches} batch(es), invoice=${invoiceId}, cp=${counterpartyName}`,
+    // ─── Step 9: Single Gemini call (classification + fiscal) ──
+    const prompt = buildGeminiPrompt(
+      preflightArticles,
+      preflightCategories,
+      preflightAccounts,
+      preflightProjects,
+      phases,
+      counterpartyInfo,
+      history,
+      memoryBlock,
+      direction,
+      inputLines,
+      userInstructionsBlock,
+      kbRules,
+      companyContext,
+      invoiceNotes || undefined,
     );
 
-    if (inputLines.length <= MAX_LINES_PER_BATCH) {
-      // Small invoice: single call, no context markers
-      const result = await classifyBatch(
-        inputLines,
-        0,
-        1,
-        apiKey,
-        buildSinglePrompt,
-      );
-      allLineResults = result.lineResults;
-      allKeywords = result.keywords;
-      if (result.error) batchErrors.push(result.error);
-      thinkingUsed = true;
+    // Thinking budget: scale with line count, generous minimum
+    const thinkingBudget = Math.max(8192, inputLines.length * 1024);
+
+    console.log(
+      `[classify] Calling Gemini 3.1 Pro for ${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}`,
+    );
+
+    const geminiResult = await callGemini(geminiKey, prompt, thinkingBudget);
+
+    if (geminiResult.error || !geminiResult.text) {
+      return json({
+        error: geminiResult.error || "Gemini returned empty response",
+        invoice_id: invoiceId,
+        lines: [],
+        invoice_notes: [],
+        invoice_level: { category_id: null, account_id: null, project_allocations: [], confidence: 0, reasoning: "Gemini error" },
+        keywords: [],
+        stats: { total_lines: inputLines.length, classified: 0, model: GEMINI_MODEL, error: geminiResult.error },
+      }, 200); // 200 so frontend can still show the error gracefully
+    }
+
+    // ─── Parse Gemini output ───────────────────────────────────
+    const fullText = geminiResult.text;
+    const cleanText = fullText.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+
+    // Split into sections
+    const notesSeparator = "---INVOICE_NOTES---";
+    const kwSeparator = "---KEYWORDS---";
+
+    let classificationText: string;
+    let invoiceNotesText: string | null = null;
+    let keywordsText: string | null = null;
+
+    // Find separators
+    const notesIdx = cleanText.indexOf(notesSeparator);
+    const kwIdx = cleanText.indexOf(kwSeparator);
+
+    if (notesIdx >= 0) {
+      classificationText = cleanText.slice(0, notesIdx).trim();
+      if (kwIdx >= 0 && kwIdx > notesIdx) {
+        invoiceNotesText = cleanText.slice(notesIdx + notesSeparator.length, kwIdx).trim();
+        keywordsText = cleanText.slice(kwIdx + kwSeparator.length).trim();
+      } else {
+        invoiceNotesText = cleanText.slice(notesIdx + notesSeparator.length).trim();
+      }
+    } else if (kwIdx >= 0) {
+      classificationText = cleanText.slice(0, kwIdx).trim();
+      keywordsText = cleanText.slice(kwIdx + kwSeparator.length).trim();
     } else {
-      // Large invoice: split line IDs into batches, each batch sees ALL lines with context markers
-      const lineIdBatches: string[][] = [];
-      for (let i = 0; i < inputLines.length; i += MAX_LINES_PER_BATCH) {
-        lineIdBatches.push(
-          inputLines.slice(i, i + MAX_LINES_PER_BATCH).map(l => l.line_id)
-        );
-      }
+      classificationText = cleanText;
+    }
 
-      console.log(
-        `[classify] Large invoice: ${inputLines.length} lines → ${lineIdBatches.length} batches of max ${MAX_LINES_PER_BATCH} (context-aware: all lines sent per batch)`,
-      );
+    // Parse classification JSON
+    const jsonStr = extractFirstJsonArray(classificationText);
+    if (!jsonStr) {
+      console.error(`[classify] No JSON array in Gemini response. First 500: ${classificationText.slice(0, 500)}`);
+      return json({
+        error: "Gemini response: no JSON array found",
+        invoice_id: invoiceId,
+        lines: [],
+        invoice_notes: [],
+        invoice_level: { category_id: null, account_id: null, project_allocations: [], confidence: 0, reasoning: "Parse error" },
+        keywords: [],
+        stats: { total_lines: inputLines.length, classified: 0, model: GEMINI_MODEL, error: "no_json_array" },
+      }, 200);
+    }
 
-      // Run batches in parallel (max MAX_PARALLEL_BATCHES concurrently)
-      for (let i = 0; i < lineIdBatches.length; i += MAX_PARALLEL_BATCHES) {
-        const parallelBatchIds = lineIdBatches.slice(i, i + MAX_PARALLEL_BATCHES);
-        const results = await Promise.all(
-          parallelBatchIds.map((batchIds, j) => {
-            const batchIdSet = new Set(batchIds);
-            // Only the batch lines count for thinking budget
-            const batchLines = inputLines.filter(l => batchIdSet.has(l.line_id));
-            return classifyBatch(
-              batchLines,
-              i + j,
-              lineIdBatches.length,
-              apiKey,
-              () => buildBatchPromptWithContext(batchIdSet),
-            );
-          }),
-        );
-        for (const r of results) {
-          allLineResults.push(...r.lineResults);
-          allKeywords.push(...r.keywords);
-          if (r.error) batchErrors.push(r.error);
+    const parsed: SonnetLineResult[] = JSON.parse(jsonStr);
+    console.log(`[classify] Parsed ${parsed.length} lines from Gemini`);
+
+    // Parse fiscal alerts
+    let fiscalAlerts: FiscalAlert[] = [];
+    if (invoiceNotesText) {
+      try {
+        const notesJson = extractFirstJsonArray(invoiceNotesText);
+        if (notesJson) {
+          fiscalAlerts = JSON.parse(notesJson) as FiscalAlert[];
+          console.log(`[classify] Parsed ${fiscalAlerts.length} fiscal alerts`);
         }
+      } catch (e) {
+        console.warn(`[classify] Failed to parse invoice_notes: ${e}`);
       }
-
-      // Deduplicate keywords
-      allKeywords = [...new Set(allKeywords)].slice(0, 10);
-      thinkingUsed = true;
     }
 
-    // Log batch errors summary
-    if (batchErrors.length > 0) {
-      console.error(`[classify] ${batchErrors.length}/${totalBatches} batch(es) failed:`, batchErrors);
+    // Parse keywords
+    let keywords: string[] = [];
+    if (keywordsText) {
+      try {
+        const kwMatch = keywordsText.match(/\[\s*[\s\S]*?\]/);
+        if (kwMatch) keywords = JSON.parse(kwMatch[0]);
+      } catch { /* ignore */ }
     }
 
-    // Normalize results
-    let lineResults: SonnetLineResult[] = allLineResults.map((item) => ({
+    // ─── Normalize results ─────────────────────────────────────
+    let lineResults: SonnetLineResult[] = parsed.map((item) => ({
       line_id: item.line_id,
       article_code: item.article_code || null,
       phase_code: item.phase_code || null,
@@ -1701,23 +1281,14 @@ Deno.serve(async (req) => {
       account_id: item.account_id || null,
       account_code: item.account_code || null,
       cost_center_allocations: item.cost_center_allocations || [],
-      confidence: Math.min(
-        Math.max(Number(item.confidence) || 50, 0),
-        100,
-      ),
+      confidence: Math.min(Math.max(Number(item.confidence) || 50, 0), 100),
       reasoning: item.reasoning || "",
       fiscal_flags: item.fiscal_flags || null,
       suggest_new_account: item.suggest_new_account || null,
       suggest_new_category: item.suggest_new_category || null,
     }));
 
-    let keywords = allKeywords;
-
-    console.log(
-      `[classify-invoice-lines] ${lineResults.length} lines classified by Haiku+Thinking (${totalBatches} batch${totalBatches > 1 ? "es" : ""})`,
-    );
-
-    // ─── Phase validation ─────────────────────────────
+    // ─── Phase validation ─────────────────────────────────────
     for (const lr of lineResults) {
       if (lr.article_code) {
         const article = articles.find((a) => a.code === lr.article_code);
@@ -1725,13 +1296,11 @@ Deno.serve(async (req) => {
           const articlePhases = phases.filter((p) => p.article_id === article.id);
           // Article has phases but AI returned no phase → auto-assign default
           if (articlePhases.length > 0 && !lr.phase_code) {
-            const sortedPhases = [...articlePhases].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+            const sortedPhases = [...articlePhases].sort((a, b) => ((a as any).sort_order ?? 0) - ((b as any).sort_order ?? 0));
             const defaultPhase = sortedPhases.find(p => p.is_counting_point) || sortedPhases[0];
             if (defaultPhase) {
               lr.phase_code = defaultPhase.code;
               console.log(`[classify] Auto-assigned default phase "${defaultPhase.code}" for article ${lr.article_code} on line ${lr.line_id}`);
-            } else {
-              console.warn(`[classify] Article ${lr.article_code} has ${articlePhases.length} phases but could not determine default for line ${lr.line_id}`);
             }
           }
           // AI returned a phase that doesn't exist → nullify
@@ -1743,15 +1312,12 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ─── Fallback: resolve category/account by name/code when UUID missing or invalid ───
+    // ─── Fallback: resolve category/account by name/code when UUID missing ───
     for (const lr of lineResults) {
-      // Fallback category: prefer direction-filtered, then allCategories
       if (!lr.category_id || !allCategories.find((c) => c.id === lr.category_id)) {
         if (lr.category_name) {
           const nameLower = lr.category_name.toLowerCase().trim();
-          // First: match in direction-filtered categories
           let match = categories.find((c) => c.name.toLowerCase().trim() === nameLower);
-          // Fallback: match in all categories
           if (!match) match = allCategories.find((c) => c.name.toLowerCase().trim() === nameLower);
           if (match) {
             console.log(`[classify] Fallback category: "${lr.category_name}" → ${match.id}`);
@@ -1759,7 +1325,6 @@ Deno.serve(async (req) => {
           }
         }
       }
-      // Fallback account: prefer primary, then secondary, then allAccounts
       if (!lr.account_id || !allAccounts.find((a) => a.id === lr.account_id)) {
         if (lr.account_code) {
           let match = primaryAccounts.find((a) => a.code === lr.account_code);
@@ -1774,43 +1339,37 @@ Deno.serve(async (req) => {
     }
 
     // ─── Post-processing: suspicious classification detection ──
-    // Log when AI may have blindly followed history instead of matching descriptions
     for (const lr of lineResults) {
       const inputLine = inputLines.find((l) => l.line_id === lr.line_id);
       if (!inputLine) continue;
       const desc = (inputLine.description || "").toLowerCase();
 
-      // Check description vs account coherence heuristics
       if (lr.account_id) {
         const acc = allAccounts.find((a) => a.id === lr.account_id);
         if (acc) {
           const accName = acc.name.toLowerCase();
-          // Flag: transport-related description but non-transport account
           const descTransport = /trasport|consegn|sped|vettor|carico/.test(desc);
           const accTransport = /trasport|sped|vettor/.test(accName);
           if (descTransport && !accTransport && !/noleggi|leasing|fermo/.test(accName)) {
-            console.warn(`[classify-sanity] Line ${lr.line_id}: desc mentions trasporto ("${desc.slice(0, 50)}") but account "${acc.code} ${acc.name}" is not trasporto-related. Confidence: ${lr.confidence}`);
+            console.warn(`[classify-sanity] Line ${lr.line_id}: desc mentions trasporto but account "${acc.code} ${acc.name}" is not trasporto-related. Confidence: ${lr.confidence}`);
           }
-          // Flag: rental/noleggio description but non-rental account
           const descRental = /noleggi|nolo|fermo macchina/.test(desc);
           const accRental = /noleggi|nolo/.test(accName);
           if (descRental && !accRental && !/trasport|leasing/.test(accName)) {
-            console.warn(`[classify-sanity] Line ${lr.line_id}: desc mentions noleggio ("${desc.slice(0, 50)}") but account "${acc.code} ${acc.name}" is not noleggio-related. Confidence: ${lr.confidence}`);
+            console.warn(`[classify-sanity] Line ${lr.line_id}: desc mentions noleggio but account "${acc.code} ${acc.name}" is not noleggio-related. Confidence: ${lr.confidence}`);
           }
         }
       }
 
-      // Check description vs article coherence
       if (lr.article_code) {
         const art = articles.find((a) => a.code === lr.article_code);
         if (art) {
           const artName = art.name.toLowerCase();
-          // Flag: description clearly about a service but article is a material (or vice versa)
           const descService = /trasport|noleggi|servizi|consulenz|manutenzi|opere|lavori/.test(desc);
           const artService = /trasport|noleggi|servizi|consulenz|manutenzi/.test(artName);
           const artMaterial = /calcar|pozzolan|inert|ghiai|sabbia|pietr/.test(artName);
           if (descService && artMaterial && !artService) {
-            console.warn(`[classify-sanity] Auto-correcting line ${lr.line_id}: desc mentions service ("${desc.slice(0, 50)}") but article "${lr.article_code} ${art.name}" is a material — removing article assignment`);
+            console.warn(`[classify-sanity] Auto-correcting line ${lr.line_id}: desc mentions service but article "${lr.article_code} ${art.name}" is a material — removing article`);
             lr.article_code = null;
             lr.phase_code = null;
             lr.confidence = Math.min(lr.confidence, 70);
@@ -1819,25 +1378,18 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ─── Level 1: Direction enforcement (hard safety net) ──────────
-    // This is the last line of defense: if the AI returned cost accounts
-    // for an active invoice (or revenue accounts for a passive one),
-    // we auto-correct here. This catches 100% of direction errors.
+    // ─── Direction enforcement (hard safety net) ───────────────
     {
       const allowedSections = dirSections.allowed;
-      const allowedCatTypes = CAT_TYPES_FOR_DIRECTION[direction] || CAT_TYPES_FOR_DIRECTION["in"];
+      const dirCatTypes = CAT_TYPES_FOR_DIRECTION[direction] || CAT_TYPES_FOR_DIRECTION["in"];
       let directionCorrections = 0;
 
       for (const lr of lineResults) {
-        let accountCorrected = false;
-        let categoryCorrected = false;
-
         // Check account section against direction
         if (lr.account_id) {
           const acc = allAccounts.find((a) => a.id === lr.account_id);
           if (acc && !allowedSections.includes(acc.section)) {
             console.warn(`[classify-direction] ⛔ Line ${lr.line_id}: account "${acc.code} ${acc.name}" (section=${acc.section}) is INVALID for direction=${direction} — removing`);
-            // Try to auto-substitute with first primary account that matches
             const fallbackAcc = primaryAccounts.length > 0 ? primaryAccounts[0] : null;
             if (fallbackAcc) {
               lr.account_id = fallbackAcc.id;
@@ -1849,7 +1401,6 @@ Deno.serve(async (req) => {
             }
             lr.confidence = Math.min(lr.confidence, 55);
             lr.reasoning = `[DIR-FIX] Conto originale incompatibile con fattura ${direction === "out" ? "attiva" : "passiva"} — sostituito. ${lr.reasoning}`;
-            accountCorrected = true;
             directionCorrections++;
           }
         }
@@ -1857,9 +1408,8 @@ Deno.serve(async (req) => {
         // Check category type against direction
         if (lr.category_id) {
           const cat = allCategories.find((c) => c.id === lr.category_id);
-          if (cat && !allowedCatTypes.includes(cat.type)) {
+          if (cat && !dirCatTypes.includes(cat.type)) {
             console.warn(`[classify-direction] ⛔ Line ${lr.line_id}: category "${cat.name}" (type=${cat.type}) is INVALID for direction=${direction} — removing`);
-            // Try to auto-substitute with first direction-filtered category
             const fallbackCat = categories.length > 0 ? categories[0] : null;
             if (fallbackCat) {
               lr.category_id = fallbackCat.id;
@@ -1869,15 +1419,12 @@ Deno.serve(async (req) => {
               lr.category_id = null;
               lr.category_name = null;
             }
-            if (!accountCorrected) {
-              lr.confidence = Math.min(lr.confidence, 55);
-            }
-            categoryCorrected = true;
+            lr.confidence = Math.min(lr.confidence, 55);
             directionCorrections++;
           }
         }
 
-        // Level 5: Validate suggest_new_account/category against direction
+        // Validate suggest_new_account/category against direction
         if (lr.suggest_new_account) {
           const suggestedSection = lr.suggest_new_account.section || "";
           if (suggestedSection && !allowedSections.includes(suggestedSection)) {
@@ -1887,7 +1434,7 @@ Deno.serve(async (req) => {
         }
         if (lr.suggest_new_category) {
           const suggestedType = lr.suggest_new_category.type || "";
-          if (suggestedType && !allowedCatTypes.includes(suggestedType)) {
+          if (suggestedType && !dirCatTypes.includes(suggestedType)) {
             console.warn(`[classify-direction] Nullifying suggest_new_category: type "${suggestedType}" is invalid for direction=${direction}`);
             lr.suggest_new_category = null;
           }
@@ -1899,109 +1446,80 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ─── Stage 2.5: Dedicated Fiscal Review (separate Haiku pass) ──────
-    // After Haiku classification + direction enforcement, run a SEPARATE
-    // fiscal-focused Haiku call to determine deducibility, IVA, ritenuta, etc.
-    // This 2-step approach gives each pass dedicated thinking budget.
-    const { updatedLines: fiscalLines, invoiceNotes: fiscalNotes } = await fiscalReview(
-      lineResults,
-      inputLines,
-      counterpartyInfo,
-      counterpartyAtecoFull,
-      direction,
-      apiKey,
-      allAccounts,
-    );
-    lineResults = fiscalLines;
+    // ─── Generate fiscal alerts from fiscal_flags.note ─────────
+    // If Gemini didn't return ---INVOICE_NOTES--- section, build alerts from per-line notes
+    if (fiscalAlerts.length === 0) {
+      const noteGroups = new Map<string, { note: string; lineIds: string[]; deducPct: number; ivaPct: number; ff: FiscalFlags }>();
+      for (const lr of lineResults) {
+        const ff = lr.fiscal_flags;
+        if (!ff?.note) continue;
+        if (!/verificar|controllare|dubbio|attenzione|incert/i.test(ff.note)) continue;
 
-    // Fiscal alerts from the dedicated review
-    let fiscalAlerts: FiscalAlert[] | undefined = fiscalNotes.length > 0 ? fiscalNotes : undefined;
+        const key = ff.note.slice(0, 80).toLowerCase();
+        if (noteGroups.has(key)) {
+          noteGroups.get(key)!.lineIds.push(lr.line_id);
+        } else {
+          noteGroups.set(key, {
+            note: ff.note,
+            lineIds: [lr.line_id],
+            deducPct: ff.deducibilita_pct,
+            ivaPct: ff.iva_detraibilita_pct,
+            ff,
+          });
+        }
+      }
 
-    // ─── Stage 3: Sonnet Escalation — DISABLED ──────────
-    // The dedicated fiscal review (Stage 2.5) now handles 95% of fiscal cases.
-    // Sonnet escalation is preserved but disabled — it will be useful in future
-    // for complex reasoning (autofatture, multi-step fiscal analysis).
-    const sonnetEscalatedCount = 0;
-    /*
-    {
-      const escalationCandidates = lineResults.filter(lr => needsSonnetEscalation(lr));
+      for (const [, group] of noteGroups) {
+        let type: FiscalAlert['type'] = 'general';
+        if (/deducibil|auto|mezzo|trasporto/i.test(group.note)) type = 'deducibilita';
+        if (/ritenuta/i.test(group.note)) type = 'ritenuta';
+        if (/reverse/i.test(group.note)) type = 'reverse_charge';
+        if (/strumentale|ammortizz/i.test(group.note)) type = 'bene_strumentale';
 
-      if (escalationCandidates.length > 0) {
-        console.log(
-          `[classify] Sonnet escalation: ${escalationCandidates.length}/${lineResults.length} lines need expert review:`,
-          escalationCandidates.map(lr => ({
-            line_id: lr.line_id,
-            confidence: lr.confidence,
-            ritenuta: !!lr.fiscal_flags?.ritenuta_acconto,
-            reverse_charge: !!lr.fiscal_flags?.reverse_charge,
-            bene_strumentale: !!lr.fiscal_flags?.bene_strumentale,
-            suggest_new: !!lr.suggest_new_account,
-          })),
-        );
-
-        const sonnetResult = await sonnetEscalate(
-          escalationCandidates,
-          inputLines,
-          allAccounts,
-          allCategories,
-          projects,
-          articles,
-          phases,
-          counterpartyInfo,
-          history,
-          memoryBlock,
-          direction,
-          systemPrompt,
-          userInstructionsBlock,
-          apiKey,
-          invoiceNotes || undefined,
-        );
-
-        if (sonnetResult.error) {
-          console.warn(`[classify] Sonnet escalation failed: ${sonnetResult.error} — keeping Haiku results`);
-        } else if (sonnetResult.lineResults.length > 0) {
-          const sonnetMap = new Map(sonnetResult.lineResults.map(lr => [lr.line_id, lr]));
-          let upgraded = 0;
-          for (let i = 0; i < lineResults.length; i++) {
-            const sonnetLr = sonnetMap.get(lineResults[i].line_id);
-            if (sonnetLr) {
-              const merged: SonnetLineResult = {
-                line_id: sonnetLr.line_id,
-                article_code: sonnetLr.article_code || lineResults[i].article_code,
-                phase_code: sonnetLr.phase_code || lineResults[i].phase_code,
-                category_id: sonnetLr.category_id || lineResults[i].category_id,
-                category_name: sonnetLr.category_name || lineResults[i].category_name,
-                account_id: sonnetLr.account_id || lineResults[i].account_id,
-                account_code: sonnetLr.account_code || lineResults[i].account_code,
-                cost_center_allocations: sonnetLr.cost_center_allocations || lineResults[i].cost_center_allocations,
-                confidence: Math.min(Math.max(Number(sonnetLr.confidence) || 50, 0), 100),
-                reasoning: `[SONNET] ${sonnetLr.reasoning || lineResults[i].reasoning}`,
-                fiscal_flags: sonnetLr.fiscal_flags || lineResults[i].fiscal_flags,
-                suggest_new_account: sonnetLr.suggest_new_account || null,
-                suggest_new_category: sonnetLr.suggest_new_category || null,
-              };
-              lineResults[i] = merged;
-              upgraded++;
-            }
-          }
-          sonnetEscalatedCount = upgraded;
-          console.log(`[classify] Sonnet escalation: ${upgraded} lines upgraded, ${sonnetResult.lineResults.length} returned`);
+        const options: FiscalAlertOption[] = [];
+        if (type === 'deducibilita') {
+          options.push(
+            { label: `Conservativo (${group.deducPct}% deducibile, ${group.ivaPct}% IVA)`, fiscal_override: { deducibilita_pct: group.deducPct, iva_detraibilita_pct: group.ivaPct }, is_default: true },
+            { label: 'Mezzo da trasporto (100%/100%)', fiscal_override: { deducibilita_pct: 100, iva_detraibilita_pct: 100 }, is_default: false },
+          );
+        } else if (type === 'bene_strumentale') {
+          options.push(
+            { label: "Costo d'esercizio", fiscal_override: { bene_strumentale: false }, is_default: true },
+            { label: 'Bene strumentale (ammortamento)', fiscal_override: { bene_strumentale: true }, is_default: false },
+          );
+        } else if (type === 'ritenuta') {
+          options.push(
+            { label: "Con ritenuta d'acconto", fiscal_override: { ritenuta_acconto: { aliquota: 20, base: "imponibile" } }, is_default: true },
+            { label: 'Senza ritenuta', fiscal_override: { ritenuta_acconto: null }, is_default: false },
+          );
         }
 
-        if (sonnetResult.invoiceNotes && sonnetResult.invoiceNotes.length > 0) {
-          fiscalAlerts = sonnetResult.invoiceNotes;
-          console.log(`[classify] Sonnet generated ${fiscalAlerts.length} fiscal alerts`);
+        if (options.length > 0) {
+          const affectedLines = group.lineIds.length === lineResults.length ? ['all'] : group.lineIds;
+          fiscalAlerts.push({
+            type,
+            severity: 'warning',
+            title: type === 'deducibilita' ? 'Deducibilità da verificare' :
+                   type === 'bene_strumentale' ? 'Possibile bene strumentale' :
+                   type === 'ritenuta' ? "Ritenuta d'acconto" :
+                   'Nota fiscale',
+            description: group.note,
+            current_choice: options.find(o => o.is_default)?.label || options[0].label,
+            options,
+            affected_lines: affectedLines,
+          });
         }
-      } else {
-        console.log(`[classify] No lines need Sonnet escalation`);
+      }
+
+      if (fiscalAlerts.length > 0) {
+        console.log(`[classify] Generated ${fiscalAlerts.length} fiscal alerts from per-line notes`);
       }
     }
-    */
 
-    // ─── Compose invoice-level ─────────────────────────
+    // ─── Compose invoice-level ─────────────────────────────────
     const invoiceLevel = composeInvoiceLevel(lineResults, inputLines);
 
-    // ─── Persist to DB ─────────────────────────────────
+    // ─── Persist to DB ─────────────────────────────────────────
     await persistResults(
       sql,
       companyId,
@@ -2010,7 +1528,7 @@ Deno.serve(async (req) => {
       invoiceLevel,
       articles,
       phases,
-      fiscalAlerts,
+      fiscalAlerts.length > 0 ? fiscalAlerts : undefined,
     );
 
     // Mark invoice as ai_suggested + save keywords
@@ -2053,25 +1571,17 @@ Deno.serve(async (req) => {
           phase_id: phaseId,
         };
       }),
-      invoice_notes: fiscalAlerts || [],
+      invoice_notes: fiscalAlerts,
       invoice_level: invoiceLevel,
       keywords,
       stats: {
         total_lines: inputLines.length,
-        classified: lineResults.filter(
-          (r) => r.confidence >= MIN_CONFIDENCE,
-        ).length,
+        classified: lineResults.filter((r) => r.confidence >= MIN_CONFIDENCE).length,
         history_count: history.length,
         memory_facts_count: memoryFacts.length,
-        model: MODEL_HAIKU,
-        thinking_enabled: thinkingUsed,
-        batches: totalBatches,
-        fiscal_review: true,
-        ...(sonnetEscalatedCount > 0 ? {
-          sonnet_escalated: sonnetEscalatedCount,
-          sonnet_model: MODEL_SONNET,
-        } : {}),
-        ...(batchErrors.length > 0 ? { batch_errors: batchErrors } : {}),
+        model: GEMINI_MODEL,
+        kb_rules_found: kbRules.length,
+        fiscal_alerts: fiscalAlerts.length,
       },
     });
   } catch (e: unknown) {
