@@ -213,6 +213,7 @@ export async function createRuleFromConfirmation(
     account_id?: string | null
     cost_center_allocations?: { project_id: string; percentage: number }[] | null
   },
+  sourceInvoiceId?: string | null,
 ): Promise<void> {
   const normalizedDesc = normalizeDescription(lineDescription)
   if (normalizedDesc.length < 3) return
@@ -237,18 +238,20 @@ export async function createRuleFromConfirmation(
 
   if (existing) {
     // Update existing rule: increment times_confirmed, update classification
+    const updatePayload: Record<string, unknown> = {
+      times_confirmed: (existing.times_confirmed || 0) + 1,
+      article_id: classification.article_id ?? null,
+      phase_id: classification.phase_id ?? null,
+      category_id: classification.category_id ?? null,
+      account_id: classification.account_id ?? null,
+      cost_center_allocations: classification.cost_center_allocations ?? null,
+      active: true, // Re-activate if it was deactivated
+      updated_at: new Date().toISOString(),
+    }
+    if (sourceInvoiceId) updatePayload.source_invoice_id = sourceInvoiceId
     await supabase
       .from('classification_rules')
-      .update({
-        times_confirmed: (existing.times_confirmed || 0) + 1,
-        article_id: classification.article_id ?? null,
-        phase_id: classification.phase_id ?? null,
-        category_id: classification.category_id ?? null,
-        account_id: classification.account_id ?? null,
-        cost_center_allocations: classification.cost_center_allocations ?? null,
-        active: true, // Re-activate if it was deactivated
-        updated_at: new Date().toISOString(),
-      })
+      .update(updatePayload)
       .eq('id', existing.id)
   } else {
     // Create new rule
@@ -270,6 +273,7 @@ export async function createRuleFromConfirmation(
       source: 'user_confirm',
       active: true,
     }
+    if (sourceInvoiceId) row.source_invoice_id = sourceInvoiceId
 
     const { error } = await supabase
       .from('classification_rules')
@@ -283,6 +287,27 @@ export async function createRuleFromConfirmation(
         console.error('[classificationRules] Error creating rule:', error.message)
       }
     }
+  }
+}
+
+/* ─── Deactivate rules for a cancelled invoice ── */
+
+/**
+ * Soft-delete (deactivate) classification rules that were created from a specific invoice.
+ * Called when the user cancels a classification ("Cancella tutto" + Save).
+ *
+ * Only deactivates rules whose source_invoice_id matches — rules without a source
+ * (legacy rules from before migration 044) are preserved.
+ */
+export async function deactivateRulesForInvoice(invoiceId: string): Promise<void> {
+  const { error } = await supabase
+    .from('classification_rules')
+    .update({ active: false, updated_at: new Date().toISOString() })
+    .eq('source_invoice_id', invoiceId)
+    .eq('active', true)
+
+  if (error) {
+    console.warn('[classificationRules] Error deactivating rules for invoice:', error.message)
   }
 }
 

@@ -44,7 +44,7 @@ import {
   type AccountSuggestion, type CategorySuggestion,
 } from '@/lib/classificationService';
 import { toast } from 'sonner';
-import { createRuleFromConfirmation, findMatchingRules } from '@/lib/classificationRulesService';
+import { createRuleFromConfirmation, findMatchingRules, deactivateRulesForInvoice, type RuleSuggestion } from '@/lib/classificationRulesService';
 import { createMemoryFromClassification } from '@/lib/companyMemoryService';
 import ExportDialog from '@/components/ExportDialog';
 import SearchableSelect from '@/components/SearchableSelect';
@@ -644,6 +644,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   // AI classification suggestion state
   const [aiClassifStatus, setAiClassifStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [aiClassifResult, setAiClassifResult] = useState<any>(null);
+  // Rules dialog: when rules match, show choice before running AI
+  const [showRulesDialog, setShowRulesDialog] = useState(false);
+  const [pendingRuleSuggestions, setPendingRuleSuggestions] = useState<RuleSuggestion[]>([]);
   const [lineFiscalFlags, setLineFiscalFlags] = useState<Record<string, any>>({});
   // AI suggestion state for new accounts/categories
   const [lineSuggestions, setLineSuggestions] = useState<Record<string, {
@@ -904,6 +907,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 article_id: lineArticleMap[line.id]?.article_id || null,
                 phase_id: lineArticleMap[line.id]?.phase_id || null,
                 cost_center_allocations: lineCdc },
+              invoice.id,
             ).catch(err => console.warn('[rules] error:', err));
           }
         }
@@ -994,20 +998,50 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     }));
   }, []);
 
-  // AI classification — fast-path rules first, then unified Sonnet classifier
+  // AI classification — check rules first, then classify
   const handleRequestAiClassification = useCallback(async () => {
     if (!invoice?.id || !company?.id) return;
+    const cp = (invoice.counterparty || {}) as any;
+    const lines = detail?.invoice_lines || [];
+
+    // Pre-check: look for matching rules (instant, 0ms)
+    const ruleSuggestions = await findMatchingRules(
+      company.id, cp?.piva || null, cp?.denom || null,
+      lines.map(l => ({ id: l.id, description: l.description })),
+      invoice.direction as 'in' | 'out',
+    );
+
+    // If rules cover ALL lines, ask user before applying
+    const coveredLineIds = new Set(ruleSuggestions.map(s => s.line_id));
+    const allCovered = lines.length > 0 && lines.every(l => coveredLineIds.has(l.id));
+    if (allCovered && ruleSuggestions.length > 0) {
+      setPendingRuleSuggestions(ruleSuggestions);
+      setShowRulesDialog(true);
+      return; // Wait for user choice
+    }
+
+    // If rules don't cover all lines (or no rules), run normally
+    runAiClassification(false);
+  }, [invoice?.id, company?.id, invoice?.counterparty, invoice?.direction, detail?.invoice_lines]);
+
+  // Core classification logic — called after rules dialog or directly
+  const runAiClassification = useCallback(async (skipRules: boolean) => {
+    if (!invoice?.id || !company?.id) return;
     setAiClassifStatus('loading');
+    setShowRulesDialog(false);
     try {
       const cp = (invoice.counterparty || {}) as any;
       const lines = detail?.invoice_lines || [];
 
-      // Step 1: Fast-path — check classification rules (instant, 0ms)
-      const ruleSuggestions = await findMatchingRules(
-        company.id, cp?.piva || null, cp?.denom || null,
-        lines.map(l => ({ id: l.id, description: l.description })),
-        invoice.direction as 'in' | 'out',
-      );
+      // Step 1: Fast-path — check classification rules (skip if user chose "Reclassifica con AI")
+      let ruleSuggestions: RuleSuggestion[] = [];
+      if (!skipRules) {
+        ruleSuggestions = await findMatchingRules(
+          company.id, cp?.piva || null, cp?.denom || null,
+          lines.map(l => ({ id: l.id, description: l.description })),
+          invoice.direction as 'in' | 'out',
+        );
+      }
 
       const coveredLineIds = new Set(ruleSuggestions.map(s => s.line_id));
       const rulesMissingCdc = ruleSuggestions.length > 0 &&
@@ -1371,6 +1405,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         await deleteInvoiceClassification(invoice.id);
         await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
         onPatchInvoice(invoice.id, { classification_status: 'none' } as Partial<DBInvoice>);
+        // Soft-delete classification rules created from this invoice
+        deactivateRulesForInvoice(invoice.id).catch(err => console.warn('[rules] deactivate error:', err));
       } else {
         const newStatus = isConfirmed ? 'confirmed' : 'manual';
         await supabase.from('invoice_classifications').update({ verified: true, assigned_by: 'manual', updated_at: new Date().toISOString() }).eq('invoice_id', invoice.id);
@@ -1413,6 +1449,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 article_id: lineArticleMap[line.id]?.article_id || null,
                 phase_id: lineArticleMap[line.id]?.phase_id || null,
                 cost_center_allocations: lineCdc },
+              invoice.id,
             ).catch(err => console.warn('[rules] error:', err));
 
             // Company memory: create counterparty_pattern fact
@@ -2648,6 +2685,33 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 <button onClick={handleClearAllClassification}
                   className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-red-600 text-white hover:bg-red-700">
                   Cancella tutto
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Rules dialog: choice between fast-path rules or fresh AI */}
+        {showRulesDialog && pendingRuleSuggestions.length > 0 && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+            <div className="bg-white rounded-xl shadow-xl p-6 max-w-sm w-full mx-4">
+              <p className="font-semibold text-gray-900 mb-2">Regole trovate</p>
+              <p className="text-sm text-gray-500 mb-4">
+                Trovate {pendingRuleSuggestions.length} regole da classificazioni precedenti per questa controparte.
+                Vuoi applicarle o reclassificare con l'AI?
+              </p>
+              <div className="flex gap-3 justify-end">
+                <button onClick={() => { setShowRulesDialog(false); setPendingRuleSuggestions([]); }}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-100">
+                  Annulla
+                </button>
+                <button onClick={() => runAiClassification(false)}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-green-600 text-green-700 hover:bg-green-50">
+                  Usa regole
+                </button>
+                <button onClick={() => runAiClassification(true)}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-700 hover:to-indigo-700">
+                  Reclassifica con AI
                 </button>
               </div>
             </div>

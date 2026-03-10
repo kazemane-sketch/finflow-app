@@ -433,7 +433,7 @@ REGOLE:
 - Il NOME della controparte rivela spesso l'attività: usalo come indizio forte.
 
 - CdC: assegna SOLO se hai un segnale chiaro (storico controparte, cantiere nella descrizione, località). Se non sei sicuro, lascia cost_center_allocations vuoto — l'utente lo assegnerà manualmente.
-- DUBBI FISCALI — REGOLA CRITICA: per OGNI riga, valuta attentamente deducibilita_pct e iva_detraibilita_pct usando le regole TUIR nel system prompt. NON mettere 100/100 di default. Ragiona: chi è la controparte (ATECO)? Che tipo di bene/servizio è? Per quale mezzo/uso è destinato? Se hai anche un MINIMO dubbio sulla percentuale corretta, ABBASSA la confidence sotto 65 e scrivi nel reasoning "Verificare: [motivo]". Questo è fondamentale perché attiva una verifica approfondita automatica. Esempi di dubbi da segnalare: deducibilità auto 20% vs mezzo trasporto 100%, IVA indetraibile parziale, possibile ritenuta d'acconto, possibile reverse charge, bene strumentale vs costo d'esercizio.
+- DUBBI FISCALI — REGOLA CRITICA: per OGNI riga, valuta attentamente deducibilita_pct e iva_detraibilita_pct usando le regole TUIR nel system prompt. NON mettere 100/100 di default. Ragiona: chi è la controparte (ATECO)? Che tipo di bene/servizio è? Per quale mezzo/uso è destinato? QUANDO HAI UN DUBBIO, USA SEMPRE LA PERCENTUALE PIÙ BASSA (conservativa). Esempio: se non sai se è auto aziendale (20%/40%) o mezzo trasporto (100%/100%), metti 20%/40% — è più sicuro fiscalmente. L'utente può correggere verso l'alto, ma non deve scoprire di aver sbagliato verso il basso in sede di verifica. Abbassa la confidence sotto 65 e scrivi nel reasoning "Verificare: [motivo]" così si attiva la verifica Sonnet automatica.
 - COERENZA FISCALE FATTURA: PRIMA di classificare le singole righe, analizza l'INTERA fattura come un insieme. Guarda: chi è la controparte (ATECO)? Che tipo di beni/servizi sono? Per quale uso/mezzo sono destinati? Le percentuali di deducibilità e IVA detraibile devono essere COERENTI tra tutte le righe della stessa fattura che riguardano lo stesso tipo di operazione. NON è possibile avere 20% su un paraurti e 100% su un braccio oscillante dello stesso veicolo. Decidi il trattamento fiscale a livello fattura, poi applicalo uniformemente. Se stai classificando un sottoinsieme di righe (vedi righe [CONTESTO]), usa le righe contesto per determinare il trattamento fiscale dell'intera fattura PRIMA di classificare le tue righe.
 ${invoiceNotes ? `\n=== NOTE UTENTE SULLA FATTURA ===\n${invoiceNotes}\nQueste note sono dell'utente e hanno PRIORITÀ MASSIMA sulla classificazione.\n===\n` : ""}${batchInstruction}
 RIGHE:
@@ -661,6 +661,8 @@ function needsSonnetEscalation(lr: SonnetLineResult): boolean {
     if (ff.ritenuta_acconto) return true;
     if (ff.reverse_charge) return true;
     if (ff.bene_strumentale) return true;
+    // Haiku wrote doubt in fiscal note → escalate
+    if (ff.note && DOUBT_PATTERN.test(ff.note)) return true;
   }
 
   // Haiku signals doubt in reasoning → escalate
