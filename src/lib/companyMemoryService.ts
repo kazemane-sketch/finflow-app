@@ -131,10 +131,16 @@ export interface BrainBackfillResult {
 
 /**
  * Triggers a FULL backfill of all entity embeddings + company_memory embeddings.
- * Unlike the fire-and-forget helpers, this **awaits** both responses so the UI
+ * Loops until all items are embedded (max 20 rounds per type, 50 items/round).
+ * Unlike the fire-and-forget helpers, this **awaits** responses so the UI
  * can show progress/results. Used by the "Attiva Brain AI" button.
+ *
+ * @param onProgress — called after each batch so the UI can update live
  */
-export async function triggerFullBrainBackfill(companyId: string): Promise<BrainBackfillResult> {
+export async function triggerFullBrainBackfill(
+  companyId: string,
+  onProgress?: (partial: BrainBackfillResult) => void,
+): Promise<BrainBackfillResult> {
   const token = await getValidAccessToken()
   const headers = {
     'Content-Type': 'application/json',
@@ -142,43 +148,72 @@ export async function triggerFullBrainBackfill(companyId: string): Promise<Brain
     'Authorization': `Bearer ${token}`,
   }
 
-  // Launch both in parallel
-  const [entitiesRes, memoryRes] = await Promise.allSettled([
-    fetch(`${SUPABASE_URL}/functions/v1/precompute-embeddings`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ company_id: companyId }),
-    }),
-    fetch(`${SUPABASE_URL}/functions/v1/memory-embed`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ company_id: companyId, mode: 'backfill' }),
-    }),
-  ])
-
   const result: BrainBackfillResult = {
     entities: {},
     memory: { processed: 0, errors: 0, remaining: 0 },
   }
 
-  // Parse entity results
-  if (entitiesRes.status === 'fulfilled' && entitiesRes.value.ok) {
+  const MAX_ROUNDS = 20
+
+  // ── Entity embeddings: loop until remaining = 0 ──
+  for (let round = 0; round < MAX_ROUNDS; round++) {
     try {
-      const data = await entitiesRes.value.json()
-      result.entities = data.processed_by_type || {}
-    } catch { /* ignore parse error */ }
-  } else {
-    console.warn('[brainBackfill] entities call failed:', entitiesRes.status === 'rejected' ? entitiesRes.reason : 'HTTP error')
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/precompute-embeddings`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ company_id: companyId }),
+      })
+      if (!res.ok) {
+        console.warn(`[brainBackfill] entities round ${round} HTTP ${res.status}`)
+        break
+      }
+      const data = await res.json()
+      const byType = (data.processed_by_type || {}) as Record<string, { processed: number; errors: number; remaining: number }>
+
+      // Accumulate into result
+      for (const [type, r] of Object.entries(byType)) {
+        if (!result.entities[type]) result.entities[type] = { processed: 0, errors: 0, remaining: 0 }
+        result.entities[type].processed += r.processed
+        result.entities[type].errors += r.errors
+        result.entities[type].remaining = r.remaining
+      }
+
+      // Check if done
+      const totalProcessed = data.total_processed ?? 0
+      const totalRemaining = Object.values(byType).reduce((sum, r) => sum + r.remaining, 0)
+      if (totalRemaining === 0 || totalProcessed === 0) break
+
+      onProgress?.({ ...result, entities: { ...result.entities }, memory: { ...result.memory } })
+    } catch (err) {
+      console.warn('[brainBackfill] entities round error:', err)
+      break
+    }
   }
 
-  // Parse memory results
-  if (memoryRes.status === 'fulfilled' && memoryRes.value.ok) {
+  // ── Memory embeddings: loop until remaining = 0 ──
+  for (let round = 0; round < MAX_ROUNDS; round++) {
     try {
-      const data = await memoryRes.value.json()
-      result.memory = { processed: data.processed || 0, errors: data.errors || 0, remaining: data.remaining || 0 }
-    } catch { /* ignore parse error */ }
-  } else {
-    console.warn('[brainBackfill] memory call failed:', memoryRes.status === 'rejected' ? memoryRes.reason : 'HTTP error')
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/memory-embed`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ company_id: companyId, mode: 'backfill' }),
+      })
+      if (!res.ok) {
+        console.warn(`[brainBackfill] memory round ${round} HTTP ${res.status}`)
+        break
+      }
+      const data = await res.json()
+      result.memory.processed += data.processed || 0
+      result.memory.errors += data.errors || 0
+      result.memory.remaining = data.remaining || 0
+
+      if (data.remaining === 0 || (data.processed || 0) === 0) break
+
+      onProgress?.({ ...result, entities: { ...result.entities }, memory: { ...result.memory } })
+    } catch (err) {
+      console.warn('[brainBackfill] memory round error:', err)
+      break
+    }
   }
 
   return result

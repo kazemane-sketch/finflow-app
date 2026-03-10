@@ -331,7 +331,10 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
     setError('')
     setResult(null)
     try {
-      const res = await triggerFullBrainBackfill(companyId)
+      const res = await triggerFullBrainBackfill(companyId, (partial) => {
+        // Live progress updates from each batch round
+        setResult({ ...partial })
+      })
       setResult(res)
     } catch (err: any) {
       setError(err.message || 'Errore durante il backfill')
@@ -340,14 +343,15 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
   }
 
   // Compute totals from result
-  const entityTotal = result
-    ? Object.values(result.entities).reduce((sum, r) => sum + r.processed, 0)
+  const show = result
+  const entityTotal = show
+    ? Object.values(show.entities).reduce((sum, r) => sum + r.processed, 0)
     : 0
-  const entityErrors = result
-    ? Object.values(result.entities).reduce((sum, r) => sum + r.errors, 0)
+  const entityErrors = show
+    ? Object.values(show.entities).reduce((sum, r) => sum + r.errors, 0)
     : 0
-  const entityRemaining = result
-    ? Object.values(result.entities).reduce((sum, r) => sum + r.remaining, 0)
+  const entityRemaining = show
+    ? Object.values(show.entities).reduce((sum, r) => sum + r.remaining, 0)
     : 0
 
   return (
@@ -373,12 +377,12 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
           {running ? (
             <>
               <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
-              Calcolo in corso...
+              Calcolo in corso{entityTotal > 0 ? ` (${entityTotal + (show?.memory.processed || 0)} processati)` : ''}...
             </>
           ) : (
             <>
               <Brain className="h-3.5 w-3.5 mr-1.5" />
-              Attiva Brain AI
+              {result ? 'Ricalcola Embeddings' : 'Attiva Brain AI'}
             </>
           )}
         </Button>
@@ -390,33 +394,37 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
           </div>
         )}
 
-        {result && (
-          <div className="bg-violet-50 rounded-lg px-3 py-2.5 space-y-1.5">
+        {show && (
+          <div className={`rounded-lg px-3 py-2.5 space-y-1.5 ${running ? 'bg-violet-50/60 border border-violet-200' : 'bg-violet-50'}`}>
             <div className="flex items-center gap-2 text-xs font-semibold text-violet-800">
-              <CheckCircle className="h-3.5 w-3.5 text-emerald-600" />
-              Backfill completato
+              {running ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-violet-500" />
+              ) : (
+                <CheckCircle className="h-3.5 w-3.5 text-emerald-600" />
+              )}
+              {running ? 'Embedding in corso...' : 'Backfill completato'}
             </div>
             <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-600">
               <span>Entità processate:</span>
               <span className="font-medium text-gray-900">{entityTotal}</span>
               <span>Memoria processata:</span>
-              <span className="font-medium text-gray-900">{result.memory.processed}</span>
-              {(entityErrors + result.memory.errors) > 0 && (
+              <span className="font-medium text-gray-900">{show.memory.processed}</span>
+              {(entityErrors + show.memory.errors) > 0 && (
                 <>
                   <span className="text-amber-600">Errori:</span>
-                  <span className="font-medium text-amber-700">{entityErrors + result.memory.errors}</span>
+                  <span className="font-medium text-amber-700">{entityErrors + show.memory.errors}</span>
                 </>
               )}
-              {(entityRemaining + result.memory.remaining) > 0 && (
+              {(entityRemaining + show.memory.remaining) > 0 && (
                 <>
                   <span>Rimanenti:</span>
-                  <span className="font-medium text-gray-700">{entityRemaining + result.memory.remaining}</span>
+                  <span className="font-medium text-gray-700">{entityRemaining + show.memory.remaining}</span>
                 </>
               )}
             </div>
-            {Object.entries(result.entities).length > 0 && (
+            {Object.entries(show.entities).length > 0 && (
               <div className="text-[10px] text-gray-400 pt-1 border-t border-violet-100">
-                {Object.entries(result.entities).map(([type, r]) => (
+                {Object.entries(show.entities).map(([type, r]) => (
                   <span key={type} className="mr-3">
                     {type.replace(/_/g, ' ')}: {r.processed}
                   </span>
