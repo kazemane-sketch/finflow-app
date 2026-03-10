@@ -36,12 +36,14 @@ import {
   loadInvoiceProjects, saveInvoiceProjects,
   loadLineClassifications, saveLineCategoryAndAccount, clearAllLineClassifications,
   loadLineProjects, saveLineProjects,
+  loadInvoiceNotes, clearInvoiceNotes, saveLineFiscalFlags,
   CATEGORY_TYPE_LABELS, SECTION_LABELS,
   createAccountFromSuggestion, createCategoryFromSuggestion,
   type Category, type Project, type ChartAccount, type CoaSection, type CategoryType,
   type InvoiceClassification, type InvoiceProjectAssignment,
   type LineClassification, type LineProjectAssignment,
   type AccountSuggestion, type CategorySuggestion,
+  type FiscalAlert, type FiscalAlertOption,
 } from '@/lib/classificationService';
 import { toast } from 'sonner';
 import { createRuleFromConfirmation, findMatchingRules, deactivateRulesForInvoice, type RuleSuggestion } from '@/lib/classificationRulesService';
@@ -303,6 +305,7 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, is
           <span className="flex items-center gap-1">
             {isMatched && <ReconciledIcon size={12} />}
             {!isMatched && suggestionScore != null && <ReconciliationDot score={suggestionScore} invoiceId={inv.id} />}
+            {(inv as any).has_fiscal_alerts && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700" title="Alert fiscali da verificare">{'\u26A0\uFE0F'}</span>}
             {nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}
             <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{getStatusLabel(inv.payment_status, inv.direction)}</span>
           </span>
@@ -648,6 +651,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [showRulesDialog, setShowRulesDialog] = useState(false);
   const [pendingRuleSuggestions, setPendingRuleSuggestions] = useState<RuleSuggestion[]>([]);
   const [lineFiscalFlags, setLineFiscalFlags] = useState<Record<string, any>>({});
+  // Fiscal review alerts from Sonnet escalation
+  const [invoiceNotes, setInvoiceNotes] = useState<FiscalAlert[]>([]);
   // AI suggestion state for new accounts/categories
   const [lineSuggestions, setLineSuggestions] = useState<Record<string, {
     suggest_new_account?: AccountSuggestion | null;
@@ -791,7 +796,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     let cancelled = false;
     (async () => {
       try {
-        const [cats, projs, accs, classif, iProjs, lineClfResult, lineProj] = await Promise.all([
+        const [cats, projs, accs, classif, iProjs, lineClfResult, lineProj, fiscalAlerts] = await Promise.all([
           loadCategories(companyId, true),
           loadProjects(companyId, true),
           loadChartOfAccounts(companyId),
@@ -799,6 +804,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           loadInvoiceProjects(invoice.id),
           loadLineClassifications(invoice.id),
           loadLineProjects(invoice.id),
+          loadInvoiceNotes(invoice.id),
         ]);
         if (cancelled) return;
         setAllCategories(cats);
@@ -806,6 +812,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setAllAccounts(accs.filter(a => !a.is_header && a.active));
         setClassification(classif);
         setInvProjects(iProjs);
+        setInvoiceNotes(fiscalAlerts);
         setLineClassifs(lineClfResult.classifs);
         setOriginalLineClassifs(lineClfResult.classifs);
         setLineProjects(lineProj);
@@ -1138,6 +1145,12 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       }
       setLineFiscalFlags(flags);
 
+      // Extract fiscal review alerts from Sonnet escalation
+      const aiInvoiceNotes = ((aiResult as any)?.invoice_notes || (result as any)?.invoice_notes || []) as FiscalAlert[];
+      if (aiInvoiceNotes.length > 0) {
+        setInvoiceNotes(aiInvoiceNotes);
+      }
+
       // Extract AI suggestions for new accounts/categories
       const suggestions: Record<string, { suggest_new_account?: AccountSuggestion | null; suggest_new_category?: CategorySuggestion | null }> = {};
       for (const lr of (result.lines || [])) {
@@ -1467,7 +1480,19 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         }
       }
 
-      // 7. Refresh badges in sidebar
+      // 7. Persist updated fiscal flags for lines that were modified by fiscal review
+      for (const [lineId, ff] of Object.entries(lineFiscalFlags)) {
+        if (ff) {
+          saveLineFiscalFlags(lineId, ff).catch(e => console.warn('[fiscal] save error:', e));
+        }
+      }
+
+      // 8. Clear invoice_notes if all alerts resolved, update has_fiscal_alerts
+      if (invoiceNotes.length === 0) {
+        clearInvoiceNotes(invoice.id).catch(e => console.warn('[fiscal] clear notes error:', e));
+      }
+
+      // 9. Refresh badges in sidebar
       onRefreshBadges(invoice.id);
       toast.success('Modifiche salvate');
     } catch (e: any) {
@@ -1479,7 +1504,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     isConfirmed, classification, classifDirty, selCategoryId, selAccountId, cdcRows, cdcMode,
     lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap,
     lineProjects, originalLineProjects, dismissedArticleLineIds,
-    detail?.invoice_lines, onPatchInvoice, onRefreshBadges, allAccounts, allCategories]);
+    detail?.invoice_lines, onPatchInvoice, onRefreshBadges, allAccounts, allCategories,
+    lineFiscalFlags, invoiceNotes]);
 
   // Copy classification from a line
   const handleCopyLineClassif = useCallback((lineId: string) => {
@@ -1535,6 +1561,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     setLineProjects({});
     setLineArticleMap({});
     setLineFiscalFlags({});
+    setInvoiceNotes([]);
     setAiSuggestions({});
     setDismissedArticleLineIds(new Set());
     setAiClassifResult(null);
@@ -1550,6 +1577,42 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       console.warn('[clear] Error clearing fiscal_flags from DB:', e);
     }
   }, [invoice?.id]);
+
+  // ─── Fiscal Review: handle user choice on an alert ─────
+  const handleFiscalChoice = useCallback((alertIdx: number, option: FiscalAlertOption | null) => {
+    const alert = invoiceNotes[alertIdx];
+    if (!alert) return;
+
+    if (option) {
+      // Apply fiscal_override to all affected lines
+      setLineFiscalFlags(prev => {
+        const updated = { ...prev };
+        for (const lineId of alert.affected_lines) {
+          updated[lineId] = { ...(updated[lineId] || {}), ...option.fiscal_override };
+        }
+        return updated;
+      });
+      setClassifDirty(true);
+
+      // Save fiscal decision to company memory (fire-and-forget)
+      if (company?.id) {
+        const cp = (invoice?.counterparty || {}) as any;
+        import('@/lib/companyMemoryService').then(({ insertMemoryFact }) => {
+          insertMemoryFact({
+            company_id: company!.id,
+            fact_type: 'fiscal_rule',
+            fact_text: `Controparte '${cp?.denom || 'N/D'}': ${alert.title} → scelta: ${option.label}`,
+            metadata: { alert_type: alert.type, fiscal_override: option.fiscal_override },
+            counterparty_id: cp?.id || null,
+            source: 'user_confirm',
+          }).catch((e: unknown) => console.warn('[memory] fiscal choice error:', e));
+        });
+      }
+    }
+
+    // Remove resolved/skipped alert
+    setInvoiceNotes(prev => prev.filter((_, i) => i !== alertIdx));
+  }, [invoiceNotes, company?.id, invoice?.counterparty]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }, suggestedPhaseId?: string | null) => {
     const companyId = company?.id;
@@ -2051,6 +2114,52 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 </span>
               )}
             </div>
+
+            {/* Fiscal Review Box — interactive alerts from Sonnet */}
+            {invoiceNotes.length > 0 && (
+              <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 mb-3">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-amber-600 text-sm">{'\u26A0\uFE0F'}</span>
+                  <span className="text-xs font-bold text-amber-800">
+                    Review Fiscale — {invoiceNotes.length} {invoiceNotes.length === 1 ? 'alert' : 'alert'} da verificare
+                  </span>
+                </div>
+                <div className="space-y-2">
+                  {invoiceNotes.map((alert, idx) => (
+                    <div key={idx} className="bg-white border border-amber-200 rounded-lg px-3 py-2">
+                      <div className="flex items-start gap-2">
+                        <span className="text-amber-500 text-xs mt-0.5">{alert.severity === 'warning' ? '\u26A0\uFE0F' : '\u2139\uFE0F'}</span>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-semibold text-gray-800">{alert.title}</p>
+                          <p className="text-[10px] text-gray-500 mt-0.5">{alert.description}</p>
+                          <div className="flex flex-wrap gap-1.5 mt-2">
+                            {alert.options.map((opt, optIdx) => (
+                              <button
+                                key={optIdx}
+                                onClick={() => handleFiscalChoice(idx, opt)}
+                                className={`text-[10px] px-2.5 py-1 rounded-md font-medium transition-colors ${
+                                  opt.is_default
+                                    ? 'bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200'
+                                    : 'bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200'
+                                }`}
+                              >
+                                {opt.label}
+                              </button>
+                            ))}
+                            <button
+                              onClick={() => handleFiscalChoice(idx, null)}
+                              className="text-[10px] px-2 py-1 text-gray-400 hover:text-gray-600 transition-colors"
+                            >
+                              Salta
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Invoice lines table with classification */}
             <div className="bg-white border rounded-xl overflow-hidden">

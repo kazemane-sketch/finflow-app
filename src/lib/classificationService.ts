@@ -492,6 +492,61 @@ export async function saveInvoiceProjects(
   if (error) throw error;
 }
 
+// ─── Fiscal alert types (from Sonnet escalation) ──────────────────────────────
+
+export interface FiscalAlertOption {
+  label: string;
+  fiscal_override: Record<string, unknown>;
+  is_default: boolean;
+}
+
+export interface FiscalAlert {
+  type: 'deducibilita' | 'ritenuta' | 'reverse_charge' | 'split_payment' | 'bene_strumentale' | 'iva_indetraibile' | 'general';
+  severity: 'warning' | 'info';
+  title: string;
+  description: string;
+  current_choice: string;
+  options: FiscalAlertOption[];
+  affected_lines: string[];
+}
+
+/** Load invoice_notes (fiscal alerts) from invoice_classifications. */
+export async function loadInvoiceNotes(invoiceId: string): Promise<FiscalAlert[]> {
+  const { data, error } = await supabase
+    .from('invoice_classifications')
+    .select('invoice_notes')
+    .eq('invoice_id', invoiceId)
+    .maybeSingle();
+  if (error || !data?.invoice_notes) return [];
+  try {
+    const notes = data.invoice_notes;
+    return Array.isArray(notes) ? notes as FiscalAlert[] : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Clear invoice_notes and has_fiscal_alerts after user resolves all alerts. */
+export async function clearInvoiceNotes(invoiceId: string): Promise<void> {
+  await supabase
+    .from('invoice_classifications')
+    .update({ invoice_notes: null } as any)
+    .eq('invoice_id', invoiceId);
+  await supabase
+    .from('invoices')
+    .update({ has_fiscal_alerts: false } as any)
+    .eq('id', invoiceId);
+}
+
+/** Save updated fiscal_flags on a single invoice line. */
+export async function saveLineFiscalFlags(lineId: string, fiscalFlags: Record<string, unknown>): Promise<void> {
+  const { error } = await supabase
+    .from('invoice_lines')
+    .update({ fiscal_flags: fiscalFlags } as any)
+    .eq('id', lineId);
+  if (error) throw error;
+}
+
 // ─── Line-level classification (category + account directly on invoice_lines) ───
 
 export interface LineClassification {

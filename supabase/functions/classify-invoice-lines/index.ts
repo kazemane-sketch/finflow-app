@@ -133,6 +133,22 @@ interface FiscalFlags {
   note: string | null;
 }
 
+interface FiscalAlertOption {
+  label: string;
+  fiscal_override: Partial<FiscalFlags>;
+  is_default: boolean;
+}
+
+interface FiscalAlert {
+  type: 'deducibilita' | 'ritenuta' | 'reverse_charge' | 'split_payment' | 'bene_strumentale' | 'iva_indetraibile' | 'general';
+  severity: 'warning' | 'info';
+  title: string;
+  description: string;
+  current_choice: string;
+  options: FiscalAlertOption[];
+  affected_lines: string[];
+}
+
 interface SonnetLineResult {
   line_id: string;
   article_code: string | null;
@@ -434,7 +450,7 @@ REGOLE:
 
 - CdC: assegna SOLO se hai un segnale chiaro (storico controparte, cantiere nella descrizione, località). Se non sei sicuro, lascia cost_center_allocations vuoto — l'utente lo assegnerà manualmente.
 - DUBBI FISCALI — REGOLA CRITICA: per OGNI riga, valuta attentamente deducibilita_pct e iva_detraibilita_pct usando le regole TUIR nel system prompt. NON mettere 100/100 di default. Ragiona: chi è la controparte (ATECO)? Che tipo di bene/servizio è? Per quale mezzo/uso è destinato? QUANDO HAI UN DUBBIO, USA SEMPRE LA PERCENTUALE PIÙ BASSA (conservativa). Esempio: se non sai se è auto aziendale (20%/40%) o mezzo trasporto (100%/100%), metti 20%/40% — è più sicuro fiscalmente. L'utente può correggere verso l'alto, ma non deve scoprire di aver sbagliato verso il basso in sede di verifica. Abbassa la confidence sotto 65 e scrivi nel reasoning "Verificare: [motivo]" così si attiva la verifica Sonnet automatica.
-- COERENZA FISCALE FATTURA: PRIMA di classificare le singole righe, analizza l'INTERA fattura come un insieme. Guarda: chi è la controparte (ATECO)? Che tipo di beni/servizi sono? Per quale uso/mezzo sono destinati? Le percentuali di deducibilità e IVA detraibile devono essere COERENTI tra tutte le righe della stessa fattura che riguardano lo stesso tipo di operazione. NON è possibile avere 20% su un paraurti e 100% su un braccio oscillante dello stesso veicolo. Decidi il trattamento fiscale a livello fattura, poi applicalo uniformemente. Se stai classificando un sottoinsieme di righe (vedi righe [CONTESTO]), usa le righe contesto per determinare il trattamento fiscale dell'intera fattura PRIMA di classificare le tue righe.
+- COERENZA FISCALE FATTURA: PRIMA di classificare le singole righe, analizza l'INTERA fattura come un insieme. Guarda: chi è la controparte (ATECO)? Che tipo di beni/servizi sono? Per quale uso/mezzo sono destinati? Le percentuali di deducibilità e IVA detraibile devono essere COERENTI tra tutte le righe della stessa fattura che riguardano lo stesso tipo di operazione. NON è possibile avere 20% su un paraurti e 100% su un braccio oscillante dello stesso veicolo. Decidi il trattamento fiscale a livello fattura, poi applicalo uniformemente. Se stai classificando un sottoinsieme di righe (vedi righe [CONTESTO]), usa le righe contesto per determinare il trattamento fiscale dell'intera fattura PRIMA di classificare le tue righe. Controlli aggiuntivi: (a) se autofattura TD16-TD19, imposta reverse_charge=true su tutte le righe; (b) se nota di credito TD04, usa lo stesso conto della fattura originale; (c) se controparte ha ATECO noto (professionista 69.xx/71.xx/74.xx), verifica se applicare ritenuta d'acconto.
 ${invoiceNotes ? `\n=== NOTE UTENTE SULLA FATTURA ===\n${invoiceNotes}\nQueste note sono dell'utente e hanno PRIORITÀ MASSIMA sulla classificazione.\n===\n` : ""}${batchInstruction}
 RIGHE:
 ${lineEntries}
@@ -547,6 +563,7 @@ async function persistResults(
   invoiceLevel: ReturnType<typeof composeInvoiceLevel>,
   articles: ArticleRow[],
   phases: ArticlePhaseRow[],
+  invoiceNotes?: FiscalAlert[],
 ): Promise<void> {
   const codeToId = new Map(articles.map((a) => [a.code, a.id]));
   let persisted = 0;
@@ -643,6 +660,29 @@ async function persistResults(
       console.error(`[persist] INSERT invoice_projects failed:`, (e as Error).message);
     }
   }
+
+  // Save invoice_notes (fiscal alerts from Sonnet) + set has_fiscal_alerts flag
+  const hasAlerts = invoiceNotes && invoiceNotes.length > 0;
+  try {
+    if (hasAlerts) {
+      await sql`
+        UPDATE invoice_classifications
+        SET invoice_notes = ${JSON.stringify(invoiceNotes)}::jsonb
+        WHERE invoice_id = ${invoiceId}`;
+      await sql`
+        UPDATE invoices
+        SET has_fiscal_alerts = true
+        WHERE id = ${invoiceId}`;
+      console.log(`[persist] Saved ${invoiceNotes!.length} fiscal alerts for invoice ${invoiceId}`);
+    } else {
+      await sql`
+        UPDATE invoices
+        SET has_fiscal_alerts = false
+        WHERE id = ${invoiceId}`;
+    }
+  } catch (e: unknown) {
+    console.error(`[persist] invoice_notes/has_fiscal_alerts failed:`, (e as Error).message);
+  }
 }
 
 /* ─── Sonnet escalation: detect lines needing fiscal expert ──── */
@@ -691,7 +731,7 @@ async function sonnetEscalate(
   userInstructionsBlock: string,
   apiKey: string,
   invoiceNotes?: string,
-): Promise<{ lineResults: SonnetLineResult[]; error?: string }> {
+): Promise<{ lineResults: SonnetLineResult[]; invoiceNotes?: FiscalAlert[]; error?: string }> {
   // Build a Sonnet prompt with full context + Haiku's attempt as reference
   const lineIds = new Set(escalationLines.map(l => l.line_id));
 
@@ -766,12 +806,21 @@ REGOLE ESCALATION:
 - Se il tentativo Haiku era corretto, CONFERMALO con confidence più alta.
 - Se era sbagliato, CORREGGILO con reasoning dettagliato.
 - fiscal_flags OBBLIGATORI e dettagliati per ogni riga.
+- Autofatture TD16-TD19: imposta reverse_charge=true. Note credito TD04: storna conto originale.
+- Professionisti (ATECO 69.xx/71.xx/74.xx): verifica ritenuta d'acconto 20%.
 
 RIGHE FATTURA (contesto completo):
 ${lineContext}
 
-JSON array (no markdown, SOLO righe [DA RICLASSIFICARE]):
-[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"dettagliato","fiscal_flags":{"ritenuta_acconto":{"aliquota":20,"base":"100%"}|null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]`;
+FORMATO OUTPUT (3 sezioni separate):
+
+Sezione 1 — JSON array classificazione righe (no markdown, SOLO righe [DA RICLASSIFICARE]):
+[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","cost_center_allocations":[{"project_id":"uuid","percentage":100}],"confidence":0-100,"reasoning":"dettagliato","fiscal_flags":{"ritenuta_acconto":{"aliquota":20,"base":"100%"}|null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]
+
+---INVOICE_NOTES---
+Array JSON di alert fiscali per l'utente. Genera alert SOLO quando ci sono dubbi fiscali che richiedono una decisione umana (es: deducibilità incerta, ritenuta da verificare, uso promiscuo vs aziendale).
+Ogni alert: {"type":"deducibilita"|"ritenuta"|"reverse_charge"|"split_payment"|"bene_strumentale"|"iva_indetraibile"|"general","severity":"warning"|"info","title":"titolo breve","description":"spiegazione per l'utente","current_choice":"scelta conservativa applicata","options":[{"label":"Opzione A (es: Trasporto 100%/100%)","fiscal_override":{"deducibilita_pct":100,"iva_detraibilita_pct":100},"is_default":false},{"label":"Opzione B (es: Auto 20%/40%)","fiscal_override":{"deducibilita_pct":20,"iva_detraibilita_pct":40},"is_default":true}],"affected_lines":["line_id1","line_id2"]}
+Se NON ci sono dubbi fiscali, restituisci: []`;
 
   console.log(`[sonnet-escalate] Escalating ${escalationLines.length} lines to Sonnet, prompt=${sonnetPrompt.length} chars`);
 
@@ -821,19 +870,48 @@ JSON array (no markdown, SOLO righe [DA RICLASSIFICARE]):
       return { lineResults: [], error: "Sonnet returned empty text" };
     }
 
-    // Parse JSON
-    let classJson = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-    let jsonStr = extractFirstJsonArray(classJson);
+    // Parse sectioned output: lines JSON + ---INVOICE_NOTES--- section
+    const cleanText = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+    const notesSeparator = "---INVOICE_NOTES---";
+    const notesIdx = cleanText.indexOf(notesSeparator);
 
+    let classificationText: string;
+    let invoiceNotesText: string | null = null;
+
+    if (notesIdx >= 0) {
+      classificationText = cleanText.slice(0, notesIdx).trim();
+      invoiceNotesText = cleanText.slice(notesIdx + notesSeparator.length).trim();
+    } else {
+      // Backward compat: entire text is classification JSON
+      classificationText = cleanText;
+    }
+
+    // Parse line classifications
+    const jsonStr = extractFirstJsonArray(classificationText);
     if (!jsonStr) {
-      const msg = `Sonnet escalation: no JSON array. First 300: ${classJson.slice(0, 300)}`;
+      const msg = `Sonnet escalation: no JSON array. First 300: ${classificationText.slice(0, 300)}`;
       console.warn(`[sonnet-escalate] ${msg}`);
       return { lineResults: [], error: msg };
     }
 
     const parsed: SonnetLineResult[] = JSON.parse(jsonStr);
     console.log(`[sonnet-escalate] Parsed ${parsed.length} lines from Sonnet`);
-    return { lineResults: parsed };
+
+    // Parse invoice notes (fiscal alerts)
+    let invoiceNotes: FiscalAlert[] = [];
+    if (invoiceNotesText) {
+      try {
+        const notesJson = extractFirstJsonArray(invoiceNotesText);
+        if (notesJson) {
+          invoiceNotes = JSON.parse(notesJson) as FiscalAlert[];
+          console.log(`[sonnet-escalate] Parsed ${invoiceNotes.length} fiscal alerts`);
+        }
+      } catch (e) {
+        console.warn(`[sonnet-escalate] Failed to parse invoice_notes: ${e}`);
+      }
+    }
+
+    return { lineResults: parsed, invoiceNotes: invoiceNotes.length > 0 ? invoiceNotes : undefined };
   } catch (e) {
     const msg = `Sonnet escalation error: ${e}`;
     console.error(`[sonnet-escalate] ${msg}`);
@@ -1602,6 +1680,7 @@ Deno.serve(async (req) => {
     // need expert fiscal review (ritenuta, reverse charge, beni strumentali,
     // suggest_new_account, or low confidence).
     let sonnetEscalatedCount = 0;
+    let fiscalAlerts: FiscalAlert[] | undefined;
     {
       const escalationCandidates = lineResults.filter(lr => needsSonnetEscalation(lr));
 
@@ -1668,6 +1747,12 @@ Deno.serve(async (req) => {
           sonnetEscalatedCount = upgraded;
           console.log(`[classify] Sonnet escalation: ${upgraded} lines upgraded, ${sonnetResult.lineResults.length} returned`);
         }
+
+        // Capture fiscal alerts from Sonnet
+        if (sonnetResult.invoiceNotes && sonnetResult.invoiceNotes.length > 0) {
+          fiscalAlerts = sonnetResult.invoiceNotes;
+          console.log(`[classify] Sonnet generated ${fiscalAlerts.length} fiscal alerts`);
+        }
       } else {
         console.log(`[classify] No lines need Sonnet escalation`);
       }
@@ -1685,6 +1770,7 @@ Deno.serve(async (req) => {
       invoiceLevel,
       articles,
       phases,
+      fiscalAlerts,
     );
 
     // Mark invoice as ai_suggested + save keywords
@@ -1727,6 +1813,7 @@ Deno.serve(async (req) => {
           phase_id: phaseId,
         };
       }),
+      invoice_notes: fiscalAlerts || [],
       invoice_level: invoiceLevel,
       keywords,
       stats: {

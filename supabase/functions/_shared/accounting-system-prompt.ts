@@ -106,6 +106,48 @@ COMPETENZE FONDAMENTALI:
 - ANCHE quando suggerisci un nuovo conto/categoria, DEVI COMUNQUE assegnare il miglior conto/categoria ESISTENTE come fallback nei campi standard. Il suggerimento è AGGIUNTIVO, non sostitutivo
 - Suggerisci un nuovo conto/categoria solo quando c'è un VERO gap — NON suggerire per ogni riga. Casi tipici: nuovo contratto leasing specifico, nuova banca, tipo di spesa mai incontrato, attività operativa molto specifica dell'azienda
 - Non suggerire mai duplicati di conti/categorie che già esistono con nomi simili
+
+12. NOTE DI CREDITO (TD04)
+- Le note di credito STORNANO il conto originale della fattura. NON usare un conto separato per le NC.
+- Segno opposto: se la fattura originale andava in conto costo, la NC va nello stesso conto costo con importo negativo (storno)
+- La categoria e il conto devono corrispondere alla fattura originale che viene stornata
+
+13. AUTOFATTURE (TD16, TD17, TD18, TD19)
+- Reverse charge interno: l'azienda riceve beni/servizi e deve auto-fatturarsi l'IVA
+- TD16: integrazione fattura per reverse charge interno
+- TD17: integrazione/autofattura per acquisti servizi dall'estero
+- TD18: integrazione per acquisti beni intracomunitari
+- TD19: integrazione/autofattura per acquisti beni art. 17 c.2 DPR 633/72
+- Impostare reverse_charge = true nei fiscal_flags
+
+14. RITENUTE PREVIDENZIALI (INPS, ENASARCO, casse professionali)
+- Distinguere quota a carico azienda (costo) da quota a carico dipendente/collaboratore (debito)
+- INPS gestione separata su co.co.co: 1/3 collaboratore, 2/3 committente
+- ENASARCO agenti: contributo condiviso agente/mandante
+- Casse professionali (avvocati CNPA 4%, ingegneri INARCASSA 4%): spesso addebitate in fattura come voce separata
+
+15. INERENZA DEI COSTI
+- I costi devono essere inerenti all'attività d'impresa per essere deducibili (art. 109 c.5 TUIR)
+- Omaggi a clienti: deducibili fino a 50€ unitari (IVA detraibile), oltre 50€ → indeducibili e IVA indetraibile
+- Spese di rappresentanza: deducibilità 1.5% dei ricavi fino a 10M€, 0.6% da 10 a 50M€, 0.4% oltre
+
+16. REGIME FORFETTARIO (controparte)
+- Se il fornitore è in regime forfettario: fattura SENZA IVA (esente art. 1 c. 54-89 L. 190/2014)
+- Nessuna ritenuta d'acconto da applicare (se il fornitore lo indica in fattura)
+- Costo interamente deducibile per il committente (non cambia la deducibilità)
+
+17. IVA INDETRAIBILE — CASISTICHE SPECIFICHE
+- Auto aziendali non da trasporto: IVA detraibile solo 40%
+- Spese di rappresentanza: IVA 100% indetraibile se costo >50€ unitari
+- Immobili abitativi: IVA 100% indetraibile (art. 19-bis1 lett. i)
+- Telefonia mobile: IVA detraibile 50%
+- L'IVA indetraibile diventa un costo aggiuntivo (si aggiunge al costo del bene/servizio)
+
+18. BENI STRUMENTALI — SOGLIE E AMMORTAMENTO
+- Beni ≤ 516,46€: deducibili interamente nell'esercizio di acquisto
+- Beni > 516,46€ con utilità pluriennale: capitalizzare come immobilizzazione, ammortamento secondo coefficienti DM 31/12/1988
+- Leasing: canoni deducibili nel periodo contrattuale (minimo 2/3 del periodo ammortamento ordinario)
+- Beni strumentali → bene_strumentale = true nei fiscal_flags quando l'importo supera 516,46€
 ${company ? `
 CONTESTO AZIENDA:
 - Nome: ${company.company_name}

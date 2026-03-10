@@ -31,7 +31,7 @@ interface MemoryInsert {
 
 /* ─── Generic: insert memory fact ───────────────── */
 
-async function insertMemoryFact(row: MemoryInsert): Promise<string | null> {
+export async function insertMemoryFact(row: MemoryInsert): Promise<string | null> {
   if (!row.fact_text || row.fact_text.length < 5) return null
 
   try {

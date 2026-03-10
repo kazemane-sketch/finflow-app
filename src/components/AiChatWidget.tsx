@@ -1,13 +1,16 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import {
   Sparkles, Send, Loader2, X, Maximize2, Minus, FileText,
-  Zap, Brain, Search, ChevronDown, ChevronRight,
+  Zap, Brain, Search, ChevronDown, ChevronRight, Menu, Plus,
+  MessageSquare,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAiChat, type ToolCallDisplay } from '@/contexts/AiChatContext'
 import { usePageEntity } from '@/contexts/PageEntityContext'
+import { useCompany } from '@/hooks/useCompany'
+import { supabase } from '@/integrations/supabase/client'
 
 /* ─── page label map ──────────────────────── */
 
@@ -46,6 +49,13 @@ const TOOL_LABELS: Record<string, string> = {
 
 /* ─── main widget ─────────────────────────── */
 
+interface ChatListItem {
+  id: string
+  title: string | null
+  updated_at: string
+  message_count: number
+}
+
 export default function AiChatWidget() {
   const location = useLocation()
   const navigate = useNavigate()
@@ -53,14 +63,52 @@ export default function AiChatWidget() {
     messages, loading, toolCalls,
     modelPreference, setModelPreference,
     sendMessage, startNewChat,
+    chatId, setChatId, setMessages, setToolCalls, chatVersion,
   } = useAiChat()
   const { entity: pageEntity } = usePageEntity()
+  const { company } = useCompany()
 
   const [open, setOpen] = useState(false)
   const [input, setInput] = useState('')
+  const [showChatList, setShowChatList] = useState(false)
+  const [chatHistory, setChatHistory] = useState<ChatListItem[]>([])
+  const [chatListLoading, setChatListLoading] = useState(false)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  /* ── load recent chats ─────────────────── */
+  const loadChatHistory = useCallback(async () => {
+    if (!company?.id) return
+    setChatListLoading(true)
+    const { data } = await supabase
+      .from('ai_chats')
+      .select('id, title, updated_at, message_count')
+      .eq('company_id', company.id)
+      .order('updated_at', { ascending: false })
+      .limit(20)
+    if (data) setChatHistory(data)
+    setChatListLoading(false)
+  }, [company?.id])
+
+  /* ── reload chat list when chatVersion bumps ── */
+  useEffect(() => {
+    if (showChatList) loadChatHistory()
+  }, [showChatList, chatVersion, loadChatHistory])
+
+  /* ── select a chat from the history ──────── */
+  const selectChat = useCallback(async (chatIdToLoad: string) => {
+    setChatId(chatIdToLoad)
+    setToolCalls([])
+    setShowChatList(false)
+    const { data } = await supabase
+      .from('ai_messages')
+      .select('id, role, content, tool_name, created_at')
+      .eq('chat_id', chatIdToLoad)
+      .order('created_at', { ascending: true })
+      .limit(100)
+    if (data) setMessages(data.filter(m => m.role === 'user' || m.role === 'assistant'))
+  }, [setChatId, setMessages, setToolCalls])
 
   /* ── scroll to bottom on new messages ──── */
   // IMPORTANT: all hooks must be BEFORE any conditional return (React Rules of Hooks)
@@ -118,9 +166,18 @@ export default function AiChatWidget() {
 
   /* ── opened: chat panel ────────────────── */
   return (
-    <div className="fixed bottom-6 right-6 z-50 w-[400px] h-[520px] flex flex-col bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden">
+    <div className="fixed bottom-6 right-6 z-50 w-[400px] h-[520px] flex flex-col bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden relative">
       {/* ── Header ─────────────────────── */}
-      <div className="flex items-center gap-2 px-4 py-3 bg-gradient-to-r from-purple-600 to-indigo-600 text-white shrink-0">
+      <div className="flex items-center gap-1.5 px-3 py-3 bg-gradient-to-r from-purple-600 to-indigo-600 text-white shrink-0">
+        {/* Chat history toggle */}
+        <button
+          onClick={() => setShowChatList(prev => !prev)}
+          className="p-1 rounded hover:bg-white/20 transition-colors"
+          title="Cronologia chat"
+        >
+          <Menu className="h-3.5 w-3.5" />
+        </button>
+
         <Sparkles className="h-4 w-4" />
         <span className="text-sm font-semibold flex-1">
           Assistente AI
@@ -131,6 +188,14 @@ export default function AiChatWidget() {
           )}
         </span>
 
+        {/* New chat */}
+        <button
+          onClick={() => { startNewChat(); setShowChatList(false) }}
+          className="p-1 rounded hover:bg-white/20 transition-colors"
+          title="Nuova chat"
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </button>
         {/* Minimize */}
         <button
           onClick={() => setOpen(false)}
@@ -162,6 +227,51 @@ export default function AiChatWidget() {
         <div className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-50 border-b border-purple-100 text-[10px] text-purple-700 shrink-0">
           <FileText className="h-3 w-3 shrink-0" />
           <span className="truncate">{pageEntity.summary}</span>
+        </div>
+      )}
+
+      {/* ── Chat history dropdown ────────── */}
+      {showChatList && (
+        <div className="absolute top-[48px] left-0 right-0 z-10 bg-white border-b border-slate-200 shadow-md max-h-[300px] overflow-y-auto">
+          <div className="p-2 space-y-0.5">
+            {chatListLoading ? (
+              <div className="flex items-center justify-center py-4 text-xs text-slate-400">
+                <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+                Caricamento...
+              </div>
+            ) : chatHistory.length === 0 ? (
+              <div className="text-center py-4 text-xs text-slate-400">
+                Nessuna chat precedente
+              </div>
+            ) : (
+              chatHistory.map(chat => (
+                <button
+                  key={chat.id}
+                  onClick={() => selectChat(chat.id)}
+                  className={`w-full text-left px-2.5 py-2 rounded-lg text-xs transition-colors hover:bg-purple-50 ${
+                    chatId === chat.id ? 'bg-purple-50 text-purple-700' : 'text-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <MessageSquare className="h-3 w-3 shrink-0 text-slate-400" />
+                    <span className="truncate font-medium">
+                      {chat.title || 'Chat senza titolo'}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2 mt-0.5 ml-[18px]">
+                    <span className="text-[10px] text-slate-400">
+                      {new Date(chat.updated_at).toLocaleDateString('it-IT', {
+                        day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+                      })}
+                    </span>
+                    <span className="text-[10px] text-slate-300">
+                      {chat.message_count} msg
+                    </span>
+                  </div>
+                </button>
+              ))
+            )}
+          </div>
         </div>
       )}
 
