@@ -586,11 +586,11 @@ Se NON ci sono dubbi fiscali: []
 async function callGemini(
   apiKey: string,
   prompt: string,
-  thinkingBudget: number,
+  thinkingLevel: "minimal" | "low" | "medium" | "high" = "high",
 ): Promise<{ text: string; thinkingText: string; error?: string }> {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
 
-  console.log(`[gemini] Calling ${GEMINI_MODEL}, prompt=${prompt.length} chars, thinking=${thinkingBudget}`);
+  console.log(`[gemini] Calling ${GEMINI_MODEL}, prompt=${prompt.length} chars, thinking=${thinkingLevel}`);
 
   try {
     const resp = await fetch(url, {
@@ -599,9 +599,8 @@ async function callGemini(
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: 16000,
-          thinkingConfig: { thinkingBudget },
+          maxOutputTokens: 65536,
+          thinkingConfig: { thinkingLevel },
         },
       }),
     });
@@ -1178,14 +1177,14 @@ Deno.serve(async (req) => {
       invoiceNotes || undefined,
     );
 
-    // Thinking budget: scale with line count, generous minimum
-    const thinkingBudget = Math.max(8192, inputLines.length * 1024);
+    // Thinking level: high for complex invoices, medium for simple ones
+    const thinkingLevel = inputLines.length > 10 ? "high" : "medium";
 
     console.log(
-      `[classify] Calling Gemini 3.1 Pro for ${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}`,
+      `[classify] Calling Gemini 3.1 Pro for ${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}, thinking=${thinkingLevel}`,
     );
 
-    const geminiResult = await callGemini(geminiKey, prompt, thinkingBudget);
+    const geminiResult = await callGemini(geminiKey, prompt, thinkingLevel);
 
     if (geminiResult.error || !geminiResult.text) {
       return json({
