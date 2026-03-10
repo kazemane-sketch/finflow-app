@@ -23,7 +23,11 @@ const corsHeaders = {
 
 /* ─── Model constants ────────────────────── */
 const MODEL_HAIKU = "claude-haiku-4-5-20251001";
-const HAIKU_THINKING_BUDGET = 5000;  // Extended Thinking token budget for Haiku
+const THINKING_PER_LINE = 400;       // thinking budget per line
+const MIN_THINKING_BUDGET = 2048;    // minimum thinking budget
+const MAX_THINKING_BUDGET = 16000;   // maximum thinking budget
+const MAX_LINES_PER_BATCH = 15;      // max lines per Haiku call
+const MAX_PARALLEL_BATCHES = 3;      // max concurrent API calls
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_DIMS = 3072;
 const MIN_CONFIDENCE = 60;
@@ -405,6 +409,8 @@ REGOLE:
 - Se NESSUNA categoria nella lista corrisponde bene alla riga, NON forzare una categoria sbagliata con confidence alta. Scegli la più vicina MA con confidence bassa (50-65).
 - Il NOME della controparte rivela spesso l'attività: usalo come indizio forte.
 
+- CdC: assegna SOLO se hai un segnale chiaro (storico controparte, cantiere nella descrizione, località). Se non sei sicuro, lascia cost_center_allocations vuoto — l'utente lo assegnerà manualmente.
+
 RIGHE:
 ${lineEntries}
 
@@ -606,6 +612,187 @@ async function persistResults(
     } catch (e: unknown) {
       console.error(`[persist] INSERT invoice_projects failed:`, (e as Error).message);
     }
+  }
+}
+
+/* ─── Extract first balanced JSON array from text ──── */
+function extractFirstJsonArray(text: string): string | null {
+  const start = text.indexOf("[");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && inString) {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "[") depth++;
+    if (ch === "]") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  // Unbalanced — try partial recovery (truncated output)
+  return null;
+}
+
+/* ─── Classify a single batch of lines ──── */
+
+async function classifyBatch(
+  batchLines: InputLine[],
+  batchIndex: number,
+  totalBatches: number,
+  apiKey: string,
+  buildPromptForBatch: (lines: InputLine[]) => string,
+): Promise<{ lineResults: SonnetLineResult[]; keywords: string[]; error?: string }> {
+  const batchThinkingBudget = Math.min(
+    MAX_THINKING_BUDGET,
+    Math.max(MIN_THINKING_BUDGET, batchLines.length * THINKING_PER_LINE),
+  );
+
+  const prompt = buildPromptForBatch(batchLines);
+
+  console.log(
+    `[classify] Batch ${batchIndex + 1}/${totalBatches}: ${batchLines.length} lines, thinking=${batchThinkingBudget}, prompt=${prompt.length} chars`,
+  );
+
+  let resp: Response;
+  try {
+    resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: MODEL_HAIKU,
+        max_tokens: 16000,
+        thinking: { type: "enabled" as const, budget_tokens: batchThinkingBudget },
+        messages: [{ role: "user" as const, content: prompt }],
+      }),
+    });
+  } catch (fetchErr) {
+    const msg = `Batch ${batchIndex + 1} fetch error: ${fetchErr}`;
+    console.error(`[classify] ${msg}`);
+    return { lineResults: [], keywords: [], error: msg };
+  }
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    const msg = `Batch ${batchIndex + 1} API ${resp.status}: ${errText.slice(0, 300)}`;
+    console.error(`[classify] ${msg}`);
+    return { lineResults: [], keywords: [], error: msg };
+  }
+
+  const data = await resp.json();
+  const contentBlocks = (data as any)?.content || [];
+
+  // Log response structure
+  console.log(`[classify] Batch ${batchIndex + 1} blocks:`, contentBlocks.map((b: any) => ({
+    type: b.type,
+    len: (b.text || b.thinking || '').length,
+  })));
+
+  // Log thinking for debug (truncated)
+  const thinkingBlock = contentBlocks.find((b: any) => b.type === "thinking");
+  if (thinkingBlock) {
+    console.log(
+      `[classify] Batch ${batchIndex + 1} thinking: ${(thinkingBlock.thinking || "").slice(0, 150)}...`,
+    );
+  }
+
+  // Extract text
+  const textBlocks = contentBlocks.filter((b: any) => b.type === "text");
+  const text = textBlocks.map((b: any) => b.text).join("") || "";
+  const stopReason = (data as any)?.stop_reason;
+  console.log(
+    `[classify] Batch ${batchIndex + 1} response: ${text.length} chars, stop=${stopReason}`,
+  );
+
+  // Safety: if no text blocks, log warning
+  if (!text) {
+    const msg = `Batch ${batchIndex + 1}: empty text response. Blocks: ${JSON.stringify(contentBlocks.map((b: any) => b.type))}. stop=${stopReason}`;
+    console.error(`[classify] ${msg}`);
+    return { lineResults: [], keywords: [], error: msg };
+  }
+
+  // Parse keywords
+  let keywords: string[] = [];
+  const keywordsSplit = text.split("---KEYWORDS---");
+  let classJson = keywordsSplit[0].trim();
+  if (keywordsSplit.length > 1) {
+    try {
+      let kwSection = keywordsSplit[1];
+      kwSection = kwSection
+        .replace(/```json\s*/g, "")
+        .replace(/```\s*/g, "")
+        .trim();
+      const kwMatch = kwSection.match(/\[\s*[\s\S]*?\]/);
+      if (kwMatch) keywords = JSON.parse(kwMatch[0]);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Parse classification JSON (with backtick stripping + bracket-counting extraction)
+  try {
+    classJson = classJson
+      .replace(/```json\s*/g, "")
+      .replace(/```\s*/g, "")
+      .trim();
+
+    // Use bracket-counting to extract first complete JSON array
+    // (avoids greedy regex matching past the array into keywords/notes)
+    let jsonStr = extractFirstJsonArray(classJson);
+
+    // Partial JSON recovery if truncated (no balanced array found)
+    if (!jsonStr && stopReason === "max_tokens") {
+      console.warn(
+        `[classify] Batch ${batchIndex + 1}: truncated output, attempting partial recovery...`,
+      );
+      const arrayStart = classJson.indexOf("[");
+      if (arrayStart >= 0) {
+        let partial = classJson.slice(arrayStart);
+        const lastCompleteObj = partial.lastIndexOf("},");
+        if (lastCompleteObj > 0) {
+          jsonStr = partial.slice(0, lastCompleteObj + 1) + "]";
+        } else {
+          const singleObj = partial.lastIndexOf("}");
+          if (singleObj > 0) {
+            jsonStr = partial.slice(0, singleObj + 1) + "]";
+          }
+        }
+        if (jsonStr)
+          console.log(
+            `[classify] Batch ${batchIndex + 1}: partial recovery succeeded`,
+          );
+      }
+    }
+
+    if (!jsonStr) {
+      const msg = `Batch ${batchIndex + 1}: no JSON array. First 300 chars: ${classJson.slice(0, 300)}`;
+      console.warn(`[classify] ${msg}`);
+      return { lineResults: [], keywords, error: msg };
+    }
+    const parsed: SonnetLineResult[] = JSON.parse(jsonStr);
+    console.log(`[classify] Batch ${batchIndex + 1}: parsed ${parsed.length} lines OK`);
+    return { lineResults: parsed, keywords };
+  } catch (e) {
+    const msg = `Batch ${batchIndex + 1} parse error: ${e}. First 300: ${classJson.slice(0, 300)}`;
+    console.error(`[classify] ${msg}`);
+    return { lineResults: [], keywords, error: msg };
   }
 }
 
@@ -854,119 +1041,86 @@ Deno.serve(async (req) => {
     // Build memory block for prompt
     const memoryBlock = getCompanyMemoryBlock(memoryFacts);
 
-    // ─── Stage 2: Haiku Classification ──────────────────
-    const focusedPrompt = buildFocusedPrompt(
-      preflightArticles,
-      preflightCategories,
-      preflightAccounts,
-      preflightProjects,
-      phases,
-      counterpartyInfo,
-      history,
-      memoryBlock,
-      direction,
-      inputLines,
-      systemPrompt,
-      userInstructionsBlock,
-    );
+    // ─── Stage 2: Haiku Classification (with batching) ──────────
+
+    // Build prompt function — context is shared across batches, only RIGHE changes
+    const buildBatchPrompt = (batchLines: InputLine[]) =>
+      buildFocusedPrompt(
+        preflightArticles,
+        preflightCategories,
+        preflightAccounts,
+        preflightProjects,
+        phases,
+        counterpartyInfo,
+        history,
+        memoryBlock,
+        direction,
+        batchLines,
+        systemPrompt,
+        userInstructionsBlock,
+      );
+
+    let allLineResults: SonnetLineResult[] = [];
+    let allKeywords: string[] = [];
+    let thinkingUsed = false;
+    const batchErrors: string[] = [];
+    const totalBatches = Math.ceil(inputLines.length / MAX_LINES_PER_BATCH);
 
     console.log(
-      `[classify-invoice-lines] Calling Haiku for ${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}`,
+      `[classify-invoice-lines] Calling Haiku for ${inputLines.length} lines → ${totalBatches} batch(es), invoice=${invoiceId}, cp=${counterpartyName}`,
     );
 
-    // ─── Stage 2: Haiku Classification with Extended Thinking ──────────
-    const haikuBody = {
-      model: MODEL_HAIKU,
-      max_tokens: 16000,  // total budget: thinking + output
-      thinking: {
-        type: "enabled" as const,
-        budget_tokens: HAIKU_THINKING_BUDGET,
-      },
-      messages: [{ role: "user", content: focusedPrompt }],
-    };
-
-    let responseText = "";
-    let thinkingUsed = false;
-
-    const haikuResp = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify(haikuBody),
-    });
-
-    if (!haikuResp.ok) {
-      const errText = await haikuResp.text();
-      console.error(`[classify] Haiku API error:`, haikuResp.status, errText.slice(0, 500));
-      return json({ error: `Haiku ${haikuResp.status}`, detail: errText.slice(0, 300) }, 502);
-    }
-
-    const haikuData = await haikuResp.json();
-    const contentBlocks = (haikuData as any)?.content || [];
-
-    // Log response structure for debug
-    console.log(`[classify] Haiku raw response structure:`, contentBlocks.map((b: any) => ({
-      type: b.type,
-      length: (b.text || b.thinking || '').length,
-    })));
-
-    // Log thinking for debug (truncated)
-    const thinkingBlock = contentBlocks.find((b: any) => b.type === "thinking");
-    if (thinkingBlock) {
+    if (inputLines.length <= MAX_LINES_PER_BATCH) {
+      // Small invoice: single call
+      const result = await classifyBatch(
+        inputLines,
+        0,
+        1,
+        apiKey,
+        buildBatchPrompt,
+      );
+      allLineResults = result.lineResults;
+      allKeywords = result.keywords;
+      if (result.error) batchErrors.push(result.error);
       thinkingUsed = true;
-      console.log(`[classify] Haiku thinking: ${(thinkingBlock.thinking || "").slice(0, 200)}...`);
-    }
-
-    // Extract text from response (Extended Thinking returns thinking + text blocks)
-    const textBlocks = contentBlocks.filter((b: any) => b.type === "text");
-    responseText = textBlocks.map((b: any) => b.text).join("") || "";
-    console.log(`[classify] Haiku response: ${responseText.length} chars, thinking=${thinkingUsed}, stop_reason=${(haikuData as any)?.stop_reason}`);
-
-    // Safety: if response is empty, try extracting from first content block
-    if (!responseText && contentBlocks.length > 0) {
-      responseText = contentBlocks[0]?.text || "";
-      console.warn(`[classify] Empty textBlocks, using first content block: ${responseText.length} chars`);
-    }
-
-    // Parse keywords
-    let keywords: string[] = [];
-    const keywordsSplit = responseText.split("---KEYWORDS---");
-    const classJson = keywordsSplit[0].trim();
-    if (keywordsSplit.length > 1) {
-      try {
-        let kwSection = keywordsSplit[1];
-        kwSection = kwSection.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-        const kwMatch = kwSection.match(/\[[\s\S]*?\]/);
-        if (kwMatch) keywords = JSON.parse(kwMatch[0]);
-      } catch { /* ignore */ }
-    }
-
-    // Parse classification JSON
-    let parsedResults: SonnetLineResult[] = [];
-    try {
-      // Strip markdown code fences if present (Haiku with thinking may wrap in ```json...```)
-      let cleanJson = classJson;
-      cleanJson = cleanJson.replace(/```json\s*/g, '').replace(/```\s*/g, '');
-      cleanJson = cleanJson.trim();
-
-      const jsonMatch = cleanJson.match(/\[[\s\S]*\]/);
-      if (!jsonMatch) {
-        console.warn(`[classify] No JSON array found in response. First 300 chars: ${cleanJson.slice(0, 300)}`);
+    } else {
+      // Large invoice: split into parallel batches
+      const batches: InputLine[][] = [];
+      for (let i = 0; i < inputLines.length; i += MAX_LINES_PER_BATCH) {
+        batches.push(inputLines.slice(i, i + MAX_LINES_PER_BATCH));
       }
-      parsedResults = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
-    } catch (e) {
-      console.error(`[classify-invoice-lines] Haiku parse error:`, e, `responseLen=${responseText.length}, classJson=${classJson.slice(0, 500)}`);
-      return json({
-        error: "Classification parse failed",
-        detail: `Response ${responseText.length} chars, thinking=${thinkingUsed}. First 300: ${classJson.slice(0, 300)}`,
-      }, 502);
+
+      console.log(
+        `[classify] Large invoice: ${inputLines.length} lines → ${batches.length} batches of max ${MAX_LINES_PER_BATCH}`,
+      );
+
+      // Run batches in parallel (max MAX_PARALLEL_BATCHES concurrently)
+      for (let i = 0; i < batches.length; i += MAX_PARALLEL_BATCHES) {
+        const parallelBatches = batches.slice(i, i + MAX_PARALLEL_BATCHES);
+        const results = await Promise.all(
+          parallelBatches.map((batch, j) =>
+            classifyBatch(batch, i + j, batches.length, apiKey, buildBatchPrompt),
+          ),
+        );
+        for (const r of results) {
+          allLineResults.push(...r.lineResults);
+          allKeywords.push(...r.keywords);
+          if (r.error) batchErrors.push(r.error);
+        }
+      }
+
+      // Deduplicate keywords
+      allKeywords = [...new Set(allKeywords)].slice(0, 10);
+      thinkingUsed = true;
+    }
+
+    // Log batch errors summary
+    if (batchErrors.length > 0) {
+      console.error(`[classify] ${batchErrors.length}/${totalBatches} batch(es) failed:`, batchErrors);
     }
 
     // Normalize results
-    let lineResults: SonnetLineResult[] = parsedResults.map((item) => ({
+    let lineResults: SonnetLineResult[] = allLineResults.map((item) => ({
       line_id: item.line_id,
       article_code: item.article_code || null,
       phase_code: item.phase_code || null,
@@ -985,7 +1139,11 @@ Deno.serve(async (req) => {
       suggest_new_category: item.suggest_new_category || null,
     }));
 
-    console.log(`[classify-invoice-lines] ${lineResults.length} lines classified by Haiku+Thinking`);
+    let keywords = allKeywords;
+
+    console.log(
+      `[classify-invoice-lines] ${lineResults.length} lines classified by Haiku+Thinking (${totalBatches} batch${totalBatches > 1 ? "es" : ""})`,
+    );
 
     // ─── Phase validation ─────────────────────────────
     for (const lr of lineResults) {
@@ -1234,7 +1392,8 @@ Deno.serve(async (req) => {
         memory_facts_count: memoryFacts.length,
         model: MODEL_HAIKU,
         thinking_enabled: thinkingUsed,
-        thinking_budget: thinkingUsed ? HAIKU_THINKING_BUDGET : 0,
+        batches: totalBatches,
+        ...(batchErrors.length > 0 ? { batch_errors: batchErrors } : {}),
       },
     });
   } catch (e: unknown) {
