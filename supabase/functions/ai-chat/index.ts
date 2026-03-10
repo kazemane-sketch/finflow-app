@@ -1048,7 +1048,7 @@ async function handleSearchCompanyMemory(sql: SqlClient, companyId: string, args
     const cpName = String(args.counterparty_name).trim();
     if (cpName) {
       const [cp] = await sql.unsafe(
-        `SELECT id FROM counterparties WHERE company_id = $1 AND denom ILIKE '%' || $2 || '%' LIMIT 1`,
+        `SELECT id FROM counterparties WHERE company_id = $1 AND name ILIKE '%' || $2 || '%' LIMIT 1`,
         [companyId, cpName],
       );
       counterpartyId = cp?.id || null;
