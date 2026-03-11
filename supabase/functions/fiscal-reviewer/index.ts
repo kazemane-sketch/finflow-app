@@ -435,18 +435,38 @@ Deno.serve(async (req) => {
       chosen_option: string;
       times_applied: number;
     }[]>();
+    const staleSourceDecisionsIgnored: {
+      id: string;
+      source_invoice_id: string;
+      classification_status: string;
+      chosen_option: string;
+    }[] = [];
 
     if (vatKey) {
       const fiscalDecisions = await sql`
         SELECT id, operation_group_code, subject_keywords, alert_type,
                chosen_option_label, fiscal_override, times_applied,
-               contract_ref, account_id
+               contract_ref, account_id, source_invoice_id
         FROM fiscal_decisions
         WHERE company_id = ${companyId}
           AND counterparty_vat_key = ${vatKey}
           AND direction = ${direction}`;
 
       if (fiscalDecisions.length > 0) {
+        const sourceInvoiceIds = fiscalDecisions
+          .map((dec) => dec.source_invoice_id)
+          .filter((id): id is string => typeof id === "string" && id.length > 0);
+        const sourceInvoiceStatuses = new Map<string, string>();
+        if (sourceInvoiceIds.length > 0) {
+          const sourceInvoices = await sql`
+            SELECT id, classification_status
+            FROM invoices
+            WHERE id = ANY(${sourceInvoiceIds}::uuid[])`;
+          for (const row of sourceInvoices) {
+            sourceInvoiceStatuses.set(row.id, row.classification_status || "");
+          }
+        }
+
         const opGroups = await sql`
           SELECT group_code, keywords FROM operation_keyword_groups WHERE active = true`;
 
@@ -462,6 +482,18 @@ Deno.serve(async (req) => {
           const lineDecisions: typeof preResolvedFiscal extends Map<string, infer V> ? V : never = [];
 
           for (const dec of fiscalDecisions) {
+            const sourceInvoiceId = dec.source_invoice_id as string | null;
+            const sourceInvoiceStatus = sourceInvoiceId ? sourceInvoiceStatuses.get(sourceInvoiceId) : null;
+            if (sourceInvoiceId && sourceInvoiceStatus === "none") {
+              staleSourceDecisionsIgnored.push({
+                id: dec.id,
+                source_invoice_id: sourceInvoiceId,
+                classification_status: sourceInvoiceStatus,
+                chosen_option: dec.chosen_option_label,
+              });
+              continue;
+            }
+
             if (dec.operation_group_code !== lineGroupCode) continue;
 
             // Contract ref compatibility: if the decision has a contract_ref,
@@ -747,6 +779,7 @@ Se nessun alert: []`);
           line_id: lid,
           decisions: decs.map(d => d.alert_type + ": " + d.chosen_option),
         })),
+        stale_source_decisions_ignored: staleSourceDecisionsIgnored,
         rule_confirmed_lines: [...ruleConfirmedLineIds],
         document_chunks_found: documentChunksDebug.length,
         document_chunks: documentChunksDebug,

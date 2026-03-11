@@ -2250,6 +2250,23 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     } catch (e) {
       console.warn('[clear] Error clearing fiscal_flags from DB:', e);
     }
+    // Revoke learning artifacts immediately as well, so legacy rules/decisions
+    // do not survive while the invoice is visually cleared in the UI.
+    try {
+      await deactivateRulesForInvoice(invoice.id);
+    } catch (e) {
+      console.warn('[clear] Error deactivating classification rules:', e);
+    }
+    try {
+      await deleteFiscalDecisionsForInvoice(invoice.id);
+    } catch (e) {
+      console.warn('[clear] Error deleting fiscal decisions:', e);
+    }
+    try {
+      await deactivateInvoiceMemoryFacts(invoice.id);
+    } catch (e) {
+      console.warn('[clear] Error deactivating invoice memory facts:', e);
+    }
   }, [invoice?.id]);
 
   // ─── Fiscal Review: handle user choice on an alert ─────
