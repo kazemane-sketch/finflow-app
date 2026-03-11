@@ -1530,24 +1530,15 @@ Deno.serve(async (req) => {
       fiscalAlerts.length > 0 ? fiscalAlerts : undefined,
     );
 
-    // Mark invoice as ai_suggested + save keywords
+    // Mark invoice as ai_suggested
     try {
-      if (keywords.length > 0) {
-        await sql`
-          UPDATE invoices
-          SET classification_status = 'ai_suggested',
-              search_keywords = ${JSON.stringify(keywords)}::jsonb
-          WHERE id = ${invoiceId}
-            AND classification_status != 'confirmed'`;
-      } else {
-        await sql`
-          UPDATE invoices
-          SET classification_status = 'ai_suggested'
-          WHERE id = ${invoiceId}
-            AND classification_status != 'confirmed'`;
-      }
+      await sql`
+        UPDATE invoices
+        SET classification_status = 'ai_suggested'
+        WHERE id = ${invoiceId}
+          AND classification_status != 'confirmed'`;
     } catch (e: unknown) {
-      console.error(`[persist] UPDATE invoices failed:`, (e as Error).message);
+      console.error(`[persist] UPDATE invoices classification_status failed:`, (e as Error).message);
     }
 
     // Resolve article codes to IDs for the response
