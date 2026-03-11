@@ -24,6 +24,8 @@ import { useState, useEffect } from 'react'
 import { supabase } from '@/integrations/supabase/client'
 import AiChatWidget from '@/components/AiChatWidget'
 import AIJobIndicator from '@/components/AIJobIndicator'
+import { Shield } from 'lucide-react'
+import { useIsAdmin } from '@/components/AdminGuard'
 
 const nav = [
   { to: '/ai', icon: Sparkles, label: 'Assistente AI', className: 'text-purple-600' },
@@ -44,6 +46,7 @@ export default function AppLayout() {
   const navigate = useNavigate()
   const [open, setOpen] = useState(false)
   const [reconBadge, setReconBadge] = useState(0)
+  const { isAdmin } = useIsAdmin()
 
   // Lightweight count of pending reconciliation suggestions for sidebar badge
   useEffect(() => {
@@ -103,6 +106,26 @@ export default function AppLayout() {
             </NavLink>
           ))}
         </nav>
+
+        {/* Admin link (only for platform admins) */}
+        {isAdmin && (
+          <div className="px-3 pb-1">
+            <NavLink
+              to="/admin"
+              onClick={() => setOpen(false)}
+              className={({ isActive }) =>
+                `flex items-center gap-3 rounded-md px-3 py-2 text-xs font-medium transition-colors ${
+                  isActive
+                    ? 'bg-red-50 text-red-700'
+                    : 'text-muted-foreground hover:bg-red-50/50 hover:text-red-600'
+                }`
+              }
+            >
+              <Shield className="h-3.5 w-3.5 shrink-0" />
+              Admin Panel
+            </NavLink>
+          </div>
+        )}
 
         {/* AI Job Indicator */}
         <AIJobIndicator />

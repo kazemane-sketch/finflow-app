@@ -489,6 +489,10 @@ export default function ImpostazioniPage() {
   const [paymentDefaults, setPaymentDefaults] = useState({ default_dso_days: '30', default_pso_days: '30' })
   const [savingDefaults, setSavingDefaults] = useState(false)
 
+  // ATECO fields
+  const [ateco, setAteco] = useState({ ateco_code: '', ateco_description: '', business_sector: '' })
+  const [savingAteco, setSavingAteco] = useState(false)
+
   // Opening balance inline edit
   const [obEdit, setObEdit] = useState<{ id: string; amount: string; date: string } | null>(null)
   const [obSaving, setObSaving] = useState(false)
@@ -510,7 +514,13 @@ export default function ImpostazioniPage() {
       default_dso_days: company?.default_dso_days != null ? String(company.default_dso_days) : '30',
       default_pso_days: company?.default_pso_days != null ? String(company.default_pso_days) : '30',
     })
-  }, [company?.default_dso_days, company?.default_pso_days])
+    const c = company as any
+    setAteco({
+      ateco_code: c?.ateco_code || '',
+      ateco_description: c?.ateco_description || '',
+      business_sector: c?.business_sector || '',
+    })
+  }, [company?.default_dso_days, company?.default_pso_days, company])
 
   const handleDeleteAccount = async () => {
     if (!deleteModal) return
@@ -555,6 +565,29 @@ export default function ImpostazioniPage() {
       alert('Errore salvataggio default scadenze: ' + e.message)
     }
     setSavingDefaults(false)
+  }
+
+  const handleSaveAteco = async () => {
+    if (!companyId) return
+    setSavingAteco(true)
+    try {
+      const { error, count } = await supabase
+        .from('companies')
+        .update({
+          ateco_code: ateco.ateco_code.trim() || null,
+          ateco_description: ateco.ateco_description.trim() || null,
+          business_sector: ateco.business_sector || null,
+          updated_at: new Date().toISOString(),
+        } as any, { count: 'exact' })
+        .eq('id', companyId)
+      if (error) throw error
+      if (count === 0) { alert('Impossibile aggiornare.'); setSavingAteco(false); return }
+      await refetchCompany()
+      alert('Dati ATECO salvati.')
+    } catch (e: any) {
+      alert('Errore: ' + e.message)
+    }
+    setSavingAteco(false)
   }
 
   const handleSaveOpeningBalance = async () => {
@@ -679,6 +712,54 @@ export default function ImpostazioniPage() {
                   <p className="text-sm font-medium mt-1">{[company.city, company.province ? `(${company.province})` : ''].filter(Boolean).join(' ')}</p>
                 </div>
               )}
+              {/* ATECO section */}
+              <div className="pt-2 border-t">
+                <Label className="text-xs text-muted-foreground font-semibold">Classificazione ATECO</Label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-2">
+                  <div>
+                    <Label className="text-xs">Codice ATECO</Label>
+                    <Input
+                      value={ateco.ateco_code}
+                      onChange={e => setAteco(a => ({ ...a, ateco_code: e.target.value }))}
+                      placeholder="es. 08.11.00"
+                      className="mt-1 font-mono text-sm"
+                    />
+                  </div>
+                  <div>
+                    <Label className="text-xs">Settore</Label>
+                    <select
+                      value={ateco.business_sector}
+                      onChange={e => setAteco(a => ({ ...a, business_sector: e.target.value }))}
+                      className="mt-1 w-full h-9 border rounded-md px-2 text-sm"
+                    >
+                      <option value="">— Seleziona —</option>
+                      <option value="estrazione_cave">Estrazione cave</option>
+                      <option value="costruzioni">Costruzioni</option>
+                      <option value="trasporti">Trasporti</option>
+                      <option value="commercio">Commercio</option>
+                      <option value="ristorazione">Ristorazione</option>
+                      <option value="servizi_professionali">Servizi professionali</option>
+                      <option value="manifattura">Manifattura</option>
+                      <option value="agricoltura">Agricoltura</option>
+                      <option value="altro">Altro</option>
+                    </select>
+                  </div>
+                  <div className="sm:col-span-2">
+                    <Label className="text-xs">Descrizione attività ATECO</Label>
+                    <Input
+                      value={ateco.ateco_description}
+                      onChange={e => setAteco(a => ({ ...a, ateco_description: e.target.value }))}
+                      placeholder="es. Estrazione di pietra, sabbia e argilla"
+                      className="mt-1"
+                    />
+                  </div>
+                </div>
+                <div className="mt-3">
+                  <Button size="sm" onClick={handleSaveAteco} disabled={savingAteco}>
+                    {savingAteco ? 'Salvataggio...' : 'Salva ATECO'}
+                  </Button>
+                </div>
+              </div>
               <div className="pt-2 border-t">
                 <Label className="text-xs text-muted-foreground">Default scadenze (giorni)</Label>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-2">
