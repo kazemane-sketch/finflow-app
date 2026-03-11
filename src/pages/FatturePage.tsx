@@ -47,6 +47,7 @@ import {
 } from '@/lib/classificationService';
 import { toast } from 'sonner';
 import { createRuleFromConfirmation, findMatchingRules, deactivateRulesForInvoice, type RuleSuggestion } from '@/lib/classificationRulesService';
+import { runClassificationPipeline } from '@/lib/classificationPipelineService';
 import { createMemoryFromClassification } from '@/lib/companyMemoryService';
 import ExportDialog from '@/components/ExportDialog';
 import SearchableSelect from '@/components/SearchableSelect';
@@ -3499,13 +3500,11 @@ export default function FatturePage() {
       if (unclassified.length === 0) return;
 
       updateProgress(0, unclassified.length);
-      let token = await getValidAccessToken();
       let successCount = 0;
       let failedCount = 0;
-      const classifiedIds: string[] = [];
 
-      // Process 3 invoices in parallel
-      const PARALLEL = 3;
+      // Process 2 invoices in parallel (pipeline is heavier than monolithic)
+      const PARALLEL = 2;
       for (let i = 0; i < unclassified.length; i += PARALLEL) {
         if (signal.aborted) return;
         const batch = unclassified.slice(i, i + PARALLEL);
@@ -3523,106 +3522,37 @@ export default function FatturePage() {
 
               const cp = (inv.counterparty || {}) as any;
 
-              // Step 1: Fast-path rules (instant, no API call)
-              const ruleSuggestions = await findMatchingRules(
-                companyId, cp?.piva || null, cp?.denom || null,
-                lines.map(l => ({ id: l.id, description: l.description })),
+              // Run the v2 cascade pipeline (deterministic → understand → classify → CdC → fiscal review)
+              await runClassificationPipeline(
+                companyId,
+                inv.id,
+                lines.map(l => ({
+                  line_id: l.id,
+                  description: l.description,
+                  quantity: l.quantity,
+                  unit_price: l.unit_price,
+                  total_price: l.total_price,
+                })),
                 inv.direction as 'in' | 'out',
+                cp?.piva || null,
+                cp?.denom || null,
+                signal,
               );
-
-              // Apply rule suggestions to DB (fire-and-forget via supabase)
-              for (const s of ruleSuggestions) {
-                if (s.category_id || s.account_id) {
-                  await supabase.from('invoice_lines').update({
-                    category_id: s.category_id, account_id: s.account_id,
-                    classification_status: 'ai_suggested',
-                  } as any).eq('id', s.line_id).is('category_id', null);
-                }
-              }
-
-              // Step 2: Uncovered lines → unified classifier
-              const coveredIds = new Set(ruleSuggestions.map(s => s.line_id));
-              const uncoveredLines = lines.filter(l => !coveredIds.has(l.id));
-
-              if (uncoveredLines.length > 0) {
-                const classifBody = JSON.stringify({
-                  company_id: companyId,
-                  invoice_id: inv.id,
-                  lines: uncoveredLines.map(l => ({
-                    line_id: l.id,
-                    description: l.description,
-                    quantity: l.quantity,
-                    unit_price: l.unit_price,
-                    total_price: l.total_price,
-                  })),
-                  direction: inv.direction,
-                  counterparty_vat_key: cp?.piva || null,
-                  counterparty_name: cp?.denom || null,
-                });
-                let res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${token}`,
-                    'apikey': SUPABASE_ANON_KEY,
-                  },
-                  body: classifBody,
-                  signal,
-                });
-                // 401 = JWT expired → force refresh and retry once
-                if (res.status === 401) {
-                  token = await getValidAccessToken({ forceRefresh: true });
-                  res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
-                    method: 'POST',
-                    headers: {
-                      'Content-Type': 'application/json',
-                      'Authorization': `Bearer ${token}`,
-                      'apikey': SUPABASE_ANON_KEY,
-                    },
-                    body: classifBody,
-                    signal,
-                  });
-                }
-                if (!res.ok) {
-                  console.error(`Classification error for ${inv.id}: HTTP ${res.status}`);
-                  return { ok: false };
-                }
-              } else if (ruleSuggestions.length > 0) {
-                // All lines covered by rules — create invoice-level classification from rules
-                const firstRule = ruleSuggestions[0];
-                await supabase.from('invoice_classifications').upsert({
-                  company_id: companyId, invoice_id: inv.id,
-                  category_id: firstRule.category_id, account_id: firstRule.account_id,
-                  assigned_by: 'ai_auto', verified: false,
-                  ai_confidence: firstRule.confidence,
-                  ai_reasoning: `${ruleSuggestions.length} righe da regole apprese`,
-                } as any, { onConflict: 'invoice_id' });
-              }
 
               return { ok: true };
             } catch (fetchErr: any) {
               if (fetchErr?.name === 'AbortError') throw fetchErr;
-              console.error('Batch classification error:', fetchErr);
+              console.error('Pipeline classification error:', fetchErr);
               return { ok: false };
             }
           }),
         );
 
         for (let j = 0; j < results.length; j++) {
-          if (results[j].ok) {
-            successCount++;
-            classifiedIds.push(batch[j].id);
-          } else {
-            failedCount++;
-          }
+          if (results[j].ok) successCount++;
+          else failedCount++;
         }
         updateProgress(Math.min(i + PARALLEL, unclassified.length), unclassified.length);
-      }
-
-      // Mark classified invoices as ai_suggested (bulk, 200 per call)
-      for (let i = 0; i < classifiedIds.length; i += 200) {
-        const chunk = classifiedIds.slice(i, i + 200);
-        await supabase.from('invoices').update({ classification_status: 'ai_suggested' } as any).in('id', chunk);
       }
 
       if (failedCount > 0 && successCount === 0) {

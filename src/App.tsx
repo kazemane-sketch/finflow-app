@@ -82,6 +82,7 @@ export default function App() {
           <Route path="documents" element={<DocumentsPage />} />
           <Route path="agents" element={<AgentConfigPage />} />
           <Route path="rules" element={<AgentRulesPage />} />
+          <Route path="keywords" element={<KeywordGroupsPage />} />
           <Route path="test-lab" element={<TestLabPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
