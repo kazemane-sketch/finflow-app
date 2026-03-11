@@ -2,10 +2,10 @@
 // Reviews ALL classified lines (from both deterministic + AI) and produces:
 // 1. Validated/corrected fiscal_flags per line
 // 2. Invoice-level fiscal alerts (notes) for user decisions
-// Uses Gemini with high thinking for thorough fiscal analysis.
 //
-// v2 (Fase 3): Pre-applies fiscal_decisions (user choices on past alerts).
-// Lines with pre-applied decisions are communicated to Gemini as "already decided".
+// v3: Reads agent_config, agent_rules, knowledge_base from Admin Panel DB.
+//     Uses thinking_level from config for thorough fiscal analysis.
+//     Pre-applies fiscal_decisions (user choices on past alerts) from Fase 3.
 
 import postgres from "npm:postgres@3.4.5";
 
@@ -14,10 +14,6 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
-
-const GEMINI_MODEL = "gemini-2.5-flash-preview-05-20";
-const EMBEDDING_MODEL = "gemini-embedding-001";
-const EXPECTED_DIMS = 3072;
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -64,14 +60,102 @@ interface ReviewResult {
   line_id: string;
   fiscal_flags_corrected: ClassifiedLine["fiscal_flags"];
   issues: string[];
-  confidence_adjustment: number; // +/- to add to original confidence
+  confidence_adjustment: number;
+}
+
+/* ─── Admin Panel types ─────────────────── */
+
+interface AgentConfig {
+  agent_type: string;
+  system_prompt: string;
+  model: string;
+  temperature: number;
+  thinking_level: string;
+  max_output_tokens: number;
+}
+
+interface AgentRule {
+  title: string;
+  rule_text: string;
+  trigger_keywords: string[];
+  sort_order: number;
+}
+
+interface KBRule {
+  id: string;
+  domain: string;
+  audience: string;
+  title: string;
+  content: string;
+  normativa_ref: string[];
+  fiscal_values: Record<string, unknown>;
+  trigger_keywords: string[];
+  trigger_ateco_prefixes: string[];
+  trigger_vat_natures: string[];
+  trigger_doc_types: string[];
+  ateco_scope: string[] | null;
+  priority: number;
+}
+
+/* ─── KB trigger matching ────────────────── */
+
+function matchesTriggers(
+  rule: KBRule,
+  companyAteco: string,
+  lineDescriptions: string[],
+): boolean {
+  const hasAnyTrigger =
+    (rule.trigger_keywords?.length > 0) ||
+    (rule.trigger_vat_natures?.length > 0) ||
+    (rule.trigger_doc_types?.length > 0) ||
+    (rule.trigger_ateco_prefixes?.length > 0);
+
+  if (!hasAnyTrigger) return true;
+
+  if (rule.trigger_ateco_prefixes?.length > 0) {
+    if (rule.trigger_ateco_prefixes.some((p) => companyAteco.startsWith(p))) return true;
+  }
+
+  if (rule.trigger_keywords?.length > 0) {
+    const allText = lineDescriptions.join(" ").toLowerCase();
+    if (rule.trigger_keywords.some((kw) => allText.includes(kw.toLowerCase()))) return true;
+  }
+
+  return false;
+}
+
+/* ─── Format helpers ─────────────────────── */
+
+function formatAgentRules(rules: AgentRule[]): string {
+  if (rules.length === 0) return "";
+  const lines = ["=== REGOLE OPERATIVE ==="];
+  rules.forEach((r, i) => {
+    lines.push(`${i + 1}. [${r.title}] — ${r.rule_text}`);
+  });
+  return lines.join("\n");
+}
+
+function formatKBRules(kbRules: KBRule[]): string {
+  if (kbRules.length === 0) return "";
+  const domainLabels: Record<string, string> = {
+    iva: "IVA", ires_irap: "IRES/IRAP", ritenute: "Ritenute",
+    classificazione: "Classificazione", settoriale: "Settoriale",
+    operativo: "Operativo", aggiornamenti: "Aggiornamenti",
+  };
+  const lines: string[] = ["=== NORMATIVA E KNOWLEDGE BASE ==="];
+  for (const r of kbRules) {
+    const ref = r.normativa_ref?.length ? ` (Rif: ${r.normativa_ref.join(", ")})` : "";
+    let entry = `[${domainLabels[r.domain] || r.domain}] ${r.title}: ${r.content}${ref}`;
+    // Include fiscal_values if available (important for the reviewer)
+    if (r.fiscal_values && Object.keys(r.fiscal_values).length > 0) {
+      entry += ` | Valori: ${JSON.stringify(r.fiscal_values)}`;
+    }
+    lines.push(entry);
+  }
+  return lines.join("\n");
 }
 
 /* ─── Helpers ────────────────────────────── */
-
-function toVectorLiteral(values: number[]): string {
-  return `[${values.map((v) => (Number.isFinite(v) ? v.toFixed(8) : "0")).join(",")}]`;
-}
 
 function extractJsonSection(text: string, marker: string): string | null {
   const idx = text.indexOf(marker);
@@ -189,34 +273,85 @@ Deno.serve(async (req) => {
   if (!invoiceId) return json({ error: "invoice_id richiesto" }, 400);
   if (lines.length === 0) return json({ error: "lines vuote" }, 400);
 
-  const sql = postgres(dbUrl, { max: 1 });
+  const sql = postgres(dbUrl, { max: 2 });
 
   try {
-    // ─── Counterparty info ──────────────────────────
-    let counterpartyInfo = counterpartyName;
-    let counterpartyLegalType = "";
-    let counterpartyAteco = "";
+    // ─── Load Admin Panel infrastructure + counterparty info in parallel ──
+    const lineDescriptions = lines.map((l) => l.description || "");
     let vatKey: string | null = null;
     if (counterpartyVatKey) {
       vatKey = counterpartyVatKey.toUpperCase().replace(/^IT/i, "").replace(/[^A-Z0-9]/gi, "");
-      if (vatKey) {
-        const [cp] = await sql`
-          SELECT ateco_code, ateco_description, legal_type, business_sector
-          FROM counterparties WHERE company_id = ${companyId} AND vat_key = ${vatKey} LIMIT 1`;
-        if (cp) {
-          counterpartyLegalType = cp.legal_type || "";
-          counterpartyAteco = cp.ateco_code || "";
-          const parts = [`P.IVA: ${counterpartyVatKey}`];
-          if (cp.ateco_code) parts.push(`ATECO: ${cp.ateco_code} ${cp.ateco_description || ""}`);
-          if (cp.legal_type) parts.push(`Tipo: ${cp.legal_type}`);
-          if (cp.business_sector) parts.push(`Settore: ${cp.business_sector}`);
-          counterpartyInfo += ` — ${parts.join(" — ")}`;
-        }
-      }
     }
 
-    // ─── Pre-resolve fiscal decisions ──────────────────
-    // Load fiscal_decisions for this counterparty and pre-apply matching ones
+    const [
+      companyRows,
+      agentConfigs,
+      agentRules,
+      counterpartyRows,
+    ] = await Promise.all([
+      // Company ATECO + name
+      sql`SELECT name, ateco_code FROM companies WHERE id = ${companyId} LIMIT 1`,
+      // Agent config for revisore
+      sql<AgentConfig[]>`
+        SELECT agent_type, system_prompt, model, temperature, thinking_level, max_output_tokens
+        FROM agent_config WHERE active = true AND agent_type = 'revisore'
+        LIMIT 1`,
+      // Agent rules for revisore
+      sql<AgentRule[]>`
+        SELECT title, rule_text, trigger_keywords, sort_order
+        FROM agent_rules WHERE active = true AND agent_type = 'revisore'
+        ORDER BY sort_order`,
+      // Counterparty info
+      vatKey
+        ? sql`SELECT ateco_code, ateco_description, legal_type, business_sector
+              FROM counterparties WHERE company_id = ${companyId} AND vat_key = ${vatKey} LIMIT 1`
+        : Promise.resolve([]),
+    ]);
+
+    const companyName = companyRows[0]?.name || "";
+    const companyAteco = companyRows[0]?.ateco_code || "";
+    const atecoPrefix = companyAteco.slice(0, 2);
+    const agentConfig = agentConfigs[0] || null;
+
+    // Counterparty info
+    let counterpartyInfo = counterpartyName;
+    let counterpartyLegalType = "";
+    let counterpartyAteco = "";
+    const cpRow = counterpartyRows[0];
+    if (cpRow) {
+      counterpartyLegalType = cpRow.legal_type || "";
+      counterpartyAteco = cpRow.ateco_code || "";
+      const parts = [`P.IVA: ${counterpartyVatKey}`];
+      if (cpRow.ateco_code) parts.push(`ATECO: ${cpRow.ateco_code} ${cpRow.ateco_description || ""}`);
+      if (cpRow.legal_type) parts.push(`Tipo: ${cpRow.legal_type}`);
+      if (cpRow.business_sector) parts.push(`Settore: ${cpRow.business_sector}`);
+      counterpartyInfo += ` — ${parts.join(" — ")}`;
+    }
+
+    // ─── Load knowledge_base (NEW: replaces old fiscal_knowledge RAG) ──
+    const allKBRules = await sql<KBRule[]>`
+      SELECT id, domain, audience, title, content, normativa_ref,
+             fiscal_values, trigger_keywords, trigger_ateco_prefixes,
+             trigger_vat_natures, trigger_doc_types, ateco_scope, priority
+      FROM knowledge_base
+      WHERE active = true AND status = 'approved'
+        AND effective_from <= CURRENT_DATE AND effective_to >= CURRENT_DATE
+        AND (ateco_scope IS NULL OR ${atecoPrefix} = ANY(ateco_scope))
+      ORDER BY priority DESC
+      LIMIT 50`;
+
+    // Filter KB by audience (revisore + both) + triggers
+    const kbFiltered = allKBRules.filter((r) =>
+      ["revisore", "both"].includes(r.audience)
+    );
+    const kbMatched = kbFiltered.filter((r) =>
+      matchesTriggers(r, companyAteco, lineDescriptions)
+    );
+    const kbUsed = kbMatched.slice(0, 30);
+
+    console.log(`[fiscal-reviewer] Admin Panel: config=${agentConfig ? "✓" : "✗"} rules=${agentRules.length} kb=${kbUsed.length}/${allKBRules.length}`);
+
+    // ─── Pre-resolve fiscal decisions (Fase 3 — preserved) ──────────
     const preResolvedFiscal = new Map<string, {
       alert_type: string;
       fiscal_override: Record<string, unknown>;
@@ -234,7 +369,6 @@ Deno.serve(async (req) => {
           AND direction = ${direction}`;
 
       if (fiscalDecisions.length > 0) {
-        // Load operation keyword groups for group matching
         const opGroups = await sql`
           SELECT group_code, keywords FROM operation_keyword_groups WHERE active = true`;
 
@@ -252,8 +386,6 @@ Deno.serve(async (req) => {
             if (dec.operation_group_code !== lineGroupCode) continue;
 
             const decSubjectSet = new Set((dec.subject_keywords as string[]) || []);
-
-            // Match subject keywords (Jaccard >= 0.80)
             const jaccard = jaccardSimilarity(lineSubjectSet, decSubjectSet);
             if (jaccard < 0.80) continue;
 
@@ -264,7 +396,6 @@ Deno.serve(async (req) => {
               times_applied: dec.times_applied,
             });
 
-            // Increment times_applied (fire-and-forget)
             sql`UPDATE fiscal_decisions SET times_applied = times_applied + 1, last_applied_at = now() WHERE id = ${dec.id}`.catch(() => {});
           }
 
@@ -275,60 +406,10 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ─── RAG: Search fiscal knowledge base ────────────
-    let kbSection = "";
-    try {
-      const queryText = lines.map((l) => l.description).join(" | ") + ` | ${counterpartyName}`;
-      const embUrl = `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${geminiKey}`;
-      const embResp = await fetch(embUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: `models/${EMBEDDING_MODEL}`,
-          content: { parts: [{ text: queryText }] },
-          taskType: "RETRIEVAL_QUERY",
-          outputDimensionality: EXPECTED_DIMS,
-        }),
-      });
-      const embData = await embResp.json();
-      const queryVec = embData?.embedding?.values;
-      if (Array.isArray(queryVec) && queryVec.length === EXPECTED_DIMS) {
-        const vecLiteral = toVectorLiteral(queryVec);
-        const atecoPrefix = counterpartyAteco ? counterpartyAteco.slice(0, 2) : "";
-        const accCodes = lines.map((l) => l.account_code).filter(Boolean).map((c) => (c as string).slice(0, 3));
-
-        const kbRows = await sql.unsafe(
-          `SELECT title, content, category, normativa, fiscal_values
-           FROM fiscal_knowledge
-           WHERE active = true AND embedding IS NOT NULL
-             AND (
-               (1 - (embedding <=> $1::halfvec(3072))) >= 0.35
-               OR ($2 != '' AND $2 = ANY(trigger_ateco_prefixes))
-               OR (trigger_account_prefixes && $3::text[])
-             )
-           ORDER BY priority DESC, embedding <=> $1::halfvec(3072)
-           LIMIT 6`,
-          [vecLiteral, atecoPrefix, accCodes],
-        );
-
-        if (kbRows.length > 0) {
-          kbSection = `\n=== NORMATIVA FISCALE RILEVANTE ===\n` +
-            kbRows.map((r: any) => {
-              let entry = `[${r.category}] ${r.title}\n${r.content}`;
-              if (r.normativa?.length) entry += `\nRif: ${r.normativa.join(", ")}`;
-              if (r.fiscal_values) entry += `\nValori: ${JSON.stringify(r.fiscal_values)}`;
-              return entry;
-            }).join("\n---\n") + `\n===\n`;
-        }
-      }
-    } catch (e) {
-      console.warn("[fiscal-reviewer] KB search failed:", e);
-    }
-
-    // ─── Build pre-resolved section for prompt ────────
+    // ─── Build pre-resolved section for prompt ────────────────
     let preResolvedSection = "";
     const preResolvedLineIds = new Set<string>();
-    const preResolvedAlertTypes = new Map<string, Set<string>>(); // line_id → Set<alert_type>
+    const preResolvedAlertTypes = new Map<string, Set<string>>();
 
     if (preResolvedFiscal.size > 0) {
       const preLines: string[] = [];
@@ -352,7 +433,7 @@ NON generare alert per queste righe su questi tipi. Applica i valori fiscali gi�
 ===\n`;
     }
 
-    // ─── Build lines with rule-confirmed flags section ──
+    // ─── Build rule-confirmed flags section ─────────────────
     let ruleConfirmedSection = "";
     const ruleConfirmedLineIds = new Set<string>();
     const ruleConfirmedLines = lines.filter(
@@ -371,7 +452,7 @@ Verificale solo se noti un'incongruenza EVIDENTE. Non generare alert su queste.
 ===\n`;
     }
 
-    // ─── Build prompt ──────────────────────────────────
+    // ─── Build classified lines section ──────────────────────
     const lineEntries = lines.map((l, i) => {
       const ff = l.fiscal_flags;
       return `${i + 1}. [${l.line_id}] "${l.description}" tot=${l.total_price ?? "N/D"}
@@ -379,16 +460,52 @@ Verificale solo se noti un'incongruenza EVIDENTE. Non generare alert su queste.
    → fiscale: deducib=${ff.deducibilita_pct}% IVA_detr=${ff.iva_detraibilita_pct}% ritenuta=${ff.ritenuta_acconto ? ff.ritenuta_acconto.aliquota + "%" : "no"} RC=${ff.reverse_charge} SP=${ff.split_payment} BS=${ff.bene_strumentale}${ff.note ? ` nota:"${ff.note}"` : ""}`;
     }).join("\n\n");
 
-    const prompt = `Sei un REVISORE CONTABILE italiano senior. Devi controllare la classificazione fiscale di questa fattura.
+    // ─── Build prompt with Admin Panel data ──────────────────
+    const promptParts: string[] = [];
 
-CONTROPARTE: ${counterpartyInfo}
-DIREZIONE: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
-${kbSection}${preResolvedSection}${ruleConfirmedSection}
+    // 1. System prompt from agent_config (or fallback)
+    if (agentConfig?.system_prompt) {
+      promptParts.push(agentConfig.system_prompt);
+    } else {
+      promptParts.push("Sei un REVISORE CONTABILE italiano senior. Devi controllare la classificazione fiscale di questa fattura.");
+    }
+    promptParts.push("");
 
-RIGHE CLASSIFICATE (da commercialista):
-${lineEntries}
+    // 2. Agent rules (BEFORE everything else)
+    const rulesBlock = formatAgentRules(agentRules);
+    if (rulesBlock) {
+      promptParts.push(rulesBlock);
+      promptParts.push("");
+    }
 
-IL TUO COMPITO:
+    // 3. Knowledge base rules (with fiscal_values for the reviewer)
+    const kbBlock = formatKBRules(kbUsed);
+    if (kbBlock) {
+      promptParts.push(kbBlock);
+      promptParts.push("");
+    }
+
+    // 4. Company ATECO context
+    promptParts.push("=== CONTESTO AZIENDA ===");
+    promptParts.push(`Azienda: ${companyName}`);
+    if (companyAteco) promptParts.push(`ATECO: ${companyAteco}`);
+    promptParts.push("");
+
+    // 5. Counterparty + direction
+    promptParts.push(`CONTROPARTE: ${counterpartyInfo}`);
+    promptParts.push(`DIREZIONE: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}`);
+    promptParts.push("");
+
+    // 6. Pre-resolved decisions + rule-confirmed flags
+    if (preResolvedSection) promptParts.push(preResolvedSection);
+    if (ruleConfirmedSection) promptParts.push(ruleConfirmedSection);
+
+    // 7. Classified lines
+    promptParts.push(`RIGHE CLASSIFICATE (da commercialista):\n${lineEntries}`);
+    promptParts.push("");
+
+    // 8. Task instructions + output format
+    promptParts.push(`IL TUO COMPITO:
 1. Per ogni riga, VERIFICA i fiscal_flags. Correggi se necessario.
 2. Genera ALERT per l'utente quando serve una decisione umana.
 3. Per le righe con decisioni già prese dall'utente o confermate da regole, RISPETTA le scelte (salvo incongruenze evidenti).
@@ -410,16 +527,32 @@ Sezione 1 — JSON array revisioni:
 ---ALERTS---
 JSON array di alert fiscali per l'utente (solo se servono decisioni umane):
 [{"type":"deducibilita"|"ritenuta"|"reverse_charge"|"split_payment"|"bene_strumentale"|"iva_indetraibile"|"general","severity":"warning"|"info","title":"titolo breve","description":"spiegazione per l'utente","current_choice":"scelta conservativa applicata","options":[{"label":"Opzione A","fiscal_override":{},"is_default":false},{"label":"Opzione B","fiscal_override":{},"is_default":true}],"affected_lines":["line_id1"]}]
-Se nessun alert: []`;
+Se nessun alert: []`);
 
-    // ─── Call Gemini ──────────────────────────────────
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`;
+    const prompt = promptParts.join("\n");
+
+    // ─── Call Gemini (using config model/temperature/thinking) ────
+    const model = agentConfig?.model || "gemini-2.5-flash";
+    const temperature = agentConfig?.temperature ?? 0.1;
+    const thinkingLevel = agentConfig?.thinking_level || "high";
+    const thinkingBudget: Record<string, number> = {
+      none: 0, low: 1024, medium: 8192, high: 24576,
+    };
+    const budget = thinkingBudget[thinkingLevel] ?? 24576;
+
+    console.log(`[fiscal-reviewer] Using model=${model} temp=${temperature} thinking=${thinkingLevel}(${budget})`);
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 32768, temperature: 0.1 },
+        generationConfig: {
+          maxOutputTokens: agentConfig?.max_output_tokens || 32768,
+          temperature,
+          ...(budget > 0 ? { thinkingConfig: { thinkingBudget: budget } } : {}),
+        },
       }),
     });
 
@@ -445,7 +578,6 @@ Se nessun alert: []`;
     for (const [lineId, decs] of preResolvedFiscal) {
       let review = reviews.find((r) => r.line_id === lineId);
       if (!review) {
-        // Create a review entry for this pre-resolved line
         const line = lines.find((l) => l.line_id === lineId);
         if (line) {
           review = {
@@ -458,7 +590,6 @@ Se nessun alert: []`;
         }
       }
       if (review) {
-        // Apply all fiscal overrides from user decisions
         for (const d of decs) {
           review.fiscal_flags_corrected = {
             ...review.fiscal_flags_corrected,
@@ -478,11 +609,10 @@ Se nessun alert: []`;
     if (alertStr) {
       try {
         const rawAlerts: FiscalAlert[] = JSON.parse(alertStr);
-        // Filter out alerts whose affected lines are all pre-resolved for that alert type
         alerts = rawAlerts.filter((a) => {
           const remainingLines = a.affected_lines.filter((lid) => {
             const preTypes = preResolvedAlertTypes.get(lid);
-            if (preTypes && preTypes.has(a.type)) return false; // pre-resolved, skip
+            if (preTypes && preTypes.has(a.type)) return false;
             return true;
           });
           a.affected_lines = remainingLines;
@@ -498,6 +628,9 @@ Se nessun alert: []`;
       alerts,
       pre_resolved_count: preResolvedFiscal.size,
       prompt_length: prompt.length,
+      model_used: model,
+      kb_rules_used: kbUsed.length,
+      agent_rules_used: agentRules.length,
     });
   } catch (err) {
     await sql.end().catch(() => {});

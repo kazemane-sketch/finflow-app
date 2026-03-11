@@ -1150,115 +1150,56 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       const cp = (invoice.counterparty || {}) as any;
       const lines = detail?.invoice_lines || [];
 
-      // Step 1: Fast-path — check classification rules (skip if user chose "Reclassifica con AI")
-      let ruleSuggestions: RuleSuggestion[] = [];
-      if (!skipRules) {
-        ruleSuggestions = await findMatchingRules(
-          company.id, cp?.piva || null, cp?.denom || null,
-          lines.map(l => ({ id: l.id, description: l.description })),
-          invoice.direction as 'in' | 'out',
-        );
-      }
-
-      const coveredLineIds = new Set(ruleSuggestions.map(s => s.line_id));
-      const rulesMissingCdc = ruleSuggestions.length > 0 &&
-        !ruleSuggestions.some(s => s.cost_center_allocations && s.cost_center_allocations.length > 0);
-      const uncoveredLines = lines
-        .filter(l => !coveredLineIds.has(l.id));
-      // Also call AI when rules cover all lines but none have CdC
-      const linesToClassify = uncoveredLines.length > 0 ? uncoveredLines
-        : (rulesMissingCdc ? lines : []);
-
-      // Step 2: For uncovered/incomplete lines, call unified classifier (Sonnet)
-      let aiResult: any = null;
-      if (linesToClassify.length > 0) {
-        const classifyBody = JSON.stringify({
-          company_id: company.id,
-          invoice_id: invoice.id,
-          lines: linesToClassify.map(l => ({
-            line_id: l.id,
-            description: l.description,
-            quantity: l.quantity,
-            unit_price: l.unit_price,
-            total_price: l.total_price,
-          })),
-          direction: invoice.direction,
-          counterparty_vat_key: cp?.piva || null,
-          counterparty_name: cp?.denom || null,
-        });
-
-        // Call with auto-retry on 401 (expired JWT)
-        let token = await getValidAccessToken();
-        let res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`,
-            'apikey': SUPABASE_ANON_KEY,
-          },
-          body: classifyBody,
-        });
-
-        // 401 = JWT expired at gateway → force refresh and retry once
-        if (res.status === 401) {
-          console.warn('[classif] 401 → forcing token refresh and retrying');
-          token = await getValidAccessToken({ forceRefresh: true });
-          res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${token}`,
-              'apikey': SUPABASE_ANON_KEY,
-            },
-            body: classifyBody,
-          });
-        }
-
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Errore AI');
-        aiResult = data;
-      }
-
-      // Merge rule suggestions + AI result into the expected format
-      const mergedLines = [
-        ...ruleSuggestions.map(s => ({
-          invoice_line_id: s.line_id,
-          article_id: s.article_id,
-          phase_id: s.phase_id || null,
-          category_id: s.category_id,
-          account_id: s.account_id,
-          project_allocations: s.cost_center_allocations || [],
-          match_type: 'rule' as const,
-          confidence: s.confidence,
-          reasoning: 'Regola appresa',
+      // Run v2 cascade pipeline (deterministic → understand → classify → CdC → fiscal review)
+      const pipelineResult = await runClassificationPipeline(
+        company.id,
+        invoice.id,
+        lines.map(l => ({
+          line_id: l.id,
+          description: l.description,
+          quantity: l.quantity,
+          unit_price: l.unit_price,
+          total_price: l.total_price,
         })),
-        ...(aiResult?.lines || []).map((lr: any) => ({
-          invoice_line_id: lr.line_id,
-          article_id: lr.article_id || null,
-          phase_id: lr.phase_id || null,
-          category_id: lr.category_id,
-          account_id: lr.account_id,
-          project_allocations: lr.cost_center_allocations || [],
-          match_type: 'ai' as const,
-          confidence: lr.confidence,
-          reasoning: lr.reasoning,
-        })),
-      ];
+        invoice.direction as 'in' | 'out',
+        cp?.piva || null,
+        cp?.denom || null,
+      );
 
-      // Aggregate CdC from rule suggestions for invoice-level fallback
-      const ruleProjectAllocations = ruleSuggestions
-        .find(s => s.cost_center_allocations && s.cost_center_allocations.length > 0)
-        ?.cost_center_allocations || [];
+      // Convert PipelineResult to FatturePage format
+      const mergedLines = pipelineResult.lines.map(lr => ({
+        invoice_line_id: lr.line_id,
+        line_id: lr.line_id,
+        article_id: lr.article_id,
+        phase_id: lr.phase_id,
+        category_id: lr.category_id,
+        account_id: lr.account_id,
+        project_allocations: lr.cost_center_allocations || [],
+        match_type: lr.source as any,
+        confidence: lr.confidence,
+        reasoning: lr.reasoning,
+        fiscal_flags: lr.fiscal_flags,
+        suggest_new_account: lr.suggest_new_account,
+        suggest_new_category: lr.suggest_new_category,
+      }));
+
+      const classified = pipelineResult.lines.filter(l => l.confidence >= 60 && (l.category_id || l.account_id));
+      const best = classified.length > 0
+        ? classified.reduce((a, b) => b.confidence > a.confidence ? b : a)
+        : null;
 
       const result = {
         invoice_id: invoice.id,
         lines: mergedLines,
-        invoice_level: aiResult?.invoice_level || {
-          category_id: ruleSuggestions[0]?.category_id || null,
-          account_id: ruleSuggestions[0]?.account_id || null,
-          project_allocations: ruleProjectAllocations,
-          confidence: ruleSuggestions[0]?.confidence || 0,
-          reasoning: `${ruleSuggestions.length} righe da regole, ${aiResult?.lines?.length || 0} da AI`,
+        invoice_level: best ? {
+          category_id: best.category_id,
+          account_id: best.account_id,
+          project_allocations: best.cost_center_allocations || [],
+          confidence: best.confidence,
+          reasoning: `Pipeline v2: ${pipelineResult.stats.deterministic} deterministiche, ${pipelineResult.stats.ai_classified} AI`,
+        } : {
+          category_id: null, account_id: null, project_allocations: [],
+          confidence: 0, reasoning: 'Nessuna classificazione riuscita',
         },
       };
 
@@ -1268,11 +1209,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       // Update local invoice object so the AI box reflects 'ai_suggested' immediately
       onPatchInvoice(invoice.id, { classification_status: 'ai_suggested' } as Partial<DBInvoice>);
 
-      // Extract fiscal flags from AI results
+      // Extract fiscal flags from pipeline results
       const flags: Record<string, any> = {};
-      for (const lr of (aiResult?.lines || [])) {
-        if (lr.fiscal_flags && lr.line_id) {
-          flags[lr.line_id] = lr.fiscal_flags;
+      for (const lr of mergedLines) {
+        if (lr.fiscal_flags && lr.invoice_line_id) {
+          flags[lr.invoice_line_id] = lr.fiscal_flags;
         }
       }
       setLineFiscalFlags(flags);
@@ -1285,15 +1226,15 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         if (lid) {
           if (lr.confidence != null) confs[lid] = lr.confidence;
           reviews[lid] = lr.confidence < 65
-            || !!(lr.fiscal_flags?.note && /verificar|controllare|dubbio/i.test(lr.fiscal_flags?.note || ''))
+            || !!(lr.fiscal_flags?.note && /verificar|controllare|dubbio/i.test(String(lr.fiscal_flags?.note || '')))
             || lr.suggest_new_account != null;
         }
       }
       setLineConfidences(confs);
       setLineReviewFlags(reviews);
 
-      // Extract fiscal review alerts from Sonnet escalation + Haiku fiscal_flags
-      const aiInvoiceNotes = ((aiResult as any)?.invoice_notes || (result as any)?.invoice_notes || []) as FiscalAlert[];
+      // Extract fiscal review alerts from pipeline fiscal reviewer
+      const aiInvoiceNotes = [...(pipelineResult.alerts || [])] as FiscalAlert[];
 
       // Generate synthetic alerts from suggest_new_account (so "Create account" button always appears)
       for (const lr of (result.lines || [])) {
@@ -1326,8 +1267,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         const lid = lr.line_id || lr.invoice_line_id;
         if (lid && (lr.suggest_new_account || lr.suggest_new_category)) {
           suggestions[lid] = {
-            suggest_new_account: lr.suggest_new_account || null,
-            suggest_new_category: lr.suggest_new_category || null,
+            suggest_new_account: (lr.suggest_new_account as unknown as AccountSuggestion) || null,
+            suggest_new_category: (lr.suggest_new_category as unknown as CategorySuggestion) || null,
           };
         }
       }
@@ -1401,8 +1342,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         const lineId = ml.invoice_line_id;
         if (lineId && ml.project_allocations?.length > 0 && !mergedLineProj[lineId]?.length) {
           mergedLineProj[lineId] = ml.project_allocations.map((pa: { project_id: string; percentage: number }) => ({
+            id: `ai_${lineId}_${pa.project_id}`,
+            invoice_line_id: lineId,
             project_id: pa.project_id,
             percentage: pa.percentage,
+            amount: null,
           }));
         }
       }
@@ -3623,27 +3567,22 @@ export default function FatturePage() {
             .eq('invoice_id', inv.id);
           if (!lines || lines.length === 0) { totalProcessed++; continue; }
           const cp = inv.counterparty as Record<string, string> | null;
-          const classifBody = JSON.stringify({
-            company_id: companyId, invoice_id: inv.id,
-            lines: lines.map(l => ({ line_id: l.id, description: l.description || '', quantity: l.quantity, unit_price: l.unit_price, total_price: l.total_price })),
-            direction: inv.direction || 'in', counterparty_name: cp?.denom || '',
-          });
-          let res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
-            body: classifBody,
+          // Run v2 cascade pipeline (same as batch classification)
+          await runClassificationPipeline(
+            companyId,
+            inv.id,
+            lines.map(l => ({
+              line_id: l.id,
+              description: l.description || '',
+              quantity: l.quantity,
+              unit_price: l.unit_price,
+              total_price: l.total_price,
+            })),
+            (inv.direction || 'in') as 'in' | 'out',
+            cp?.piva || null,
+            cp?.denom || null,
             signal,
-          });
-          // 401 = JWT expired → force refresh and retry once
-          if (res.status === 401) {
-            token = await getValidAccessToken({ forceRefresh: true });
-            res = await fetch(`${SUPABASE_URL}/functions/v1/classify-invoice-lines`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${token}` },
-              body: classifBody,
-              signal,
-            });
-          }
+          );
           totalProcessed++;
           updateProgress(totalProcessed, totalProcessed + Math.max(0, pending.length - 1));
         }

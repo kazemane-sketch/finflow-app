@@ -2,6 +2,8 @@
 // Takes understanding results from Stage A and assigns account, category, article.
 // Only sees FILTERED chart of accounts (by section from Stage A).
 // Produces: category_id, account_id, article_code, phase_code, confidence, fiscal_flags.
+//
+// v3: Reads agent_config, agent_rules, knowledge_base from Admin Panel DB.
 
 import postgres from "npm:postgres@3.4.5";
 import {
@@ -17,7 +19,6 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const GEMINI_MODEL = "gemini-2.5-flash-preview-05-20";
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_DIMS = 3072;
 
@@ -74,6 +75,93 @@ interface ClassifyResult {
   suggest_new_category?: {
     name: string; type: string; reason: string;
   } | null;
+}
+
+/* ─── Admin Panel types ─────────────────── */
+
+interface AgentConfig {
+  agent_type: string;
+  system_prompt: string;
+  model: string;
+  temperature: number;
+  thinking_level: string;
+  max_output_tokens: number;
+}
+
+interface AgentRule {
+  title: string;
+  rule_text: string;
+  trigger_keywords: string[];
+  sort_order: number;
+}
+
+interface KBRule {
+  id: string;
+  domain: string;
+  audience: string;
+  title: string;
+  content: string;
+  normativa_ref: string[];
+  fiscal_values: Record<string, unknown>;
+  trigger_keywords: string[];
+  trigger_ateco_prefixes: string[];
+  trigger_vat_natures: string[];
+  trigger_doc_types: string[];
+  ateco_scope: string[] | null;
+  priority: number;
+}
+
+/* ─── KB trigger matching ────────────────── */
+
+function matchesTriggers(
+  rule: KBRule,
+  companyAteco: string,
+  lineDescriptions: string[],
+): boolean {
+  const hasAnyTrigger =
+    (rule.trigger_keywords?.length > 0) ||
+    (rule.trigger_vat_natures?.length > 0) ||
+    (rule.trigger_doc_types?.length > 0) ||
+    (rule.trigger_ateco_prefixes?.length > 0);
+
+  if (!hasAnyTrigger) return true;
+
+  if (rule.trigger_ateco_prefixes?.length > 0) {
+    if (rule.trigger_ateco_prefixes.some((p) => companyAteco.startsWith(p))) return true;
+  }
+
+  if (rule.trigger_keywords?.length > 0) {
+    const allText = lineDescriptions.join(" ").toLowerCase();
+    if (rule.trigger_keywords.some((kw) => allText.includes(kw.toLowerCase()))) return true;
+  }
+
+  return false;
+}
+
+/* ─── Format helpers ─────────────────────── */
+
+function formatAgentRules(rules: AgentRule[]): string {
+  if (rules.length === 0) return "";
+  const lines = ["=== REGOLE OPERATIVE ==="];
+  rules.forEach((r, i) => {
+    lines.push(`${i + 1}. [${r.title}] — ${r.rule_text}`);
+  });
+  return lines.join("\n");
+}
+
+function formatKBRules(kbRules: KBRule[]): string {
+  if (kbRules.length === 0) return "";
+  const domainLabels: Record<string, string> = {
+    iva: "IVA", ires_irap: "IRES/IRAP", ritenute: "Ritenute",
+    classificazione: "Classificazione", settoriale: "Settoriale",
+    operativo: "Operativo", aggiornamenti: "Aggiornamenti",
+  };
+  const lines: string[] = ["=== NORMATIVA E KNOWLEDGE BASE ==="];
+  for (const r of kbRules) {
+    const ref = r.normativa_ref?.length ? ` (Rif: ${r.normativa_ref.join(", ")})` : "";
+    lines.push(`[${domainLabels[r.domain] || r.domain}] ${r.title}: ${r.content}${ref}`);
+  }
+  return lines.join("\n");
 }
 
 /* ─── Direction enforcement ──────────────── */
@@ -171,7 +259,7 @@ Deno.serve(async (req) => {
   if (!invoiceId) return json({ error: "invoice_id richiesto" }, 400);
   if (lines.length === 0) return json({ error: "lines vuote" }, 400);
 
-  const sql = postgres(dbUrl, { max: 1 });
+  const sql = postgres(dbUrl, { max: 2 });
 
   try {
     // Build understanding map
@@ -185,23 +273,62 @@ Deno.serve(async (req) => {
         if (dirSections.allowed.includes(s)) neededSections.add(s);
       }
     }
-    // Fallback: if no sections determined, use all allowed
     if (neededSections.size === 0) {
       for (const s of dirSections.allowed) neededSections.add(s);
     }
 
     const allowedCatTypes = CAT_TYPES_FOR_DIRECTION[direction] || CAT_TYPES_FOR_DIRECTION["in"];
+    const lineDescriptions = lines.map((l) => l.description || "");
 
-    // ─── Load context in parallel ──────────────────────────────
-    const [articles, categories, accounts, phases, companyRow] = await Promise.all([
+    // ─── Load context + Admin Panel infrastructure in parallel ──────
+    const [articles, categories, accounts, phases, companyRow, agentConfigs, agentRules] = await Promise.all([
       sql`SELECT id, code, name, description, keywords FROM articles WHERE company_id = ${companyId} AND active = true ORDER BY code`,
       sql`SELECT id, name, type FROM categories WHERE company_id = ${companyId} AND active = true AND type = ANY(${allowedCatTypes}::text[]) ORDER BY sort_order, name`,
       sql`SELECT id, code, name, section FROM chart_of_accounts WHERE company_id = ${companyId} AND active = true AND is_header = false AND section = ANY(${[...neededSections]}::text[]) ORDER BY code`,
       sql`SELECT id, article_id, code, name, phase_type, is_counting_point, invoice_direction FROM article_phases WHERE company_id = ${companyId} AND active = true ORDER BY article_id, sort_order`,
-      sql`SELECT name, vat_number FROM companies WHERE id = ${companyId} LIMIT 1`,
+      sql`SELECT name, vat_number, ateco_code FROM companies WHERE id = ${companyId} LIMIT 1`,
+      // Agent config for commercialista
+      sql<AgentConfig[]>`
+        SELECT agent_type, system_prompt, model, temperature, thinking_level, max_output_tokens
+        FROM agent_config WHERE active = true AND agent_type = 'commercialista'
+        LIMIT 1`,
+      // Agent rules for commercialista
+      sql<AgentRule[]>`
+        SELECT title, rule_text, trigger_keywords, sort_order
+        FROM agent_rules WHERE active = true AND agent_type = 'commercialista'
+        ORDER BY sort_order`,
     ]);
 
+    const companyName = companyRow[0]?.name || "";
+    const companyVat = companyRow[0]?.vat_number || "";
+    const companyAteco = companyRow[0]?.ateco_code || "";
+    const atecoPrefix = companyAteco.slice(0, 2);
+    const agentConfig = agentConfigs[0] || null;
+
     console.log(`[classify-v2] Loaded: ${accounts.length} accounts (sections: ${[...neededSections].join(",")}), ${categories.length} cats, ${articles.length} articles`);
+
+    // Load knowledge_base (needs atecoPrefix)
+    const allKBRules = await sql<KBRule[]>`
+      SELECT id, domain, audience, title, content, normativa_ref,
+             fiscal_values, trigger_keywords, trigger_ateco_prefixes,
+             trigger_vat_natures, trigger_doc_types, ateco_scope, priority
+      FROM knowledge_base
+      WHERE active = true AND status = 'approved'
+        AND effective_from <= CURRENT_DATE AND effective_to >= CURRENT_DATE
+        AND (ateco_scope IS NULL OR ${atecoPrefix} = ANY(ateco_scope))
+      ORDER BY priority DESC
+      LIMIT 50`;
+
+    // Filter KB by audience + triggers
+    const kbFiltered = allKBRules.filter((r) =>
+      ["commercialista", "both"].includes(r.audience)
+    );
+    const kbMatched = kbFiltered.filter((r) =>
+      matchesTriggers(r, companyAteco, lineDescriptions)
+    );
+    const kbUsed = kbMatched.slice(0, 30);
+
+    console.log(`[classify-v2] Admin Panel: config=${agentConfig ? "✓" : "✗"} rules=${agentRules.length} kb=${kbUsed.length}/${allKBRules.length}`);
 
     // Counterparty info
     let counterpartyInfo = counterpartyName;
@@ -210,15 +337,15 @@ Deno.serve(async (req) => {
     if (counterpartyVatKey) {
       const vatKey = counterpartyVatKey.toUpperCase().replace(/^IT/i, "").replace(/[^A-Z0-9]/gi, "");
       if (vatKey) {
-        const [cp] = await sql`
+        const [cpRow] = await sql`
           SELECT ateco_code, ateco_description, business_sector, legal_type, address
           FROM counterparties WHERE company_id = ${companyId} AND vat_key = ${vatKey} LIMIT 1`;
-        if (cp) {
+        if (cpRow) {
           const parts = [`P.IVA: ${counterpartyVatKey}`];
-          if (cp.ateco_code) { parts.push(`ATECO: ${cp.ateco_code} ${cp.ateco_description || ""}`); counterpartyAtecoFull = cp.ateco_code; }
-          if (cp.business_sector) parts.push(`Settore: ${cp.business_sector}`);
-          if (cp.legal_type) { parts.push(`Tipo: ${cp.legal_type}`); counterpartyLegalType = cp.legal_type; }
-          if (cp.address) parts.push(`Sede: ${cp.address}`);
+          if (cpRow.ateco_code) { parts.push(`ATECO: ${cpRow.ateco_code} ${cpRow.ateco_description || ""}`); counterpartyAtecoFull = cpRow.ateco_code; }
+          if (cpRow.business_sector) parts.push(`Settore: ${cpRow.business_sector}`);
+          if (cpRow.legal_type) { parts.push(`Tipo: ${cpRow.legal_type}`); counterpartyLegalType = cpRow.legal_type; }
+          if (cpRow.address) parts.push(`Sede: ${cpRow.address}`);
           counterpartyInfo += ` — ${parts.join(" — ")}`;
         }
       }
@@ -226,7 +353,7 @@ Deno.serve(async (req) => {
 
     // Company context
     const companyContext: CompanyContext | undefined = companyRow.length > 0
-      ? { company_name: companyRow[0].name, sector: "servizi", vat_number: companyRow[0].vat_number }
+      ? { company_name: companyName, sector: "servizi", vat_number: companyVat, ateco_code: companyAteco }
       : undefined;
 
     // User instructions
@@ -324,34 +451,66 @@ Deno.serve(async (req) => {
       return `${i + 1}. [${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} tot=${l.total_price ?? "N/D"}${uCtx}`;
     }).join("\n");
 
-    // Build prompt
-    const prompt = `Sei un COMMERCIALISTA SENIOR italiano. Classifica ogni riga della fattura.
+    // ─── Build prompt with Admin Panel data ──────────────────
+    const promptParts: string[] = [];
 
-${companyContext ? `AZIENDA: ${companyContext.company_name} (P.IVA: ${companyContext.vat_number})` : ""}
-CONTROPARTE: ${counterpartyInfo}
-DIREZIONE: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
-${userInstructionsBlock}
-${memoryBlock}
+    // 1. System prompt from agent_config (or fallback)
+    if (agentConfig?.system_prompt) {
+      promptParts.push(agentConfig.system_prompt);
+    } else {
+      promptParts.push("Sei un COMMERCIALISTA SENIOR italiano. Classifica ogni riga della fattura.");
+    }
+    promptParts.push("");
 
-IMPORTANTE — COMPRENSIONE (Stage A):
+    // 2. Agent rules (CRITICAL: BEFORE lines and context)
+    const rulesBlock = formatAgentRules(agentRules);
+    if (rulesBlock) {
+      promptParts.push(rulesBlock);
+      promptParts.push("");
+    }
+
+    // 3. Knowledge base rules
+    const kbBlock = formatKBRules(kbUsed);
+    if (kbBlock) {
+      promptParts.push(kbBlock);
+      promptParts.push("");
+    }
+
+    // 4. Company + counterparty context
+    promptParts.push("=== CONTESTO AZIENDA ===");
+    promptParts.push(`AZIENDA: ${companyName} (P.IVA: ${companyVat})`);
+    if (companyAteco) promptParts.push(`ATECO: ${companyAteco}`);
+    promptParts.push(`CONTROPARTE: ${counterpartyInfo}`);
+    promptParts.push(`DIREZIONE: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}`);
+    promptParts.push("");
+
+    // 5. User instructions + memory
+    if (userInstructionsBlock) promptParts.push(userInstructionsBlock);
+    if (memoryBlock) promptParts.push(memoryBlock);
+    promptParts.push("");
+
+    // 6. Comprehension context
+    promptParts.push(`IMPORTANTE — COMPRENSIONE (Stage A):
 Ogni riga ha una "COMPRENSIONE" allegata che ti dice cos'è l'operazione e in quali sezioni cercare il conto.
 RISPETTA le sezioni indicate. Se la comprensione dice sections=cost_production, NON scegliere conti in assets.
-Se la comprensione dice NOT=["vendita di pozzolana"], allora NON classificare come vendita.
+Se la comprensione dice NOT=["vendita di pozzolana"], allora NON classificare come vendita.`);
+    promptParts.push("");
 
-CATEGORIE:
-${catSection}
+    // 7. Charts of accounts, categories, articles
+    promptParts.push(`CATEGORIE:\n${catSection}`);
+    promptParts.push("");
+    promptParts.push(`CONTI (filtrati per le sezioni rilevanti):\n${accSection}`);
+    promptParts.push("");
+    if (artSection) { promptParts.push(`ARTICOLI:\n${artSection}`); promptParts.push(""); }
+    if (historySection) { promptParts.push(historySection); promptParts.push(""); }
+    if (articleHistorySection) { promptParts.push(articleHistorySection); promptParts.push(""); }
 
-CONTI (filtrati per le sezioni rilevanti):
-${accSection}
+    // 8. Lines
+    promptParts.push(`RIGHE:\n${lineEntries}`);
+    promptParts.push("");
 
-${artSection ? `ARTICOLI:\n${artSection}` : ""}
-${historySection}
-${articleHistorySection}
-
-RIGHE:
-${lineEntries}
-
-REGOLE:
+    // 9. Output format
+    promptParts.push(`REGOLE DI CLASSIFICAZIONE:
 - category_id e account_id: SEMPRE UUID dalla lista sopra
 - article_code + phase_code: solo se il materiale corrisponde
 - confidence 0-100 (dubbio → bassa, mai confidence alta su scelte incerte)
@@ -359,16 +518,30 @@ REGOLE:
 - Righe con tot=0: informative, confidence 30-50
 
 Rispondi con JSON array (no markdown):
-[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","confidence":0-100,"reasoning":"max 30 parole","fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]`;
+[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","confidence":0-100,"reasoning":"max 30 parole","fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]`);
 
-    // Call Gemini
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`;
+    const prompt = promptParts.join("\n");
+
+    // ─── Call Gemini (using config model/temperature/thinking) ────
+    const model = agentConfig?.model || "gemini-2.5-flash";
+    const temperature = agentConfig?.temperature ?? 0.2;
+    const thinkingLevel = agentConfig?.thinking_level || "medium";
+    const thinkingBudget: Record<string, number> = {
+      none: 0, low: 1024, medium: 8192, high: 24576,
+    };
+    const budget = thinkingBudget[thinkingLevel] ?? 8192;
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 32768, temperature: 0.2 },
+        generationConfig: {
+          maxOutputTokens: agentConfig?.max_output_tokens || 32768,
+          temperature,
+          ...(budget > 0 ? { thinkingConfig: { thinkingBudget: budget } } : {}),
+        },
       }),
     });
 
@@ -381,7 +554,7 @@ Rispondi con JSON array (no markdown):
     const data = await resp.json();
     const gParts = (data as any)?.candidates?.[0]?.content?.parts || [];
     let responseText = "";
-    for (const part of gParts) { if (part.text) responseText += part.text; }
+    for (const part of gParts) { if (part.text && !part.thought) responseText += part.text; }
 
     const jsonStr = extractFirstJsonArray(responseText);
     let results: ClassifyResult[] = [];
@@ -398,7 +571,6 @@ Rispondi con JSON array (no markdown):
     const validCatIds = new Set((categories as any[]).map((c) => c.id));
 
     for (const r of results) {
-      // If AI returned invalid UUID, try to resolve by code/name
       if (r.account_id && !validAccIds.has(r.account_id)) {
         if (r.account_code) {
           const match = (accounts as any[]).find((a) => a.code === r.account_code);
@@ -426,6 +598,9 @@ Rispondi con JSON array (no markdown):
       prompt_length: prompt.length,
       accounts_shown: accounts.length,
       categories_shown: categories.length,
+      model_used: model,
+      kb_rules_used: kbUsed.length,
+      agent_rules_used: agentRules.length,
     });
   } catch (err) {
     await sql.end().catch(() => {});
