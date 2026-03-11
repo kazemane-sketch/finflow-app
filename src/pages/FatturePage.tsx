@@ -1959,7 +1959,10 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       if (headerDropdownRef.current?.contains(target)) return;
       setHeaderDropdown(null);
     };
-    const scrollHandler = () => setHeaderDropdown(null);
+    const scrollHandler = (e: Event) => {
+      if (headerDropdownRef.current?.contains(e.target as Node)) return;
+      setHeaderDropdown(null);
+    };
     document.addEventListener('mousedown', clickHandler);
     window.addEventListener('scroll', scrollHandler, true);
     return () => {
