@@ -411,8 +411,8 @@ export interface InvoiceClassificationMeta {
   lines_with_category: number  // lines where category_id IS NOT NULL
   lines_with_account: number   // lines where account_id IS NOT NULL
   lines_with_cdc: number       // distinct lines with at least one invoice_line_projects row
-  lines_with_article: number   // distinct lines with at least one invoice_line_articles row
-  lines_with_complete_article: number // lines where article is assigned AND (article has no phases OR phase_id IS NOT NULL)
+  lines_with_article: number   // visible article state: verified or AI suggestion with confidence >= 70
+  lines_with_complete_article: number // visible article state with required phase completeness
   review_count: number         // lines with needs_review = true (for sidebar badge)
   // Convenience booleans — true when ALL lines have the field
   has_category: boolean
@@ -449,7 +449,7 @@ export async function loadInvoiceClassificationMeta(
       // 2. Article assignments per line (with phase_id + article_id for phase completeness check)
       supabase
         .from('invoice_line_articles')
-        .select('invoice_id, invoice_line_id, article_id, phase_id')
+        .select('invoice_id, invoice_line_id, article_id, phase_id, verified, confidence')
         .eq('company_id', companyId)
         .in('invoice_id', batchIds),
       // 3. Line-level CdC assignments (distinct invoice_line_id)
@@ -495,9 +495,17 @@ export async function loadInvoiceClassificationMeta(
     // Distinct lines with article assignments per invoice + completeness tracking
     const articleLinesByInv = new Map<string, Set<string>>()
     const completeArticleLinesByInv = new Map<string, Set<string>>()
+    const verifiedArticleLinesByInv = new Map<string, Set<string>>()
     for (const row of (assignedRes.data || []) as any[]) {
+      const isVisibleInUi = !!row.verified || Number(row.confidence || 0) >= 70
+      if (!isVisibleInUi) continue
+
       if (!articleLinesByInv.has(row.invoice_id)) articleLinesByInv.set(row.invoice_id, new Set())
       articleLinesByInv.get(row.invoice_id)!.add(row.invoice_line_id)
+      if (row.verified) {
+        if (!verifiedArticleLinesByInv.has(row.invoice_id)) verifiedArticleLinesByInv.set(row.invoice_id, new Set())
+        verifiedArticleLinesByInv.get(row.invoice_id)!.add(row.invoice_line_id)
+      }
       // Complete = article has no phases, OR article has phases AND phase_id is set
       const isMultiStep = articlesWithPhases.has(row.article_id)
       const isComplete = !isMultiStep || !!row.phase_id
@@ -530,6 +538,7 @@ export async function loadInvoiceClassificationMeta(
     for (const id of batchIds) {
       const ls = lineStats.get(id) || { total: 0, withCat: 0, withAcct: 0 }
       const lc = ls.total
+      const verifiedArtLines = verifiedArticleLinesByInv.get(id)?.size || 0
       const artLines = articleLinesByInv.get(id)?.size || 0
       const completeArtLines = completeArticleLinesByInv.get(id)?.size || 0
       const cdcLines = cdcLinesByInv.get(id)?.size || 0
@@ -542,7 +551,7 @@ export async function loadInvoiceClassificationMeta(
 
       result.set(id, {
         line_count: lc,
-        assigned_count: artLines,
+        assigned_count: verifiedArtLines,
         lines_with_category: linesWithCat,
         lines_with_account: linesWithAcct,
         lines_with_cdc: linesWithCdc,
