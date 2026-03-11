@@ -413,6 +413,7 @@ export interface InvoiceClassificationMeta {
   lines_with_cdc: number       // distinct lines with at least one invoice_line_projects row
   lines_with_article: number   // distinct lines with at least one invoice_line_articles row
   lines_with_complete_article: number // lines where article is assigned AND (article has no phases OR phase_id IS NOT NULL)
+  review_count: number         // lines with needs_review = true (for sidebar badge)
   // Convenience booleans — true when ALL lines have the field
   has_category: boolean
   has_account: boolean
@@ -439,7 +440,7 @@ export async function loadInvoiceClassificationMeta(
   for (let i = 0; i < invoiceIds.length; i += BATCH) {
     const batchIds = invoiceIds.slice(i, i + BATCH)
 
-    const [linesRes, assignedRes, lineProjRes, projRes, phasesRes] = await Promise.all([
+    const [linesRes, assignedRes, lineProjRes, projRes, phasesRes, reviewRes] = await Promise.all([
       // 1. Lines with category_id and account_id per invoice
       supabase
         .from('invoice_lines')
@@ -467,6 +468,12 @@ export async function loadInvoiceClassificationMeta(
         .select('article_id')
         .eq('company_id', companyId)
         .eq('active', true),
+      // 6. Lines needing review (for sidebar "Da revisionare" badge)
+      supabase
+        .from('invoice_lines')
+        .select('invoice_id')
+        .in('invoice_id', batchIds)
+        .eq('needs_review', true),
     ])
 
     // Per-invoice line stats
@@ -513,6 +520,12 @@ export async function loadInvoiceClassificationMeta(
       invProjSet.add(row.invoice_id)
     }
 
+    // Review count per invoice (needs_review = true lines)
+    const reviewByInv = new Map<string, number>()
+    for (const row of (reviewRes.data || []) as any[]) {
+      reviewByInv.set(row.invoice_id, (reviewByInv.get(row.invoice_id) || 0) + 1)
+    }
+
     // Merge per invoice
     for (const id of batchIds) {
       const ls = lineStats.get(id) || { total: 0, withCat: 0, withAcct: 0 }
@@ -535,6 +548,7 @@ export async function loadInvoiceClassificationMeta(
         lines_with_cdc: linesWithCdc,
         lines_with_article: artLines,
         lines_with_complete_article: completeArtLines,
+        review_count: reviewByInv.get(id) || 0,
         has_category: lc > 0 && linesWithCat >= lc,
         has_account: lc > 0 && linesWithAcct >= lc,
         has_cost_center: lc > 0 && linesWithCdc >= lc,

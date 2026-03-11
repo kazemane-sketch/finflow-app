@@ -280,6 +280,30 @@ function ImportProgress({ phase, current, total, logs }: { phase: 'reading' | 's
 }
 
 // ============================================================
+// REVIEW BADGE — shows AI confidence-based review indicators on lines
+// ============================================================
+function ReviewBadge({ confidence, hasNote, needsReview }: {
+  confidence?: number; hasNote?: boolean; needsReview?: boolean;
+}) {
+  const conf = confidence;
+  if (!needsReview && (conf == null || conf > 65)) return null;
+
+  if (conf != null && conf < 50) {
+    return <span className="ml-1.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-100 text-red-700 border border-red-300 whitespace-nowrap">{'\u26A0\uFE0F'} Da revisionare</span>;
+  }
+  if (conf != null && conf <= 65 && hasNote) {
+    return <span className="ml-1.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-orange-100 text-orange-700 border border-orange-300 whitespace-nowrap">{'\u26A1'} Verifica fiscale</span>;
+  }
+  if (conf != null && conf <= 65) {
+    return <span className="ml-1.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-yellow-100 text-yellow-700 border border-yellow-300 whitespace-nowrap">{'\uD83D\uDCA1'} Suggerimento AI</span>;
+  }
+  if (needsReview) {
+    return <span className="ml-1.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-yellow-100 text-yellow-700 border border-yellow-300 whitespace-nowrap">{'\uD83D\uDCA1'} Suggerimento AI</span>;
+  }
+  return null;
+}
+
+// ============================================================
 // SIDEBAR CARD
 // ============================================================
 function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, isMatched, suggestionScore, meta }: { inv: DBInvoice; selected: boolean; checked: boolean; selectMode: boolean; onSelect: () => void; onCheck: () => void; isMatched?: boolean; suggestionScore?: number; meta?: InvoiceClassificationMeta }) {
@@ -306,6 +330,7 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, is
             {isMatched && <ReconciledIcon size={12} />}
             {!isMatched && suggestionScore != null && <ReconciliationDot score={suggestionScore} invoiceId={inv.id} />}
             {(inv as any).has_fiscal_alerts && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700" title="Alert fiscali da verificare">{'\u26A0\uFE0F'}</span>}
+            {meta && meta.review_count > 0 && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-rose-100 text-rose-700" title={`${meta.review_count} righe da revisionare`}>{'\uD83D\uDD0D'} {meta.review_count}</span>}
             {nc && <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-red-100 text-red-700">NC</span>}
             <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded ${STATUS_COLORS[inv.payment_status] || 'bg-gray-100 text-gray-600'}`}>{getStatusLabel(inv.payment_status, inv.direction)}</span>
           </span>
@@ -726,6 +751,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [showRulesDialog, setShowRulesDialog] = useState(false);
   const [pendingRuleSuggestions, setPendingRuleSuggestions] = useState<RuleSuggestion[]>([]);
   const [lineFiscalFlags, setLineFiscalFlags] = useState<Record<string, any>>({});
+  // AI confidence + review flags per line (for "Da revisionare" badges)
+  const [lineConfidences, setLineConfidences] = useState<Record<string, number>>({});
+  const [lineReviewFlags, setLineReviewFlags] = useState<Record<string, boolean>>({});
   // Fiscal review alerts from Sonnet escalation
   const [invoiceNotes, setInvoiceNotes] = useState<FiscalAlert[]>([]);
   // AI suggestion state for new accounts/categories
@@ -892,8 +920,10 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setOriginalLineClassifs(lineClfResult.classifs);
         setLineProjects(lineProj);
         setOriginalLineProjects(lineProj);
-        // Load fiscal flags from DB (persisted by AI classification)
+        // Load fiscal flags + review metadata from DB (persisted by AI classification)
         setLineFiscalFlags(lineClfResult.fiscalFlags);
+        setLineConfidences(lineClfResult.confidences);
+        setLineReviewFlags(lineClfResult.reviewFlags);
         // Initialize local CdC rows from DB assignments
         setCdcRows(iProjs.map(ip => ({
           project_id: ip.project_id,
@@ -1242,8 +1272,47 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       }
       setLineFiscalFlags(flags);
 
+      // Extract AI confidence + review flags from response
+      const confs: Record<string, number> = {};
+      const reviews: Record<string, boolean> = {};
+      for (const lr of (result.lines || [])) {
+        const lid = lr.line_id || lr.invoice_line_id;
+        if (lid) {
+          if (lr.confidence != null) confs[lid] = lr.confidence;
+          reviews[lid] = lr.confidence < 65
+            || !!(lr.fiscal_flags?.note && /verificar|controllare|dubbio/i.test(lr.fiscal_flags?.note || ''))
+            || lr.suggest_new_account != null;
+        }
+      }
+      setLineConfidences(confs);
+      setLineReviewFlags(reviews);
+
       // Extract fiscal review alerts from Sonnet escalation + Haiku fiscal_flags
       const aiInvoiceNotes = ((aiResult as any)?.invoice_notes || (result as any)?.invoice_notes || []) as FiscalAlert[];
+
+      // Generate synthetic alerts from suggest_new_account (so "Create account" button always appears)
+      for (const lr of (result.lines || [])) {
+        const lid = lr.line_id || lr.invoice_line_id;
+        if (lid && lr.suggest_new_account) {
+          const s = lr.suggest_new_account;
+          const existing = aiInvoiceNotes.find(n => n.affected_lines?.includes(lid));
+          if (!existing) {
+            aiInvoiceNotes.push({
+              type: 'general' as const,
+              severity: 'info' as const,
+              title: `Suggerimento: nuovo conto ${s.code}`,
+              description: `L'AI suggerisce di creare il conto "${s.code} - ${s.name}" (sezione: ${s.section}, sotto: ${s.parent_code}). Motivo: ${s.reason}`,
+              current_choice: 'Usando conto esistente come fallback',
+              options: [
+                { label: `Crea conto "${s.code}"`, fiscal_override: {}, is_default: false },
+                { label: 'Mantieni conto attuale', fiscal_override: {}, is_default: true },
+              ],
+              affected_lines: [lid],
+            });
+          }
+        }
+      }
+
       setInvoiceNotes(buildAggregatedNotes(aiInvoiceNotes, flags));
 
       // Extract AI suggestions for new accounts/categories
@@ -1273,6 +1342,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       const lineClf = lineClfResult.classifs;
       // Merge persisted fiscal flags with fresh AI flags (AI takes priority)
       setLineFiscalFlags(prev => ({ ...lineClfResult.fiscalFlags, ...prev }));
+      // Merge confidence/review from DB with fresh AI values (AI takes priority)
+      setLineConfidences(prev => ({ ...lineClfResult.confidences, ...prev }));
+      setLineReviewFlags(prev => ({ ...lineClfResult.reviewFlags, ...prev }));
 
       // Rebuild lineArticleMap + aiSuggestions with fresh DB data (includes phase_id)
       const freshMap: Record<string, LineArticleInfo> = {};
@@ -1656,6 +1728,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     setLineProjects({});
     setLineArticleMap({});
     setLineFiscalFlags({});
+    setLineConfidences({});
+    setLineReviewFlags({});
     setInvoiceNotes([]);
     setAiSuggestions({});
     setDismissedArticleLineIds(new Set());
@@ -2373,6 +2447,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                       <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                         <td className="text-left px-3 py-2 max-w-[200px]">
                           <span className="text-gray-800">{l.descrizione}</span>
+                          {lineId && <ReviewBadge
+                            confidence={lineConfidences[lineId]}
+                            hasNote={!!(ff?.note && /verificar|controllare|dubbio/i.test(ff.note || ''))}
+                            needsReview={lineReviewFlags[lineId]}
+                          />}
                           {/* Article badge + phase dropdown inline */}
                           {lineId && articles.length > 0 && (
                             <span className="ml-1.5 inline-flex items-center gap-1 align-middle flex-wrap">
@@ -2413,7 +2492,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                         <td className="text-right px-2 py-2 text-gray-600">{fmtNum(safeFloat(l.prezzoUnitario))}</td>
                         <td className="text-right px-2 py-2 text-gray-600">{fmtNum(safeFloat(l.aliquotaIVA))}%</td>
                         <td className={`text-right px-2 py-2 font-bold ${safeFloat(l.prezzoTotale) < 0 ? 'text-red-600' : 'text-gray-800'}`}>{fmtNum(safeFloat(l.prezzoTotale))}</td>
-                        {allCategories.length > 0 && <td className="text-center px-1 py-1">
+                        {allCategories.length > 0 && <td className={`text-center px-1 py-1${lineId && lineConfidences[lineId] != null && lineConfidences[lineId] < 50 ? ' opacity-40' : ''}`}>
                           {lineId ? (
                             <SearchableSelect
                               value={lineCat || null}
@@ -2452,7 +2531,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                               </button>
                           ) : <span className="text-[9px] text-gray-300">{'\u2014'}</span>}
                         </td>}
-                        {allAccounts.length > 0 && <td className="text-center px-1 py-1">
+                        {allAccounts.length > 0 && <td className={`text-center px-1 py-1${lineId && lineConfidences[lineId] != null && lineConfidences[lineId] < 50 ? ' opacity-40' : ''}`}>
                           {lineId ? (
                             <SearchableSelect
                               value={lineAcc || null}
@@ -2580,6 +2659,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                       <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                         <td className="text-left px-3 py-2">
                           <span className="text-gray-800">{l.description}</span>
+                          <ReviewBadge
+                            confidence={lineConfidences[l.id]}
+                            hasNote={!!(ff2?.note && /verificar|controllare|dubbio/i.test(ff2.note || ''))}
+                            needsReview={lineReviewFlags[l.id]}
+                          />
                           {articles.length > 0 && (
                             <span className="ml-1.5 inline-flex items-center gap-1 align-middle flex-wrap">
                               <ArticleDropdown articles={articles} current={lineArticleMap[l.id] || null} suggestion={aiSuggestions[l.id] || null}
@@ -2612,7 +2696,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                         <td className="text-right px-2 py-2 text-gray-600">{fmtNum(l.unit_price)}</td>
                         <td className="text-right px-2 py-2 text-gray-600">{fmtNum(l.vat_rate)}%</td>
                         <td className={`text-right px-2 py-2 font-bold ${(l.total_price ?? 0) < 0 ? 'text-red-600' : 'text-gray-800'}`}>{fmtNum(l.total_price)}</td>
-                        {allCategories.length > 0 && <td className="text-center px-1 py-1">
+                        {allCategories.length > 0 && <td className={`text-center px-1 py-1${lineConfidences[l.id] != null && lineConfidences[l.id] < 50 ? ' opacity-40' : ''}`}>
                           <SearchableSelect
                             value={lineCat || null}
                             options={allCategories.map(c => ({ id: c.id, label: c.name }))}
@@ -2640,7 +2724,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                             {lineProjects[l.id]?.length ? lineProjects[l.id].map(lp => { const p = allProjects.find(pp => pp.id === lp.project_id); return p ? `${p.code} ${p.name?.substring(0, 8) || ''}` : ''; }).filter(Boolean).join(', ').substring(0, 18) : (cdcRows.length > 0 ? '\u2190 Fatt.' : '\u2014')}
                           </button>
                         </td>}
-                        {allAccounts.length > 0 && <td className="text-center px-1 py-1">
+                        {allAccounts.length > 0 && <td className={`text-center px-1 py-1${lineConfidences[l.id] != null && lineConfidences[l.id] < 50 ? ' opacity-40' : ''}`}>
                           <SearchableSelect
                             value={lineAcc || null}
                             options={allAccounts.map(a => ({ id: a.id, label: `${a.code} \u2014 ${a.name}`, searchText: `${a.code} ${a.name}` }))}

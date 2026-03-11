@@ -789,7 +789,19 @@ async function persistResults(
   let persisted = 0;
 
   for (const lr of lineResults) {
-    if (lr.confidence < MIN_CONFIDENCE) continue;
+    if (lr.confidence < MIN_CONFIDENCE) {
+      // Still mark low-confidence lines so the UI shows "⚠ Da revisionare"
+      try {
+        await sql`
+          UPDATE invoice_lines
+          SET ai_confidence = ${Math.round(lr.confidence)},
+              needs_review = true
+          WHERE id = ${lr.line_id}`;
+      } catch (e) {
+        console.warn(`[persist] low-conf line ${lr.line_id} needs_review update failed`);
+      }
+      continue;
+    }
 
     // Resolve article_code → article_id
     const articleId = lr.article_code ? (codeToId.get(lr.article_code) || null) : null;
@@ -808,12 +820,19 @@ async function persistResults(
         const fiscalJson = lr.fiscal_flags
           ? (typeof lr.fiscal_flags === 'string' ? lr.fiscal_flags : JSON.stringify(lr.fiscal_flags))
           : null;
+        // Compute needs_review flag
+        const needsReview = lr.confidence < 65
+          || !!(lr.fiscal_flags?.note && /verificar|controllare|dubbio/i.test(
+               typeof lr.fiscal_flags.note === 'string' ? lr.fiscal_flags.note : ''))
+          || lr.suggest_new_account != null;
         await sql`
           UPDATE invoice_lines
           SET category_id = COALESCE(${lr.category_id}, category_id),
               account_id = COALESCE(${lr.account_id}, account_id),
               fiscal_flags = COALESCE(${fiscalJson}::jsonb, fiscal_flags),
-              classification_status = 'ai_suggested'
+              classification_status = 'ai_suggested',
+              ai_confidence = ${Math.round(lr.confidence)},
+              needs_review = ${needsReview}
           WHERE id = ${lr.line_id}
             AND (category_id IS NULL OR account_id IS NULL)`;
       } catch (e: unknown) {

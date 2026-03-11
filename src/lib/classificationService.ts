@@ -555,20 +555,24 @@ export interface LineClassification {
   account_id: string | null;
 }
 
-/** Load line-level category/account + fiscal_flags for all lines in an invoice.
+/** Load line-level category/account + fiscal_flags + review metadata for all lines in an invoice.
  *  Reads directly from invoice_lines — works independently of article assignment. */
 export async function loadLineClassifications(invoiceId: string): Promise<{
   classifs: Record<string, LineClassification>;
   fiscalFlags: Record<string, any>;
+  confidences: Record<string, number>;
+  reviewFlags: Record<string, boolean>;
 }> {
   const { data, error } = await supabase
     .from('invoice_lines')
-    .select('id, category_id, account_id, fiscal_flags')
+    .select('id, category_id, account_id, fiscal_flags, ai_confidence, needs_review')
     .eq('invoice_id', invoiceId);
   if (error) throw error;
   const classifs: Record<string, LineClassification> = {};
   const fiscalFlags: Record<string, any> = {};
-  for (const row of (data || []) as { id: string; category_id: string | null; account_id: string | null; fiscal_flags: any }[]) {
+  const confidences: Record<string, number> = {};
+  const reviewFlags: Record<string, boolean> = {};
+  for (const row of (data || []) as { id: string; category_id: string | null; account_id: string | null; fiscal_flags: any; ai_confidence: number | null; needs_review: boolean | null }[]) {
     if (row.category_id || row.account_id) {
       classifs[row.id] = {
         invoice_line_id: row.id,
@@ -579,8 +583,14 @@ export async function loadLineClassifications(invoiceId: string): Promise<{
     if (row.fiscal_flags) {
       fiscalFlags[row.id] = row.fiscal_flags;
     }
+    if (row.ai_confidence != null) {
+      confidences[row.id] = row.ai_confidence;
+    }
+    if (row.needs_review) {
+      reviewFlags[row.id] = true;
+    }
   }
-  return { classifs, fiscalFlags };
+  return { classifs, fiscalFlags, confidences, reviewFlags };
 }
 
 /** Clear category, account, and fiscal_flags on ALL lines of an invoice.
@@ -588,7 +598,7 @@ export async function loadLineClassifications(invoiceId: string): Promise<{
 export async function clearAllLineClassifications(invoiceId: string): Promise<void> {
   const { error } = await supabase
     .from('invoice_lines')
-    .update({ category_id: null, account_id: null, fiscal_flags: null } as any)
+    .update({ category_id: null, account_id: null, fiscal_flags: null, ai_confidence: null, needs_review: false } as any)
     .eq('invoice_id', invoiceId);
   if (error) throw error;
 }
@@ -602,7 +612,7 @@ export async function saveLineCategoryAndAccount(
 ): Promise<void> {
   const { error } = await supabase
     .from('invoice_lines')
-    .update({ category_id: categoryId, account_id: accountId } as any)
+    .update({ category_id: categoryId, account_id: accountId, needs_review: false } as any)
     .eq('id', lineId);
   if (error) throw error;
 }
