@@ -1,6 +1,6 @@
 // classify-v2-classify — Stage B: Classification
 // Takes understanding results from Stage A and assigns account, category, article.
-// Only sees FILTERED chart of accounts (by section from Stage A).
+// Loads ALL active accounts (Stage A sections are prompt GUIDANCE, not a hard filter).
 // Produces: category_id, account_id, article_code, phase_code, confidence, fiscal_flags.
 //
 // v3: Reads agent_config, agent_rules, knowledge_base from Admin Panel DB.
@@ -265,18 +265,6 @@ Deno.serve(async (req) => {
     // Build understanding map
     const underMap = new Map(understandings.map((u) => [u.line_id, u]));
 
-    // Collect all needed sections from understandings
-    const neededSections = new Set<string>();
-    const dirSections = SECTIONS_FOR_DIRECTION[direction] || SECTIONS_FOR_DIRECTION["in"];
-    for (const u of understandings) {
-      for (const s of u.account_sections) {
-        if (dirSections.allowed.includes(s)) neededSections.add(s);
-      }
-    }
-    if (neededSections.size === 0) {
-      for (const s of dirSections.allowed) neededSections.add(s);
-    }
-
     const allowedCatTypes = CAT_TYPES_FOR_DIRECTION[direction] || CAT_TYPES_FOR_DIRECTION["in"];
     const lineDescriptions = lines.map((l) => l.description || "");
 
@@ -284,7 +272,7 @@ Deno.serve(async (req) => {
     const [articles, categories, accounts, phases, companyRow, agentConfigs, agentRules] = await Promise.all([
       sql`SELECT id, code, name, description, keywords FROM articles WHERE company_id = ${companyId} AND active = true ORDER BY code`,
       sql`SELECT id, name, type FROM categories WHERE company_id = ${companyId} AND active = true AND type = ANY(${allowedCatTypes}::text[]) ORDER BY sort_order, name`,
-      sql`SELECT id, code, name, section FROM chart_of_accounts WHERE company_id = ${companyId} AND active = true AND is_header = false AND section = ANY(${[...neededSections]}::text[]) ORDER BY code`,
+      sql`SELECT id, code, name, section FROM chart_of_accounts WHERE company_id = ${companyId} AND active = true AND is_header = false ORDER BY code`,
       sql`SELECT id, article_id, code, name, phase_type, is_counting_point, invoice_direction FROM article_phases WHERE company_id = ${companyId} AND active = true ORDER BY article_id, sort_order`,
       sql`SELECT name, vat_number, ateco_code FROM companies WHERE id = ${companyId} LIMIT 1`,
       // Agent config for commercialista
@@ -305,7 +293,7 @@ Deno.serve(async (req) => {
     const atecoPrefix = companyAteco.slice(0, 2);
     const agentConfig = agentConfigs[0] || null;
 
-    console.log(`[classify-v2] Loaded: ${accounts.length} accounts (sections: ${[...neededSections].join(",")}), ${categories.length} cats, ${articles.length} articles`);
+    console.log(`[classify-v2] Loaded: ${accounts.length} accounts (ALL sections), ${categories.length} cats, ${articles.length} articles`);
 
     // Load knowledge_base (needs atecoPrefix)
     const allKBRules = await sql<KBRule[]>`
@@ -489,17 +477,18 @@ Deno.serve(async (req) => {
     if (memoryBlock) promptParts.push(memoryBlock);
     promptParts.push("");
 
-    // 6. Comprehension context
+    // 6. Comprehension context (sections = guidance, NOT hard filter)
     promptParts.push(`IMPORTANTE — COMPRENSIONE (Stage A):
-Ogni riga ha una "COMPRENSIONE" allegata che ti dice cos'è l'operazione e in quali sezioni cercare il conto.
-RISPETTA le sezioni indicate. Se la comprensione dice sections=cost_production, NON scegliere conti in assets.
-Se la comprensione dice NOT=["vendita di pozzolana"], allora NON classificare come vendita.`);
+Ogni riga ha una "COMPRENSIONE" allegata che ti dice cos'è l'operazione e in quali sezioni PROBABILMENTE cercare il conto.
+Le sezioni suggerite sono una GUIDA, non un vincolo assoluto: se trovi un conto più appropriato in un'altra sezione, USALO.
+Se la comprensione dice NOT=["vendita di pozzolana"], allora NON classificare come vendita.
+Priorità: memoria aziendale e storico > comprensione Stage A > ragionamento autonomo.`);
     promptParts.push("");
 
     // 7. Charts of accounts, categories, articles
     promptParts.push(`CATEGORIE:\n${catSection}`);
     promptParts.push("");
-    promptParts.push(`CONTI (filtrati per le sezioni rilevanti):\n${accSection}`);
+    promptParts.push(`CONTI (tutti i conti attivi dell'azienda):\n${accSection}`);
     promptParts.push("");
     if (artSection) { promptParts.push(`ARTICOLI:\n${artSection}`); promptParts.push(""); }
     if (historySection) { promptParts.push(historySection); promptParts.push(""); }
