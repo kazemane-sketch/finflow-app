@@ -443,6 +443,13 @@ export default function KBDocumentsPage() {
   }
 
   // ── Save document ──
+  /** Convert empty strings / undefined / empty arrays → null for Supabase CHECK constraints */
+  function emptyToNull(val: any): any {
+    if (val === '' || val === undefined) return null;
+    if (Array.isArray(val) && val.length === 0) return null;
+    return val;
+  }
+
   const handleSave = async () => {
     if (!form.title?.trim()) { toast.error('Il titolo è obbligatorio'); return }
 
@@ -450,29 +457,29 @@ export default function KBDocumentsPage() {
     try {
       const payload: Record<string, any> = {
         title: form.title!.trim(),
-        source_type: form.source_type || null,
+        source_type: emptyToNull(form.source_type),
         source_input_type: form._inputType,
-        source_url: form.source_url || null,
-        authority: form.authority || null,
-        legal_reference: form.legal_reference || null,
-        category: form.category || null,
-        subcategory: form.subcategory || null,
-        tax_area: form.tax_area || [],
-        accounting_area: form.accounting_area || [],
-        topic_tags: form.topic_tags || [],
-        applies_to_legal_forms: form.applies_to_legal_forms,
-        applies_to_regimes: form.applies_to_regimes,
-        applies_to_ateco_prefixes: form.applies_to_ateco_prefixes,
-        applies_to_operations: form.applies_to_operations,
-        applies_to_counterparty: form.applies_to_counterparty,
-        applies_to_size: form.applies_to_size,
-        amount_threshold_min: form.amount_threshold_min || null,
-        amount_threshold_max: form.amount_threshold_max || null,
-        publication_date: form.publication_date || null,
-        effective_from: form.effective_from || null,
-        effective_until: form.effective_until || null,
-        update_frequency: form.update_frequency || null,
-        summary: form.summary || null,
+        source_url: emptyToNull(form.source_url),
+        authority: emptyToNull(form.authority),
+        legal_reference: emptyToNull(form.legal_reference),
+        category: emptyToNull(form.category),
+        subcategory: emptyToNull(form.subcategory),
+        tax_area: emptyToNull(form.tax_area),
+        accounting_area: emptyToNull(form.accounting_area),
+        topic_tags: emptyToNull(form.topic_tags),
+        applies_to_legal_forms: emptyToNull(form.applies_to_legal_forms),
+        applies_to_regimes: emptyToNull(form.applies_to_regimes),
+        applies_to_ateco_prefixes: emptyToNull(form.applies_to_ateco_prefixes),
+        applies_to_operations: emptyToNull(form.applies_to_operations),
+        applies_to_counterparty: emptyToNull(form.applies_to_counterparty),
+        applies_to_size: emptyToNull(form.applies_to_size),
+        amount_threshold_min: emptyToNull(form.amount_threshold_min),
+        amount_threshold_max: emptyToNull(form.amount_threshold_max),
+        publication_date: emptyToNull(form.publication_date),
+        effective_from: emptyToNull(form.effective_from),
+        effective_until: emptyToNull(form.effective_until),
+        update_frequency: emptyToNull(form.update_frequency),
+        summary: emptyToNull(form.summary),
         active: form.active ?? true,
       }
 
