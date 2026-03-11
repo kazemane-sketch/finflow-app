@@ -9,12 +9,14 @@ import {
   FlaskConical,
   Tags,
   ArrowLeft,
+  Library,
 } from 'lucide-react'
 
 const adminNav = [
   { to: '/admin', icon: LayoutDashboard, label: 'Dashboard', end: true },
   { to: '/admin/knowledge', icon: BookOpen, label: 'Knowledge Base' },
   { to: '/admin/documents', icon: FileText, label: 'Documenti' },
+  { to: '/admin/kb-documents', icon: Library, label: 'Documenti KB' },
   { to: '/admin/agents', icon: Bot, label: 'Agent Config' },
   { to: '/admin/rules', icon: ScrollText, label: 'Agent Rules' },
   { to: '/admin/keywords', icon: Tags, label: 'Dizionario Sinonimi' },

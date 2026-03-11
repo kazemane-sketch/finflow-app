@@ -24,6 +24,7 @@ import AgentConfigPage from '@/pages/admin/AgentConfigPage'
 import AgentRulesPage from '@/pages/admin/AgentRulesPage'
 import TestLabPage from '@/pages/admin/TestLabPage'
 import KeywordGroupsPage from '@/pages/admin/KeywordGroupsPage'
+import KBDocumentsPage from '@/pages/admin/KBDocumentsPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth()
@@ -83,6 +84,7 @@ export default function App() {
           <Route path="agents" element={<AgentConfigPage />} />
           <Route path="rules" element={<AgentRulesPage />} />
           <Route path="keywords" element={<KeywordGroupsPage />} />
+          <Route path="kb-documents" element={<KBDocumentsPage />} />
           <Route path="test-lab" element={<TestLabPage />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

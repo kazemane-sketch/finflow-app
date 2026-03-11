@@ -6,7 +6,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useAuth } from '@/hooks/useAuth'
 import { useCompany } from '@/hooks/useCompany'
-import { Settings, Building2, Landmark, Pencil, Trash2, Plus, X, AlertTriangle, CheckCircle, Tag, FolderKanban, BookOpen, Brain, Loader2 } from 'lucide-react'
+import { Settings, Building2, Landmark, Pencil, Trash2, Plus, X, AlertTriangle, CheckCircle, Tag, FolderKanban, BookOpen, Brain, Loader2, Scale } from 'lucide-react'
 import { supabase } from '@/integrations/supabase/client'
 import { saveOpeningBalance } from '@/lib/bankParser'
 import CategoriesTab from '@/components/settings/CategoriesTab'
@@ -471,6 +471,160 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
 }
 
 // ============================================================
+// FISCAL PROFILE CARD
+// ============================================================
+const LEGAL_FORMS = [
+  { value: 'srl', label: 'SRL' }, { value: 'spa', label: 'SPA' },
+  { value: 'sapa', label: 'SAPA' }, { value: 'snc', label: 'SNC' },
+  { value: 'sas', label: 'SAS' }, { value: 'ss', label: 'SS' },
+  { value: 'ditta_individuale', label: 'Ditta individuale' },
+  { value: 'cooperativa', label: 'Cooperativa' },
+  { value: 'associazione', label: 'Associazione' },
+  { value: 'fondazione', label: 'Fondazione' },
+  { value: 'ente_non_commerciale', label: 'Ente non commerciale' },
+  { value: 'consorzio', label: 'Consorzio' },
+  { value: 'societa_tra_professionisti', label: 'STP' },
+  { value: 'altro', label: 'Altro' },
+]
+
+const SIZE_CLASSES = [
+  { value: 'micro', label: 'Micro — attivo <350K / ricavi <700K' },
+  { value: 'piccola', label: 'Piccola — attivo <6M' },
+  { value: 'media', label: 'Media — attivo <20M' },
+  { value: 'grande', label: 'Grande — attivo >20M' },
+]
+
+const IVA_SPECIAL_REGIMES = [
+  { value: 'ordinario', label: 'Ordinario' },
+  { value: 'agricoltura_speciale', label: 'Agricoltura speciale' },
+  { value: 'agriturismo', label: 'Agriturismo' },
+  { value: 'editoria', label: 'Editoria' },
+  { value: 'agenzie_viaggio', label: 'Agenzie di viaggio' },
+  { value: 'beni_usati', label: 'Beni usati' },
+  { value: 'intrattenimento', label: 'Intrattenimento' },
+  { value: 'altro', label: 'Altro' },
+]
+
+function FiscalProfileCard({ companyId, company, refetchCompany }: {
+  companyId: string; company: any; refetchCompany: () => Promise<void>
+}) {
+  const c = company as any
+  const [form, setForm] = useState({
+    legal_form: c?.legal_form || '',
+    iva_periodicity: c?.iva_periodicity || 'trimestrale',
+    size_class: c?.size_class || '',
+    start_year: c?.start_year ? String(c.start_year) : '',
+    revisione_legale: c?.revisione_legale || false,
+    iva_special_regime: c?.iva_special_regime || '',
+  })
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    const co = company as any
+    setForm({
+      legal_form: co?.legal_form || '',
+      iva_periodicity: co?.iva_periodicity || 'trimestrale',
+      size_class: co?.size_class || '',
+      start_year: co?.start_year ? String(co.start_year) : '',
+      revisione_legale: co?.revisione_legale || false,
+      iva_special_regime: co?.iva_special_regime || '',
+    })
+  }, [company])
+
+  const handleSave = async () => {
+    setSaving(true)
+    try {
+      const { error, count } = await supabase
+        .from('companies')
+        .update({
+          legal_form: form.legal_form || null,
+          iva_periodicity: form.iva_periodicity || 'trimestrale',
+          size_class: form.size_class || null,
+          start_year: form.start_year ? parseInt(form.start_year) : null,
+          revisione_legale: form.revisione_legale,
+          iva_special_regime: form.iva_special_regime || null,
+          updated_at: new Date().toISOString(),
+        } as any, { count: 'exact' })
+        .eq('id', companyId)
+      if (error) throw error
+      if (count === 0) { alert('Impossibile aggiornare.'); setSaving(false); return }
+      await refetchCompany()
+      alert('Profilo fiscale salvato.')
+    } catch (e: any) {
+      alert('Errore: ' + e.message)
+    }
+    setSaving(false)
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base flex items-center gap-2">
+          <Scale className="h-4 w-4 text-amber-600" /> Profilo Fiscale
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-xs text-gray-500">
+          Questi dati vengono usati dalla Knowledge Base per filtrare le norme applicabili alla tua azienda.
+        </p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <Label className="text-xs">Forma giuridica</Label>
+            <select value={form.legal_form} onChange={e => setForm(f => ({ ...f, legal_form: e.target.value }))}
+              className="mt-1 w-full h-9 border rounded-md px-2 text-sm">
+              <option value="">— Seleziona —</option>
+              {LEGAL_FORMS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <Label className="text-xs">Periodicità IVA</Label>
+            <select value={form.iva_periodicity} onChange={e => setForm(f => ({ ...f, iva_periodicity: e.target.value }))}
+              className="mt-1 w-full h-9 border rounded-md px-2 text-sm">
+              <option value="mensile">Mensile</option>
+              <option value="trimestrale">Trimestrale</option>
+            </select>
+          </div>
+          <div>
+            <Label className="text-xs">Classe dimensionale</Label>
+            <select value={form.size_class} onChange={e => setForm(f => ({ ...f, size_class: e.target.value }))}
+              className="mt-1 w-full h-9 border rounded-md px-2 text-sm">
+              <option value="">— Seleziona —</option>
+              {SIZE_CLASSES.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <Label className="text-xs">Anno inizio attività</Label>
+            <Input type="number" min={1900} max={2100} value={form.start_year}
+              onChange={e => setForm(f => ({ ...f, start_year: e.target.value }))}
+              placeholder="Es. 2015" className="mt-1" />
+          </div>
+          <div>
+            <Label className="text-xs">Regime IVA speciale</Label>
+            <select value={form.iva_special_regime} onChange={e => setForm(f => ({ ...f, iva_special_regime: e.target.value }))}
+              className="mt-1 w-full h-9 border rounded-md px-2 text-sm">
+              <option value="">— Non applicabile —</option>
+              {IVA_SPECIAL_REGIMES.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+          </div>
+          <div className="flex items-center gap-3 pt-5">
+            <Label className="text-xs">Obbligo revisione legale</Label>
+            <button type="button" onClick={() => setForm(f => ({ ...f, revisione_legale: !f.revisione_legale }))}
+              className={`w-10 h-5 rounded-full transition-all ${form.revisione_legale ? 'bg-green-500' : 'bg-gray-300'}`}>
+              <div className={`h-4 w-4 bg-white rounded-full shadow transition-transform ${form.revisione_legale ? 'translate-x-5' : 'translate-x-0.5'}`} />
+            </button>
+          </div>
+        </div>
+        <div className="pt-2">
+          <Button size="sm" onClick={handleSave} disabled={saving}>
+            {saving ? 'Salvataggio...' : 'Salva profilo fiscale'}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+// ============================================================
 // MAIN PAGE
 // ============================================================
 export default function ImpostazioniPage() {
@@ -800,6 +954,11 @@ export default function ImpostazioniPage() {
           )}
         </CardContent>
       </Card>
+
+      {/* Profilo Fiscale */}
+      {companyId && company && (
+        <FiscalProfileCard companyId={companyId} company={company} refetchCompany={refetchCompany} />
+      )}
 
       {/* Conti bancari */}
       {companyId && (
