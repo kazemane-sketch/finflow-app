@@ -2,7 +2,7 @@
 // Platform-level normative document management with rich taxonomy
 // Supports CRUD, taxonomy filters, detail view with chunks, relations, and rule generation
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -14,7 +14,8 @@ import { toast } from 'sonner'
 import {
   Plus, X, Search, Loader2, FileText, Globe, Type, Trash2,
   ChevronDown, ChevronUp, ArrowLeft, Link2, BookOpen, Sparkles,
-  Calendar, Shield, Building2, Eye, Pencil, ExternalLink,
+  Calendar, Shield, Building2, Eye, Pencil, ExternalLink, Upload,
+  Brain, CheckCircle2,
 } from 'lucide-react'
 
 // ════════════════════════════════════════════════
@@ -332,6 +333,19 @@ export default function KBDocumentsPage() {
   const [generatedRules, setGeneratedRules] = useState<{ id: string; title: string; domain: string }[]>([])
   const [loadingDetail, setLoadingDetail] = useState(false)
 
+  // Processing / Classify state
+  const [processing, setProcessing] = useState(false)
+  const [classifying, setClassifying] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Suggested relations dialog (from AI classification)
+  const [showSuggestedRels, setShowSuggestedRels] = useState(false)
+  const [suggestedRels, setSuggestedRels] = useState<{
+    target_id: string; target_type: 'document' | 'rule';
+    relation_type: string; note: string; checked: boolean; target_title?: string
+  }[]>([])
+
   // Relation dialog
   const [showRelationDialog, setShowRelationDialog] = useState(false)
   const [relForm, setRelForm] = useState({ relation_type: 'rinvia_a', target_type: 'doc' as 'doc' | 'rule', target_id: '', note: '' })
@@ -468,19 +482,38 @@ export default function KBDocumentsPage() {
         payload.full_text = form._rawText
       }
 
+      // If URL input, set source_url
+      if (form._inputType === 'url' && form.source_url) {
+        payload.source_url = form.source_url
+      }
+
       if (editId) {
         const { error } = await supabase
           .from('kb_documents')
           .update(payload as any)
           .eq('id', editId)
         if (error) throw error
+
+        // Upload PDF if new file selected
+        if (form._file && form._inputType === 'pdf') {
+          await handlePdfUpload(form._file, editId)
+        }
+
         toast.success('Documento aggiornato')
       } else {
         payload.status = 'pending'
-        const { error } = await supabase
+        const { data: inserted, error } = await supabase
           .from('kb_documents')
           .insert(payload as any)
+          .select('id')
+          .single()
         if (error) throw error
+
+        // Upload PDF if file selected
+        if (form._file && form._inputType === 'pdf' && inserted?.id) {
+          await handlePdfUpload(form._file, inserted.id)
+        }
+
         toast.success('Documento creato')
       }
 
@@ -546,6 +579,138 @@ export default function KBDocumentsPage() {
     if (error) { toast.error(error.message); return }
     setRelations(r => r.filter(x => x.id !== relId))
     toast.success('Relazione rimossa')
+  }
+
+  // ── Process document (text extraction + chunking + embedding) ──
+  const handleProcess = async (docId: string) => {
+    setProcessing(true)
+    try {
+      const { data, error } = await supabase.functions.invoke('kb-process-document', {
+        body: { action: 'process', document_id: docId },
+      })
+      if (error) throw new Error(error.message || 'Errore invocazione')
+      if (data?.error) throw new Error(data.error)
+      toast.success(`Documento processato: ${data.chunks} chunk creati`)
+      // Reload detail
+      const { data: updatedDoc } = await supabase
+        .from('kb_documents').select('*').eq('id', docId).single()
+      if (updatedDoc) {
+        setSelectedDoc(updatedDoc as any)
+        loadDetail(updatedDoc as any)
+      }
+    } catch (e: any) {
+      toast.error('Errore processing: ' + e.message)
+    }
+    setProcessing(false)
+  }
+
+  // ── Classify document (AI metadata) ──
+  const handleClassify = async (docId: string) => {
+    setClassifying(true)
+    try {
+      const { data, error } = await supabase.functions.invoke('kb-process-document', {
+        body: { action: 'classify', document_id: docId },
+      })
+      if (error) throw new Error(error.message || 'Errore invocazione')
+      if (data?.error) throw new Error(data.error)
+
+      const updated = data.fields_updated?.length || 0
+      toast.success(`Classificazione completata: ${updated} campi aggiornati`)
+
+      // Reload document detail
+      const { data: updatedDoc } = await supabase
+        .from('kb_documents').select('*').eq('id', docId).single()
+      if (updatedDoc) {
+        setSelectedDoc(updatedDoc as any)
+        loadDetail(updatedDoc as any)
+      }
+
+      // Show suggested relations dialog if any
+      const rels = data.suggested_relations || []
+      if (rels.length > 0) {
+        // Resolve target titles
+        const enriched = await Promise.all(rels.map(async (r: any) => {
+          let title = '(sconosciuto)'
+          if (r.target_type === 'document') {
+            const { data: td } = await supabase
+              .from('kb_documents').select('title').eq('id', r.target_id).single()
+            title = td?.title || r.target_id
+          } else if (r.target_type === 'rule') {
+            const { data: tr } = await supabase
+              .from('knowledge_base').select('title').eq('id', r.target_id).single()
+            title = tr?.title || r.target_id
+          }
+          return { ...r, checked: true, target_title: title }
+        }))
+        setSuggestedRels(enriched)
+        setShowSuggestedRels(true)
+      }
+    } catch (e: any) {
+      toast.error('Errore classificazione: ' + e.message)
+    }
+    setClassifying(false)
+  }
+
+  // ── Approve suggested relations ──
+  const approveSuggestedRels = async () => {
+    const checked = suggestedRels.filter(r => r.checked)
+    if (!selectedDoc || checked.length === 0) {
+      setShowSuggestedRels(false)
+      return
+    }
+    let inserted = 0
+    for (const r of checked) {
+      const payload: Record<string, any> = {
+        source_document_id: selectedDoc.id,
+        relation_type: r.relation_type,
+        note: r.note || null,
+      }
+      if (r.target_type === 'document') payload.target_document_id = r.target_id
+      else payload.target_rule_id = r.target_id
+
+      const { error } = await supabase.from('kb_document_relations').insert(payload as any)
+      if (!error) inserted++
+    }
+    toast.success(`${inserted} relazioni aggiunte`)
+    setShowSuggestedRels(false)
+    if (selectedDoc) loadDetail(selectedDoc)
+  }
+
+  // ── Upload PDF to storage ──
+  const handlePdfUpload = async (file: File, docId: string) => {
+    setUploading(true)
+    try {
+      const storagePath = `${docId}/${file.name}`
+      const { error: uploadErr } = await supabase.storage
+        .from('kb-documents')
+        .upload(storagePath, file, { upsert: true })
+      if (uploadErr) throw uploadErr
+
+      // Update document record
+      const { error: updateErr } = await supabase
+        .from('kb_documents')
+        .update({
+          storage_path: storagePath,
+          original_filename: file.name,
+          source_input_type: 'pdf',
+          status: 'pending',
+        } as any)
+        .eq('id', docId)
+      if (updateErr) throw updateErr
+
+      toast.success(`PDF "${file.name}" caricato`)
+
+      // Reload
+      const { data: updatedDoc } = await supabase
+        .from('kb_documents').select('*').eq('id', docId).single()
+      if (updatedDoc) {
+        setSelectedDoc(updatedDoc as any)
+        loadDetail(updatedDoc as any)
+      }
+    } catch (e: any) {
+      toast.error('Errore upload: ' + e.message)
+    }
+    setUploading(false)
   }
 
   // ── Stats ──
@@ -754,8 +919,19 @@ export default function KBDocumentsPage() {
               <Pencil className="h-3.5 w-3.5 mr-1" />Modifica
             </Button>
             {(doc.status === 'pending' || doc.status === 'error') && (
-              <Button size="sm" onClick={() => toast.info('Processing non ancora implementato. Sarà nella prossima fase.')}>
-                <Sparkles className="h-3.5 w-3.5 mr-1" />Processa
+              <Button size="sm" onClick={() => handleProcess(doc.id)} disabled={processing}>
+                {processing
+                  ? <><Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />Processando...</>
+                  : <><Sparkles className="h-3.5 w-3.5 mr-1" />Processa</>
+                }
+              </Button>
+            )}
+            {doc.full_text && (
+              <Button variant="outline" size="sm" onClick={() => handleClassify(doc.id)} disabled={classifying}>
+                {classifying
+                  ? <><Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />Analisi AI...</>
+                  : <><Brain className="h-3.5 w-3.5 mr-1" />Compila metadata con AI</>
+                }
               </Button>
             )}
             <Button variant="outline" size="sm"
@@ -831,6 +1007,34 @@ export default function KBDocumentsPage() {
             {doc.processing_error && (
               <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">
                 <strong>Errore:</strong> {doc.processing_error}
+              </div>
+            )}
+
+            {/* PDF upload for pending PDF docs without file yet */}
+            {doc.source_input_type === 'pdf' && !doc.storage_path && (doc.status === 'pending' || doc.status === 'error') && (
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+                <p className="text-sm text-amber-700 font-medium mb-2">PDF non ancora caricato</p>
+                <div
+                  className="border-2 border-dashed border-amber-300 rounded-lg p-4 text-center text-amber-500 text-sm cursor-pointer hover:border-amber-400 hover:bg-amber-100/30 transition-colors"
+                  onDragOver={e => { e.preventDefault() }}
+                  onDrop={e => {
+                    e.preventDefault()
+                    const file = e.dataTransfer.files?.[0]
+                    if (file && file.type === 'application/pdf') handlePdfUpload(file, doc.id)
+                    else toast.error('Solo file PDF supportati')
+                  }}
+                  onClick={() => {
+                    const input = document.createElement('input')
+                    input.type = 'file'; input.accept = 'application/pdf'
+                    input.onchange = () => { if (input.files?.[0]) handlePdfUpload(input.files[0], doc.id) }
+                    input.click()
+                  }}
+                >
+                  {uploading
+                    ? <><Loader2 className="h-6 w-6 mx-auto mb-1 animate-spin" />Caricamento in corso...</>
+                    : <><Upload className="h-6 w-6 mx-auto mb-1 opacity-50" />Trascina il PDF qui o clicca per caricare</>
+                  }
+                </div>
               </div>
             )}
 
@@ -965,6 +1169,60 @@ export default function KBDocumentsPage() {
             </div>
           </div>
         )}
+
+        {/* ── Suggested Relations Dialog (from AI classification) ── */}
+        {showSuggestedRels && suggestedRels.length > 0 && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+            <div className="bg-white rounded-xl shadow-xl p-6 max-w-lg w-full mx-4 space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="font-semibold text-gray-900 flex items-center gap-2">
+                  <Brain className="h-4 w-4 text-purple-600" />
+                  Relazioni suggerite dall'AI ({suggestedRels.length})
+                </h3>
+                <button onClick={() => setShowSuggestedRels(false)} className="text-gray-400 hover:text-gray-600">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <p className="text-xs text-gray-500">
+                L'AI ha suggerito le seguenti relazioni. Seleziona quelle che vuoi approvare.
+              </p>
+
+              <div className="max-h-64 overflow-y-auto space-y-2">
+                {suggestedRels.map((r, i) => (
+                  <label key={i} className="flex items-start gap-2 bg-gray-50 rounded-lg px-3 py-2 cursor-pointer hover:bg-gray-100 transition-colors">
+                    <input type="checkbox" checked={r.checked}
+                      onChange={() => setSuggestedRels(prev =>
+                        prev.map((x, j) => j === i ? { ...x, checked: !x.checked } : x)
+                      )}
+                      className="mt-1 rounded border-gray-300" />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[10px] font-medium bg-sky-100 text-sky-700 px-1.5 py-0.5 rounded">
+                          {RELATION_TYPES.find(t => t.value === r.relation_type)?.label || r.relation_type}
+                        </span>
+                        <span className="text-[10px] font-medium bg-gray-200 text-gray-600 px-1 py-0.5 rounded">
+                          {r.target_type === 'document' ? 'Doc' : 'Regola'}
+                        </span>
+                      </div>
+                      <p className="text-sm text-gray-700 mt-0.5 line-clamp-1">{r.target_title || r.target_id}</p>
+                      {r.note && <p className="text-[11px] text-gray-400 italic mt-0.5">{r.note}</p>}
+                    </div>
+                  </label>
+                ))}
+              </div>
+
+              <div className="flex gap-2 justify-end">
+                <Button variant="outline" size="sm" onClick={() => setShowSuggestedRels(false)}>Ignora tutto</Button>
+                <Button size="sm" onClick={approveSuggestedRels}
+                  disabled={!suggestedRels.some(r => r.checked)}>
+                  <CheckCircle2 className="h-3.5 w-3.5 mr-1" />
+                  Approva selezionate ({suggestedRels.filter(r => r.checked).length})
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     )
   }
@@ -1023,9 +1281,42 @@ export default function KBDocumentsPage() {
           )}
 
           {form._inputType === 'pdf' && (
-            <div className="border-2 border-dashed rounded-lg p-6 text-center text-gray-400 text-sm">
-              <FileText className="h-8 w-8 mx-auto mb-2 opacity-30" />
-              Upload PDF sarà implementato nella prossima fase
+            <div>
+              {form.storage_path || form.original_filename ? (
+                <div className="border rounded-lg p-4 bg-green-50 text-sm flex items-center gap-2">
+                  <CheckCircle2 className="h-4 w-4 text-green-600" />
+                  <span className="text-green-700 font-medium">PDF caricato: {form.original_filename || form.storage_path}</span>
+                  <button type="button" onClick={() => setForm(f => ({ ...f, storage_path: null, original_filename: null, _file: null }))}
+                    className="ml-auto text-gray-400 hover:text-red-500"><X className="h-4 w-4" /></button>
+                </div>
+              ) : (
+                <div
+                  className="border-2 border-dashed rounded-lg p-6 text-center text-gray-400 text-sm cursor-pointer hover:border-sky-400 hover:bg-sky-50/30 transition-colors"
+                  onDragOver={e => { e.preventDefault(); e.currentTarget.classList.add('border-sky-400', 'bg-sky-50/30') }}
+                  onDragLeave={e => { e.currentTarget.classList.remove('border-sky-400', 'bg-sky-50/30') }}
+                  onDrop={e => {
+                    e.preventDefault(); e.currentTarget.classList.remove('border-sky-400', 'bg-sky-50/30')
+                    const file = e.dataTransfer.files?.[0]
+                    if (file && file.type === 'application/pdf') {
+                      setForm(f => ({ ...f, _file: file, original_filename: file.name }))
+                    } else {
+                      toast.error('Solo file PDF sono supportati')
+                    }
+                  }}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <Upload className="h-8 w-8 mx-auto mb-2 opacity-30" />
+                  {form._file
+                    ? <p className="text-gray-700 font-medium">{form._file.name} <span className="text-gray-400">({(form._file.size / 1024 / 1024).toFixed(1)} MB)</span></p>
+                    : <p>Trascina un PDF qui oppure clicca per selezionare</p>
+                  }
+                  <input ref={fileInputRef} type="file" accept="application/pdf" className="hidden"
+                    onChange={e => {
+                      const file = e.target.files?.[0]
+                      if (file) setForm(f => ({ ...f, _file: file, original_filename: file.name }))
+                    }} />
+                </div>
+              )}
             </div>
           )}
 

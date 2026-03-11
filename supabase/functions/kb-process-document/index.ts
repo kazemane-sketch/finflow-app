@@ -1,6 +1,11 @@
+// kb-process-document/index.ts
+// Two actions:
+//   process  — text extraction (PDF/URL/text) + chunking + embedding
+//   classify — AI metadata via Gemini 3.1 Pro Preview (fills taxonomy, applicability, relations)
+
 import { createClient } from "npm:@supabase/supabase-js@2";
 
-/* ─── CORS ───────────────────────────────── */
+/* ─── CORS ──────────────────────────────────────── */
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
@@ -8,15 +13,16 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-/* ─── Config ─────────────────────────────── */
+/* ─── Models (VERIFIED — DO NOT CHANGE) ─────────── */
 const EMBEDDING_MODEL = "gemini-embedding-001";
+const FLASH_MODEL = "gemini-2.5-flash";
+const PRO_MODEL = "gemini-3.1-pro-preview";
 const EMBEDDING_DIMS = 3072;
-const CHUNK_TARGET_WORDS = 600;
-const CHUNK_MAX_WORDS = 800;
-const CHUNK_OVERLAP_WORDS = 100;
-const MAX_CHUNKS = 200; // safety cap
+const CHUNK_TARGET_CHARS = 3200; // ~800 tokens
+const CHUNK_OVERLAP_CHARS = 400; // ~100 tokens
+const MAX_CHUNKS = 200;
 
-/* ─── Helpers ────────────────────────────── */
+/* ─── Helpers ───────────────────────────────────── */
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -25,44 +31,72 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 function getBearerToken(req: Request): string | null {
-  const auth = req.headers.get("authorization") ?? req.headers.get("Authorization");
+  const auth =
+    req.headers.get("authorization") ?? req.headers.get("Authorization");
   if (!auth) return null;
   const m = auth.match(/^Bearer\s+(.+)$/i);
   return m?.[1]?.trim() || null;
 }
 
 function toVectorLiteral(values: number[]): string {
-  return `[${values.map((v) => Number.isFinite(v) ? v.toFixed(8) : "0").join(",")}]`;
+  return `[${values.map((v) => (Number.isFinite(v) ? v.toFixed(8) : "0")).join(",")}]`;
 }
 
-/* ─── Text extraction ────────────────────── */
+function stripHtml(html: string): string {
+  return html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/* ─── Gemini URL builders ───────────────────────── */
+function geminiUrl(model: string, method: string, apiKey: string): string {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${model}:${method}?key=${apiKey}`;
+}
+
+/* ─── Text extraction: PDF via Gemini Flash ─────── */
 async function extractTextFromPdf(
-  geminiKey: string,
+  apiKey: string,
   fileBytes: Uint8Array,
 ): Promise<string> {
-  const base64 = btoa(String.fromCharCode(...fileBytes));
+  // Build base64 in chunks to avoid stack overflow on large PDFs
+  let base64 = "";
+  const chunkSize = 8192;
+  for (let i = 0; i < fileBytes.length; i += chunkSize) {
+    const slice = fileBytes.subarray(i, Math.min(i + chunkSize, fileBytes.length));
+    base64 += btoa(String.fromCharCode(...slice));
+  }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`;
-  const res = await fetch(url, {
+  const res = await fetch(geminiUrl(FLASH_MODEL, "generateContent", apiKey), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      contents: [
-        {
-          parts: [
-            {
-              inlineData: {
-                mimeType: "application/pdf",
-                data: base64,
-              },
+      contents: [{
+        parts: [
+          {
+            inlineData: {
+              mimeType: "application/pdf",
+              data: base64,
             },
-            {
-              text: "Estrai tutto il testo dal documento PDF. Restituisci SOLO il testo estratto, senza commenti, senza formattazione markdown, senza intestazioni aggiunte. Mantieni la struttura originale con paragrafi e a capo.",
-            },
-          ],
-        },
-      ],
+          },
+          {
+            text: `Sei un sistema di estrazione testo da documenti normativi italiani.
+Estrai TUTTO il testo da questo PDF, mantenendo la struttura originale (titoli, articoli, commi, lettere, numeri).
+NON riassumere, NON commentare — restituisci il testo integrale.
+Se ci sono tabelle, convertile in formato testuale leggibile.`,
+          },
+        ],
+      }],
       generationConfig: {
         temperature: 0,
         maxOutputTokens: 30000,
@@ -72,348 +106,590 @@ async function extractTextFromPdf(
 
   const payload = await res.json();
   if (!res.ok) {
-    const msg = payload?.error?.message || `HTTP ${res.status}`;
-    throw new Error(`Gemini PDF extraction error: ${msg}`);
+    throw new Error(`Gemini PDF extraction: ${payload?.error?.message || `HTTP ${res.status}`}`);
   }
-
   const text = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text || typeof text !== "string") {
-    throw new Error("Gemini non ha restituito testo dal PDF");
-  }
+  if (!text) throw new Error("Gemini non ha restituito testo dal PDF");
   return text.trim();
 }
 
-function extractTextFromPlain(bytes: Uint8Array): string {
-  return new TextDecoder("utf-8").decode(bytes).trim();
-}
-
-/* ─── Chunking ───────────────────────────── */
-
-function chunkText(text: string): string[] {
-  // Split into paragraphs, then group into chunks of ~CHUNK_TARGET_WORDS
-  const paragraphs = text.split(/\n\s*\n/).filter((p) => p.trim().length > 0);
-  const chunks: string[] = [];
-  let current: string[] = [];
-  let currentWords = 0;
-
-  for (const para of paragraphs) {
-    const paraWords = para.split(/\s+/).length;
-
-    // If single paragraph exceeds max, split by sentences
-    if (paraWords > CHUNK_MAX_WORDS) {
-      // Flush current
-      if (current.length > 0) {
-        chunks.push(current.join("\n\n"));
-        current = [];
-        currentWords = 0;
-      }
-      // Split long paragraph by sentences
-      const sentences = para.match(/[^.!?\n]+[.!?\n]+|[^.!?\n]+$/g) || [para];
-      let sentBuf: string[] = [];
-      let sentWords = 0;
-      for (const sent of sentences) {
-        const sw = sent.split(/\s+/).length;
-        if (sentWords + sw > CHUNK_TARGET_WORDS && sentBuf.length > 0) {
-          chunks.push(sentBuf.join(" "));
-          // Overlap: keep last sentence
-          const overlapSent = sentBuf.slice(-1);
-          sentBuf = [...overlapSent, sent];
-          sentWords = overlapSent.join(" ").split(/\s+/).length + sw;
-        } else {
-          sentBuf.push(sent);
-          sentWords += sw;
-        }
-      }
-      if (sentBuf.length > 0) {
-        chunks.push(sentBuf.join(" "));
-      }
-      continue;
-    }
-
-    if (currentWords + paraWords > CHUNK_TARGET_WORDS && current.length > 0) {
-      chunks.push(current.join("\n\n"));
-      // Overlap: keep last paragraph if small enough
-      const lastPara = current[current.length - 1];
-      const lastWords = lastPara.split(/\s+/).length;
-      if (lastWords <= CHUNK_OVERLAP_WORDS) {
-        current = [lastPara, para];
-        currentWords = lastWords + paraWords;
-      } else {
-        current = [para];
-        currentWords = paraWords;
-      }
-    } else {
-      current.push(para);
-      currentWords += paraWords;
-    }
+/* ─── Text extraction: URL via fetch + strip ────── */
+async function extractTextFromUrl(
+  apiKey: string,
+  url: string,
+): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  let html: string;
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    html = await res.text();
+  } finally {
+    clearTimeout(timeout);
   }
 
-  if (current.length > 0) {
-    chunks.push(current.join("\n\n"));
-  }
+  let text = stripHtml(html);
 
-  // Safety cap
-  return chunks.slice(0, MAX_CHUNKS);
-}
-
-/* ─── Embeddings ─────────────────────────── */
-
-async function embedChunks(
-  geminiKey: string,
-  texts: string[],
-): Promise<number[][]> {
-  // Gemini batchEmbedContents supports up to 100 texts per call
-  const allEmbeddings: number[][] = [];
-  const batchSize = 100;
-
-  for (let i = 0; i < texts.length; i += batchSize) {
-    const batch = texts.slice(i, i + batchSize);
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:batchEmbedContents?key=${geminiKey}`;
-
-    const res = await fetch(url, {
+  // Fallback: if stripped text is too short, ask Gemini Flash
+  if (text.length < 100) {
+    console.log(`URL text too short (${text.length} chars), using Gemini Flash fallback`);
+    const res = await fetch(geminiUrl(FLASH_MODEL, "generateContent", apiKey), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        requests: batch.map((text) => ({
-          model: `models/${EMBEDDING_MODEL}`,
-          content: { parts: [{ text }] },
-          taskType: "RETRIEVAL_DOCUMENT",
-          outputDimensionality: EMBEDDING_DIMS,
-        })),
+        contents: [{
+          role: "user",
+          parts: [{
+            text: `Estrai il testo principale da questa pagina web normativa, ignorando navigazione, footer e sidebar:\n\n${html.substring(0, 50000)}`,
+          }],
+        }],
+        generationConfig: { temperature: 0, maxOutputTokens: 16000 },
       }),
     });
-
     const payload = await res.json();
-    if (!res.ok) {
-      const msg = payload?.error?.message || `HTTP ${res.status}`;
-      throw new Error(`Gemini batch embedding error: ${msg}`);
-    }
-
-    const embeddings = payload?.embeddings;
-    if (!Array.isArray(embeddings) || embeddings.length !== batch.length) {
-      throw new Error(`Gemini returned ${embeddings?.length ?? 0} embeddings, expected ${batch.length}`);
-    }
-
-    for (const emb of embeddings) {
-      const values = emb?.values;
-      if (!Array.isArray(values) || values.length !== EMBEDDING_DIMS) {
-        throw new Error(`Embedding dims ${values?.length}, expected ${EMBEDDING_DIMS}`);
-      }
-      allEmbeddings.push(values.map(Number));
+    if (res.ok) {
+      text = payload?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || text;
     }
   }
 
-  return allEmbeddings;
+  return text;
 }
 
-/* ─── Main handler ───────────────────────── */
+/* ─── Chunking ──────────────────────────────────── */
+interface Chunk {
+  content: string;
+  section_title: string | null;
+}
 
-Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
-  if (req.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
+function detectSectionTitle(text: string): string | null {
+  const firstLine = text.split("\n")[0]?.trim();
+  if (!firstLine) return null;
+  // Match patterns like "Art. 164", "CAPO III", "Comma 1", uppercase headers
+  if (/^(Art\.|Articolo|CAPO|TITOLO|Sezione|Comma|Allegato|PARTE)\s/i.test(firstLine)) {
+    return firstLine.length > 120 ? firstLine.substring(0, 120) : firstLine;
+  }
+  if (firstLine === firstLine.toUpperCase() && firstLine.length > 3 && firstLine.length < 120) {
+    return firstLine;
+  }
+  return null;
+}
 
-  const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
-  const serviceRoleKey = (Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "").trim();
-  const supabaseUrl = (Deno.env.get("SUPABASE_URL") ?? "").trim();
-
-  if (!geminiKey) return jsonResponse({ error: "GEMINI_API_KEY non configurata" }, 500);
-  if (!serviceRoleKey) return jsonResponse({ error: "SUPABASE_SERVICE_ROLE_KEY non configurata" }, 500);
-
-  // Auth: accept user bearer token (the function uses service_role internally)
-  const bearer = getBearerToken(req);
-  if (!bearer) return jsonResponse({ error: "Non autorizzato" }, 401);
-
-  const body = await req.json().catch(() => ({})) as {
-    document_id?: string;
-    company_id?: string;
-    pdf_base64?: string; // Admin upload: PDF data passed directly
-  };
-
-  const documentId = body.document_id;
-  const companyId = body.company_id || null; // null for admin platform-level documents
-  if (!documentId) {
-    return jsonResponse({ error: "document_id è richiesto" }, 400);
+function chunkText(text: string): Chunk[] {
+  // If text is short enough, single chunk
+  if (text.length <= CHUNK_TARGET_CHARS * 1.5) {
+    return [{ content: text, section_title: detectSectionTitle(text) }];
   }
 
-  // Service client for internal operations
-  const svc = createClient(supabaseUrl, serviceRoleKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
+  const chunks: Chunk[] = [];
+  let offset = 0;
+
+  while (offset < text.length) {
+    let end = offset + CHUNK_TARGET_CHARS;
+    if (end >= text.length) {
+      // Last chunk
+      chunks.push({
+        content: text.substring(offset),
+        section_title: detectSectionTitle(text.substring(offset)),
+      });
+      break;
+    }
+
+    // Find best break point: prefer \n\n, then \n, then ". "
+    let breakAt = -1;
+    const searchRegion = text.substring(end - 400, end + 400);
+
+    // Double newline
+    const dn = searchRegion.lastIndexOf("\n\n");
+    if (dn !== -1) {
+      breakAt = end - 400 + dn + 2;
+    } else {
+      // Single newline
+      const sn = searchRegion.lastIndexOf("\n");
+      if (sn !== -1) {
+        breakAt = end - 400 + sn + 1;
+      } else {
+        // Period + space
+        const ps = searchRegion.lastIndexOf(". ");
+        if (ps !== -1) {
+          breakAt = end - 400 + ps + 2;
+        } else {
+          breakAt = end;
+        }
+      }
+    }
+
+    const chunkContent = text.substring(offset, breakAt);
+    chunks.push({
+      content: chunkContent,
+      section_title: detectSectionTitle(chunkContent),
+    });
+
+    // Move forward with overlap
+    offset = Math.max(offset + 1, breakAt - CHUNK_OVERLAP_CHARS);
+
+    if (chunks.length >= MAX_CHUNKS) break;
+  }
+
+  return chunks;
+}
+
+/* ─── Embedding: sequential with 500ms pause ────── */
+async function embedSingle(
+  apiKey: string,
+  text: string,
+): Promise<number[]> {
+  const res = await fetch(geminiUrl(EMBEDDING_MODEL, "embedContent", apiKey), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: `models/${EMBEDDING_MODEL}`,
+      content: { parts: [{ text }] },
+      taskType: "RETRIEVAL_DOCUMENT",
+      outputDimensionality: EMBEDDING_DIMS,
+    }),
   });
 
-  // User client to verify membership
-  const userClient = createClient(supabaseUrl, serviceRoleKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-    global: { headers: { Authorization: `Bearer ${bearer}` } },
-  });
+  const payload = await res.json();
+  if (!res.ok) {
+    throw new Error(`Embedding error: ${payload?.error?.message || `HTTP ${res.status}`}`);
+  }
+  const values = payload?.embedding?.values;
+  if (!Array.isArray(values) || values.length !== EMBEDDING_DIMS) {
+    throw new Error(`Embedding dims ${values?.length}, expected ${EMBEDDING_DIMS}`);
+  }
+  return values.map(Number);
+}
+
+/* ─── Error helper: mark document as error ──────── */
+async function markError(
+  svc: ReturnType<typeof createClient>,
+  docId: string,
+  msg: string,
+): Promise<void> {
+  const errMsg = msg.length > 500 ? msg.substring(0, 500) : msg;
+  await svc
+    .from("kb_documents")
+    .update({
+      status: "error",
+      processing_error: errMsg,
+      error_message: errMsg,
+    } as any)
+    .eq("id", docId);
+}
+
+// ══════════════════════════════════════════════════
+// ACTION: PROCESS — extract text + chunk + embed
+// ══════════════════════════════════════════════════
+async function handleProcess(
+  svc: ReturnType<typeof createClient>,
+  apiKey: string,
+  documentId: string,
+): Promise<Response> {
+  // 1. Get document
+  const { data: doc, error: docErr } = await svc
+    .from("kb_documents")
+    .select("*")
+    .eq("id", documentId)
+    .single();
+  if (docErr || !doc) return jsonResponse({ error: "Documento non trovato" }, 404);
+
+  // 2. Validate status
+  if (doc.status !== "pending" && doc.status !== "error") {
+    return jsonResponse({ error: `Documento già in stato '${doc.status}', non processabile` }, 400);
+  }
+
+  // 3. Set status → processing
+  await svc
+    .from("kb_documents")
+    .update({ status: "processing", processing_error: null, error_message: null } as any)
+    .eq("id", documentId);
 
   try {
-    // 1. Verify authorization (company member OR platform admin)
-    if (companyId) {
-      // Company-scoped document: check company membership
-      const { data: membership } = await userClient
-        .from("company_members")
-        .select("user_id")
-        .eq("company_id", companyId)
-        .limit(1)
-        .single();
-      if (!membership) return jsonResponse({ error: "Non autorizzato per questa azienda" }, 403);
-    } else {
-      // Platform-level document (admin): check platform_admins
-      const { data: adminCheck } = await svc
-        .from("platform_admins")
-        .select("user_id")
-        .limit(1);
-      // Extract user_id from bearer token to verify admin status
-      let callerId: string | null = null;
-      try {
-        const payload = JSON.parse(atob(bearer.split(".")[1]));
-        callerId = payload.sub;
-      } catch { /* ignore */ }
-      const isAdmin = callerId && Array.isArray(adminCheck) && adminCheck.some((a: any) => a.user_id === callerId);
-      if (!isAdmin) return jsonResponse({ error: "Non sei un platform admin" }, 403);
-    }
+    // 4. Extract text based on source_input_type
+    let fullText = doc.full_text as string | null;
+    const inputType = doc.source_input_type || doc.file_type || "text";
 
-    // 2. Get document record
-    let docQuery = svc
-      .from("kb_documents")
-      .select("*")
-      .eq("id", documentId);
-    if (companyId) {
-      docQuery = docQuery.eq("company_id", companyId);
-    } else {
-      docQuery = docQuery.is("company_id", null);
-    }
-    const { data: doc, error: docErr } = await docQuery.single();
-    if (docErr || !doc) return jsonResponse({ error: "Documento non trovato" }, 404);
-
-    // 3. Get file bytes — from storage (company docs) or base64 (admin docs) or full_text
-    let fileBytes: Uint8Array | null = null;
-
-    if (body.pdf_base64) {
-      // Admin path: PDF passed as base64 in request body
-      const binaryString = atob(body.pdf_base64);
-      fileBytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        fileBytes[i] = binaryString.charCodeAt(i);
+    if (inputType === "text") {
+      // full_text should already be set
+      if (!fullText || fullText.length < 10) {
+        throw new Error("Nessun testo disponibile. Inserisci il testo nel campo full_text.");
       }
-    } else if (doc.storage_path) {
-      // Company path: download from storage bucket
-      const { data: fileData, error: dlErr } = await svc
-        .storage
+      console.log(`[process] Text input, ${fullText.length} chars already available`);
+    } else if (inputType === "url") {
+      const sourceUrl = doc.source_url as string;
+      if (!sourceUrl) throw new Error("URL fonte mancante");
+      console.log(`[process] Fetching URL: ${sourceUrl}`);
+      fullText = await extractTextFromUrl(apiKey, sourceUrl);
+      // Save extracted text
+      await svc
+        .from("kb_documents")
+        .update({ full_text: fullText } as any)
+        .eq("id", documentId);
+      console.log(`[process] URL text extracted: ${fullText.length} chars`);
+    } else if (inputType === "pdf") {
+      // Read from Supabase Storage
+      const storagePath = doc.storage_path as string;
+      if (!storagePath) throw new Error("PDF non caricato (storage_path mancante)");
+      console.log(`[process] Downloading PDF from storage: ${storagePath}`);
+      const { data: fileData, error: dlErr } = await svc.storage
         .from("kb-documents")
-        .download(doc.storage_path);
+        .download(storagePath);
       if (dlErr || !fileData) {
-        await svc.from("kb_documents").update({
-          status: "error",
-          error_message: `Download fallito: ${dlErr?.message || "file non trovato"}`,
-        }).eq("id", documentId);
-        return jsonResponse({ error: "Download file fallito" }, 500);
+        throw new Error(`Download PDF fallito: ${dlErr?.message || "file non trovato"}`);
       }
-      fileBytes = new Uint8Array(await fileData.arrayBuffer());
-    }
-
-    // 4. Extract text
-    let fullText: string;
-    try {
-      if (fileBytes && (doc.file_type === "pdf" || body.pdf_base64)) {
-        fullText = await extractTextFromPdf(geminiKey, fileBytes);
-        // Save full_text on the document for admin docs
-        await svc.from("kb_documents").update({ full_text: fullText }).eq("id", documentId);
-      } else if (fileBytes) {
-        fullText = extractTextFromPlain(fileBytes);
-      } else if (doc.full_text) {
-        // Text documents: full_text already saved on the record
-        fullText = doc.full_text;
-      } else {
-        throw new Error("Nessun file o testo disponibile per il processing");
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await svc.from("kb_documents").update({
-        status: "error",
-        error_message: `Estrazione testo fallita: ${msg.slice(0, 500)}`,
-      }).eq("id", documentId);
-      return jsonResponse({ error: `Estrazione fallita: ${msg}` }, 500);
+      const fileBytes = new Uint8Array(await fileData.arrayBuffer());
+      console.log(`[process] PDF downloaded: ${fileBytes.length} bytes, extracting text...`);
+      fullText = await extractTextFromPdf(apiKey, fileBytes);
+      // Save extracted text
+      await svc
+        .from("kb_documents")
+        .update({ full_text: fullText } as any)
+        .eq("id", documentId);
+      console.log(`[process] PDF text extracted: ${fullText.length} chars`);
+    } else {
+      throw new Error(`Tipo input sconosciuto: ${inputType}`);
     }
 
     if (!fullText || fullText.length < 10) {
-      await svc.from("kb_documents").update({
-        status: "error",
-        error_message: "Documento vuoto o troppo corto",
-      }).eq("id", documentId);
-      return jsonResponse({ error: "Documento vuoto" }, 400);
+      throw new Error("Testo estratto vuoto o troppo corto");
     }
 
-    // 5. Chunk the text
+    // 5. Chunking
+    await svc
+      .from("kb_documents")
+      .update({ status: "chunking" } as any)
+      .eq("id", documentId);
+
     const chunks = chunkText(fullText);
-    if (chunks.length === 0) {
-      await svc.from("kb_documents").update({
-        status: "error",
-        error_message: "Nessun chunk generato dal testo",
-      }).eq("id", documentId);
-      return jsonResponse({ error: "Nessun chunk" }, 400);
-    }
+    console.log(`[process] Created ${chunks.length} chunks`);
 
-    // 6. Generate embeddings for all chunks
-    let embeddings: number[][];
-    try {
-      embeddings = await embedChunks(geminiKey, chunks);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      await svc.from("kb_documents").update({
-        status: "error",
-        error_message: `Embedding fallito: ${msg.slice(0, 500)}`,
-      }).eq("id", documentId);
-      return jsonResponse({ error: `Embedding fallito: ${msg}` }, 500);
-    }
+    // 6. Delete old chunks (in case of retry after error)
+    await svc.from("kb_chunks").delete().eq("document_id", documentId);
 
-    // 7. Insert chunks with embeddings
-    const chunkRows = chunks.map((content, i) => ({
-      document_id: documentId,
-      company_id: companyId, // null for admin platform-level documents
-      chunk_index: i,
-      content,
-      token_count: Math.ceil(content.split(/\s+/).length * 1.3), // rough estimate
-      embedding: toVectorLiteral(embeddings[i]),
-    }));
+    // 7. Embed and insert each chunk sequentially
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      console.log(`[process] Embedding chunk ${i + 1}/${chunks.length}...`);
+      const embedding = await embedSingle(apiKey, chunk.content);
 
-    // Insert in batches of 50 to avoid payload limits
-    for (let i = 0; i < chunkRows.length; i += 50) {
-      const batch = chunkRows.slice(i, i + 50);
-      const { error: insertErr } = await svc
-        .from("kb_chunks")
-        .insert(batch);
+      const { error: insertErr } = await svc.from("kb_chunks").insert({
+        document_id: documentId,
+        chunk_index: i,
+        content: chunk.content,
+        section_title: chunk.section_title,
+        embedding: toVectorLiteral(embedding),
+      } as any);
+
       if (insertErr) {
-        await svc.from("kb_documents").update({
-          status: "error",
-          error_message: `Inserimento chunks fallito: ${insertErr.message.slice(0, 500)}`,
-        }).eq("id", documentId);
-        return jsonResponse({ error: `Insert error: ${insertErr.message}` }, 500);
+        throw new Error(`Insert chunk ${i} fallito: ${insertErr.message}`);
+      }
+
+      // 500ms pause between embeddings for rate limiting
+      if (i < chunks.length - 1) {
+        await sleep(500);
       }
     }
 
-    // 8. Update document status → ready
-    await svc.from("kb_documents").update({
-      status: "ready",
-      chunk_count: chunks.length,
-      error_message: null,
-      updated_at: new Date().toISOString(),
-    }).eq("id", documentId);
+    // 8. Finalize
+    await svc
+      .from("kb_documents")
+      .update({
+        status: "ready",
+        chunk_count: chunks.length,
+        processing_error: null,
+        error_message: null,
+      } as any)
+      .eq("id", documentId);
+
+    console.log(`[process] Document ${documentId} ready with ${chunks.length} chunks`);
 
     return jsonResponse({
-      status: "ready",
+      status: "ok",
       document_id: documentId,
       chunks: chunks.length,
       text_length: fullText.length,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Try to mark document as error
-    await svc.from("kb_documents").update({
-      status: "error",
-      error_message: `Errore imprevisto: ${msg.slice(0, 500)}`,
-    }).eq("id", documentId).catch(() => {});
+    console.error(`[process] Error: ${msg}`);
+    // Cleanup partial chunks
+    await svc.from("kb_chunks").delete().eq("document_id", documentId);
+    await markError(svc, documentId, msg);
+    return jsonResponse({ error: msg }, 500);
+  }
+}
 
+// ══════════════════════════════════════════════════
+// ACTION: CLASSIFY — AI metadata via Gemini Pro
+// ══════════════════════════════════════════════════
+async function handleClassify(
+  svc: ReturnType<typeof createClient>,
+  apiKey: string,
+  documentId: string,
+): Promise<Response> {
+  // 1. Get document
+  const { data: doc, error: docErr } = await svc
+    .from("kb_documents")
+    .select("*")
+    .eq("id", documentId)
+    .single();
+  if (docErr || !doc) return jsonResponse({ error: "Documento non trovato" }, 404);
+
+  // 2. Validate: full_text must exist
+  const fullText = doc.full_text as string | null;
+  if (!fullText || fullText.length < 10) {
+    return jsonResponse({
+      error: "Il documento non ha testo. Processalo prima (action: process).",
+    }, 400);
+  }
+
+  // 3. Load existing docs and rules for relation suggestions
+  const { data: existingDocs } = await svc
+    .from("kb_documents")
+    .select("id, title, legal_reference, category")
+    .eq("active", true)
+    .neq("id", documentId)
+    .limit(200);
+
+  const { data: existingRules } = await svc
+    .from("knowledge_base")
+    .select("id, title, domain")
+    .eq("active", true)
+    .limit(100);
+
+  const docsCtx = (existingDocs || [])
+    .map((d: any) => `- [${d.id}] ${d.title} (${d.legal_reference || "N/A"})`)
+    .join("\n");
+
+  const rulesCtx = (existingRules || [])
+    .map((r: any) => `- [${r.id}] ${r.title} (${r.domain})`)
+    .join("\n");
+
+  // 4. Build classification prompt
+  const classificationPrompt = `Sei un esperto di diritto tributario e contabilità italiana con 30 anni di esperienza. Ti viene dato il testo di un documento normativo. Devi analizzarlo e classificarlo con metadata strutturata.
+
+DOCUMENTO:
+Titolo: ${doc.title || "(senza titolo)"}
+Tipo fonte: ${doc.source_type || "non specificato"}
+Categoria attuale: ${doc.category || "non specificata"}
+
+TESTO:
+${fullText.substring(0, 30000)}
+
+DOCUMENTI GIÀ PRESENTI NEL KNOWLEDGE BASE (per suggerire relazioni):
+${docsCtx || "(nessuno)"}
+
+REGOLE GIÀ PRESENTI NEL KNOWLEDGE BASE:
+${rulesCtx || "(nessuna)"}
+
+Restituisci un JSON con questa struttura:
+{
+  "subcategory": "string — sottocategoria tematica (es. 'ammortamento', 'reverse_charge', 'leasing', 'veicoli', 'rappresentanza')",
+
+  "tax_area": ["array di aree fiscali tra: imposte_dirette, iva, irap, ritenute, imu, imposta_registro"],
+
+  "accounting_area": ["array di aree contabili tra: bilancio, ammortamento, fondi_rischi, ratei_risconti, conto_economico, stato_patrimoniale"],
+
+  "topic_tags": ["tag tematici tra: veicoli, immobili, leasing, rappresentanza, telefonia, carburanti, reverse_charge, split_payment, intrastat, professionisti, beni_strumentali, omaggi, vitto_alloggio, interessi_passivi, perdite_su_crediti, ammortamento, ritenuta_acconto, contributi_previdenziali, operazioni_esenti, autofattura, nota_credito, fatturazione_elettronica — puoi aggiungerne di nuovi se nessuno è adatto"],
+
+  "applies_to_legal_forms": ["srl","spa","sapa","snc","sas","ditta_individuale","cooperativa","associazione","ente_non_commerciale"] | null,
+
+  "applies_to_regimes": ["ordinario","semplificato","forfettario"] | null,
+
+  "applies_to_ateco_prefixes": ["08","41","43","F"] | null,
+
+  "applies_to_operations": ["acquisto_beni_strumentali","leasing","noleggio","servizi","cessione","prestazione_professionale","rimborso_spese","autofattura"] | null,
+
+  "applies_to_counterparty": ["fornitore_it","professionista","fornitore_ue","fornitore_extraue","pa","banca","assicurazione","forfettario"] | null,
+
+  "applies_to_size": ["micro","piccola","media","grande"] | null,
+
+  "amount_threshold_min": number | null,
+  "amount_threshold_max": number | null,
+
+  "effective_from": "YYYY-MM-DD",
+  "effective_until": "YYYY-MM-DD" | null,
+  "update_frequency": "static" | "annual" | "periodic" | "volatile",
+
+  "summary": "Riassunto in 2-3 frasi: cosa stabilisce il documento e a chi si applica.",
+
+  "suggested_relations": [
+    {
+      "target_id": "uuid",
+      "target_type": "document" | "rule",
+      "relation_type": "rinvia_a" | "modifica" | "interpreta" | "abroga" | "attua" | "deroga" | "integra" | "cita",
+      "note": "breve spiegazione"
+    }
+  ]
+}
+
+REGOLE DI CLASSIFICAZIONE:
+- Campi applies_to_*: null = si applica a TUTTI. Metti un array SOLO se il documento si applica esclusivamente a specifiche forme/regimi/settori.
+- Sii CONSERVATIVO con i filtri di applicabilità: null è meglio di un array incompleto
+- Sii GENEROSO con topic_tags: meglio più tag pertinenti che pochi
+- amount_threshold_min/max: SOLO se il documento menziona esplicitamente soglie legali con importi specifici
+- effective_from: usa la data di pubblicazione se non c'è data esplicita di entrata in vigore
+- suggested_relations: suggerisci SOLO relazioni chiare ed evidenti, non forzare connessioni deboli
+- Per documenti fiscali generali (es. art. 109 TUIR inerenza): applies_to_* tutto null perché si applica a tutti`;
+
+  // 5. Call Gemini 3.1 Pro Preview with thinking
+  console.log(`[classify] Calling Gemini Pro for document ${documentId}...`);
+  const classifyRes = await fetch(
+    geminiUrl(PRO_MODEL, "generateContent", apiKey),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          role: "user",
+          parts: [{ text: classificationPrompt }],
+        }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 8192,
+          responseMimeType: "application/json",
+        },
+        thinkingConfig: {
+          thinkingBudget: 8192,
+        },
+      }),
+    },
+  );
+
+  const classifyPayload = await classifyRes.json();
+  if (!classifyRes.ok) {
+    const msg = classifyPayload?.error?.message || `HTTP ${classifyRes.status}`;
+    return jsonResponse({ error: `Gemini Pro classification failed: ${msg}` }, 500);
+  }
+
+  // 6. Parse JSON response (may have thinking parts before content)
+  let classification: any;
+  try {
+    const parts = classifyPayload?.candidates?.[0]?.content?.parts || [];
+    // Find the text part (skip thinking parts)
+    const textPart = parts.find((p: any) => p.text !== undefined);
+    if (!textPart?.text) throw new Error("No text in response");
+    classification = JSON.parse(textPart.text);
+  } catch (e) {
+    console.error("[classify] Failed to parse JSON response:", e);
+    return jsonResponse({ error: "AI non ha restituito JSON valido" }, 500);
+  }
+
+  console.log(`[classify] Classification received, updating document...`);
+
+  // 7. Update only empty/null fields (preserve manual edits)
+  const fieldsUpdated: string[] = [];
+  const fieldsSkipped: string[] = [];
+  const updates: Record<string, any> = {};
+
+  function maybeUpdate(
+    fieldName: string,
+    currentValue: any,
+    newValue: any,
+  ): void {
+    const isEmpty =
+      currentValue === null ||
+      currentValue === undefined ||
+      currentValue === "" ||
+      (Array.isArray(currentValue) && currentValue.length === 0);
+
+    if (isEmpty && newValue !== null && newValue !== undefined) {
+      updates[fieldName] = newValue;
+      fieldsUpdated.push(fieldName);
+    } else {
+      fieldsSkipped.push(fieldName);
+    }
+  }
+
+  maybeUpdate("subcategory", doc.subcategory, classification.subcategory);
+  maybeUpdate("tax_area", doc.tax_area, classification.tax_area);
+  maybeUpdate("accounting_area", doc.accounting_area, classification.accounting_area);
+  maybeUpdate("topic_tags", doc.topic_tags, classification.topic_tags);
+  maybeUpdate("applies_to_legal_forms", doc.applies_to_legal_forms, classification.applies_to_legal_forms);
+  maybeUpdate("applies_to_regimes", doc.applies_to_regimes, classification.applies_to_regimes);
+  maybeUpdate("applies_to_ateco_prefixes", doc.applies_to_ateco_prefixes, classification.applies_to_ateco_prefixes);
+  maybeUpdate("applies_to_operations", doc.applies_to_operations, classification.applies_to_operations);
+  maybeUpdate("applies_to_counterparty", doc.applies_to_counterparty, classification.applies_to_counterparty);
+  maybeUpdate("applies_to_size", doc.applies_to_size, classification.applies_to_size);
+  maybeUpdate("amount_threshold_min", doc.amount_threshold_min, classification.amount_threshold_min);
+  maybeUpdate("amount_threshold_max", doc.amount_threshold_max, classification.amount_threshold_max);
+  maybeUpdate("effective_from", doc.effective_from === "2000-01-01" ? null : doc.effective_from, classification.effective_from);
+  maybeUpdate("effective_until", doc.effective_until, classification.effective_until);
+  maybeUpdate("update_frequency", doc.update_frequency === "static" ? null : doc.update_frequency, classification.update_frequency);
+  maybeUpdate("summary", doc.summary, classification.summary);
+
+  if (Object.keys(updates).length > 0) {
+    const { error: updateErr } = await svc
+      .from("kb_documents")
+      .update(updates as any)
+      .eq("id", documentId);
+    if (updateErr) {
+      console.error(`[classify] Update error: ${updateErr.message}`);
+      return jsonResponse({ error: `Aggiornamento fallito: ${updateErr.message}` }, 500);
+    }
+  }
+
+  console.log(
+    `[classify] Updated ${fieldsUpdated.length} fields, skipped ${fieldsSkipped.length}`,
+  );
+
+  // 8. Return classification + suggested_relations for frontend review
+  return jsonResponse({
+    status: "ok",
+    classification,
+    fields_updated: fieldsUpdated,
+    fields_skipped: fieldsSkipped,
+    suggested_relations: classification.suggested_relations || [],
+    suggested_relations_count: (classification.suggested_relations || []).length,
+  });
+}
+
+// ══════════════════════════════════════════════════
+// MAIN HANDLER
+// ══════════════════════════════════════════════════
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
+  if (req.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
+
+  const apiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
+  const serviceRoleKey = (Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "").trim();
+  const supabaseUrl = (Deno.env.get("SUPABASE_URL") ?? "").trim();
+
+  if (!apiKey) return jsonResponse({ error: "GEMINI_API_KEY non configurata" }, 500);
+  if (!serviceRoleKey) return jsonResponse({ error: "SUPABASE_SERVICE_ROLE_KEY non configurata" }, 500);
+
+  // Auth: accept user bearer token
+  const bearer = getBearerToken(req);
+  if (!bearer) return jsonResponse({ error: "Non autorizzato" }, 401);
+
+  const body = (await req.json().catch(() => ({}))) as {
+    action?: string;
+    document_id?: string;
+  };
+
+  const action = body.action;
+  const documentId = body.document_id;
+
+  if (!documentId) return jsonResponse({ error: "document_id è richiesto" }, 400);
+  if (!action || !["process", "classify"].includes(action)) {
+    return jsonResponse({ error: "action deve essere 'process' o 'classify'" }, 400);
+  }
+
+  // Service client for all DB operations
+  const svc = createClient(supabaseUrl, serviceRoleKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+
+  try {
+    if (action === "process") {
+      return await handleProcess(svc, apiKey, documentId);
+    } else {
+      return await handleClassify(svc, apiKey, documentId);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[kb-process-document] Unhandled error: ${msg}`);
+    await markError(svc, documentId, msg);
     return jsonResponse({ error: msg }, 500);
   }
 });
