@@ -7,6 +7,7 @@ import {
   Bot,
   ScrollText,
   FlaskConical,
+  Tags,
   ArrowLeft,
 } from 'lucide-react'
 
@@ -16,6 +17,7 @@ const adminNav = [
   { to: '/admin/documents', icon: FileText, label: 'Documenti' },
   { to: '/admin/agents', icon: Bot, label: 'Agent Config' },
   { to: '/admin/rules', icon: ScrollText, label: 'Agent Rules' },
+  { to: '/admin/keywords', icon: Tags, label: 'Dizionario Sinonimi' },
   { to: '/admin/test-lab', icon: FlaskConical, label: 'Test Lab' },
 ]
 

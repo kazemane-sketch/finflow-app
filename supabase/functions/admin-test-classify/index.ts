@@ -100,10 +100,31 @@ interface RequestBody {
     doc_type: string;
     counterparty_name: string;
     counterparty_vat: string;
+    counterparty_ateco: string;
+    counterparty_legal_type: string;
     total_amount: number;
     notes: string;
   };
   lines: TestLine[];
+}
+
+function formatCounterpartyLegalType(value: string): string {
+  switch ((value || "").trim().toLowerCase()) {
+    case "srl":
+      return "SRL";
+    case "spa":
+      return "SPA";
+    case "persona_fisica":
+      return "Persona fisica";
+    case "studio_associato":
+      return "Studio associato";
+    case "pa":
+      return "PA";
+    case "altro":
+      return "Altro";
+    default:
+      return "";
+  }
 }
 
 /* ─── Gemini call ────────────────────────── */
@@ -271,9 +292,19 @@ function buildCommercialistaPrompt(
   lines.push("");
 
   // Counterparty
+  const counterpartyAteco = body.invoice_data.counterparty_ateco?.trim();
+  const counterpartyLegalType = formatCounterpartyLegalType(
+    body.invoice_data.counterparty_legal_type,
+  );
   lines.push("=== CONTROPARTE ===");
   lines.push(`Nome: ${body.invoice_data.counterparty_name}`);
   lines.push(`P.IVA: ${body.invoice_data.counterparty_vat}`);
+  if (counterpartyAteco) {
+    lines.push(`ATECO: ${counterpartyAteco}`);
+  }
+  if (counterpartyLegalType) {
+    lines.push(`Tipo legale: ${counterpartyLegalType}`);
+  }
   lines.push("");
 
   // Invoice
@@ -365,9 +396,19 @@ function buildRevisorePrompt(
   lines.push("");
 
   // Counterparty
+  const counterpartyAteco = body.invoice_data.counterparty_ateco?.trim();
+  const counterpartyLegalType = formatCounterpartyLegalType(
+    body.invoice_data.counterparty_legal_type,
+  );
   lines.push("=== CONTROPARTE ===");
   lines.push(`Nome: ${body.invoice_data.counterparty_name}`);
   lines.push(`P.IVA: ${body.invoice_data.counterparty_vat}`);
+  if (counterpartyAteco) {
+    lines.push(`ATECO: ${counterpartyAteco}`);
+  }
+  if (counterpartyLegalType) {
+    lines.push(`Tipo legale: ${counterpartyLegalType}`);
+  }
   lines.push("");
 
   // Commercialista output (if chain mode)

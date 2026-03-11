@@ -81,6 +81,16 @@ const SECTORS = [
   { value: 'altro', label: 'Altro' },
 ]
 
+const COUNTERPARTY_LEGAL_TYPES = [
+  { value: '', label: 'Non specificato' },
+  { value: 'srl', label: 'SRL' },
+  { value: 'spa', label: 'SPA' },
+  { value: 'persona_fisica', label: 'Persona fisica' },
+  { value: 'studio_associato', label: 'Studio associato' },
+  { value: 'pa', label: 'PA' },
+  { value: 'altro', label: 'Altro' },
+]
+
 /* ─── Confidence badge ───────────────── */
 function ConfBadge({ value }: { value: number }) {
   const cls =
@@ -127,6 +137,8 @@ export default function TestLabPage() {
     company_ateco: '08.11.00',
     company_sector: 'estrazione_cave',
     company_name: 'Test Company',
+    counterparty_ateco: '',
+    counterparty_legal_type: '',
   })
   const [direction, setDirection] = useState<'in' | 'out'>('in')
 
@@ -227,6 +239,8 @@ export default function TestLabPage() {
             doc_type: body.tipo || 'TD01',
             counterparty_name: cp?.denom || '',
             counterparty_vat: cp?.piva || '',
+            counterparty_ateco: testContext.counterparty_ateco,
+            counterparty_legal_type: testContext.counterparty_legal_type,
             total_amount: parseFloat(body.totale) || 0,
             notes: body.causali?.join(' | ') || '',
           },
@@ -256,6 +270,7 @@ export default function TestLabPage() {
     setLoading(false)
     setLoadingAgent(null)
     setShowDetails({})
+    setTestContext(c => ({ ...c, counterparty_ateco: '', counterparty_legal_type: '' }))
     if (fileRef.current) fileRef.current.value = ''
   }
 
@@ -401,7 +416,7 @@ export default function TestLabPage() {
             <h2 className="text-sm font-bold text-slate-800 flex items-center gap-2">
               <Zap className="h-4 w-4 text-amber-500" /> Contesto di test
             </h2>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
               <div>
                 <Label className="text-xs">Codice ATECO</Label>
                 <Input
@@ -429,6 +444,29 @@ export default function TestLabPage() {
                   className="mt-1 h-8 text-sm"
                   placeholder="Test Company"
                 />
+              </div>
+              <div>
+                <Label className="text-xs">ATECO controparte</Label>
+                <Input
+                  value={testContext.counterparty_ateco}
+                  onChange={e => setTestContext(c => ({ ...c, counterparty_ateco: e.target.value }))}
+                  className="mt-1 h-8 text-sm"
+                  placeholder="es. 69.10.00 (lascia vuoto se non rilevante)"
+                />
+              </div>
+              <div>
+                <Label className="text-xs">Tipo legale controparte</Label>
+                <select
+                  value={testContext.counterparty_legal_type}
+                  onChange={e => setTestContext(c => ({ ...c, counterparty_legal_type: e.target.value }))}
+                  className="mt-1 w-full h-8 border rounded-md px-2 text-sm"
+                >
+                  {COUNTERPARTY_LEGAL_TYPES.map(type => (
+                    <option key={type.value || 'unspecified'} value={type.value}>
+                      {type.label}
+                    </option>
+                  ))}
+                </select>
               </div>
             </div>
           </div>
