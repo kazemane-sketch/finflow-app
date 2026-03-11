@@ -2748,12 +2748,13 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               {/* Portal dropdown for header column popovers — escapes overflow container */}
               {headerDropdown && headerDropdownRect && createPortal(
                 <div ref={headerDropdownRef}
-                  className="fixed z-[9999] w-60 bg-white border border-gray-200 rounded-lg shadow-xl max-h-64 overflow-y-auto"
+                  className="fixed z-[9999] w-60 bg-white border border-gray-200 rounded-lg shadow-xl overflow-y-auto"
                   style={{
                     top: headerDropdownRect.bottom + 4,
                     left: headerDropdown === 'account'
                       ? Math.max(8, headerDropdownRect.right - 256)
                       : headerDropdownRect.left,
+                    maxHeight: Math.min(400, window.innerHeight - headerDropdownRect.bottom - 16),
                   }}>
                   <div className="px-2 py-1.5 text-[9px] text-gray-400 border-b bg-gray-50 sticky top-0">Applica a righe vuote</div>
                   {headerDropdown === 'category' && dirCategories.map(c => (
