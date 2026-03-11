@@ -1936,13 +1936,18 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   // State for header dropdown popovers — portal-based to escape overflow container
   const [headerDropdown, setHeaderDropdown] = useState<'category' | 'account' | 'cdc' | null>(null);
   const [headerDropdownRect, setHeaderDropdownRect] = useState<DOMRect | null>(null);
+  const [headerDropdownSearch, setHeaderDropdownSearch] = useState('');
   const headerDropdownRef = useRef<HTMLDivElement>(null);
+  const headerDropdownSearchRef = useRef<HTMLInputElement>(null);
 
   const openHeaderDropdown = useCallback((type: 'category' | 'account' | 'cdc', e: React.MouseEvent) => {
     if (headerDropdown === type) { setHeaderDropdown(null); return; }
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     setHeaderDropdownRect(rect);
+    setHeaderDropdownSearch('');
     setHeaderDropdown(type);
+    // Auto-focus search input after render
+    setTimeout(() => headerDropdownSearchRef.current?.focus(), 50);
   }, [headerDropdown]);
 
   // Close header dropdown on outside click or scroll (portal-aware)
@@ -2748,44 +2753,83 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               {/* Portal dropdown for header column popovers — escapes overflow container */}
               {headerDropdown && headerDropdownRect && createPortal(
                 <div ref={headerDropdownRef}
-                  className="fixed z-[9999] w-60 bg-white border border-gray-200 rounded-lg shadow-xl overflow-y-auto"
+                  className="fixed z-[9999] w-72 bg-white border border-gray-200 rounded-lg shadow-xl flex flex-col"
                   style={{
                     top: headerDropdownRect.bottom + 4,
                     left: headerDropdown === 'account'
-                      ? Math.max(8, headerDropdownRect.right - 256)
+                      ? Math.max(8, headerDropdownRect.right - 288)
                       : headerDropdownRect.left,
-                    maxHeight: Math.min(400, window.innerHeight - headerDropdownRect.bottom - 16),
+                    maxHeight: Math.min(420, window.innerHeight - headerDropdownRect.bottom - 16),
                   }}>
-                  <div className="px-2 py-1.5 text-[9px] text-gray-400 border-b bg-gray-50 sticky top-0">Applica a righe vuote</div>
-                  {headerDropdown === 'category' && dirCategories.map(c => (
-                    <button key={c.id} onClick={() => { handleHeaderApplyCategory(c.id); setHeaderDropdown(null); }}
-                      className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
-                      {c.name}
-                    </button>
-                  ))}
-                  {headerDropdown === 'cdc' && allProjects.map(p => (
-                    <button key={p.id} onClick={() => { handleHeaderApplyCdc(p.id); setHeaderDropdown(null); }}
-                      className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
-                      {p.code} {'\u2014'} {p.name}
-                    </button>
-                  ))}
-                  {headerDropdown === 'account' && (<>
-                    {dirPrimaryAccounts.map(a => (
-                      <button key={a.id} onClick={() => { handleHeaderApplyAccount(a.id); setHeaderDropdown(null); }}
+                  {/* Sticky header with search */}
+                  <div className="sticky top-0 bg-white border-b z-10 rounded-t-lg">
+                    <div className="px-2 py-1 text-[9px] text-gray-400 bg-gray-50 rounded-t-lg">Applica a righe vuote</div>
+                    <div className="px-2 py-1.5">
+                      <input
+                        ref={headerDropdownSearchRef}
+                        type="text"
+                        value={headerDropdownSearch}
+                        onChange={e => setHeaderDropdownSearch(e.target.value)}
+                        className="w-full px-2 py-1 text-[11px] border border-gray-200 rounded focus:ring-1 focus:ring-purple-400 outline-none"
+                        placeholder={
+                          headerDropdown === 'category' ? 'Cerca categoria...' :
+                          headerDropdown === 'cdc' ? 'Cerca CdC...' :
+                          'Cerca conto (nome o codice)...'
+                        }
+                      />
+                    </div>
+                  </div>
+                  {/* Scrollable list */}
+                  <div className="overflow-y-auto flex-1">
+                  {headerDropdown === 'category' && (() => {
+                    const q = headerDropdownSearch.toLowerCase().trim();
+                    const filtered = q ? dirCategories.filter(c => c.name.toLowerCase().includes(q)) : dirCategories;
+                    return filtered.length > 0 ? filtered.map(c => (
+                      <button key={c.id} onClick={() => { handleHeaderApplyCategory(c.id); setHeaderDropdown(null); }}
                         className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
-                        {a.code} {'\u2014'} {a.name}
+                        {c.name}
                       </button>
-                    ))}
-                    {dirSecondaryAccounts.length > 0 && (
-                      <div className="px-2 py-1 text-[9px] text-gray-400 border-t bg-gray-50 sticky">Speciali</div>
-                    )}
-                    {dirSecondaryAccounts.map(a => (
-                      <button key={a.id} onClick={() => { handleHeaderApplyAccount(a.id); setHeaderDropdown(null); }}
+                    )) : <div className="px-2 py-3 text-[10px] text-gray-400 text-center">Nessun risultato</div>;
+                  })()}
+                  {headerDropdown === 'cdc' && (() => {
+                    const q = headerDropdownSearch.toLowerCase().trim();
+                    const filtered = q ? allProjects.filter(p =>
+                      p.code.toLowerCase().includes(q) || p.name.toLowerCase().includes(q)
+                    ) : allProjects;
+                    return filtered.length > 0 ? filtered.map(p => (
+                      <button key={p.id} onClick={() => { handleHeaderApplyCdc(p.id); setHeaderDropdown(null); }}
                         className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
-                        {a.code} {'\u2014'} {a.name}
+                        {p.code} {'\u2014'} {p.name}
                       </button>
-                    ))}
-                  </>)}
+                    )) : <div className="px-2 py-3 text-[10px] text-gray-400 text-center">Nessun risultato</div>;
+                  })()}
+                  {headerDropdown === 'account' && (() => {
+                    const q = headerDropdownSearch.toLowerCase().trim();
+                    const filterAcc = (a: typeof dirPrimaryAccounts[0]) =>
+                      !q || a.code.toLowerCase().includes(q) || a.name.toLowerCase().includes(q);
+                    const filteredPrimary = dirPrimaryAccounts.filter(filterAcc);
+                    const filteredSecondary = dirSecondaryAccounts.filter(filterAcc);
+                    const total = filteredPrimary.length + filteredSecondary.length;
+                    if (total === 0) return <div className="px-2 py-3 text-[10px] text-gray-400 text-center">Nessun risultato</div>;
+                    return (<>
+                      {filteredPrimary.map(a => (
+                        <button key={a.id} onClick={() => { handleHeaderApplyAccount(a.id); setHeaderDropdown(null); }}
+                          className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
+                          {a.code} {'\u2014'} {a.name}
+                        </button>
+                      ))}
+                      {filteredSecondary.length > 0 && (
+                        <div className="px-2 py-1 text-[9px] text-gray-400 border-t bg-gray-50 sticky">Speciali</div>
+                      )}
+                      {filteredSecondary.map(a => (
+                        <button key={a.id} onClick={() => { handleHeaderApplyAccount(a.id); setHeaderDropdown(null); }}
+                          className="w-full text-left px-2 py-1.5 text-[10px] hover:bg-purple-50 hover:text-purple-700 transition-colors truncate">
+                          {a.code} {'\u2014'} {a.name}
+                        </button>
+                      ))}
+                    </>);
+                  })()}
+                  </div>
                 </div>,
                 document.body
               )}
