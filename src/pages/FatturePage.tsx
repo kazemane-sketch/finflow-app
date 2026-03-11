@@ -2070,13 +2070,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       return dbLine?.id;
     }).filter(Boolean)
   );
-  // Count classified lines: direct line-level values OR invoice-level header fallback
-  const hasInvoiceLevelClassif = !!(selCategoryId || selAccountId);
-  const classifiedLineCount = hasInvoiceLevelClassif
-    ? visibleLineCount  // all lines covered by header classification
-    : Object.keys(lineClassifs)
-        .filter(lid => visibleLineIds.has(lid) && (lineClassifs[lid]?.category_id || lineClassifs[lid]?.account_id))
-        .length;
+  const classifiedLineCount = Object.keys(lineClassifs)
+    .filter(lid => visibleLineIds.has(lid) && (lineClassifs[lid]?.category_id || lineClassifs[lid]?.account_id))
+    .length;
 
   return (
     <div className="flex flex-col h-full" id="invoice-detail-print">
@@ -2855,7 +2851,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                           : 'Nessuna classificazione'}
                   </span>
                   {/* "Cancella tutto" — clears entire classification (always visible when there's data) */}
-                  {(classification || Object.keys(lineClassifs).length > 0 || Object.keys(lineArticleMap).length > 0 || Object.keys(aiSuggestions).length > 0) && (
+                  {(classification || Object.keys(lineClassifs).length > 0 || Object.keys(lineArticleMap).length > 0 || Object.keys(aiSuggestions).length > 0 || cdcRows.length > 0 || invProjects.length > 0) && (
                     <button onClick={() => setShowClearDialog(true)}
                       className="px-2 py-1 text-[10px] font-semibold rounded-md border border-red-200 text-red-500 hover:bg-red-50 transition-colors">
                       {'\uD83D\uDDD1'} Cancella tutto

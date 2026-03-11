@@ -439,7 +439,7 @@ export async function loadInvoiceClassificationMeta(
   for (let i = 0; i < invoiceIds.length; i += BATCH) {
     const batchIds = invoiceIds.slice(i, i + BATCH)
 
-    const [linesRes, assignedRes, lineProjRes, classifRes, projRes, phasesRes] = await Promise.all([
+    const [linesRes, assignedRes, lineProjRes, projRes, phasesRes] = await Promise.all([
       // 1. Lines with category_id and account_id per invoice
       supabase
         .from('invoice_lines')
@@ -456,17 +456,12 @@ export async function loadInvoiceClassificationMeta(
         .from('invoice_line_projects')
         .select('invoice_id, invoice_line_id')
         .in('invoice_id', batchIds),
-      // 4. Invoice-level classifications (fallback for category + account)
-      supabase
-        .from('invoice_classifications')
-        .select('invoice_id, category_id, account_id')
-        .in('invoice_id', batchIds),
-      // 5. Invoice-level projects (fallback for CdC)
+      // 4. Invoice-level projects (fallback for CdC — shows "← Fatt." inheritance in UI)
       supabase
         .from('invoice_projects')
         .select('invoice_id')
         .in('invoice_id', batchIds),
-      // 6. Articles with phases (to know which articles are multi-step)
+      // 5. Articles with phases (to know which articles are multi-step)
       supabase
         .from('article_phases')
         .select('article_id')
@@ -512,16 +507,7 @@ export async function loadInvoiceClassificationMeta(
       cdcLinesByInv.get(row.invoice_id)!.add(row.invoice_line_id)
     }
 
-    // Invoice-level classification fallbacks
-    const invClassif = new Map<string, { has_category: boolean; has_account: boolean }>()
-    for (const row of (classifRes.data || []) as any[]) {
-      invClassif.set(row.invoice_id, {
-        has_category: !!row.category_id,
-        has_account: !!row.account_id,
-      })
-    }
-
-    // Invoice-level CdC fallback
+    // Invoice-level CdC fallback (kept: CdC shows "← Fatt." inheritance in UI)
     const invProjSet = new Set<string>()
     for (const row of (projRes.data || [])) {
       invProjSet.add(row.invoice_id)
@@ -534,12 +520,11 @@ export async function loadInvoiceClassificationMeta(
       const artLines = articleLinesByInv.get(id)?.size || 0
       const completeArtLines = completeArticleLinesByInv.get(id)?.size || 0
       const cdcLines = cdcLinesByInv.get(id)?.size || 0
-      const invCf = invClassif.get(id)
 
-      // For category/account: use line-level if any lines have it, otherwise fall back to invoice-level
-      const linesWithCat = ls.withCat > 0 ? ls.withCat : (invCf?.has_category ? lc : 0)
-      const linesWithAcct = ls.withAcct > 0 ? ls.withAcct : (invCf?.has_account ? lc : 0)
-      // For CdC: use line-level if any lines have it, otherwise fall back to invoice-level
+      // Use actual line-level data only — no invoice-level fallback
+      // (invoice_classifications may have data but lines may not → badges would be misleading)
+      const linesWithCat = ls.withCat
+      const linesWithAcct = ls.withAcct
       const linesWithCdc = cdcLines > 0 ? cdcLines : (invProjSet.has(id) ? lc : 0)
 
       result.set(id, {
