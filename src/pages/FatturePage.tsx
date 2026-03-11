@@ -4232,7 +4232,7 @@ export default function FatturePage() {
 
   useEffect(() => {
     const restoreContext = pendingSidebarRestoreRef.current;
-    if (!restoreContext || invoices.length === 0) return;
+    if (!restoreContext || loadingList || companyLoading || invoices.length === 0) return;
 
     let frame2 = 0;
     const frame1 = window.requestAnimationFrame(() => {
@@ -4250,6 +4250,11 @@ export default function FatturePage() {
           if (rowTop < visibleTop || rowBottom > visibleBottom) {
             row.scrollIntoView({ block: 'center' });
           }
+        } else if (invoices.some(inv => inv.id === restoreContext.selectedInvoiceId)) {
+          const fallbackRow = container.querySelector<HTMLElement>(`[data-invoice-id="${restoreContext.selectedInvoiceId}"]`);
+          fallbackRow?.scrollIntoView({ block: 'center' });
+        } else {
+          return;
         }
 
         pendingSidebarRestoreRef.current = null;
@@ -4261,7 +4266,7 @@ export default function FatturePage() {
       window.cancelAnimationFrame(frame1);
       if (frame2) window.cancelAnimationFrame(frame2);
     };
-  }, [invoices]);
+  }, [invoices, loadingList, companyLoading]);
 
   // IntersectionObserver for infinite scroll
   useEffect(() => {
