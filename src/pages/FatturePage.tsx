@@ -49,9 +49,9 @@ import {
 import { toast } from 'sonner';
 import { createRuleFromConfirmation, findMatchingRules, deactivateRulesForInvoice, handleRuleCorrection, type RuleSuggestion } from '@/lib/classificationRulesService';
 import { runClassificationPipeline, type PipelineStepDebug } from '@/lib/classificationPipelineService';
-import { createMemoryFromClassification } from '@/lib/companyMemoryService';
+import { createMemoryFromClassification, createMemoryFromFiscalChoice, deactivateInvoiceMemoryFacts } from '@/lib/companyMemoryService';
 import { extractProvinceSiglaFromAddress, loadCounterpartyHeaderInfo } from '@/lib/counterpartyService';
-import { saveFiscalDecision } from '@/lib/fiscalDecisionService';
+import { deleteFiscalDecisionsForInvoice, saveFiscalDecision } from '@/lib/fiscalDecisionService';
 import ExportDialog from '@/components/ExportDialog';
 import SearchableSelect from '@/components/SearchableSelect';
 
@@ -171,6 +171,17 @@ function parseXmlDetail(xmlStr: string): any {
     },
     bodies,
   };
+}
+
+function extractPrimaryContractRef(rawXml?: string | null): string | null {
+  if (!rawXml) return null;
+  try {
+    const parsed = parseXmlDetail(rawXml);
+    const body = parsed?.bodies?.[0];
+    return body?.contratti?.[0]?.id || null;
+  } catch {
+    return null;
+  }
 }
 
 // ============================================================
@@ -944,6 +955,18 @@ function buildAggregatedNotes(
   return alerts;
 }
 
+type PendingFiscalChoice = {
+  first_line_id: string
+  alert_type: string
+  alert_title: string
+  chosen_option_label: string
+  fiscal_override: Record<string, unknown>
+  affected_lines: string[]
+  line_description: string
+  contract_ref: string | null
+  account_id: string | null
+}
+
 function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, onDelete, onReload, onPatchInvoice, onRefreshBadges, onOpenCounterparty, onOpenScadenzario, onNavigateCounterparty }: {
   invoice: DBInvoice; detail: DBInvoiceDetail | null; installments: InvoiceInstallment[]; loadingDetail: boolean;
   onEdit: (u: InvoiceUpdate) => Promise<void>; onDelete: () => void; onReload: () => void;
@@ -1068,6 +1091,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [aiClassifResult, setAiClassifResult] = useState<any>(null);
   const activeInvoiceIdRef = useRef(invoice.id);
   const mountedRef = useRef(true);
+  const primaryContractRef = useMemo(() => extractPrimaryContractRef(detail?.raw_xml), [detail?.raw_xml]);
   // Rules dialog: when rules match, show choice before running AI
   const [showRulesDialog, setShowRulesDialog] = useState(false);
   const [pendingRuleSuggestions, setPendingRuleSuggestions] = useState<RuleSuggestion[]>([]);
@@ -1077,6 +1101,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [lineReviewFlags, setLineReviewFlags] = useState<Record<string, boolean>>({});
   // Fiscal review alerts from Sonnet escalation
   const [invoiceNotes, setInvoiceNotes] = useState<FiscalAlert[]>([]);
+  const [pendingFiscalChoices, setPendingFiscalChoices] = useState<PendingFiscalChoice[]>([]);
   const [pipelineDebug, setPipelineDebug] = useState<PipelineStepDebug[] | null>(null);
   // AI suggestion state for new accounts/categories
   const [lineSuggestions, setLineSuggestions] = useState<Record<string, {
@@ -1177,6 +1202,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const isPostConfirmDirty = useMemo(() => {
     // Check dismissed AI article suggestions (need saving to delete from DB)
     if (dismissedArticleLineIds.size > 0) return true;
+    if (pendingFiscalChoices.length > 0) return true;
     // Check line classifications changed
     const lcKeys = new Set([...Object.keys(lineClassifs), ...Object.keys(originalLineClassifs)]);
     for (const k of lcKeys) {
@@ -1202,7 +1228,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     }
     // Also check invoice-level dirty (CdC etc.)
     return classifDirty;
-  }, [dismissedArticleLineIds, lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap, lineProjects, originalLineProjects, classifDirty]);
+  }, [dismissedArticleLineIds, pendingFiscalChoices, lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap, lineProjects, originalLineProjects, classifDirty]);
 
   // Load articles + existing assignments when invoice changes
   useEffect(() => {
@@ -1313,6 +1339,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setLineFiscalFlags(lineClfResult.fiscalFlags);
         setLineConfidences(lineClfResult.confidences);
         setLineReviewFlags(lineClfResult.reviewFlags);
+        setPendingFiscalChoices([]);
         // Initialize local CdC rows from DB assignments
         setCdcRows(iProjs.map(ip => ({
           project_id: ip.project_id,
@@ -1879,8 +1906,16 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const handleConfirmChanges = useCallback(async () => {
     const companyId = company?.id;
     if (!companyId || !invoice?.id) return;
+    const cp = (invoice.counterparty || {}) as any;
     setConfirmChangesSaving(true);
     try {
+      const learningWarnings: string[] = [];
+      const pushLearningWarning = (label: string, error: unknown) => {
+        console.warn(`[learning] ${label}:`, error);
+        const message = error instanceof Error ? error.message : String(error ?? 'errore sconosciuto');
+        learningWarnings.push(`${label}: ${message}`);
+      };
+
       // 1. Save invoice-level classification (category, account, CdC) if dirty
       if (classifDirty) {
         await saveInvoiceClassification(companyId, invoice.id, selCategoryId, selAccountId);
@@ -1945,13 +1980,29 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       const hasAnyData = selCategoryId || selAccountId ||
         Object.values(lineClassifs).some(lc => lc?.category_id || lc?.account_id) ||
         Object.keys(lineArticleMap).length > 0;
+
       if (!hasAnyData) {
         // User cleared everything → delete classification and set status 'none'
         await deleteInvoiceClassification(invoice.id);
         await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
         onPatchInvoice(invoice.id, { classification_status: 'none' } as Partial<DBInvoice>);
-        // Soft-delete classification rules created from this invoice
-        deactivateRulesForInvoice(invoice.id).catch(err => console.warn('[rules] deactivate error:', err));
+
+        try {
+          await deactivateRulesForInvoice(invoice.id);
+        } catch (error) {
+          pushLearningWarning('revoca regole classificazione', error);
+        }
+        try {
+          await deleteFiscalDecisionsForInvoice(invoice.id);
+        } catch (error) {
+          pushLearningWarning('revoca decisioni fiscali', error);
+        }
+        try {
+          await deactivateInvoiceMemoryFacts(invoice.id);
+        } catch (error) {
+          pushLearningWarning('revoca memoria fattura', error);
+        }
+        setPendingFiscalChoices([]);
       } else {
         const newStatus = isConfirmed ? 'confirmed' : 'manual';
         await supabase.from('invoice_classifications').update({ verified: true, assigned_by: 'manual', updated_at: new Date().toISOString() }).eq('invoice_id', invoice.id);
@@ -1969,6 +2020,124 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         }
         await supabase.from('invoices').update({ classification_status: newStatus } as any).eq('id', invoice.id);
         onPatchInvoice(invoice.id, { classification_status: newStatus } as Partial<DBInvoice>);
+        try {
+          await deactivateRulesForInvoice(invoice.id);
+        } catch (error) {
+          pushLearningWarning('riallineamento regole classificazione', error);
+        }
+        try {
+          await deactivateInvoiceMemoryFacts(invoice.id, ['invoice_classification']);
+        } catch (error) {
+          pushLearningWarning('riallineamento memoria classificazione', error);
+        }
+        if (pendingFiscalChoices.length > 0) {
+          try {
+            await deleteFiscalDecisionsForInvoice(invoice.id);
+          } catch (error) {
+            pushLearningWarning('reset decisioni fiscali precedenti', error);
+          }
+          try {
+            await deactivateInvoiceMemoryFacts(invoice.id, ['invoice_fiscal_choice']);
+          } catch (error) {
+            pushLearningWarning('riallineamento memoria fiscale', error);
+          }
+        }
+
+        if (detail?.invoice_lines) {
+          for (const line of detail.invoice_lines) {
+            const lc = lineClassifs[line.id];
+            if (!(lc?.category_id || lc?.account_id)) continue;
+
+            const lineCdc = lineProjects[line.id]?.length
+              ? lineProjects[line.id].map(p => ({ project_id: p.project_id, percentage: p.percentage }))
+              : (cdcRows.length > 0 ? cdcRows.map(c => ({ project_id: c.project_id, percentage: c.percentage })) : null);
+            const lineFF = lineFiscalFlags[line.id] || null;
+
+            try {
+              await createRuleFromConfirmation(
+                companyId, cp?.piva || null, cp?.denom || null,
+                line.description, invoice.direction as 'in' | 'out',
+                {
+                  category_id: lc.category_id,
+                  account_id: lc.account_id,
+                  article_id: lineArticleMap[line.id]?.article_id || null,
+                  phase_id: lineArticleMap[line.id]?.phase_id || null,
+                  cost_center_allocations: lineCdc,
+                  fiscal_flags: lineFF,
+                },
+                invoice.id,
+                primaryContractRef,
+              );
+            } catch (error) {
+              pushLearningWarning(`salvataggio regola riga "${line.description.slice(0, 40)}"`, error);
+            }
+
+            const memAcc = lc.account_id ? allAccounts.find(a => a.id === lc.account_id) : null;
+            const memCat = lc.category_id ? allCategories.find(c => c.id === lc.category_id) : null;
+            const memArt = lineArticleMap[line.id];
+            try {
+              await createMemoryFromClassification(
+                companyId, cp?.id || null, cp?.denom || null,
+                line.description, memCat?.name || null,
+                memAcc?.code || null, memAcc?.name || null,
+                invoice.direction as 'in' | 'out',
+                memArt?.code || null, memArt?.name || null,
+                { sourceInvoiceId: invoice.id, origin: 'invoice_classification' },
+              );
+            } catch (error) {
+              pushLearningWarning(`salvataggio memoria riga "${line.description.slice(0, 40)}"`, error);
+            }
+          }
+        }
+
+        let fiscalChoicesSynced = true;
+        for (const choice of pendingFiscalChoices) {
+          try {
+            await createMemoryFromFiscalChoice(
+              companyId,
+              cp?.id || null,
+              cp?.denom || null,
+              choice.alert_title,
+              choice.chosen_option_label,
+              choice.alert_type,
+              choice.fiscal_override,
+              invoice.id,
+            );
+          } catch (error) {
+            fiscalChoicesSynced = false;
+            pushLearningWarning(`salvataggio memoria fiscale "${choice.alert_title}"`, error);
+          }
+
+          if (!cp?.piva) {
+            fiscalChoicesSynced = false;
+            learningWarnings.push(`decisione fiscale "${choice.alert_title}" non salvata: P.IVA controparte mancante`);
+            continue;
+          }
+
+          try {
+            await saveFiscalDecision(
+              companyId,
+              invoice.id,
+              choice.line_description,
+              cp.piva,
+              invoice.direction as 'in' | 'out',
+              {
+                type: choice.alert_type,
+                chosen_option_label: choice.chosen_option_label,
+                fiscal_override: choice.fiscal_override,
+              },
+              choice.contract_ref,
+              choice.account_id,
+            );
+          } catch (error) {
+            fiscalChoicesSynced = false;
+            pushLearningWarning(`salvataggio decisione fiscale "${choice.alert_title}"`, error);
+          }
+        }
+
+        if (fiscalChoicesSynced) {
+          setPendingFiscalChoices([]);
+        }
       }
 
       // 5. Update original snapshots so dirty state resets
@@ -1978,69 +2147,25 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setDismissedArticleLineIds(new Set());
       setClassifDirty(false);
 
-      // 6. Create classification rules + company memory from confirmed data (fire-and-forget)
-      // v2: rules now include fiscal_flags from lineFiscalFlags for learning loop
-      // v3: includes contract_ref from DatiContratto.IdDocumento
-      const cp = (invoice.counterparty || {}) as any;
-      let contractRefForRules2: string | null = null;
-      try {
-        if (detail?.raw_xml) {
-          const px2 = parseXmlDetail(detail.raw_xml);
-          const b02 = px2?.bodies?.[0];
-          if (b02?.contratti?.length) contractRefForRules2 = b02.contratti[0]?.id || null;
-        }
-      } catch { /* ignore */ }
-
-      if (detail?.invoice_lines) {
-        for (const line of detail.invoice_lines) {
-          const lc = lineClassifs[line.id];
-          if (lc?.category_id || lc?.account_id) {
-            const lineCdc = lineProjects[line.id]?.length
-              ? lineProjects[line.id].map(p => ({ project_id: p.project_id, percentage: p.percentage }))
-              : (cdcRows.length > 0 ? cdcRows.map(c => ({ project_id: c.project_id, percentage: c.percentage })) : null);
-            const lineFF = lineFiscalFlags[line.id] || null;
-            createRuleFromConfirmation(
-              companyId, cp?.piva || null, cp?.denom || null,
-              line.description, invoice.direction as 'in' | 'out',
-              { category_id: lc.category_id, account_id: lc.account_id,
-                article_id: lineArticleMap[line.id]?.article_id || null,
-                phase_id: lineArticleMap[line.id]?.phase_id || null,
-                cost_center_allocations: lineCdc,
-                fiscal_flags: lineFF },
-              invoice.id,
-              contractRefForRules2,
-            ).catch(err => console.warn('[rules] error:', err));
-
-            // Company memory: create counterparty_pattern fact
-            const memAcc = lc.account_id ? allAccounts.find(a => a.id === lc.account_id) : null;
-            const memCat = lc.category_id ? allCategories.find(c => c.id === lc.category_id) : null;
-            const memArt = lineArticleMap[line.id];
-            createMemoryFromClassification(
-              companyId, cp?.id || null, cp?.denom || null,
-              line.description, memCat?.name || null,
-              memAcc?.code || null, memAcc?.name || null,
-              invoice.direction as 'in' | 'out',
-              memArt?.code || null, memArt?.name || null,
-            ).catch(err => console.warn('[memory] error:', err));
-          }
-        }
-      }
-
-      // 7. Persist updated fiscal flags for lines that were modified by fiscal review
+      // 6. Persist updated fiscal flags for lines that were modified by fiscal review
       for (const [lineId, ff] of Object.entries(lineFiscalFlags)) {
         if (ff) {
-          saveLineFiscalFlags(lineId, ff).catch(e => console.warn('[fiscal] save error:', e));
+          await saveLineFiscalFlags(lineId, ff);
         }
       }
 
-      // 8. Clear invoice_notes if all alerts resolved, update has_fiscal_alerts
+      // 7. Clear invoice_notes if all alerts resolved, update has_fiscal_alerts
       if (invoiceNotes.length === 0) {
-        clearInvoiceNotes(invoice.id).catch(e => console.warn('[fiscal] clear notes error:', e));
+        await clearInvoiceNotes(invoice.id);
       }
 
-      // 9. Refresh badges in sidebar
+      // 8. Refresh badges in sidebar
       onRefreshBadges(invoice.id);
-      toast.success('Modifiche salvate');
+      if (learningWarnings.length > 0) {
+        toast.warning(`Modifiche salvate con ${learningWarnings.length} warning di apprendimento`);
+      } else {
+        toast.success('Modifiche salvate');
+      }
     } catch (e: any) {
       console.error('Confirm changes error:', e);
       toast.error('Errore nel salvataggio delle modifiche');
@@ -2051,7 +2176,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap,
     lineProjects, originalLineProjects, dismissedArticleLineIds,
     detail?.invoice_lines, onPatchInvoice, onRefreshBadges, allAccounts, allCategories,
-    lineFiscalFlags, invoiceNotes]);
+    lineFiscalFlags, invoiceNotes, pendingFiscalChoices, primaryContractRef]);
 
   // Copy classification from a line
   const handleCopyLineClassif = useCallback((lineId: string) => {
@@ -2110,6 +2235,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     setLineConfidences({});
     setLineReviewFlags({});
     setInvoiceNotes([]);
+    setPendingFiscalChoices([]);
     setAiSuggestions({});
     setDismissedArticleLineIds(new Set());
     setAiClassifResult(null);
@@ -2141,57 +2267,27 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         return updated;
       });
       setClassifDirty(true);
-
-      // Save fiscal decision for the learning loop (fire-and-forget)
-      if (company?.id && invoice?.id) {
-        const cp = (invoice?.counterparty || {}) as any;
-        const vatKey = cp?.piva || null;
-        const dir = (invoice?.direction || 'in') as 'in' | 'out';
-
-        // Save structured fiscal_decision (for deterministic pre-resolution)
-        // v3: includes contract_ref and account_id for per-contract matching
-        if (vatKey) {
-          const firstLineId = alert.affected_lines[0];
-          const firstLine = detail?.invoice_lines?.find(l => l.id === firstLineId);
-          if (firstLine) {
-            let fdContractRef: string | null = null;
-            try {
-              if (detail?.raw_xml) {
-                const pxFd = parseXmlDetail(detail.raw_xml);
-                const b0Fd = pxFd?.bodies?.[0];
-                if (b0Fd?.contratti?.length) fdContractRef = b0Fd.contratti[0]?.id || null;
-              }
-            } catch { /* ignore */ }
-            const fdAccountId = lineClassifs[firstLineId]?.account_id || null;
-            saveFiscalDecision(
-              company!.id, invoice!.id,
-              firstLine.description, vatKey, dir,
-              { type: alert.type, chosen_option_label: option.label, fiscal_override: option.fiscal_override },
-              fdContractRef,
-              fdAccountId,
-            ).catch((e: unknown) => console.warn('[fiscal-decision] save error:', e));
-          }
-        }
-
-        // Also save to company memory for AI context
-        import('@/lib/companyMemoryService').then(({ insertMemoryFact }) => {
-          insertMemoryFact({
-            company_id: company!.id,
-            fact_type: 'fiscal_rule',
-            fact_text: `Controparte '${cp?.denom || 'N/D'}': ${alert.title} → scelta: ${option.label}`,
-            metadata: { alert_type: alert.type, fiscal_override: option.fiscal_override },
-            counterparty_id: cp?.id || null,
-            source: 'user_confirm',
-          }).catch((e: unknown) => console.warn('[memory] fiscal choice error:', e));
-        });
-
-        toast.success('Decisione fiscale salvata — verrà applicata automaticamente per fatture simili');
-      }
+      const firstLineId = alert.affected_lines[0];
+      const firstLine = detail?.invoice_lines?.find(l => l.id === firstLineId);
+      setPendingFiscalChoices(prev => [
+        ...prev.filter(choice => !(choice.first_line_id === firstLineId && choice.alert_type === alert.type)),
+        {
+          first_line_id: firstLineId,
+          alert_type: alert.type,
+          alert_title: alert.title,
+          chosen_option_label: option.label,
+          fiscal_override: option.fiscal_override,
+          affected_lines: [...alert.affected_lines],
+          line_description: firstLine?.description || alert.title,
+          contract_ref: primaryContractRef,
+          account_id: lineClassifs[firstLineId]?.account_id || null,
+        },
+      ]);
     }
 
     // Remove resolved/skipped alert
     setInvoiceNotes(prev => prev.filter((_, i) => i !== alertIdx));
-  }, [invoiceNotes, company?.id, invoice?.id, invoice?.counterparty, invoice?.direction, detail?.invoice_lines]);
+  }, [invoiceNotes, detail?.invoice_lines, lineClassifs, primaryContractRef]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }, suggestedPhaseId?: string | null) => {
     const companyId = company?.id;

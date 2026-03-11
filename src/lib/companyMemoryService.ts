@@ -19,6 +19,7 @@ import { getValidAccessToken } from '@/lib/getValidAccessToken'
 
 type FactType = 'counterparty_pattern' | 'account_mapping' | 'user_correction' | 'fiscal_rule' | 'general'
 type FactSource = 'system' | 'user_confirm' | 'user_correction' | 'reconciliation' | 'ai_chat' | 'manual'
+export type InvoiceMemoryOrigin = 'invoice_classification' | 'invoice_fiscal_choice'
 
 interface MemoryInsert {
   company_id: string
@@ -52,12 +53,12 @@ export async function insertMemoryFact(row: MemoryInsert): Promise<string | null
       // Dedup index violation → fact already exists, just return null
       if (error.code === '23505') return null
       console.warn('[companyMemory] insertMemoryFact error:', error.message)
-      return null
+      throw error
     }
     return data?.id || null
   } catch (err) {
     console.warn('[companyMemory] insertMemoryFact exception:', err)
-    return null
+    throw err
   }
 }
 
@@ -268,6 +269,10 @@ export async function createMemoryFromClassification(
   direction: 'in' | 'out',
   articleCode?: string | null,
   articleName?: string | null,
+  options?: {
+    sourceInvoiceId?: string | null
+    origin?: InvoiceMemoryOrigin
+  },
 ): Promise<string | null> {
   if (!lineDescription || lineDescription.length < 3) return null
 
@@ -289,12 +294,43 @@ export async function createMemoryFromClassification(
   if (accountCode) metadata.account_code = accountCode
   if (categoryName) metadata.category_name = categoryName
   if (articleCode) metadata.article_code = articleCode
+  if (options?.sourceInvoiceId) metadata.source_invoice_id = options.sourceInvoiceId
+  if (options?.origin) metadata.origin = options.origin
 
   const memId = await insertMemoryFact({
     company_id: companyId,
     fact_type: 'counterparty_pattern',
     fact_text: factText,
     metadata,
+    counterparty_id: counterpartyId,
+    source: 'user_confirm',
+  })
+
+  if (memId) triggerMemoryEmbed([memId], companyId)
+  return memId
+}
+
+export async function createMemoryFromFiscalChoice(
+  companyId: string,
+  counterpartyId: string | null,
+  counterpartyName: string | null,
+  alertTitle: string,
+  optionLabel: string,
+  alertType: string,
+  fiscalOverride: Record<string, unknown>,
+  sourceInvoiceId?: string | null,
+): Promise<string | null> {
+  const cpLabel = counterpartyName || 'sconosciuto'
+  const memId = await insertMemoryFact({
+    company_id: companyId,
+    fact_type: 'fiscal_rule',
+    fact_text: `Controparte '${cpLabel}': ${alertTitle} → scelta: ${optionLabel}`,
+    metadata: {
+      alert_type: alertType,
+      fiscal_override: fiscalOverride,
+      source_invoice_id: sourceInvoiceId || null,
+      origin: 'invoice_fiscal_choice',
+    },
     counterparty_id: counterpartyId,
     source: 'user_confirm',
   })
@@ -443,4 +479,35 @@ export async function resetCounterpartyMemory(
   }
 
   return { memoryDeactivated, rulesDeactivated }
+}
+
+export async function deactivateInvoiceMemoryFacts(
+  invoiceId: string,
+  origins?: InvoiceMemoryOrigin[],
+): Promise<number> {
+  const originList = origins && origins.length > 0 ? origins : [null]
+  let deactivated = 0
+
+  for (const origin of originList) {
+    let query = supabase
+      .from('company_memory')
+      .update({ active: false, updated_at: new Date().toISOString() })
+      .eq('active', true)
+      .contains('metadata', { source_invoice_id: invoiceId })
+
+    if (origin) {
+      query = query.contains('metadata', { origin })
+    }
+
+    const { data, error } = await query.select('id')
+
+    if (error) {
+      console.error('[companyMemory] deactivateInvoiceMemoryFacts error:', error.message)
+      throw error
+    }
+
+    deactivated += data?.length || 0
+  }
+
+  return deactivated
 }

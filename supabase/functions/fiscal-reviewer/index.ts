@@ -57,6 +57,7 @@ interface ClassifiedLine {
   description: string;
   total_price: number | null;
   category_name: string | null;
+  account_id?: string | null;
   account_code: string | null;
   account_name: string | null;
   confidence: number;
@@ -269,6 +270,10 @@ function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
   return union > 0 ? intersection / union : 0;
 }
 
+function requiresExactContractRef(description: string): boolean {
+  return /\b(leasing|locazione finanziaria)\b/i.test(description);
+}
+
 /* ─── Main ───────────────────────────────── */
 
 Deno.serve(async (req) => {
@@ -452,6 +457,7 @@ Deno.serve(async (req) => {
 
           const lineSubjectKw = extractSubjectKeywords(line.description);
           const lineSubjectSet = new Set(lineSubjectKw);
+          const requireContractRef = requiresExactContractRef(line.description);
 
           const lineDecisions: typeof preResolvedFiscal extends Map<string, infer V> ? V : never = [];
 
@@ -460,17 +466,17 @@ Deno.serve(async (req) => {
 
             // Contract ref compatibility: if the decision has a contract_ref,
             // the invoice MUST have the same ref
-            if (dec.contract_ref) {
+            if (requireContractRef) {
+              if (!dec.contract_ref) continue;
+              if (!contractRefs.includes(dec.contract_ref)) continue;
+            } else if (dec.contract_ref) {
               if (!contractRefs.includes(dec.contract_ref)) continue;
             }
 
             // Account ID compatibility: if the decision has an account_id,
             // the line must have the same account
             if (dec.account_id) {
-              const lineAccCode = line.account_code;
-              // We don't have account_id directly on the line, but we skip
-              // if the decision is account-specific (downstream will match via frontend)
-              // For now, skip this check in the edge function since we don't have line account_id
+              if (line.account_id !== dec.account_id) continue;
             }
 
             const decSubjectSet = new Set((dec.subject_keywords as string[]) || []);

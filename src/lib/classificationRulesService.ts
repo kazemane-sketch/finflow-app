@@ -378,10 +378,14 @@ export async function createRuleFromConfirmation(
       updated_at: new Date().toISOString(),
     }
     if (sourceInvoiceId) updatePayload.source_invoice_id = sourceInvoiceId
-    await supabase
+    const { error } = await supabase
       .from('classification_rules')
       .update(updatePayload)
       .eq('id', existing.id)
+    if (error) {
+      console.error('[classificationRules] Error updating rule:', error.message)
+      throw error
+    }
   } else {
     // Create new rule
     const row: Record<string, unknown> = {
@@ -418,6 +422,7 @@ export async function createRuleFromConfirmation(
         console.warn('[classificationRules] Duplicate rule, skipping:', normalizedDesc.slice(0, 50))
       } else {
         console.error('[classificationRules] Error creating rule:', error.message)
+        throw error
       }
     }
   }
@@ -441,6 +446,7 @@ export async function deactivateRulesForInvoice(invoiceId: string): Promise<void
 
   if (error) {
     console.warn('[classificationRules] Error deactivating rules for invoice:', error.message)
+    throw error
   }
 }
 

@@ -36,6 +36,10 @@ export interface FiscalDecision {
   operation_group_code: string
 }
 
+function requiresExactContractRef(description: string): boolean {
+  return /\b(leasing|locazione finanziaria)\b/i.test(description)
+}
+
 /* ─── Save a fiscal decision ─────────────────── */
 
 /**
@@ -89,7 +93,23 @@ export async function saveFiscalDecision(
 
   if (error) {
     console.warn('[fiscalDecision] saveFiscalDecision error:', error.message)
+    throw error
   }
+}
+
+export async function deleteFiscalDecisionsForInvoice(invoiceId: string): Promise<number> {
+  const { data, error } = await supabase
+    .from('fiscal_decisions')
+    .delete()
+    .eq('source_invoice_id', invoiceId)
+    .select('id')
+
+  if (error) {
+    console.warn('[fiscalDecision] deleteFiscalDecisionsForInvoice error:', error.message)
+    throw error
+  }
+
+  return data?.length || 0
 }
 
 /* ─── Find matching fiscal decisions ─────────── */
@@ -131,6 +151,7 @@ export async function findMatchingFiscalDecisions(
 
     const lineSubjectKw = extractSubjectKeywords(line.description)
     const lineSubjectSet = new Set(lineSubjectKw)
+    const requireContractRef = requiresExactContractRef(line.description)
 
     const matching: FiscalDecision[] = []
 
@@ -140,7 +161,10 @@ export async function findMatchingFiscalDecisions(
 
       // Check 1.5: contract_ref compatibility
       // If the decision has a contract_ref, the invoice MUST have the same ref
-      if ((dec as any).contract_ref) {
+      if (requireContractRef) {
+        if (!(dec as any).contract_ref) continue
+        if (!contractRefs?.includes((dec as any).contract_ref)) continue
+      } else if ((dec as any).contract_ref) {
         if (!contractRefs?.includes((dec as any).contract_ref)) continue
       }
 

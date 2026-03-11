@@ -532,6 +532,7 @@ export async function runClassificationPipeline(
         description: l.description,
         total_price: l.total_price,
         category_name: null, // would need lookup
+        account_id: lr?.account_id || null,
         account_code: lr?.account_code || null,
         account_name: null,
         confidence: lr?.confidence || 0,
