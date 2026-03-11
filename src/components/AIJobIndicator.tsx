@@ -80,6 +80,7 @@ function JobCard({ job }: { job: AIJob }) {
   const Icon = cfg.icon
   const elapsed = useElapsed(job.startedAt, job.endedAt)
   const pct = job.total > 0 ? Math.round((job.current / job.total) * 100) : 0
+  const latestLog = job.logs[job.logs.length - 1]?.text || null
 
   return (
     <div className={`relative rounded-lg border px-2.5 py-2 ${cfg.bgColor} transition-all`}>
@@ -111,6 +112,21 @@ function JobCard({ job }: { job: AIJob }) {
         )}
       </div>
 
+      {(job.stage || job.message) && (
+        <div className="mt-1 space-y-0.5">
+          {job.stage && (
+            <p className="text-[10px] font-medium text-slate-700 truncate" title={job.stage}>
+              {job.stage}
+            </p>
+          )}
+          {job.message && (
+            <p className="text-[10px] text-gray-500 truncate" title={job.message}>
+              {job.message}
+            </p>
+          )}
+        </div>
+      )}
+
       {/* Progress row (only when running and total > 0) */}
       {job.status === 'running' && job.total > 0 && (
         <div className="mt-1.5">
@@ -125,6 +141,12 @@ function JobCard({ job }: { job: AIJob }) {
             />
           </div>
         </div>
+      )}
+
+      {latestLog && latestLog !== job.message && (
+        <p className="mt-1 text-[10px] text-gray-500 truncate" title={latestLog}>
+          {latestLog}
+        </p>
       )}
 
       {/* Error message */}

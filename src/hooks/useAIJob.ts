@@ -4,23 +4,33 @@
  * Usage:
  *   const { isRunning, progress, startOrStop } = useAIJob('articoli-classify', 'Classificazione Articoli')
  *
- *   <button onClick={() => startOrStop(async (signal, updateProgress) => {
+ *   <button onClick={() => startOrStop(async (signal, updateProgress, appendLog) => {
  *     for (let i = 0; i < items.length; i++) {
  *       if (signal.aborted) return
  *       await doWork(items[i])
- *       updateProgress(i + 1, items.length)
+ *       updateProgress(i + 1, items.length, { message: `Elemento ${i + 1}/${items.length}` })
+ *       appendLog?.(`Completato elemento ${i + 1}`)
  *     }
  *   }, items.length)}>
  *     {isRunning ? `⏹ Stop (${progress.pct}%)` : '✨ Start'}
  *   </button>
  */
 import { useCallback } from 'react'
-import { useAIJobStore, type AIJob } from '@/stores/useAIJobStore'
+import {
+  useAIJobStore,
+  type AIJob,
+  type AIJobProgressMeta,
+} from '@/stores/useAIJobStore'
 
 export type WorkFn = (
   signal: AbortSignal,
-  updateProgress: (current: number, total?: number) => void,
+  updateProgress: (current: number, total?: number, meta?: AIJobProgressMeta) => void,
+  appendLog?: (text: string) => void,
 ) => Promise<void>
+
+export interface UseAIJobOptions {
+  instanceKey?: string | null
+}
 
 export interface UseAIJobReturn {
   isRunning: boolean
@@ -31,9 +41,9 @@ export interface UseAIJobReturn {
   stop: () => void
 }
 
-export function useAIJob(type: string, label: string): UseAIJobReturn {
-  // Subscribe reactively to the job for this type
-  const job = useAIJobStore(s => s.getJobByType(type))
+export function useAIJob(type: string, label: string, options?: UseAIJobOptions): UseAIJobReturn {
+  const instanceKey = options?.instanceKey ?? null
+  const job = useAIJobStore(s => s.getJobByType(type, instanceKey))
   const isRunning = job?.status === 'running'
 
   const current = job?.current ?? 0
@@ -41,16 +51,19 @@ export function useAIJob(type: string, label: string): UseAIJobReturn {
   const pct = total > 0 ? Math.round((current / total) * 100) : 0
 
   const start = useCallback((workFn: WorkFn, totalEstimate?: number) => {
-    // Use getState() for imperative access (avoids stale closures)
     const store = useAIJobStore.getState()
-    const { id, signal } = store.startJob(type, label, totalEstimate)
+    const { id, signal } = store.startJob(type, label, totalEstimate, { instanceKey })
 
-    // Fire-and-forget — runs even if component unmounts
-    workFn(signal, (cur, tot) => {
-      useAIJobStore.getState().updateProgress(id, cur, tot)
-    })
+    workFn(
+      signal,
+      (cur, tot, meta) => {
+        useAIJobStore.getState().updateProgress(id, cur, tot, meta)
+      },
+      (text) => {
+        useAIJobStore.getState().appendLog(id, text)
+      },
+    )
       .then(() => {
-        // Only mark complete if not already cancelled
         const current = useAIJobStore.getState().jobs[id]
         if (current && current.status === 'running') {
           useAIJobStore.getState().completeJob(id)
@@ -66,23 +79,23 @@ export function useAIJob(type: string, label: string): UseAIJobReturn {
           useAIJobStore.getState().failJob(id, msg)
         }
       })
-  }, [type, label])
+  }, [type, label, instanceKey])
 
   const stop = useCallback(() => {
     const store = useAIJobStore.getState()
-    const running = Object.values(store.jobs).find(j => j.type === type && j.status === 'running')
-    if (running) store.cancelJob(running.id)
-  }, [type])
+    const running = store.getJobByType(type, instanceKey)
+    if (running?.status === 'running') store.cancelJob(running.id)
+  }, [type, instanceKey])
 
   const startOrStop = useCallback((workFn: WorkFn, totalEstimate?: number) => {
     const store = useAIJobStore.getState()
-    const running = Object.values(store.jobs).find(j => j.type === type && j.status === 'running')
-    if (running) {
+    const running = store.getJobByType(type, instanceKey)
+    if (running?.status === 'running') {
       store.cancelJob(running.id)
     } else {
       start(workFn, totalEstimate)
     }
-  }, [type, start])
+  }, [type, instanceKey, start])
 
   return { isRunning, job, progress: { current, total, pct }, startOrStop, start, stop }
 }
