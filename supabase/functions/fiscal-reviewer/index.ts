@@ -22,6 +22,34 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+const EMBEDDING_MODEL = "gemini-embedding-001";
+const EXPECTED_DIMS = 3072;
+
+/* ─── Embedding helper ───────────────────── */
+
+function toVectorLiteral(values: number[]): string {
+  return `[${values.map((v) => (Number.isFinite(v) ? v.toFixed(8) : "0")).join(",")}]`;
+}
+
+async function callGeminiEmbedding(apiKey: string, text: string): Promise<number[]> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${apiKey}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: `models/${EMBEDDING_MODEL}`,
+      content: { parts: [{ text }] },
+      taskType: "RETRIEVAL_QUERY",
+      outputDimensionality: EXPECTED_DIMS,
+    }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Gemini embedding error: ${payload?.error?.message || response.status}`);
+  const values = payload?.embedding?.values;
+  if (!Array.isArray(values) || values.length !== EXPECTED_DIMS) throw new Error("Bad embedding dims");
+  return values.map((v: unknown) => Number(v));
+}
+
 /* ─── Types ──────────────────────────────── */
 
 interface ClassifiedLine {
@@ -353,6 +381,48 @@ Deno.serve(async (req) => {
 
     console.log(`[fiscal-reviewer] Admin Panel: config=${agentConfig ? "✓" : "✗"} rules=${agentRules.length} kb=${kbUsed.length}/${allKBRules.length}`);
 
+    // ─── RAG: Document chunks from kb_chunks ────────────────
+    let documentChunksSection = "";
+    let documentChunksDebug: { title: string; similarity: number }[] = [];
+    try {
+      const ragQueryText = lines.map((l) => l.description).join(" | ") + ` | ${counterpartyName}`;
+      const ragVec = await callGeminiEmbedding(geminiKey, ragQueryText);
+      const ragVecLiteral = toVectorLiteral(ragVec);
+
+      const docChunks = await sql.unsafe(
+        `SELECT kc.content, kc.section_title, kc.article_reference,
+                kd.title AS doc_title,
+                (1 - (kc.embedding <=> $1::halfvec(3072)))::float AS similarity
+         FROM kb_chunks kc
+         JOIN kb_documents kd ON kc.document_id = kd.id
+         WHERE (kc.company_id IS NULL OR kc.company_id = $2)
+           AND kd.status = 'ready'
+         ORDER BY kc.embedding <=> $1::halfvec(3072)
+         LIMIT 8`,
+        [ragVecLiteral, companyId],
+      );
+
+      const relevantChunks = (docChunks as any[]).filter((c) => c.similarity >= 0.40);
+      if (relevantChunks.length > 0) {
+        const chunkLines = relevantChunks.slice(0, 5).map((c, i) => {
+          const header = c.section_title || c.doc_title || "Documento";
+          const ref = c.article_reference ? ` (Art. ${c.article_reference})` : "";
+          const content = (c.content || "").slice(0, 1500);
+          return `${i + 1}. [${header}${ref}] (sim=${c.similarity.toFixed(2)})\n${content}`;
+        });
+        documentChunksSection = `\n=== CONTESTO NORMATIVO (da documenti caricati) ===\n${chunkLines.join("\n\n")}\n===\n`;
+        documentChunksDebug = relevantChunks.slice(0, 5).map((c) => ({
+          title: c.section_title || c.doc_title || "N/D",
+          similarity: c.similarity,
+        }));
+        console.log(`[fiscal-reviewer] RAG: ${relevantChunks.length} relevant chunks (top sim=${relevantChunks[0].similarity.toFixed(3)})`);
+      } else {
+        console.log(`[fiscal-reviewer] RAG: no relevant chunks (best sim=${(docChunks as any[])[0]?.similarity?.toFixed(3) || "N/A"})`);
+      }
+    } catch (e) {
+      console.warn("[fiscal-reviewer] RAG kb_chunks failed:", e);
+    }
+
     // ─── Pre-resolve fiscal decisions (Fase 3 — preserved) ──────────
     const preResolvedFiscal = new Map<string, {
       alert_type: string;
@@ -500,6 +570,12 @@ Verificale solo se noti un'incongruenza EVIDENTE. Non generare alert su queste.
     const kbBlock = formatKBRules(kbUsed);
     if (kbBlock) {
       promptParts.push(kbBlock);
+      promptParts.push("");
+    }
+
+    // 3b. Document chunks (RAG)
+    if (documentChunksSection) {
+      promptParts.push(documentChunksSection);
       promptParts.push("");
     }
 
@@ -666,6 +742,8 @@ Se nessun alert: []`);
           decisions: decs.map(d => d.alert_type + ": " + d.chosen_option),
         })),
         rule_confirmed_lines: [...ruleConfirmedLineIds],
+        document_chunks_found: documentChunksDebug.length,
+        document_chunks: documentChunksDebug,
       },
     });
   } catch (err) {

@@ -11,7 +11,7 @@ import { supabase, SUPABASE_URL } from '@/integrations/supabase/client'
 import { toast } from 'sonner'
 import {
   Plus, X, Search, Loader2, FileText, Globe, Type,
-  ChevronDown, ChevronUp, BookOpen, Upload, Hash
+  ChevronDown, ChevronUp, BookOpen, Upload, Hash, Sparkles, Check
 } from 'lucide-react'
 
 interface KBDocument {
@@ -24,6 +24,15 @@ interface KBDocument {
 interface KBChunk {
   id: string; chunk_index: number; content: string;
   section_title: string | null; article_reference: string | null; token_count: number;
+}
+
+interface CandidateRule {
+  domain: string; audience: string; title: string; content: string;
+  normativa_ref: string[]; fiscal_values: Record<string, unknown>;
+  trigger_keywords: string[]; trigger_ateco_prefixes: string[];
+  trigger_vat_natures: string[]; trigger_doc_types: string[];
+  priority: number;
+  _selected?: boolean; // frontend-only
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -52,6 +61,13 @@ export default function DocumentsPage() {
   const [pdfFile, setPdfFile] = useState<File | null>(null)
   const [uploading, setUploading] = useState(false)
   const pdfRef = useRef<HTMLInputElement>(null)
+
+  // Extract rules state
+  const [extracting, setExtracting] = useState(false)
+  const [extractDocId, setExtractDocId] = useState<string | null>(null)
+  const [candidates, setCandidates] = useState<CandidateRule[]>([])
+  const [showExtractDialog, setShowExtractDialog] = useState(false)
+  const [savingRules, setSavingRules] = useState(false)
 
   // Status polling
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -209,6 +225,82 @@ export default function DocumentsPage() {
     loadDocs()
   }
 
+  // Extract rules from document
+  const handleExtractRules = async (docId: string) => {
+    setExtracting(true)
+    setExtractDocId(docId)
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/admin-extract-rules`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session?.access_token}`,
+        },
+        body: JSON.stringify({
+          document_id: docId,
+          company_id: session?.user?.user_metadata?.company_id || (await supabase.from('company_members').select('company_id').eq('user_id', session?.user?.id || '').limit(1).single()).data?.company_id,
+        }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'Errore sconosciuto' }))
+        throw new Error(err.error || `HTTP ${res.status}`)
+      }
+      const result = await res.json()
+      const cands = (result.candidates || []).map((c: CandidateRule) => ({ ...c, _selected: true }))
+      setCandidates(cands)
+      setShowExtractDialog(true)
+      if (cands.length === 0) {
+        toast.info('Nessuna regola fiscale trovata in questo documento')
+      } else {
+        toast.success(`${cands.length} regole candidate estratte`)
+      }
+    } catch (e: any) {
+      toast.error(`Estrazione fallita: ${e.message}`)
+    }
+    setExtracting(false)
+  }
+
+  // Save approved candidate rules to knowledge_base
+  const handleSaveExtractedRules = async () => {
+    const selected = candidates.filter(c => c._selected)
+    if (selected.length === 0) {
+      toast.warning('Seleziona almeno una regola')
+      return
+    }
+    setSavingRules(true)
+    try {
+      const rows = selected.map(c => ({
+        domain: c.domain,
+        audience: c.audience,
+        title: c.title,
+        content: c.content,
+        normativa_ref: c.normativa_ref,
+        fiscal_values: c.fiscal_values,
+        trigger_keywords: c.trigger_keywords,
+        trigger_ateco_prefixes: c.trigger_ateco_prefixes,
+        trigger_vat_natures: c.trigger_vat_natures,
+        trigger_doc_types: c.trigger_doc_types,
+        priority: c.priority,
+        status: 'approved',
+        active: true,
+        effective_from: new Date().toISOString().slice(0, 10),
+        effective_to: '2099-12-31',
+        source_document_id: extractDocId,
+      }))
+
+      const { error } = await supabase.from('knowledge_base').insert(rows as any)
+      if (error) throw error
+
+      toast.success(`${selected.length} regole salvate nella Knowledge Base`)
+      setShowExtractDialog(false)
+      setCandidates([])
+    } catch (e: any) {
+      toast.error(`Salvataggio fallito: ${e.message}`)
+    }
+    setSavingRules(false)
+  }
+
   // Load chunks for expanded document
   const loadChunks = async (docId: string) => {
     if (chunks[docId]) return // already loaded
@@ -357,8 +449,13 @@ export default function DocumentsPage() {
                     )}
 
                     <div className="flex gap-2">
-                      <Button size="sm" variant="outline" onClick={() => toast.info('Funzionalità in arrivo. Crea le regole manualmente dalla Knowledge Base.')}>
-                        <BookOpen className="h-3.5 w-3.5 mr-1" /> Estrai regole
+                      <Button size="sm" variant="outline"
+                        disabled={doc.status !== 'ready' || (extracting && extractDocId === doc.id)}
+                        onClick={(e) => { e.stopPropagation(); handleExtractRules(doc.id) }}>
+                        {(extracting && extractDocId === doc.id)
+                          ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+                          : <Sparkles className="h-3.5 w-3.5 mr-1" />}
+                        Estrai regole AI
                       </Button>
                       <Button size="sm" variant="outline" onClick={() => markSuperseded(doc.id)}>
                         Segna come superato
@@ -369,6 +466,89 @@ export default function DocumentsPage() {
               </div>
             )
           })}
+        </div>
+      )}
+
+      {/* Extract Rules Dialog */}
+      {showExtractDialog && candidates.length > 0 && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 overflow-y-auto py-8">
+          <div className="bg-white rounded-xl shadow-2xl p-6 max-w-2xl w-full mx-4 space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+                <Sparkles className="h-5 w-5 text-amber-500" />
+                Regole estratte ({candidates.filter(c => c._selected).length}/{candidates.length} selezionate)
+              </h2>
+              <button onClick={() => { setShowExtractDialog(false); setCandidates([]) }} className="text-slate-400 hover:text-slate-600">
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="space-y-2 max-h-[60vh] overflow-y-auto">
+              {candidates.map((c, i) => {
+                const domainColors: Record<string, string> = {
+                  iva: 'bg-blue-100 text-blue-700', ires_irap: 'bg-purple-100 text-purple-700',
+                  ritenute: 'bg-rose-100 text-rose-700', classificazione: 'bg-emerald-100 text-emerald-700',
+                  settoriale: 'bg-amber-100 text-amber-700', operativo: 'bg-slate-100 text-slate-700',
+                  aggiornamenti: 'bg-cyan-100 text-cyan-700',
+                }
+                return (
+                  <div key={i} className={`border rounded-lg p-3 cursor-pointer transition-colors ${c._selected ? 'border-sky-300 bg-sky-50/30' : 'border-gray-200 bg-gray-50/50 opacity-60'}`}
+                    onClick={() => setCandidates(prev => prev.map((cc, j) => j === i ? { ...cc, _selected: !cc._selected } : cc))}>
+                    <div className="flex items-start gap-2">
+                      <div className={`mt-0.5 w-4 h-4 rounded border flex items-center justify-center shrink-0 ${c._selected ? 'bg-sky-500 border-sky-500' : 'border-gray-300'}`}>
+                        {c._selected && <Check className="h-3 w-3 text-white" />}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${domainColors[c.domain] || 'bg-gray-100 text-gray-600'}`}>
+                            {c.domain.toUpperCase()}
+                          </span>
+                          <span className="text-[9px] text-slate-400">{c.audience}</span>
+                          <span className="text-[9px] text-slate-400">P{c.priority}</span>
+                        </div>
+                        <p className="text-sm font-medium text-slate-800 mt-1">{c.title}</p>
+                        <p className="text-xs text-slate-600 mt-0.5 line-clamp-2">{c.content}</p>
+                        {c.normativa_ref.length > 0 && (
+                          <p className="text-[10px] text-sky-600 mt-1">{c.normativa_ref.join(', ')}</p>
+                        )}
+                        {Object.keys(c.fiscal_values).length > 0 && (
+                          <p className="text-[10px] text-purple-600 mt-0.5">
+                            Valori: {Object.entries(c.fiscal_values).map(([k, v]) => `${k}=${v}`).join(', ')}
+                          </p>
+                        )}
+                        {c.trigger_keywords.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-1">
+                            {c.trigger_keywords.slice(0, 6).map((kw, ki) => (
+                              <span key={ki} className="text-[9px] bg-slate-200 text-slate-600 px-1 py-0.5 rounded">{kw}</span>
+                            ))}
+                            {c.trigger_keywords.length > 6 && <span className="text-[9px] text-slate-400">+{c.trigger_keywords.length - 6}</span>}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+
+            <div className="flex items-center justify-between pt-2 border-t">
+              <div className="flex gap-2">
+                <button className="text-xs text-sky-600 hover:text-sky-800" onClick={() => setCandidates(prev => prev.map(c => ({ ...c, _selected: true })))}>
+                  Seleziona tutte
+                </button>
+                <button className="text-xs text-slate-500 hover:text-slate-700" onClick={() => setCandidates(prev => prev.map(c => ({ ...c, _selected: false })))}>
+                  Deseleziona tutte
+                </button>
+              </div>
+              <div className="flex gap-2">
+                <Button variant="outline" onClick={() => { setShowExtractDialog(false); setCandidates([]) }}>Annulla</Button>
+                <Button onClick={handleSaveExtractedRules} disabled={savingRules || candidates.filter(c => c._selected).length === 0}>
+                  {savingRules ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Check className="h-4 w-4 mr-1" />}
+                  Salva {candidates.filter(c => c._selected).length} regole
+                </Button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 

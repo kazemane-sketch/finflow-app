@@ -367,6 +367,49 @@ Deno.serve(async (req) => {
       console.warn("[classify-v2] Memory embedding failed:", e);
     }
 
+    // ─── RAG: Document chunks from kb_chunks ────────────────
+    let documentChunksSection = "";
+    let documentChunksDebug: { title: string; similarity: number }[] = [];
+    try {
+      // Reuse the same embedding we computed for memory (or compute if missing)
+      const ragQueryText = lines.map((l) => l.description).join(" | ") + ` | ${counterpartyName}`;
+      const ragVec = await callGeminiEmbedding(geminiKey, ragQueryText);
+      const ragVecLiteral = toVectorLiteral(ragVec);
+
+      const docChunks = await sql.unsafe(
+        `SELECT kc.content, kc.section_title, kc.article_reference,
+                kd.title AS doc_title,
+                (1 - (kc.embedding <=> $1::halfvec(3072)))::float AS similarity
+         FROM kb_chunks kc
+         JOIN kb_documents kd ON kc.document_id = kd.id
+         WHERE (kc.company_id IS NULL OR kc.company_id = $2)
+           AND kd.status = 'ready'
+         ORDER BY kc.embedding <=> $1::halfvec(3072)
+         LIMIT 8`,
+        [ragVecLiteral, companyId],
+      );
+
+      const relevantChunks = (docChunks as any[]).filter((c) => c.similarity >= 0.40);
+      if (relevantChunks.length > 0) {
+        const chunkLines = relevantChunks.slice(0, 5).map((c, i) => {
+          const header = c.section_title || c.doc_title || "Documento";
+          const ref = c.article_reference ? ` (Art. ${c.article_reference})` : "";
+          const content = (c.content || "").slice(0, 1500);
+          return `${i + 1}. [${header}${ref}] (sim=${c.similarity.toFixed(2)})\n${content}`;
+        });
+        documentChunksSection = `\n=== CONTESTO NORMATIVO (da documenti caricati) ===\n${chunkLines.join("\n\n")}\n===\n`;
+        documentChunksDebug = relevantChunks.slice(0, 5).map((c) => ({
+          title: c.section_title || c.doc_title || "N/D",
+          similarity: c.similarity,
+        }));
+        console.log(`[classify-v2] RAG: ${relevantChunks.length} relevant chunks found (top sim=${relevantChunks[0].similarity.toFixed(3)})`);
+      } else {
+        console.log(`[classify-v2] RAG: no relevant chunks (best sim=${(docChunks as any[])[0]?.similarity?.toFixed(3) || "N/A"})`);
+      }
+    } catch (e) {
+      console.warn("[classify-v2] RAG kb_chunks failed:", e);
+    }
+
     // Cross-counterparty article history
     let articleHistorySection = "";
     try {
@@ -461,6 +504,12 @@ Deno.serve(async (req) => {
     const kbBlock = formatKBRules(kbUsed);
     if (kbBlock) {
       promptParts.push(kbBlock);
+      promptParts.push("");
+    }
+
+    // 3b. Document chunks (RAG)
+    if (documentChunksSection) {
+      promptParts.push(documentChunksSection);
       promptParts.push("");
     }
 
@@ -612,6 +661,8 @@ Rispondi con JSON array (no markdown):
         })),
         history_count: historySection ? historySection.split("\n").length : 0,
         memory_facts_count: memoryBlock ? memoryBlock.split("\n").length : 0,
+        document_chunks_found: documentChunksDebug.length,
+        document_chunks: documentChunksDebug,
       },
     });
   } catch (err) {
