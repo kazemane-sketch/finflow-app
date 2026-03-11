@@ -379,6 +379,7 @@ function buildGeminiPrompt(
   phases: ArticlePhaseRow[],
   counterpartyInfo: string,
   history: HistoryRow[],
+  articleHistory: Array<{ description: string; article_code: string; article_name: string; phase_code: string | null; phase_name: string | null; count: number }>,
   memoryBlock: string,
   direction: string,
   lines: InputLine[],
@@ -443,6 +444,16 @@ function buildGeminiPrompt(
       return parts.join(" → ");
     });
     historySection = `STORICO (usa SOLO se la descrizione corrisponde):\n${histLines.join("\n")}`;
+  }
+
+  // Article assignment patterns (cross-counterparty)
+  let articleHistorySection = "";
+  if (articleHistory.length > 0) {
+    const artHistLines = articleHistory.map(ah => {
+      const phasePart = ah.phase_code ? ` fase:${ah.phase_code} (${ah.phase_name})` : "";
+      return `- "${ah.description}" \u2192 art:${ah.article_code} (${ah.article_name})${phasePart} [${ah.count}x confermato]`;
+    });
+    articleHistorySection = `\nSTORICO ARTICOLI (pattern confermati da TUTTE le controparti, non solo questa):\n${artHistLines.join("\n")}\nREGOLA ARTICOLI: Se la descrizione di una riga corrisponde o \u00e8 molto simile a uno di questi pattern confermati, SUGGERISCI lo stesso article_code e phase_code. Il numero tra parentesi indica quante volte \u00e8 stato confermato \u2014 pi\u00f9 \u00e8 alto, pi\u00f9 \u00e8 affidabile. Se la descrizione non corrisponde a nessun pattern, lascia article_code=null.`;
   }
 
   // Fiscal KB rules
@@ -543,6 +554,7 @@ REGOLA: Il NOME della controparte spesso rivela la sua attività principale. Usa
 ===
 
 ${historySection}
+${articleHistorySection}
 
 === VINCOLO DIREZIONE (${direction === "in" ? "PASSIVA" : "ATTIVA"}) ===
 ${direction === "in" ? "Conti di COSTO. category.type: expense/both. VIETATO: conti revenue." : "Conti di RICAVO. category.type: revenue/both. VIETATO: conti costo."}
@@ -1068,6 +1080,45 @@ Deno.serve(async (req) => {
       }
     }
 
+    // ─── Step 5b: Cross-counterparty article history ────────────
+    // Articles are cross-counterparty: "Vendita pozzolana..." appears in invoices
+    // from 10+ different counterparties, all classified with POZ-RSS phase VND.
+    let articleHistory: Array<{
+      description: string;
+      article_code: string;
+      article_name: string;
+      phase_code: string | null;
+      phase_name: string | null;
+      count: number;
+    }> = [];
+
+    try {
+      articleHistory = (await sql`
+        SELECT il.description,
+               art.code as article_code, art.name as article_name,
+               ap.code as phase_code, ap.name as phase_name,
+               count(*)::int as count
+        FROM invoice_line_articles ila
+        JOIN articles art ON ila.article_id = art.id
+        LEFT JOIN article_phases ap ON ila.phase_id = ap.id
+        JOIN invoice_lines il ON ila.invoice_line_id = il.id
+        JOIN invoices i ON ila.invoice_id = i.id
+        WHERE ila.company_id = ${companyId}
+          AND ila.verified = true
+          AND i.direction = ${direction}
+        GROUP BY il.description, art.code, art.name, ap.code, ap.name
+        HAVING count(*) >= 2
+        ORDER BY count(*) DESC
+        LIMIT 30
+      `) as typeof articleHistory;
+
+      if (articleHistory.length > 0) {
+        console.log(`[classify] Cross-counterparty article history: ${articleHistory.length} patterns found`);
+      }
+    } catch (e) {
+      console.warn(`[classify] Cross-counterparty article history failed:`, e);
+    }
+
     // ─── Step 6: Load company context + user instructions ───────
     const companyRow = await sql`
       SELECT name, vat_number FROM companies WHERE id = ${companyId} LIMIT 1
@@ -1169,6 +1220,7 @@ Deno.serve(async (req) => {
       phases,
       counterpartyInfo,
       history,
+      articleHistory,
       memoryBlock,
       direction,
       inputLines,
@@ -1569,6 +1621,7 @@ Deno.serve(async (req) => {
         total_lines: inputLines.length,
         classified: lineResults.filter((r) => r.confidence >= MIN_CONFIDENCE).length,
         history_count: history.length,
+        article_history_patterns: articleHistory.length,
         memory_facts_count: memoryFacts.length,
         model: GEMINI_MODEL,
         kb_rules_found: kbRules.length,
