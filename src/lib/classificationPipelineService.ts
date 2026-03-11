@@ -32,9 +32,11 @@ interface DeterministicResult {
   article_id: string | null
   phase_id: string | null
   cost_center_allocations: { project_id: string; percentage: number }[] | null
+  fiscal_flags: Record<string, unknown> | null
   confidence: number
   reasoning: string
   source: 'rule' | 'history'
+  rule_id: string | null
   matched_groups: string[]
 }
 
@@ -100,6 +102,7 @@ export interface PipelineResult {
     reasoning: string
     fiscal_flags: Record<string, unknown>
     source: string
+    rule_id?: string | null
     suggest_new_account?: Record<string, string> | null
     suggest_new_category?: Record<string, string> | null
   }[]
@@ -274,6 +277,20 @@ export async function runClassificationPipeline(
   // Merge deterministic results into final format
   const lineResults = new Map<string, PipelineResult['lines'][0]>()
   for (const r of resolved) {
+    // Use fiscal_flags from rule if available, otherwise defaults
+    const defaultFlags = {
+      ritenuta_acconto: null,
+      reverse_charge: false,
+      split_payment: false,
+      bene_strumentale: false,
+      deducibilita_pct: 100,
+      iva_detraibilita_pct: 100,
+      note: null,
+    }
+    const fiscalFlags = r.fiscal_flags && Object.keys(r.fiscal_flags).length > 0
+      ? { ...defaultFlags, ...r.fiscal_flags }
+      : defaultFlags
+
     lineResults.set(r.line_id, {
       line_id: r.line_id,
       category_id: r.category_id,
@@ -284,16 +301,9 @@ export async function runClassificationPipeline(
       cost_center_allocations: r.cost_center_allocations || [],
       confidence: r.confidence,
       reasoning: r.reasoning,
-      fiscal_flags: {
-        ritenuta_acconto: null,
-        reverse_charge: false,
-        split_payment: false,
-        bene_strumentale: false,
-        deducibilita_pct: 100,
-        iva_detraibilita_pct: 100,
-        note: null,
-      },
+      fiscal_flags: fiscalFlags,
       source: r.source,
+      rule_id: r.rule_id || null,
     })
   }
 
@@ -382,8 +392,12 @@ export async function runClassificationPipeline(
   let fiscalIssues = 0
   try {
     // Build review input from all classified lines
+    // For rule-confirmed lines, communicate their fiscal_flags_source
     const reviewLines = lines.map(l => {
       const lr = lineResults.get(l.line_id)
+      const ruleResolved = resolved.find(r => r.line_id === l.line_id)
+      const hasFiscalFromRule = ruleResolved?.fiscal_flags && Object.keys(ruleResolved.fiscal_flags).length > 0
+
       return {
         line_id: l.line_id,
         description: l.description,
@@ -397,6 +411,8 @@ export async function runClassificationPipeline(
           bene_strumentale: false, deducibilita_pct: 100, iva_detraibilita_pct: 100, note: null,
         },
         source: lr?.source || 'unknown',
+        fiscal_flags_source: hasFiscalFromRule ? 'rule_confirmed' : 'to_review',
+        fiscal_flags_preset: hasFiscalFromRule ? ruleResolved!.fiscal_flags : null,
       }
     }).filter(l => {
       const lr = lineResults.get(l.line_id)

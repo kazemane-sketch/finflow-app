@@ -46,9 +46,10 @@ import {
   type FiscalAlert, type FiscalAlertOption,
 } from '@/lib/classificationService';
 import { toast } from 'sonner';
-import { createRuleFromConfirmation, findMatchingRules, deactivateRulesForInvoice, type RuleSuggestion } from '@/lib/classificationRulesService';
+import { createRuleFromConfirmation, findMatchingRules, deactivateRulesForInvoice, handleRuleCorrection, type RuleSuggestion } from '@/lib/classificationRulesService';
 import { runClassificationPipeline } from '@/lib/classificationPipelineService';
 import { createMemoryFromClassification } from '@/lib/companyMemoryService';
+import { saveFiscalDecision } from '@/lib/fiscalDecisionService';
 import ExportDialog from '@/components/ExportDialog';
 import SearchableSelect from '@/components/SearchableSelect';
 
@@ -1005,6 +1006,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       }
 
       // Create classification rules from confirmed line-level data (fire-and-forget)
+      // v2: includes fiscal_flags for learning loop
       const cp = (invoice.counterparty || {}) as any;
       if (detail?.invoice_lines) {
         for (const line of detail.invoice_lines) {
@@ -1013,13 +1015,15 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
             const lineCdc = lineProjects[line.id]?.length
               ? lineProjects[line.id].map(p => ({ project_id: p.project_id, percentage: p.percentage }))
               : (cdcRows.length > 0 ? cdcRows.map(c => ({ project_id: c.project_id, percentage: c.percentage })) : null);
+            const lineFF = lineFiscalFlags[line.id] || null;
             createRuleFromConfirmation(
               companyId, cp?.piva || null, cp?.denom || null,
               line.description, invoice.direction as 'in' | 'out',
               { category_id: lc.category_id, account_id: lc.account_id,
                 article_id: lineArticleMap[line.id]?.article_id || null,
                 phase_id: lineArticleMap[line.id]?.phase_id || null,
-                cost_center_allocations: lineCdc },
+                cost_center_allocations: lineCdc,
+                fiscal_flags: lineFF },
               invoice.id,
             ).catch(err => console.warn('[rules] error:', err));
           }
@@ -1032,7 +1036,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     setClassifSaving(false);
   }, [company?.id, invoice?.id, selCategoryId, selAccountId, cdcRows, cdcMode, detail?.invoice_lines,
     lineClassifs, lineArticleMap, originalLineArticleMap, lineProjects, originalLineProjects,
-    invoice?.counterparty, invoice?.direction, onRefreshBadges]);
+    invoice?.counterparty, invoice?.direction, onRefreshBadges, lineFiscalFlags]);
 
   // Local CdC row management (no DB calls)
   const handleAddCdc = useCallback(() => {
@@ -1615,6 +1619,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setClassifDirty(false);
 
       // 6. Create classification rules + company memory from confirmed data (fire-and-forget)
+      // v2: rules now include fiscal_flags from lineFiscalFlags for learning loop
       const cp = (invoice.counterparty || {}) as any;
       if (detail?.invoice_lines) {
         for (const line of detail.invoice_lines) {
@@ -1623,13 +1628,15 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
             const lineCdc = lineProjects[line.id]?.length
               ? lineProjects[line.id].map(p => ({ project_id: p.project_id, percentage: p.percentage }))
               : (cdcRows.length > 0 ? cdcRows.map(c => ({ project_id: c.project_id, percentage: c.percentage })) : null);
+            const lineFF = lineFiscalFlags[line.id] || null;
             createRuleFromConfirmation(
               companyId, cp?.piva || null, cp?.denom || null,
               line.description, invoice.direction as 'in' | 'out',
               { category_id: lc.category_id, account_id: lc.account_id,
                 article_id: lineArticleMap[line.id]?.article_id || null,
                 phase_id: lineArticleMap[line.id]?.phase_id || null,
-                cost_center_allocations: lineCdc },
+                cost_center_allocations: lineCdc,
+                fiscal_flags: lineFF },
               invoice.id,
             ).catch(err => console.warn('[rules] error:', err));
 
@@ -1764,9 +1771,26 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       });
       setClassifDirty(true);
 
-      // Save fiscal decision to company memory (fire-and-forget)
-      if (company?.id) {
+      // Save fiscal decision for the learning loop (fire-and-forget)
+      if (company?.id && invoice?.id) {
         const cp = (invoice?.counterparty || {}) as any;
+        const vatKey = cp?.piva || null;
+        const dir = (invoice?.direction || 'in') as 'in' | 'out';
+
+        // Save structured fiscal_decision (for deterministic pre-resolution)
+        if (vatKey) {
+          const firstLineId = alert.affected_lines[0];
+          const firstLine = detail?.invoice_lines?.find(l => l.id === firstLineId);
+          if (firstLine) {
+            saveFiscalDecision(
+              company!.id, invoice!.id,
+              firstLine.description, vatKey, dir,
+              { type: alert.type, chosen_option_label: option.label, fiscal_override: option.fiscal_override },
+            ).catch((e: unknown) => console.warn('[fiscal-decision] save error:', e));
+          }
+        }
+
+        // Also save to company memory for AI context
         import('@/lib/companyMemoryService').then(({ insertMemoryFact }) => {
           insertMemoryFact({
             company_id: company!.id,
@@ -1777,12 +1801,14 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
             source: 'user_confirm',
           }).catch((e: unknown) => console.warn('[memory] fiscal choice error:', e));
         });
+
+        toast.success('Decisione fiscale salvata — verrà applicata automaticamente per fatture simili');
       }
     }
 
     // Remove resolved/skipped alert
     setInvoiceNotes(prev => prev.filter((_, i) => i !== alertIdx));
-  }, [invoiceNotes, company?.id, invoice?.counterparty]);
+  }, [invoiceNotes, company?.id, invoice?.id, invoice?.counterparty, invoice?.direction, detail?.invoice_lines]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }, suggestedPhaseId?: string | null) => {
     const companyId = company?.id;

@@ -5,10 +5,13 @@
  * invoice line appears from the same counterparty, the system proposes the same
  * classification instantly (0ms) as a SUGGESTION — never applied automatically.
  *
+ * v2 (Fase 3): rules now include fiscal_flags, operation_group_code, and
+ * subject_keywords for smarter matching. Wrong rules are DELETED (not deactivated).
+ *
  * Flow:
  *   1. User confirms → createRuleFromConfirmation() → upsert classification_rules
  *   2. New invoice opened → findMatchingRules() → instant suggestions
- *   3. User corrects a rule suggestion → recordRuleCorrection() → deactivate if too many corrections
+ *   3. User corrects → handleRuleCorrection() → DELETE old rule + create new one
  */
 import { supabase } from '@/integrations/supabase/client'
 
@@ -26,6 +29,9 @@ export interface ClassificationRule {
   category_id: string | null
   account_id: string | null
   cost_center_allocations: { project_id: string; percentage: number }[] | null
+  fiscal_flags: Record<string, unknown> | null
+  operation_group_code: string | null
+  subject_keywords: string[]
   confidence: number
   times_applied: number
   times_confirmed: number
@@ -42,8 +48,30 @@ export interface RuleSuggestion {
   category_id: string | null
   account_id: string | null
   cost_center_allocations: { project_id: string; percentage: number }[] | null
+  fiscal_flags: Record<string, unknown> | null
   confidence: number
   source: 'rule'
+}
+
+/* ─── Operation keyword groups cache ─────────── */
+
+let _groupsCache: { group_code: string; group_name: string; keywords: string[] }[] | null = null
+let _groupsCacheTime = 0
+const GROUPS_CACHE_TTL = 5 * 60 * 1000 // 5 min
+
+async function loadKeywordGroups(): Promise<{ group_code: string; group_name: string; keywords: string[] }[]> {
+  const now = Date.now()
+  if (_groupsCache && now - _groupsCacheTime < GROUPS_CACHE_TTL) return _groupsCache
+
+  const { data } = await supabase
+    .from('operation_keyword_groups')
+    .select('group_code, group_name, keywords')
+    .eq('active', true)
+    .order('sort_order')
+
+  _groupsCache = (data || []) as { group_code: string; group_name: string; keywords: string[] }[]
+  _groupsCacheTime = now
+  return _groupsCache
 }
 
 /* ─── Description normalization ──────────────── */
@@ -78,17 +106,88 @@ export function normalizeDescription(desc: string): string {
  * Normalize a VAT key for consistent matching.
  * Strips country prefix and non-alphanumeric characters.
  */
-function normalizeVatKey(piva: string): string {
+export function normalizeVatKey(piva: string): string {
   return piva.toUpperCase().replace(/^IT/i, '').replace(/[^A-Z0-9]/gi, '')
+}
+
+/* ─── Operation group matching ───────────────── */
+
+/**
+ * Cerca nel dizionario sinonimi il gruppo operazione per una descrizione.
+ * Ritorna il gruppo con la keyword più lunga trovata (match più specifico).
+ */
+export async function getOperationGroupForDescription(
+  description: string,
+): Promise<{ group_code: string; group_name: string } | null> {
+  const descLower = description.toLowerCase()
+  const groups = await loadKeywordGroups()
+
+  let bestMatch: { group_code: string; group_name: string; matchLen: number } | null = null
+
+  for (const g of groups) {
+    for (const kw of (g.keywords || [])) {
+      const kwLower = kw.toLowerCase()
+      if (descLower.includes(kwLower)) {
+        if (!bestMatch || kwLower.length > bestMatch.matchLen) {
+          bestMatch = { group_code: g.group_code, group_name: g.group_name, matchLen: kwLower.length }
+        }
+      }
+    }
+  }
+
+  return bestMatch ? { group_code: bestMatch.group_code, group_name: bestMatch.group_name } : null
+}
+
+/* ─── Subject keywords extraction ────────────── */
+
+const STOPWORDS = new Set([
+  'per', 'con', 'del', 'della', 'dei', 'delle', 'dal', 'dalla',
+  'nel', 'nella', 'sul', 'sulla', 'che', 'non', 'una', 'uno',
+  'gli', 'alla', 'alle', 'tra', 'fra', 'come', 'anche', 'più',
+  'rif', 'vostro', 'nostro', 'sig', 'spett', 'fattura', 'fatt',
+  'numero', 'num', 'art', 'cod', 'tipo', 'data', 'periodo',
+  'mese', 'anno', 'totale', 'importo', 'prezzo', 'costo',
+  'netto', 'lordo', 'iva', 'inclusa', 'esclusa',
+])
+
+/**
+ * Estrae le keywords del SOGGETTO dalla descrizione.
+ * Il soggetto è CIÒ su cui si agisce (camion, auto, escavatore, ufficio...),
+ * non L'AZIONE (riparazione, vendita, trasporto).
+ *
+ * Approccio: rimuovi targhe/numeri/importi/date, poi filtra stopwords.
+ * Le parole restanti significative sono i subject keywords.
+ */
+export function extractSubjectKeywords(description: string): string[] {
+  let desc = description.toLowerCase()
+
+  // Rimuovi targhe (es. FG123XX, AB789ZZ)
+  desc = desc.replace(/\b[a-z]{2}\d{3}[a-z]{2}\b/gi, '')
+
+  // Rimuovi numeri, importi, date
+  desc = desc.replace(/\b\d+([.,]\d+)?\s*(eur|euro|€|kg|lt|ton|pz|nr|q\.li)?\b/gi, '')
+  desc = desc.replace(/\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b/g, '')
+
+  // Rimuovi punteggiatura
+  desc = desc.replace(/[,;:()[\]{}'"/\\.\-]/g, ' ')
+
+  // Normalizza spazi
+  desc = desc.replace(/\s+/g, ' ').trim()
+
+  // Le parole rimaste (filtrate per lunghezza >= 3 e non stopwords)
+  const words = desc.split(' ').filter(w => w.length >= 3 && !STOPWORDS.has(w))
+
+  // Ritorna max 5 keywords significative (le più lunghe = più specifiche)
+  return [...new Set(words)]
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 5)
 }
 
 /* ─── Find matching rules ────────────────────── */
 
 /**
  * For each invoice line, search for a matching classification rule.
- * Match logic:
- *   1. If vat_key available → search by vat_key + description_pattern (substring match)
- *   2. If no vat_key → search by counterparty_name_pattern
+ * v2: uses operation_group_code matching and Jaccard similarity >= 0.85.
  *
  * Returns only SUGGESTIONS — never writes to DB.
  */
@@ -144,34 +243,42 @@ export async function findMatchingRules(
   const suggestions: RuleSuggestion[] = []
 
   for (const line of lines) {
-    const normalizedDesc = normalizeDescription(line.description)
-    if (normalizedDesc.length < 3) continue
+    const normalizedLine = normalizeDescription(line.description)
+    if (normalizedLine.length < 3) continue
 
-    // Find best matching rule: the rule's description_pattern must be a substring of the normalized description
-    let bestRule: ClassificationRule | null = null
-    let bestMatchLength = 0
+    // Estrai operation group della riga corrente
+    const lineOpGroup = await getOperationGroupForDescription(line.description)
+
+    const lineWords = new Set(normalizedLine.split(' ').filter(w => w.length >= 2))
 
     for (const rule of rules) {
-      // Check if the rule's pattern is contained in the line's normalized description
-      if (normalizedDesc.includes(rule.description_pattern)) {
-        // Prefer longer patterns (more specific match)
-        if (rule.description_pattern.length > bestMatchLength) {
-          bestMatchLength = rule.description_pattern.length
-          bestRule = rule
-        }
-      }
-    }
+      const ruleWords = new Set(
+        (rule.description_pattern || '').split(' ').filter((w: string) => w.length >= 2)
+      )
 
-    if (bestRule) {
+      // ── CHECK 1: Operation group deve corrispondere ──
+      // Se la regola ha un operation_group_code e la riga ha un gruppo diverso → skip
+      if (rule.operation_group_code && lineOpGroup?.group_code) {
+        if (rule.operation_group_code !== lineOpGroup.group_code) continue
+      }
+
+      // ── CHECK 2: Similarità Jaccard sulle parole normalizzate ──
+      const intersection = [...lineWords].filter(w => ruleWords.has(w)).length
+      const union = new Set([...lineWords, ...ruleWords]).size
+      const similarity = union > 0 ? intersection / union : 0
+
+      if (similarity < 0.85) continue
+
       suggestions.push({
         line_id: line.id,
-        rule_id: bestRule.id,
-        article_id: bestRule.article_id,
-        phase_id: bestRule.phase_id,
-        category_id: bestRule.category_id,
-        account_id: bestRule.account_id,
-        cost_center_allocations: bestRule.cost_center_allocations,
-        confidence: Number(bestRule.confidence),
+        rule_id: rule.id,
+        article_id: rule.article_id,
+        phase_id: rule.phase_id,
+        category_id: rule.category_id,
+        account_id: rule.account_id,
+        cost_center_allocations: rule.cost_center_allocations,
+        fiscal_flags: rule.fiscal_flags || null,
+        confidence: Number(rule.confidence),
         source: 'rule',
       })
 
@@ -180,11 +287,13 @@ export async function findMatchingRules(
         supabase
           .from('classification_rules')
           .update({
-            times_applied: (bestRule.times_applied || 0) + 1,
+            times_applied: (rule.times_applied || 0) + 1,
             last_applied_at: new Date().toISOString(),
           })
-          .eq('id', bestRule.id)
+          .eq('id', rule.id)
       ).catch(() => {})
+
+      break // una sola regola per riga
     }
   }
 
@@ -195,7 +304,7 @@ export async function findMatchingRules(
 
 /**
  * Create or update a classification rule when the user CONFIRMS a classification.
- * Called alongside createClassificationExample() in the confirm flow.
+ * v2: now includes fiscal_flags, operation_group_code, subject_keywords.
  *
  * If a rule already exists for the same counterparty + description pattern,
  * increment times_confirmed and update classification if changed.
@@ -212,6 +321,7 @@ export async function createRuleFromConfirmation(
     category_id?: string | null
     account_id?: string | null
     cost_center_allocations?: { project_id: string; percentage: number }[] | null
+    fiscal_flags?: Record<string, unknown> | null
   },
   sourceInvoiceId?: string | null,
 ): Promise<void> {
@@ -219,6 +329,12 @@ export async function createRuleFromConfirmation(
   if (normalizedDesc.length < 3) return
 
   const vatKey = counterpartyVatKey ? normalizeVatKey(counterpartyVatKey) : null
+
+  // Estrai operation_group_code dal dizionario sinonimi
+  const operationGroup = await getOperationGroupForDescription(lineDescription)
+
+  // Estrai subject_keywords dalla descrizione
+  const subjectKw = extractSubjectKeywords(lineDescription)
 
   // Check if rule exists
   let query = supabase
@@ -245,6 +361,9 @@ export async function createRuleFromConfirmation(
       category_id: classification.category_id ?? null,
       account_id: classification.account_id ?? null,
       cost_center_allocations: classification.cost_center_allocations ?? null,
+      fiscal_flags: classification.fiscal_flags ?? null,
+      operation_group_code: operationGroup?.group_code || null,
+      subject_keywords: subjectKw,
       active: true, // Re-activate if it was deactivated
       updated_at: new Date().toISOString(),
     }
@@ -266,6 +385,9 @@ export async function createRuleFromConfirmation(
       category_id: classification.category_id ?? null,
       account_id: classification.account_id ?? null,
       cost_center_allocations: classification.cost_center_allocations ?? null,
+      fiscal_flags: classification.fiscal_flags ?? null,
+      operation_group_code: operationGroup?.group_code || null,
+      subject_keywords: subjectKw,
       confidence: 95,
       times_applied: 0,
       times_confirmed: 1,
@@ -311,9 +433,57 @@ export async function deactivateRulesForInvoice(invoiceId: string): Promise<void
   }
 }
 
-/* ─── Record rule correction ─────────────────── */
+/* ─── Handle rule correction (DELETE + recreate) ── */
 
 /**
+ * L'utente ha corretto una classificazione suggerita da una regola.
+ * ELIMINA la regola sbagliata e crea una nuova con i dati corretti.
+ *
+ * v2: DELETE fisico, non disattivazione.
+ */
+export async function handleRuleCorrection(
+  companyId: string,
+  invoiceId: string,
+  ruleId: string,
+  correctedLine: {
+    description: string
+    category_id: string | null
+    account_id: string | null
+    fiscal_flags?: Record<string, unknown> | null
+  },
+  counterpartyVatKey: string | null,
+  counterpartyName: string | null,
+  direction: 'in' | 'out',
+  articleId?: string | null,
+  phaseId?: string | null,
+  costCenterAllocations?: { project_id: string; percentage: number }[] | null,
+): Promise<void> {
+  // ELIMINA la regola sbagliata (DELETE fisico, non disattivazione)
+  await supabase
+    .from('classification_rules')
+    .delete()
+    .eq('id', ruleId)
+
+  // Crea una nuova regola con i dati corretti
+  await createRuleFromConfirmation(
+    companyId, counterpartyVatKey, counterpartyName,
+    correctedLine.description, direction,
+    {
+      category_id: correctedLine.category_id,
+      account_id: correctedLine.account_id,
+      article_id: articleId || null,
+      phase_id: phaseId || null,
+      cost_center_allocations: costCenterAllocations || null,
+      fiscal_flags: correctedLine.fiscal_flags || null,
+    },
+    invoiceId,
+  )
+}
+
+/* ─── Record rule correction (legacy, kept for compat) ── */
+
+/**
+ * @deprecated Use handleRuleCorrection() instead.
  * When a user corrects a classification that was suggested by a rule.
  * Increment times_corrected. If correction rate > 30%, deactivate the rule.
  */
