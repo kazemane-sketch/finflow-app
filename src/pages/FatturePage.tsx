@@ -2,7 +2,7 @@
 // Tab layout redesign: Classification-first UX with Documento/Pagamenti/Note tabs
 import React, { useState, useCallback, useRef, useEffect, useMemo, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { processInvoiceFile, TIPO, MP, REG, mpLabel, tpLabel } from '@/lib/invoiceParser';
 import {
   saveInvoicesToDB, loadInvoices, loadInvoiceDetail, loadInvoiceStats,
@@ -50,6 +50,7 @@ import { toast } from 'sonner';
 import { createRuleFromConfirmation, findMatchingRules, deactivateRulesForInvoice, handleRuleCorrection, type RuleSuggestion } from '@/lib/classificationRulesService';
 import { runClassificationPipeline, type PipelineStepDebug } from '@/lib/classificationPipelineService';
 import { createMemoryFromClassification } from '@/lib/companyMemoryService';
+import { extractProvinceSiglaFromAddress, loadCounterpartyHeaderInfo } from '@/lib/counterpartyService';
 import { saveFiscalDecision } from '@/lib/fiscalDecisionService';
 import ExportDialog from '@/components/ExportDialog';
 import SearchableSelect from '@/components/SearchableSelect';
@@ -514,7 +515,7 @@ function SingleInvoiceAIProgressCard({ job, onStop }: { job: AIJob; onStop: () =
 // ============================================================
 // SIDEBAR CARD
 // ============================================================
-function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, isMatched, suggestionScore, meta }: { inv: DBInvoice; selected: boolean; checked: boolean; selectMode: boolean; onSelect: () => void; onCheck: () => void; isMatched?: boolean; suggestionScore?: number; meta?: InvoiceClassificationMeta }) {
+function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, isMatched, suggestionScore, meta, rowRef }: { inv: DBInvoice; selected: boolean; checked: boolean; selectMode: boolean; onSelect: () => void; onCheck: () => void; isMatched?: boolean; suggestionScore?: number; meta?: InvoiceClassificationMeta; rowRef?: (node: HTMLDivElement | null) => void }) {
   const nc = inv.doc_type === 'TD04' || inv.doc_type === 'TD05';
   const cp = (inv.counterparty || {}) as any;
   const displayName = cp?.denom || inv.source_filename || 'Sconosciuto';
@@ -525,7 +526,11 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, is
   );
   const needsClassification = !hasAnyField && inv.classification_status !== 'ai_suggested';
   return (
-    <div className={`flex items-start gap-2 px-3 py-2.5 cursor-pointer border-b border-gray-100 transition-all ${checked ? 'bg-blue-50 border-l-4 border-l-blue-500' : selected ? 'bg-sky-50 border-l-4 border-l-sky-500' : 'border-l-4 border-l-transparent hover:bg-gray-50'}`}>
+    <div
+      ref={rowRef}
+      data-invoice-id={inv.id}
+      className={`flex items-start gap-2 px-3 py-2.5 cursor-pointer border-b border-gray-100 transition-all ${checked ? 'bg-blue-50 border-l-4 border-l-blue-500' : selected ? 'bg-sky-50 border-l-4 border-l-sky-500' : 'border-l-4 border-l-transparent hover:bg-gray-50'}`}
+    >
       {selectMode && <input type="checkbox" checked={checked} onChange={onCheck} className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />}
       <div className="flex-1 min-w-0" onClick={onSelect}>
         <div className="flex justify-between items-center">
@@ -762,6 +767,101 @@ const DETAIL_TABS: { key: DetailTab; label: string; icon: string }[] = [
   { key: 'note', label: 'Note', icon: '\uD83D\uDCDD' },
 ];
 
+type FattureReturnFilters = {
+  direction: 'all' | 'in' | 'out';
+  status: 'all' | 'pending' | 'overdue' | 'paid';
+  aiSuggested: boolean;
+  dateFrom: string;
+  dateTo: string;
+  query: string;
+  amountMin?: number;
+  amountMax?: number;
+  counterpartyPattern?: string;
+};
+
+type FattureReturnContext = {
+  origin: 'invoice-counterparty';
+  selectedInvoiceId: string;
+  filters: FattureReturnFilters;
+  loadedPageIndex: number;
+  sidebarScrollTop: number;
+};
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function parseFiniteNumber(value: unknown): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function readFattureReturnContext(state: unknown): FattureReturnContext | null {
+  const root = isPlainRecord(state) ? state : null;
+  const raw = root && isPlainRecord(root.returnContext) ? root.returnContext : null;
+  if (!raw) return null;
+
+  const selectedInvoiceId = typeof raw.selectedInvoiceId === 'string' ? raw.selectedInvoiceId.trim() : '';
+  const rawFilters = isPlainRecord(raw.filters) ? raw.filters : {};
+  if (raw.origin !== 'invoice-counterparty' || !selectedInvoiceId) return null;
+
+  const rawDirection = rawFilters.direction;
+  const rawStatus = rawFilters.status;
+  const direction = rawDirection === 'all' || rawDirection === 'in' || rawDirection === 'out' ? rawDirection : 'in';
+  const status = rawStatus === 'all' || rawStatus === 'pending' || rawStatus === 'overdue' || rawStatus === 'paid'
+    ? rawStatus
+    : 'all';
+
+  return {
+    origin: 'invoice-counterparty',
+    selectedInvoiceId,
+    filters: {
+      direction,
+      status,
+      aiSuggested: Boolean(rawFilters.aiSuggested),
+      dateFrom: typeof rawFilters.dateFrom === 'string' ? rawFilters.dateFrom : '',
+      dateTo: typeof rawFilters.dateTo === 'string' ? rawFilters.dateTo : '',
+      query: typeof rawFilters.query === 'string' ? rawFilters.query : '',
+      amountMin: parseFiniteNumber(rawFilters.amountMin),
+      amountMax: parseFiniteNumber(rawFilters.amountMax),
+      counterpartyPattern: typeof rawFilters.counterpartyPattern === 'string' && rawFilters.counterpartyPattern.trim()
+        ? rawFilters.counterpartyPattern
+        : undefined,
+    },
+    loadedPageIndex: Math.max(0, Math.floor(parseFiniteNumber(raw.loadedPageIndex) ?? 0)),
+    sidebarScrollTop: Math.max(0, parseFiniteNumber(raw.sidebarScrollTop) ?? 0),
+  };
+}
+
+function replaceCurrentHistoryLocationState(nextLocationState: Record<string, unknown>) {
+  if (typeof window === 'undefined') return;
+  const currentHistoryState = isPlainRecord(window.history.state) ? window.history.state : {};
+  window.history.replaceState(
+    { ...currentHistoryState, usr: nextLocationState },
+    '',
+    window.location.href,
+  );
+}
+
+function writeFattureReturnContext(context: FattureReturnContext) {
+  if (typeof window === 'undefined') return;
+  const currentHistoryState = isPlainRecord(window.history.state) ? window.history.state : {};
+  const currentLocationState = isPlainRecord(currentHistoryState.usr) ? currentHistoryState.usr : {};
+  replaceCurrentHistoryLocationState({
+    ...currentLocationState,
+    returnContext: context,
+  });
+}
+
+function consumeFattureReturnContextFromHistory() {
+  if (typeof window === 'undefined') return;
+  const currentHistoryState = isPlainRecord(window.history.state) ? window.history.state : {};
+  const currentLocationState = isPlainRecord(currentHistoryState.usr) ? currentHistoryState.usr : {};
+  if (!('returnContext' in currentLocationState)) return;
+  const { returnContext: _ignored, ...rest } = currentLocationState;
+  replaceCurrentHistoryLocationState(rest);
+}
+
 /* ─── Aggregate fiscal notes from Sonnet + Haiku fiscal_flags ─── */
 function buildAggregatedNotes(
   sonnetNotes: FiscalAlert[],
@@ -855,6 +955,10 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [notesText, setNotesText] = useState(invoice.notes || '');
   const [notesSaving, setNotesSaving] = useState(false);
   const notesDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const [counterpartyHeaderInfo, setCounterpartyHeaderInfo] = useState<{ atecoCode: string | null; provinceSigla: string | null }>({
+    atecoCode: null,
+    provinceSigla: extractProvinceSiglaFromAddress((invoice.counterparty as any)?.sede || null),
+  });
 
   // ─── Article assignment state ───
   const [articles, setArticles] = useState<ArticleWithPhases[]>([]);
@@ -994,6 +1098,10 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   // Hide zero-amount lines toggle
   const [showZeroLines, setShowZeroLines] = useState(false);
   const isConfirmed = invoice.classification_status === 'confirmed';
+  const counterpartyAddressFallback = useMemo(() => {
+    const cp = (invoice.counterparty || {}) as any;
+    return cp?.sede || null;
+  }, [invoice.counterparty]);
   const singleInvoiceJobLabel = useMemo(() => {
     const cp = (invoice.counterparty || {}) as any;
     const idPart = invoice.number ? `Fatt. ${invoice.number}` : `Fattura ${invoice.id.slice(0, 8)}`;
@@ -1015,6 +1123,33 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
+
+  useEffect(() => {
+    const fallbackProvince = extractProvinceSiglaFromAddress(counterpartyAddressFallback);
+    if (!invoice.counterparty_id) {
+      setCounterpartyHeaderInfo({ atecoCode: null, provinceSigla: fallbackProvince });
+      return;
+    }
+
+    let cancelled = false;
+    setCounterpartyHeaderInfo(prev => ({ ...prev, provinceSigla: fallbackProvince }));
+
+    loadCounterpartyHeaderInfo(invoice.counterparty_id)
+      .then(info => {
+        if (cancelled) return;
+        setCounterpartyHeaderInfo({
+          atecoCode: info.atecoCode,
+          provinceSigla: info.provinceSigla || fallbackProvince,
+        });
+      })
+      .catch(err => {
+        if (cancelled) return;
+        console.warn('[invoice-detail] counterparty header info error:', err);
+        setCounterpartyHeaderInfo({ atecoCode: null, provinceSigla: fallbackProvince });
+      });
+
+    return () => { cancelled = true; };
+  }, [invoice.counterparty_id, counterpartyAddressFallback]);
 
   useEffect(() => {
     if (!singleInvoiceJob) return;
@@ -2418,22 +2553,38 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
   return (
     <div className="flex flex-col h-full" id="invoice-detail-print">
-      {/* HEADER STRIP */}
-      <div className="px-4 pt-3 pb-2 bg-white border-b flex-shrink-0">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2 min-w-0">
-            <button
-              onClick={onNavigateCounterparty}
-              className="text-base font-bold text-blue-700 hover:text-blue-900 hover:underline cursor-pointer truncate max-w-[280px] bg-transparent border-none p-0 text-left"
-              title="Vai alla controparte"
-            >
-              {cp?.denom || invoice.source_filename || 'Sconosciuto'}
-            </button>
-            <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${STATUS_COLORS[invoice.payment_status] || 'bg-gray-100 text-gray-600'}`}>
-              {getStatusLabel(invoice.payment_status, invoice.direction)}
-            </span>
-          </div>
-          <div className="flex items-center gap-1">
+	      {/* HEADER STRIP */}
+	      <div className="px-4 pt-3 pb-2 bg-white border-b flex-shrink-0">
+	        <div className="flex items-center justify-between">
+	          <div className="min-w-0">
+	            {(counterpartyHeaderInfo.atecoCode || counterpartyHeaderInfo.provinceSigla) && (
+	              <div className="flex items-center gap-1.5 mb-1 flex-wrap">
+	                {counterpartyHeaderInfo.atecoCode && (
+	                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-violet-50 text-violet-700 border border-violet-200">
+	                    ATECO {counterpartyHeaderInfo.atecoCode}
+	                  </span>
+	                )}
+	                {counterpartyHeaderInfo.provinceSigla && (
+	                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 border border-slate-200">
+	                    ({counterpartyHeaderInfo.provinceSigla})
+	                  </span>
+	                )}
+	              </div>
+	            )}
+	            <div className="flex items-center gap-2 min-w-0">
+	              <button
+	                onClick={onNavigateCounterparty}
+	                className="text-base font-bold text-blue-700 hover:text-blue-900 hover:underline cursor-pointer truncate max-w-[280px] bg-transparent border-none p-0 text-left"
+	                title="Vai alla controparte"
+	              >
+	                {cp?.denom || invoice.source_filename || 'Sconosciuto'}
+	              </button>
+	              <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${STATUS_COLORS[invoice.payment_status] || 'bg-gray-100 text-gray-600'}`}>
+	                {getStatusLabel(invoice.payment_status, invoice.direction)}
+	              </span>
+	            </div>
+	          </div>
+	          <div className="flex items-center gap-1">
             {detail?.raw_xml && (
               <button onClick={() => setShowXml(!showXml)} className={`w-8 h-8 flex items-center justify-center rounded-md border text-xs ${showXml ? 'bg-sky-600 text-white border-sky-600' : 'border-gray-200 hover:bg-gray-50 text-gray-500'}`} title="Vedi XML">&lt;/&gt;</button>
             )}
@@ -3679,13 +3830,21 @@ import { askInvoiceAiSearch, type InvoiceAiResult } from '@/lib/invoiceAiSearch'
 // ============================================================
 export default function FatturePage() {
   const { company, loading: companyLoading, ensureCompany, refetch: refetchCompany } = useCompany();
+  const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const companyId = company?.id || null;
   const { matchedInvoiceIds, invoiceScores, refresh: refreshBadges } = useReconciliationBadges();
   const { setEntity: setPageEntity } = usePageEntity();
+  const initialReturnContextRef = useRef<FattureReturnContext | null>(readFattureReturnContext(location.state));
+  const pendingReturnContextRef = useRef<FattureReturnContext | null>(initialReturnContextRef.current);
+  const pendingSidebarRestoreRef = useRef<FattureReturnContext | null>(initialReturnContextRef.current);
+  const loadedPageRef = useRef(initialReturnContextRef.current?.loadedPageIndex ?? 0);
+  const invoiceListScrollRef = useRef<HTMLDivElement>(null);
+  const invoiceRowRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const initialReturnFilters = initialReturnContextRef.current?.filters;
   const [invoices, setInvoices] = useState<DBInvoice[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(initialReturnContextRef.current?.selectedInvoiceId || null);
   const [detail, setDetail] = useState<DBInvoiceDetail | null>(null);
   const [installments, setInstallments] = useState<InvoiceInstallment[]>([]);
   const [loadingDetail, setLoadingDetail] = useState(false);
@@ -3698,7 +3857,7 @@ export default function FatturePage() {
   const [allLoaded, setAllLoaded] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState(initialReturnFilters?.query || '');
   const queryDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [serverStats, setServerStats] = useState<{ total: number; daPagare: number; scadute: number; pagate: number } | null>(null);
   const [tabCounts, setTabCounts] = useState<{ in: number; out: number }>({ in: 0, out: 0 });
@@ -3709,17 +3868,17 @@ export default function FatturePage() {
   const [importTotal, setImportTotal] = useState(0);
   const [importLogs, setImportLogs] = useState<ImportLog[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
-  const [query, setQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'overdue' | 'paid'>('all');
-  const [aiSuggestedFilter, setAiSuggestedFilter] = useState(false);
-  const [directionFilter, setDirectionFilter] = useState<'all' | 'in' | 'out'>('in');
+  const [query, setQuery] = useState(initialReturnFilters?.query || '');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'overdue' | 'paid'>(initialReturnFilters?.status || 'all');
+  const [aiSuggestedFilter, setAiSuggestedFilter] = useState(Boolean(initialReturnFilters?.aiSuggested));
+  const [directionFilter, setDirectionFilter] = useState<'all' | 'in' | 'out'>(initialReturnFilters?.direction || 'in');
   const [selectMode, setSelectMode] = useState(false);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [deleteModal, setDeleteModal] = useState<{ open: boolean; ids: string[] }>({ open: false, ids: [] });
 
   // ── Date filter ──
-  const [dateFrom, setDateFrom] = useState('');
-  const [dateTo, setDateTo] = useState('');
+  const [dateFrom, setDateFrom] = useState(initialReturnFilters?.dateFrom || '');
+  const [dateTo, setDateTo] = useState(initialReturnFilters?.dateTo || '');
 
   // ── Export dialog ──
   const [exportOpen, setExportOpen] = useState(false);
@@ -3747,9 +3906,9 @@ export default function FatturePage() {
   const [aiError, setAiError] = useState('');
 
   // ── AI filter state (structured filters from AI classification) ──
-  const [amountMin, setAmountMin] = useState<number | undefined>(undefined);
-  const [amountMax, setAmountMax] = useState<number | undefined>(undefined);
-  const [counterpartyPattern, setCounterpartyPattern] = useState<string | undefined>(undefined);
+  const [amountMin, setAmountMin] = useState<number | undefined>(initialReturnFilters?.amountMin);
+  const [amountMax, setAmountMax] = useState<number | undefined>(initialReturnFilters?.amountMax);
+  const [counterpartyPattern, setCounterpartyPattern] = useState<string | undefined>(initialReturnFilters?.counterpartyPattern);
 
   // ── Batch AI Classification ──
   const { isRunning: batchClassifRunning, progress: batchClassifJobProgress, startOrStop: classifStartOrStop } = useAIJob('fatture-classify', 'Classificazione Fatture AI');
@@ -3953,6 +4112,25 @@ export default function FatturePage() {
     classificationStatus: aiSuggestedFilter ? 'ai_suggested' : undefined,
   }), [directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.candidateIds, amountMin, amountMax, counterpartyPattern, aiSuggestedFilter]);
 
+  const loadInvoicePagesUpTo = useCallback(async (filters: InvoiceFilters, lastPageIndex: number) => {
+    const pageIndexes = Array.from({ length: lastPageIndex + 1 }, (_, idx) => idx);
+    const results = await Promise.all(
+      pageIndexes.map(pageIndex => loadInvoices(companyId!, filters, { page: pageIndex, pageSize: PAGE_SIZE })),
+    );
+    const merged = new Map<string, DBInvoice>();
+    for (const result of results) {
+      for (const invoice of result.data) {
+        merged.set(invoice.id, invoice);
+      }
+    }
+    const lastPageLength = results[results.length - 1]?.data.length ?? 0;
+    return {
+      data: Array.from(merged.values()),
+      count: results[0]?.count ?? 0,
+      lastPageLength,
+    };
+  }, [companyId, PAGE_SIZE]);
+
   const reload = useCallback(async (reset = true) => {
     if (!companyId) return;
     if (reset) {
@@ -3965,9 +4143,24 @@ export default function FatturePage() {
     const currentPage = reset ? 0 : page;
     const filters = buildFilters();
     try {
-      const result = await loadInvoices(companyId, filters, { page: currentPage, pageSize: PAGE_SIZE });
+      const restoreContext = reset ? pendingReturnContextRef.current : null;
+      const restoreTargetPage = restoreContext ? Math.max(0, restoreContext.loadedPageIndex) : 0;
+      const result = restoreContext
+        ? await loadInvoicePagesUpTo(filters, restoreTargetPage)
+        : await loadInvoices(companyId, filters, { page: currentPage, pageSize: PAGE_SIZE });
       if (reset) {
         setInvoices(result.data);
+        loadedPageRef.current = restoreContext ? restoreTargetPage : 0;
+        if (restoreContext) {
+          pendingSidebarRestoreRef.current = restoreContext;
+          pendingReturnContextRef.current = null;
+          setSelectedId(restoreContext.selectedInvoiceId);
+          if (restoreTargetPage > 0) setPage(restoreTargetPage);
+          if (result.data.length === 0) {
+            pendingSidebarRestoreRef.current = null;
+            consumeFattureReturnContextFromHistory();
+          }
+        }
         // Load stats + tab counts in parallel (pass all filter fields including amount/counterparty)
         const statsFilters = { direction: filters.direction, dateFrom: filters.dateFrom, dateTo: filters.dateTo, query: filters.query, amountMin: filters.amountMin, amountMax: filters.amountMax, counterpartyPattern: filters.counterpartyPattern };
         const [stats, inStats, outStats, aiSugCount] = await Promise.all([
@@ -3980,14 +4173,16 @@ export default function FatturePage() {
         setTabCounts({ in: inStats.total, out: outStats.total });
         setAiSuggestedCount(aiSugCount as number);
       } else {
+        loadedPageRef.current = currentPage;
         setInvoices(prev => [...prev, ...result.data]);
       }
       setTotalCount(result.count);
-      if (result.data.length < PAGE_SIZE) setAllLoaded(true);
+      const loadedCount = reset ? result.data.length : ((currentPage + 1) * PAGE_SIZE);
+      if (result.data.length < PAGE_SIZE || loadedCount >= result.count) setAllLoaded(true);
     } catch (e) { console.error('Errore:', e); }
     setLoadingList(false);
     setLoadingMore(false);
-  }, [companyId, buildFilters, page]);
+  }, [companyId, buildFilters, loadInvoicePagesUpTo, page]);
 
   // Initial load + reload when filters change
   useEffect(() => {
@@ -3998,7 +4193,44 @@ export default function FatturePage() {
   }, [companyId, directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.candidateIds?.join(','), amountMin, amountMax, counterpartyPattern, aiSuggestedFilter, reloadTrigger]);
 
   // Load next page
-  useEffect(() => { if (page > 0) reload(false); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [page]);
+  useEffect(() => {
+    if (page <= loadedPageRef.current) return;
+    reload(false);
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, [page]);
+
+  useEffect(() => {
+    const restoreContext = pendingSidebarRestoreRef.current;
+    if (!restoreContext || invoices.length === 0) return;
+
+    let frame2 = 0;
+    const frame1 = window.requestAnimationFrame(() => {
+      frame2 = window.requestAnimationFrame(() => {
+        const container = invoiceListScrollRef.current;
+        if (!container) return;
+
+        container.scrollTop = restoreContext.sidebarScrollTop;
+        const row = invoiceRowRefs.current[restoreContext.selectedInvoiceId];
+        if (row) {
+          const visibleTop = container.scrollTop;
+          const visibleBottom = visibleTop + container.clientHeight;
+          const rowTop = row.offsetTop;
+          const rowBottom = rowTop + row.offsetHeight;
+          if (rowTop < visibleTop || rowBottom > visibleBottom) {
+            row.scrollIntoView({ block: 'center' });
+          }
+        }
+
+        pendingSidebarRestoreRef.current = null;
+        consumeFattureReturnContextFromHistory();
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame1);
+      if (frame2) window.cancelAnimationFrame(frame2);
+    };
+  }, [invoices]);
 
   // IntersectionObserver for infinite scroll
   useEffect(() => {
@@ -4209,6 +4441,50 @@ export default function FatturePage() {
   // (handles deep-link case where invoice isn't in the visible page of results)
   const selectedInvoice = invoices.find(i => i.id === selectedId) ?? (selectedId && detail ? detail : null);
   const allFilteredChecked = invoices.length > 0 && invoices.every(i => checked.has(i.id));
+  const navigateToCounterparty = useCallback((mode?: 'verify' | 'edit') => {
+    const returnContext: FattureReturnContext | null = selectedInvoice ? {
+      origin: 'invoice-counterparty',
+      selectedInvoiceId: selectedInvoice.id,
+      filters: {
+        direction: directionFilter,
+        status: statusFilter,
+        aiSuggested: aiSuggestedFilter,
+        dateFrom,
+        dateTo,
+        query,
+        amountMin,
+        amountMax,
+        counterpartyPattern,
+      },
+      loadedPageIndex: loadedPageRef.current,
+      sidebarScrollTop: invoiceListScrollRef.current?.scrollTop || 0,
+    } : null;
+
+    if (returnContext) {
+      writeFattureReturnContext(returnContext);
+    }
+
+    if (selectedInvoice?.counterparty_id) {
+      const params = new URLSearchParams({ counterpartyId: selectedInvoice.counterparty_id });
+      if (mode) params.set('mode', mode);
+      navigate(`/controparti?${params.toString()}`);
+      return;
+    }
+
+    navigate('/controparti');
+  }, [
+    selectedInvoice,
+    directionFilter,
+    statusFilter,
+    aiSuggestedFilter,
+    dateFrom,
+    dateTo,
+    query,
+    amountMin,
+    amountMax,
+    counterpartyPattern,
+    navigate,
+  ]);
 
   // ── Expose selected invoice to AI widget ──
   useEffect(() => {
@@ -4362,14 +4638,14 @@ export default function FatturePage() {
               </>}
             </div>
           </div>
-          <div className="flex-1 overflow-y-auto">
-            {loadingList || companyLoading ? <div className="text-center py-8 text-gray-400 text-sm">Caricamento...</div>
-              : invoices.length === 0 ? <div className="text-center py-8 text-gray-400 text-sm">Nessun risultato</div>
-              : <>
-                {invoices.map(inv => <InvoiceCard key={inv.id} inv={inv} selected={selectedId === inv.id} checked={checked.has(inv.id)} selectMode={selectMode} onSelect={() => setSelectedId(inv.id)} onCheck={() => toggleCheck(inv.id)} isMatched={matchedInvoiceIds.has(inv.id)} suggestionScore={invoiceScores.get(inv.id)} meta={classifMeta.get(inv.id)} />)}
-                {!allLoaded && <div ref={bottomRef} className="py-4 text-center text-xs text-gray-400">{loadingMore ? 'Caricamento...' : ''}</div>}
-              </>}
-          </div>
+	          <div ref={invoiceListScrollRef} className="flex-1 overflow-y-auto">
+	            {loadingList || companyLoading ? <div className="text-center py-8 text-gray-400 text-sm">Caricamento...</div>
+	              : invoices.length === 0 ? <div className="text-center py-8 text-gray-400 text-sm">Nessun risultato</div>
+	              : <>
+	                {invoices.map(inv => <InvoiceCard key={inv.id} inv={inv} selected={selectedId === inv.id} checked={checked.has(inv.id)} selectMode={selectMode} onSelect={() => setSelectedId(inv.id)} onCheck={() => toggleCheck(inv.id)} isMatched={matchedInvoiceIds.has(inv.id)} suggestionScore={invoiceScores.get(inv.id)} meta={classifMeta.get(inv.id)} rowRef={(node) => { invoiceRowRefs.current[inv.id] = node; }} />)}
+	                {!allLoaded && <div ref={bottomRef} className="py-4 text-center text-xs text-gray-400">{loadingMore ? 'Caricamento...' : ''}</div>}
+	              </>}
+	          </div>
         </div>
         {/* Detail */}
         <div className="flex-1 flex flex-col overflow-hidden bg-gray-50">
@@ -4381,28 +4657,16 @@ export default function FatturePage() {
             onEdit={handleEdit}
             onDelete={() => setDeleteModal({ open: true, ids: [selectedInvoice.id] })}
             onReload={reload}
-            onPatchInvoice={patchInvoice}
-            onRefreshBadges={refreshClassifMeta}
-            onOpenCounterparty={(mode) => {
-              if (selectedInvoice.counterparty_id) {
-                navigate(`/controparti?counterpartyId=${selectedInvoice.counterparty_id}&mode=${mode}`);
-              } else {
-                navigate('/controparti');
-              }
-            }}
-            onOpenScadenzario={() => {
-              const tab = selectedInvoice.direction === 'out' ? 'incassi' : 'pagamenti';
-              const q = encodeURIComponent(selectedInvoice.number || '');
-              navigate(`/scadenzario?tab=${tab}&period=all&status=all&invoiceId=${selectedInvoice.id}&query=${q}`);
-            }}
-            onNavigateCounterparty={() => {
-              if (selectedInvoice.counterparty_id) {
-                navigate(`/controparti?counterpartyId=${selectedInvoice.counterparty_id}`);
-              } else {
-                navigate('/controparti');
-              }
-            }}
-          />
+	            onPatchInvoice={patchInvoice}
+	            onRefreshBadges={refreshClassifMeta}
+	            onOpenCounterparty={(mode) => navigateToCounterparty(mode)}
+	            onOpenScadenzario={() => {
+	              const tab = selectedInvoice.direction === 'out' ? 'incassi' : 'pagamenti';
+	              const q = encodeURIComponent(selectedInvoice.number || '');
+	              navigate(`/scadenzario?tab=${tab}&period=all&status=all&invoiceId=${selectedInvoice.id}&query=${q}`);
+	            }}
+	            onNavigateCounterparty={() => navigateToCounterparty()}
+	          />
             : <div className="flex items-center justify-center h-full text-gray-400 text-sm">Seleziona una fattura dalla lista</div>}
         </div>
       </div>

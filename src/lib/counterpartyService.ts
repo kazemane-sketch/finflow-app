@@ -75,6 +75,11 @@ export interface CounterpartyAnalytics {
   }>
 }
 
+export interface CounterpartyHeaderInfo {
+  atecoCode: string | null
+  provinceSigla: string | null
+}
+
 export interface CounterpartyInstallmentFlowRow {
   installment_id: string
   invoice_id: string
@@ -134,6 +139,19 @@ function mergeRoles(a: CounterpartyRole, b: CounterpartyRole): CounterpartyRole 
 function safeNum(v: unknown, fallback = 0): number {
   const n = Number(v)
   return Number.isFinite(n) ? n : fallback
+}
+
+export function extractProvinceSiglaFromAddress(address: string | null | undefined): string | null {
+  const text = String(address || '').trim().toUpperCase()
+  if (!text) return null
+
+  const parenMatch = text.match(/\(([A-Z]{2})\)/)
+  if (parenMatch) return parenMatch[1]
+
+  const capMatch = text.match(/\b\d{5}\s+[^,()]+?\s+([A-Z]{2})\b(?:,|$)/)
+  if (capMatch) return capMatch[1]
+
+  return null
 }
 
 async function updateInvoiceSnapshotsForCounterparty(
@@ -384,6 +402,21 @@ export async function loadCounterparties(
   const { data, error } = await query
   if (error) throw new Error(error.message)
   return (data || []) as Counterparty[]
+}
+
+export async function loadCounterpartyHeaderInfo(counterpartyId: string): Promise<CounterpartyHeaderInfo> {
+  const { data, error } = await supabase
+    .from('counterparties')
+    .select('ateco_code, address')
+    .eq('id', counterpartyId)
+    .maybeSingle()
+
+  if (error) throw new Error(error.message)
+
+  return {
+    atecoCode: data?.ateco_code || null,
+    provinceSigla: extractProvinceSiglaFromAddress(data?.address || null),
+  }
 }
 
 export async function createManualCounterparty(
