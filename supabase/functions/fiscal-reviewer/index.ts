@@ -631,6 +631,24 @@ Se nessun alert: []`);
       model_used: model,
       kb_rules_used: kbUsed.length,
       agent_rules_used: agentRules.length,
+      _debug: {
+        prompt_sent: prompt,
+        raw_response: responseText,
+        model_used: model,
+        agent_config_loaded: !!agentConfig,
+        agent_rules_count: agentRules.length,
+        kb_rules_count: kbUsed.length,
+        kb_source_table: "knowledge_base",
+        company_ateco: companyAteco,
+        company_sector: companyName,
+        counterparty_ateco: counterpartyAteco,
+        counterparty_legal_type: counterpartyLegalType,
+        pre_resolved_decisions: [...preResolvedFiscal.entries()].map(([lid, decs]) => ({
+          line_id: lid,
+          decisions: decs.map(d => d.alert_type + ": " + d.chosen_option),
+        })),
+        rule_confirmed_lines: [...ruleConfirmedLineIds],
+      },
     });
   } catch (err) {
     await sql.end().catch(() => {});

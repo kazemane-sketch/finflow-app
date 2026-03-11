@@ -21,6 +21,7 @@ import { usePageEntity } from '@/contexts/PageEntityContext';
 import { ReconciledIcon, ReconciliationDot } from '@/components/ReconciliationIndicators';
 import { triggerAutoReconciliation } from '@/lib/reconciliationTrigger';
 import { useAIJob } from '@/hooks/useAIJob';
+import type { AIJob } from '@/stores/useAIJobStore';
 import {
   subscribeExtraction, getExtractionState,
   loadExtractionStats as loadExtStats,
@@ -47,7 +48,7 @@ import {
 } from '@/lib/classificationService';
 import { toast } from 'sonner';
 import { createRuleFromConfirmation, findMatchingRules, deactivateRulesForInvoice, handleRuleCorrection, type RuleSuggestion } from '@/lib/classificationRulesService';
-import { runClassificationPipeline } from '@/lib/classificationPipelineService';
+import { runClassificationPipeline, type PipelineStepDebug } from '@/lib/classificationPipelineService';
 import { createMemoryFromClassification } from '@/lib/companyMemoryService';
 import { saveFiscalDecision } from '@/lib/fiscalDecisionService';
 import ExportDialog from '@/components/ExportDialog';
@@ -303,6 +304,211 @@ function ReviewBadge({ confidence, hasNote, needsReview }: {
     return <span className="ml-1.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-yellow-100 text-yellow-700 border border-yellow-300 whitespace-nowrap">{'\uD83D\uDCA1'} Suggerimento AI</span>;
   }
   return null;
+}
+
+/* ─── Pipeline Debug Panel ─────────────────────── */
+
+function PipelineStepDetailPanel({ step }: { step: PipelineStepDebug }) {
+  const stepLabels: Record<string, string> = {
+    deterministic: '\uD83D\uDD0D Step 1: Regole + Storico',
+    understand: '\uD83E\uDDE0 Step 2: Comprensione',
+    classify: '\uD83D\uDCCB Step 3: Classificazione',
+    cdc: '\uD83C\uDFE2 Step 4: Centri di Costo',
+    reviewer: '\u2696\uFE0F Step 5: Revisore Fiscale',
+  };
+
+  return (
+    <details className="border border-slate-100 rounded-lg">
+      <summary className="px-3 py-2 bg-slate-50 cursor-pointer text-xs font-semibold text-slate-600 hover:bg-slate-100 flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span>{stepLabels[step.step] || step.step}</span>
+        {step.model_used && <span className="text-[10px] font-normal text-slate-400">({step.model_used})</span>}
+        {step.kb_rules_count !== undefined && <span className="text-[10px] font-normal text-slate-400">KB: {step.kb_rules_count} regole</span>}
+        {step.agent_rules_count !== undefined && <span className="text-[10px] font-normal text-slate-400">Rules: {step.agent_rules_count}</span>}
+        {step.accounts_shown !== undefined && <span className="text-[10px] font-normal text-slate-400">Conti: {step.accounts_shown}</span>}
+        {step.company_ateco && <span className="text-[10px] font-normal text-emerald-600">ATECO: {step.company_ateco}</span>}
+      </summary>
+      <div className="p-3 space-y-3 text-xs">
+
+        {/* Config status badges */}
+        <div className="flex flex-wrap gap-2">
+          {step.agent_config_loaded !== undefined && (
+            <span className={`px-2 py-0.5 rounded text-[10px] font-semibold ${step.agent_config_loaded ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+              {step.agent_config_loaded ? '\u2713 Agent Config' : '\u2717 Agent Config MANCANTE'}
+            </span>
+          )}
+          {step.agent_rules_count !== undefined && (
+            <span className="px-2 py-0.5 rounded bg-blue-100 text-blue-700 text-[10px] font-semibold">
+              {step.agent_rules_count} Agent Rules
+            </span>
+          )}
+          {step.kb_rules_count !== undefined && (
+            <span className="px-2 py-0.5 rounded bg-purple-100 text-purple-700 text-[10px] font-semibold">
+              {step.kb_rules_count} KB Rules
+            </span>
+          )}
+        </div>
+
+        {/* KB Rules titles */}
+        {step.kb_rules_titles && step.kb_rules_titles.length > 0 && (
+          <div>
+            <div className="font-semibold text-slate-500 mb-1">Regole KB caricate:</div>
+            <div className="flex flex-wrap gap-1">
+              {step.kb_rules_titles.map((t, i) => (
+                <span key={i} className="px-1.5 py-0.5 rounded bg-purple-50 text-purple-600 text-[10px]">{t}</span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Understandings (for classify step) */}
+        {step.understandings && step.understandings.length > 0 && (
+          <div>
+            <div className="font-semibold text-slate-500 mb-1">Comprensione Stadio A:</div>
+            {step.understandings.map((u, i) => (
+              <div key={i} className="ml-2 mb-1">
+                <span className="text-slate-400">[{u.line_id.slice(0, 8)}]</span>{' '}
+                <span className="font-semibold">{u.operation_type}</span>{' '}
+                {'\u2192'} sezioni: <span className="text-blue-600">{u.account_sections.join(', ')}</span>
+                {u.is_NOT.length > 0 && (
+                  <span className="text-red-500 ml-1">NON: {u.is_NOT.join(', ')}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Accounts by section */}
+        {step.accounts_by_section && (
+          <div>
+            <div className="font-semibold text-slate-500 mb-1">Conti per sezione:</div>
+            <div className="flex flex-wrap gap-2">
+              {Object.entries(step.accounts_by_section).map(([section, count]) => (
+                <span key={section} className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 text-[10px]">
+                  {section}: {count as number}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Extra data */}
+        {step.extra && Object.keys(step.extra).length > 0 && (
+          <div>
+            <div className="font-semibold text-slate-500 mb-1">Dati aggiuntivi:</div>
+            <pre className="text-[10px] bg-slate-50 p-2 rounded overflow-x-auto max-h-32 overflow-y-auto">
+              {JSON.stringify(step.extra, null, 2)}
+            </pre>
+          </div>
+        )}
+
+        {/* Prompt sent (collapsible) */}
+        {step.prompt_sent && (
+          <details className="border border-slate-100 rounded">
+            <summary className="px-2 py-1 cursor-pointer text-[10px] font-semibold text-slate-500 hover:bg-slate-50 flex items-center justify-between">
+              <span>{'\uD83D\uDCCB'} Prompt inviata ({step.prompt_sent.length.toLocaleString()} chars)</span>
+              <button
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  navigator.clipboard.writeText(step.prompt_sent!);
+                  toast.success('Prompt copiata');
+                }}
+                className="text-blue-500 hover:text-blue-700 text-[10px]"
+              >
+                Copia
+              </button>
+            </summary>
+            <pre className="p-2 text-[10px] font-mono bg-slate-900 text-slate-300 overflow-x-auto max-h-96 overflow-y-auto whitespace-pre-wrap">
+              {step.prompt_sent}
+            </pre>
+          </details>
+        )}
+
+        {/* Raw AI response (collapsible) */}
+        {step.raw_response && (
+          <details className="border border-slate-100 rounded">
+            <summary className="px-2 py-1 cursor-pointer text-[10px] font-semibold text-slate-500 hover:bg-slate-50 flex items-center justify-between">
+              <span>{'\uD83E\uDD16'} Risposta AI ({step.raw_response.length.toLocaleString()} chars)</span>
+              <button
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  navigator.clipboard.writeText(step.raw_response!);
+                  toast.success('Risposta copiata');
+                }}
+                className="text-blue-500 hover:text-blue-700 text-[10px]"
+              >
+                Copia
+              </button>
+            </summary>
+            <pre className="p-2 text-[10px] font-mono bg-slate-900 text-green-300 overflow-x-auto max-h-96 overflow-y-auto whitespace-pre-wrap">
+              {step.raw_response}
+            </pre>
+          </details>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function SingleInvoiceAIProgressCard({ job, onStop }: { job: AIJob; onStop: () => void }) {
+  const pct = job.total > 0 ? Math.round((job.current / job.total) * 100) : 0;
+  const logs = job.logs.slice(-4);
+
+  return (
+    <div className="border border-violet-200 bg-violet-50 rounded-xl p-3 space-y-2">
+      <div className="flex items-center gap-2">
+        <span className="text-sm animate-spin">{'\u21BB'}</span>
+        <div className="min-w-0 flex-1">
+          <div className="text-xs font-semibold text-violet-800 truncate">{job.label}</div>
+          <div className="text-[11px] text-violet-700 truncate">
+            {job.stage || 'Classificazione AI in corso'}
+          </div>
+        </div>
+        <button
+          onClick={onStop}
+          className="px-2 py-1 text-[10px] font-semibold rounded-md border border-violet-300 text-violet-700 hover:bg-violet-100"
+        >
+          Stop
+        </button>
+      </div>
+
+      {(job.message || job.total > 0) && (
+        <div className="space-y-1">
+          {job.message && (
+            <p className="text-[11px] text-violet-700">{job.message}</p>
+          )}
+          {job.total > 0 && (
+            <>
+              <div className="flex items-center justify-between text-[10px] text-violet-700">
+                <span>{job.current}/{job.total}</span>
+                <span>{pct}%</span>
+              </div>
+              <div className="h-2 rounded-full bg-violet-200 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-violet-500 transition-all duration-300"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {logs.length > 0 && (
+        <div className="bg-white/80 border border-violet-100 rounded-lg px-2.5 py-2">
+          <div className="text-[10px] font-semibold text-violet-700 uppercase tracking-wide mb-1">Log attività</div>
+          <div className="space-y-1">
+            {logs.map(log => (
+              <div key={log.at} className="text-[11px] text-slate-600 leading-snug">
+                {log.text}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ============================================================
@@ -749,6 +955,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   // AI classification suggestion state
   const [aiClassifStatus, setAiClassifStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [aiClassifResult, setAiClassifResult] = useState<any>(null);
+  const activeInvoiceIdRef = useRef(invoice.id);
+  const mountedRef = useRef(true);
   // Rules dialog: when rules match, show choice before running AI
   const [showRulesDialog, setShowRulesDialog] = useState(false);
   const [pendingRuleSuggestions, setPendingRuleSuggestions] = useState<RuleSuggestion[]>([]);
@@ -758,6 +966,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [lineReviewFlags, setLineReviewFlags] = useState<Record<string, boolean>>({});
   // Fiscal review alerts from Sonnet escalation
   const [invoiceNotes, setInvoiceNotes] = useState<FiscalAlert[]>([]);
+  const [pipelineDebug, setPipelineDebug] = useState<PipelineStepDebug[] | null>(null);
   // AI suggestion state for new accounts/categories
   const [lineSuggestions, setLineSuggestions] = useState<Record<string, {
     suggest_new_account?: AccountSuggestion | null;
@@ -785,6 +994,42 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   // Hide zero-amount lines toggle
   const [showZeroLines, setShowZeroLines] = useState(false);
   const isConfirmed = invoice.classification_status === 'confirmed';
+  const singleInvoiceJobLabel = useMemo(() => {
+    const cp = (invoice.counterparty || {}) as any;
+    const idPart = invoice.number ? `Fatt. ${invoice.number}` : `Fattura ${invoice.id.slice(0, 8)}`;
+    return cp?.denom ? `Classificazione AI · ${idPart} · ${cp.denom}` : `Classificazione AI · ${idPart}`;
+  }, [invoice.id, invoice.number, invoice.counterparty]);
+  const {
+    job: singleInvoiceJob,
+    isRunning: singleInvoiceJobRunning,
+    progress: singleInvoiceJobProgress,
+    start: startSingleInvoiceJob,
+    stop: stopSingleInvoiceJob,
+  } = useAIJob('fatture-classify-single', singleInvoiceJobLabel, { instanceKey: invoice.id });
+
+  useEffect(() => {
+    activeInvoiceIdRef.current = invoice.id;
+  }, [invoice.id]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!singleInvoiceJob) return;
+    if (singleInvoiceJob.status === 'running') {
+      setAiClassifStatus('loading');
+      return;
+    }
+    if (singleInvoiceJob.status === 'failed') {
+      setAiClassifStatus('error');
+      return;
+    }
+    if (singleInvoiceJob.status === 'cancelled') {
+      setAiClassifStatus(prev => prev === 'loading' ? 'idle' : prev);
+    }
+  }, [singleInvoiceJob]);
 
   // Dirty state: any line classification, article, or CdC changed vs originals
   const isPostConfirmDirty = useMemo(() => {
@@ -938,6 +1183,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         // Reset transient AI state from previous invoice
         setAiClassifResult(null);
         setAiClassifStatus('idle');
+        setPipelineDebug(null);
         setLineSuggestions({});
         setDismissedSuggestions(new Set());
       } catch (e) { console.error('Classification load error:', e); }
@@ -1142,18 +1388,24 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   }, [invoice?.id, company?.id, invoice?.counterparty, invoice?.direction, detail?.invoice_lines]);
 
   // Core classification logic — called after rules dialog or directly
-  const runAiClassification = useCallback(async (skipRules: boolean) => {
+  const runAiClassification = useCallback((skipRules: boolean) => {
     if (!invoice?.id || !company?.id) return;
-    setAiClassifStatus('loading');
-    setShowRulesDialog(false);
-    try {
-      const cp = (invoice.counterparty || {}) as any;
-      const lines = detail?.invoice_lines || [];
 
-      // Run v2 cascade pipeline (deterministic → understand → classify → CdC → fiscal review)
+    const runInvoiceId = invoice.id;
+    const cp = (invoice.counterparty || {}) as any;
+    const lines = detail?.invoice_lines || [];
+
+    setAiClassifStatus('loading');
+    setAiClassifResult(null);
+    setPipelineDebug(null);
+    setShowRulesDialog(false);
+
+    startSingleInvoiceJob(async (signal, updateProgress, appendLog) => {
+      appendLog?.(`Avvio classificazione su ${lines.length} righe${skipRules ? ' (forzando AI)' : ''}`);
+
       const pipelineResult = await runClassificationPipeline(
         company.id,
-        invoice.id,
+        runInvoiceId,
         lines.map(l => ({
           line_id: l.id,
           description: l.description,
@@ -1164,9 +1416,21 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         invoice.direction as 'in' | 'out',
         cp?.piva || null,
         cp?.denom || null,
+        signal,
+        {
+          onStage: (stage, current, total, message) => {
+            updateProgress(current, total, { stage, message });
+          },
+          onProgress: (current, total, meta) => {
+            updateProgress(current, total, meta);
+          },
+          onLog: (text) => appendLog?.(text),
+        },
       );
 
-      // Convert PipelineResult to FatturePage format
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (!mountedRef.current || activeInvoiceIdRef.current !== runInvoiceId) return;
+
       const mergedLines = pipelineResult.lines.map(lr => ({
         invoice_line_id: lr.line_id,
         line_id: lr.line_id,
@@ -1189,7 +1453,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         : null;
 
       const result = {
-        invoice_id: invoice.id,
+        invoice_id: runInvoiceId,
         lines: mergedLines,
         invoice_level: best ? {
           category_id: best.category_id,
@@ -1205,11 +1469,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
       setAiClassifResult(result);
       setAiClassifStatus('done');
+      if (pipelineResult.debug) setPipelineDebug(pipelineResult.debug);
+      onPatchInvoice(runInvoiceId, { classification_status: 'ai_suggested' } as Partial<DBInvoice>);
 
-      // Update local invoice object so the AI box reflects 'ai_suggested' immediately
-      onPatchInvoice(invoice.id, { classification_status: 'ai_suggested' } as Partial<DBInvoice>);
-
-      // Extract fiscal flags from pipeline results
       const flags: Record<string, any> = {};
       for (const lr of mergedLines) {
         if (lr.fiscal_flags && lr.invoice_line_id) {
@@ -1218,7 +1480,6 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       }
       setLineFiscalFlags(flags);
 
-      // Extract AI confidence + review flags from response
       const confs: Record<string, number> = {};
       const reviews: Record<string, boolean> = {};
       for (const lr of (result.lines || [])) {
@@ -1233,10 +1494,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setLineConfidences(confs);
       setLineReviewFlags(reviews);
 
-      // Extract fiscal review alerts from pipeline fiscal reviewer
       const aiInvoiceNotes = [...(pipelineResult.alerts || [])] as FiscalAlert[];
-
-      // Generate synthetic alerts from suggest_new_account (so "Create account" button always appears)
       for (const lr of (result.lines || [])) {
         const lid = lr.line_id || lr.invoice_line_id;
         if (lid && lr.suggest_new_account) {
@@ -1258,10 +1516,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           }
         }
       }
-
       setInvoiceNotes(buildAggregatedNotes(aiInvoiceNotes, flags));
 
-      // Extract AI suggestions for new accounts/categories
       const suggestions: Record<string, { suggest_new_account?: AccountSuggestion | null; suggest_new_category?: CategorySuggestion | null }> = {};
       for (const lr of (result.lines || [])) {
         const lid = lr.line_id || lr.invoice_line_id;
@@ -1275,128 +1531,122 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setLineSuggestions(suggestions);
       setDismissedSuggestions(new Set());
 
-      // Reload classification data + article assignments to reflect persisted suggestions (incl. phase_id)
-      const [classif, lineClfResult, lineProj, freshInvProjs, freshAssignments] = await Promise.all([
-        loadInvoiceClassification(invoice.id),
-        loadLineClassifications(invoice.id),
-        loadLineProjects(invoice.id),
-        loadInvoiceProjects(invoice.id),
-        supabase.from('invoice_line_articles')
-          .select('invoice_line_id, article_id, phase_id, assigned_by, verified, location, confidence, article:articles!inner(id, code, name, unit, keywords)')
-          .eq('invoice_id', invoice.id).then(r => r.data || []),
-      ]);
-      const lineClf = lineClfResult.classifs;
-      // Merge persisted fiscal flags with fresh AI flags (AI takes priority)
-      setLineFiscalFlags(prev => ({ ...lineClfResult.fiscalFlags, ...prev }));
-      // Merge confidence/review from DB with fresh AI values (AI takes priority)
-      setLineConfidences(prev => ({ ...lineClfResult.confidences, ...prev }));
-      setLineReviewFlags(prev => ({ ...lineClfResult.reviewFlags, ...prev }));
+      try {
+        const [classif, lineClfResult, lineProj, freshInvProjs, freshAssignments] = await Promise.all([
+          loadInvoiceClassification(runInvoiceId),
+          loadLineClassifications(runInvoiceId),
+          loadLineProjects(runInvoiceId),
+          loadInvoiceProjects(runInvoiceId),
+          supabase.from('invoice_line_articles')
+            .select('invoice_line_id, article_id, phase_id, assigned_by, verified, location, confidence, article:articles!inner(id, code, name, unit, keywords)')
+            .eq('invoice_id', runInvoiceId).then(r => r.data || []),
+        ]);
 
-      // Rebuild lineArticleMap + aiSuggestions with fresh DB data (includes phase_id)
-      const freshMap: Record<string, LineArticleInfo> = {};
-      const freshDbSugg: Record<string, MatchResult> = {};
-      for (const a of freshAssignments) {
-        const art = (a as any).article;
-        const fullArtWithPhases = articles.find(ar => ar.id === a.article_id);
-        const phase = a.phase_id ? fullArtWithPhases?.phases?.find(p => p.id === a.phase_id) : null;
-        if (a.verified) {
-          freshMap[a.invoice_line_id] = {
-            article_id: a.article_id, code: art?.code || '', name: art?.name || '',
-            assigned_by: a.assigned_by, verified: a.verified, location: a.location,
-            phase_id: a.phase_id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
-          };
-        } else {
-          const fullArt = articles.find(ar => ar.id === a.article_id);
-          if (fullArt) {
-            freshDbSugg[a.invoice_line_id] = {
-              article: fullArt, confidence: Number(a.confidence) || 50,
-              matchedKeywords: [], totalKeywords: fullArt.keywords.length, source: 'deterministic',
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (!mountedRef.current || activeInvoiceIdRef.current !== runInvoiceId) return;
+
+        const lineClf = lineClfResult.classifs;
+        setLineFiscalFlags(prev => ({ ...lineClfResult.fiscalFlags, ...prev }));
+        setLineConfidences(prev => ({ ...lineClfResult.confidences, ...prev }));
+        setLineReviewFlags(prev => ({ ...lineClfResult.reviewFlags, ...prev }));
+
+        const freshMap: Record<string, LineArticleInfo> = {};
+        const freshDbSugg: Record<string, MatchResult> = {};
+        for (const a of freshAssignments) {
+          const art = (a as any).article;
+          const fullArtWithPhases = articles.find(ar => ar.id === a.article_id);
+          const phase = a.phase_id ? fullArtWithPhases?.phases?.find(p => p.id === a.phase_id) : null;
+          if (a.verified) {
+            freshMap[a.invoice_line_id] = {
+              article_id: a.article_id, code: art?.code || '', name: art?.name || '',
+              assigned_by: a.assigned_by, verified: a.verified, location: a.location,
+              phase_id: a.phase_id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
+            };
+          } else {
+            const fullArt = articles.find(ar => ar.id === a.article_id);
+            if (fullArt) {
+              freshDbSugg[a.invoice_line_id] = {
+                article: fullArt, confidence: Number(a.confidence) || 50,
+                matchedKeywords: [], totalKeywords: fullArt.keywords.length, source: 'deterministic',
+              };
+            }
+          }
+        }
+        setAiSuggestions(freshDbSugg);
+        if (classif) {
+          setClassification(classif);
+          setSelCategoryId(classif.category_id || selCategoryId);
+          setSelAccountId(classif.account_id || selAccountId);
+        }
+
+        const mergedLineClf = { ...lineClf };
+        for (const ml of mergedLines) {
+          const lineId = ml.invoice_line_id;
+          if (lineId && (ml.category_id || ml.account_id)) {
+            mergedLineClf[lineId] = {
+              invoice_line_id: lineId,
+              category_id: ml.category_id || mergedLineClf[lineId]?.category_id || null,
+              account_id: ml.account_id || mergedLineClf[lineId]?.account_id || null,
             };
           }
         }
-      }
-      // NOTE: setLineArticleMap is handled below after merging AI suggestions
-      setAiSuggestions(freshDbSugg);
-      if (classif) {
-        setClassification(classif);
-        setSelCategoryId(classif.category_id || selCategoryId);
-        setSelAccountId(classif.account_id || selAccountId);
-      }
-      // Merge AI/rule suggestions into lineClassifs (handles re-classification of already-classified invoices)
-      const mergedLineClf = { ...lineClf };
-      for (const ml of mergedLines) {
-        const lineId = ml.invoice_line_id;
-        if (lineId && (ml.category_id || ml.account_id)) {
-          mergedLineClf[lineId] = {
-            invoice_line_id: lineId,
-            category_id: ml.category_id || mergedLineClf[lineId]?.category_id || null,
-            account_id: ml.account_id || mergedLineClf[lineId]?.account_id || null,
-          };
-        }
-      }
-      setLineClassifs(mergedLineClf);
+        setLineClassifs(mergedLineClf);
 
-      // Merge AI/rule suggestions into lineProjects per-line
-      const mergedLineProj = { ...lineProj };
-      for (const ml of mergedLines) {
-        const lineId = ml.invoice_line_id;
-        if (lineId && ml.project_allocations?.length > 0 && !mergedLineProj[lineId]?.length) {
-          mergedLineProj[lineId] = ml.project_allocations.map((pa: { project_id: string; percentage: number }) => ({
-            id: `ai_${lineId}_${pa.project_id}`,
-            invoice_line_id: lineId,
+        const mergedLineProj = { ...lineProj };
+        for (const ml of mergedLines) {
+          const lineId = ml.invoice_line_id;
+          if (lineId && ml.project_allocations?.length > 0 && !mergedLineProj[lineId]?.length) {
+            mergedLineProj[lineId] = ml.project_allocations.map((pa: { project_id: string; percentage: number }) => ({
+              id: `ai_${lineId}_${pa.project_id}`,
+              invoice_line_id: lineId,
+              project_id: pa.project_id,
+              percentage: pa.percentage,
+              amount: null,
+            }));
+          }
+        }
+        setLineProjects(mergedLineProj);
+
+        const mergedArticleMap = { ...freshMap };
+        for (const ml of mergedLines) {
+          const lineId = ml.invoice_line_id;
+          if (lineId && ml.article_id && !mergedArticleMap[lineId]) {
+            const art = articles.find(a => a.id === ml.article_id);
+            if (art) {
+              const fullArt = art as ArticleWithPhases;
+              const phase = ml.phase_id ? fullArt.phases?.find(p => p.id === ml.phase_id) : null;
+              mergedArticleMap[lineId] = {
+                article_id: ml.article_id, code: art.code || '', name: art.name || '',
+                assigned_by: ml.match_type === 'rule' ? 'rule' : 'ai_classification',
+                verified: false, location: null,
+                phase_id: ml.phase_id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
+              };
+            }
+          }
+        }
+        setLineArticleMap(mergedArticleMap);
+
+        if (freshInvProjs.length > 0) {
+          setInvProjects(freshInvProjs);
+          setCdcRows(freshInvProjs.map(ip => ({
+            project_id: ip.project_id,
+            percentage: Number(ip.percentage),
+            amount: ip.amount ?? null,
+          })));
+        } else if (result.invoice_level?.project_allocations?.length > 0) {
+          const total = Math.abs(invoice.total_amount || 0);
+          setCdcRows(result.invoice_level.project_allocations.map((pa: { project_id: string; percentage: number }) => ({
             project_id: pa.project_id,
             percentage: pa.percentage,
-            amount: null,
-          }));
+            amount: total > 0 ? Math.round(total * pa.percentage / 100 * 100) / 100 : null,
+          })));
         }
+      } catch (syncErr) {
+        if (syncErr instanceof DOMException && syncErr.name === 'AbortError') throw syncErr;
+        console.warn('[AI classification] post-sync warning:', syncErr);
       }
-      setLineProjects(mergedLineProj);
-
-      // Merge AI/rule article suggestions into lineArticleMap (for re-classification)
-      const mergedArticleMap = { ...freshMap };
-      for (const ml of mergedLines) {
-        const lineId = ml.invoice_line_id;
-        if (lineId && ml.article_id && !mergedArticleMap[lineId]) {
-          const art = articles.find(a => a.id === ml.article_id);
-          if (art) {
-            const fullArt = art as ArticleWithPhases;
-            const phase = ml.phase_id ? fullArt.phases?.find(p => p.id === ml.phase_id) : null;
-            mergedArticleMap[lineId] = {
-              article_id: ml.article_id, code: art.code || '', name: art.name || '',
-              assigned_by: ml.match_type === 'rule' ? 'rule' : 'ai_classification',
-              verified: false, location: null,
-              phase_id: ml.phase_id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
-            };
-          }
-        }
-      }
-      setLineArticleMap(mergedArticleMap);
-
-      // NOTE: Do NOT update originals here — we want isPostConfirmDirty = true
-      // so the Save button appears after AI/rule suggestions fill in the fields.
-
-      // Update CdC from DB-persisted invoice-level projects
-      if (freshInvProjs.length > 0) {
-        setInvProjects(freshInvProjs);
-        setCdcRows(freshInvProjs.map(ip => ({
-          project_id: ip.project_id,
-          percentage: Number(ip.percentage),
-          amount: ip.amount ?? null,
-        })));
-      } else if (result.invoice_level?.project_allocations?.length > 0) {
-        // Fallback: use AI result directly if DB didn't persist yet
-        const total = Math.abs(invoice.total_amount || 0);
-        setCdcRows(result.invoice_level.project_allocations.map((pa: { project_id: string; percentage: number }) => ({
-          project_id: pa.project_id,
-          percentage: pa.percentage,
-          amount: total > 0 ? Math.round(total * pa.percentage / 100 * 100) / 100 : null,
-        })));
-      }
-    } catch (e: any) {
-      console.error('AI classification error:', e);
-      setAiClassifStatus('error');
-    }
-  }, [invoice?.id, company?.id, invoice?.counterparty, invoice?.direction, detail?.invoice_lines, selCategoryId, selAccountId, onPatchInvoice]);
+    }, 6);
+  }, [invoice?.id, invoice?.counterparty, invoice?.direction, invoice?.total_amount, company?.id, detail?.invoice_lines, selCategoryId, selAccountId, onPatchInvoice, startSingleInvoiceJob, articles]);
 
   // Confirm AI suggestion — set verified=true on invoice_classifications + line-level records
   // NOTE: handleConfirmAiClassification, handleRejectAiClassification, handleConfirmExistingClassification
@@ -2217,9 +2467,16 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                   <span>{'\u2728'}</span> Suggerisci AI
                 </button>
               )}
-              {aiClassifStatus === 'loading' && (
+              {aiClassifStatus === 'loading' && !singleInvoiceJobRunning && (
                 <div className="flex items-center gap-2 text-xs text-purple-600">
                   <span className="animate-spin">{'\u21BB'}</span> Classificazione AI...
+                </div>
+              )}
+              {singleInvoiceJobRunning && singleInvoiceJob && (
+                <div className="flex items-center gap-2 text-xs text-purple-700">
+                  <span className="animate-spin">{'\u21BB'}</span>
+                  <span>{singleInvoiceJob.stage || 'Classificazione AI in corso'}</span>
+                  <span className="text-purple-500">{singleInvoiceJobProgress.pct}%</span>
                 </div>
               )}
               {aiClassifStatus === 'error' && (
@@ -2262,6 +2519,10 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 </span>
               )}
             </div>
+
+            {singleInvoiceJobRunning && singleInvoiceJob && (
+              <SingleInvoiceAIProgressCard job={singleInvoiceJob} onStop={stopSingleInvoiceJob} />
+            )}
 
             {/* AI Assistant Box — always visible, 3 states */}
             {(() => {
@@ -2349,6 +2610,21 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 </div>
               );
             })()}
+
+            {/* Pipeline Debug Panel — visible only after fresh classification */}
+            {pipelineDebug && pipelineDebug.length > 0 && (
+              <details className="mb-3 border border-slate-200 rounded-xl overflow-hidden">
+                <summary className="px-4 py-2.5 bg-slate-50 cursor-pointer text-sm font-semibold text-slate-700 hover:bg-slate-100 flex items-center gap-2">
+                  <span className="text-base">{'\uD83D\uDD0D'}</span>
+                  Dettagli Pipeline AI ({pipelineDebug.length} step)
+                </summary>
+                <div className="p-4 space-y-3 bg-white">
+                  {pipelineDebug.map((step, i) => (
+                    <PipelineStepDetailPanel key={i} step={step} />
+                  ))}
+                </div>
+              </details>
+            )}
 
             {/* Invoice lines table with classification */}
             <div className="bg-white border rounded-xl overflow-hidden">

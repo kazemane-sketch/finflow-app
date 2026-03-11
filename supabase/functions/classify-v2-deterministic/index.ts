@@ -328,6 +328,13 @@ Deno.serve(async (req) => {
         resolved_by_history: resolvedLines.filter((r) => r.source === "history").length,
         unresolved: unresolvedWithGroups.length,
       },
+      _debug: {
+        rules_checked: rules.length,
+        history_checked: unresolvedLines.length,
+        keyword_groups_loaded: groups.length,
+        rules_matched: resolvedLines.filter((r) => r.source === "rule").length,
+        history_matched: resolvedLines.filter((r) => r.source === "history").length,
+      },
     });
   } catch (err) {
     await sql.end().catch(() => {});

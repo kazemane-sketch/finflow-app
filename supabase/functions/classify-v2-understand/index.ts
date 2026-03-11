@@ -420,6 +420,18 @@ ATTENZIONE AI GRUPPI KEYWORD: Se una riga ha GRUPPI_KEYWORD, quei gruppi ti dico
       model_used: model,
       kb_rules_used: kbUsed.length,
       agent_rules_used: agentRules.length,
+      _debug: {
+        prompt_sent: prompt,
+        raw_response: responseText,
+        model_used: model,
+        agent_config_loaded: !!agentConfig,
+        agent_rules_count: agentRules.length,
+        kb_rules_count: kbUsed.length,
+        kb_rules_titles: kbUsed.map((r: any) => r.title),
+        company_ateco: companyAteco,
+        company_sector: companyName,
+        counterparty_info: counterpartyInfo,
+      },
     });
   } catch (err) {
     await sql.end().catch(() => {});

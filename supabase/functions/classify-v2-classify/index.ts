@@ -601,6 +601,29 @@ Rispondi con JSON array (no markdown):
       model_used: model,
       kb_rules_used: kbUsed.length,
       agent_rules_used: agentRules.length,
+      _debug: {
+        prompt_sent: prompt,
+        raw_response: responseText,
+        model_used: model,
+        agent_config_loaded: !!agentConfig,
+        agent_rules_count: agentRules.length,
+        kb_rules_count: kbUsed.length,
+        kb_rules_titles: kbUsed.map((r: any) => r.title),
+        company_ateco: companyAteco,
+        accounts_by_section: Object.fromEntries(
+          [...new Set((accounts as any[]).map(a => a.section))].map(s => [
+            s, (accounts as any[]).filter(a => a.section === s).length,
+          ])
+        ),
+        understandings_received: understandings.map(u => ({
+          line_id: u.line_id,
+          operation_type: u.operation_type,
+          account_sections: u.account_sections,
+          is_NOT: u.is_NOT,
+        })),
+        history_count: historySection ? historySection.split("\n").length : 0,
+        memory_facts_count: memoryBlock ? memoryBlock.split("\n").length : 0,
+      },
     });
   } catch (err) {
     await sql.end().catch(() => {});

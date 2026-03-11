@@ -89,6 +89,27 @@ interface FiscalAlert {
   affected_lines: string[]
 }
 
+export interface PipelineStepDebug {
+  step: string              // 'deterministic' | 'understand' | 'classify' | 'cdc' | 'reviewer'
+  prompt_sent?: string      // Full prompt sent to Gemini
+  raw_response?: string     // Raw AI response
+  model_used?: string
+  agent_config_loaded?: boolean
+  agent_rules_count?: number
+  kb_rules_count?: number
+  kb_rules_titles?: string[]
+  company_ateco?: string
+  accounts_shown?: number
+  accounts_by_section?: Record<string, number>
+  understandings?: Array<{
+    line_id: string
+    operation_type: string
+    account_sections: string[]
+    is_NOT: string[]
+  }>
+  extra?: Record<string, unknown>  // catch-all for extra data
+}
+
 export interface PipelineResult {
   lines: {
     line_id: string
@@ -114,6 +135,40 @@ export interface PipelineResult {
     cdc_assigned: number
     fiscal_issues: number
   }
+  debug?: PipelineStepDebug[]
+}
+
+export interface PipelineEvents {
+  onStage?: (stage: string, current: number, total: number, message?: string) => void
+  onProgress?: (current: number, total: number, meta?: { stage?: string; message?: string }) => void
+  onLog?: (text: string) => void
+}
+
+const PIPELINE_TOTAL_STEPS = 6
+
+function abortError(): DOMException {
+  return new DOMException('Aborted', 'AbortError')
+}
+
+function throwIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) throw abortError()
+}
+
+function createPipelineReporter(events?: PipelineEvents) {
+  let current = 0
+
+  const beginStage = (stage: string, message?: string) => {
+    events?.onStage?.(stage, current, PIPELINE_TOTAL_STEPS, message)
+    events?.onProgress?.(current, PIPELINE_TOTAL_STEPS, { stage, message })
+  }
+
+  const finishStage = (stage: string, message?: string) => {
+    current += 1
+    events?.onProgress?.(current, PIPELINE_TOTAL_STEPS, { stage, message })
+    if (message) events?.onLog?.(message)
+  }
+
+  return { beginStage, finishStage, total: PIPELINE_TOTAL_STEPS }
 }
 
 /* ─── API call helper ────────────────────────── */
@@ -164,12 +219,13 @@ async function persistPipelineResults(
   companyId: string,
   invoiceId: string,
   result: PipelineResult,
+  signal?: AbortSignal,
 ): Promise<void> {
   const MIN_CONFIDENCE = 60
 
   for (const lr of result.lines) {
+    throwIfAborted(signal)
     if (lr.confidence < MIN_CONFIDENCE) {
-      // Still mark low-confidence lines for review
       await supabase.from('invoice_lines').update({
         ai_confidence: Math.round(lr.confidence),
         needs_review: true,
@@ -195,6 +251,7 @@ async function persistPipelineResults(
 
     // CdC allocations
     for (const pa of lr.cost_center_allocations || []) {
+      throwIfAborted(signal)
       try {
         await supabase.from('invoice_line_projects').upsert({
           company_id: companyId,
@@ -230,7 +287,7 @@ async function persistPipelineResults(
     } as any, { onConflict: 'invoice_id' })
   }
 
-  // Set has_fiscal_alerts flag on invoice
+  throwIfAborted(signal)
   await supabase.from('invoices').update({
     has_fiscal_alerts: result.alerts.length > 0,
     classification_status: 'ai_suggested',
@@ -247,8 +304,11 @@ export async function runClassificationPipeline(
   counterpartyVatKey: string | null,
   counterpartyName: string | null,
   signal?: AbortSignal,
+  events?: PipelineEvents,
 ): Promise<PipelineResult> {
+  const reporter = createPipelineReporter(events)
   const token = await getValidAccessToken()
+  const debugSteps: PipelineStepDebug[] = []
   const commonBody = {
     company_id: companyId,
     invoice_id: invoiceId,
@@ -257,7 +317,7 @@ export async function runClassificationPipeline(
     counterparty_name: counterpartyName,
   }
 
-  // ─── Step 1: Deterministic (rules + history) ──────────
+  reporter.beginStage('Ricerca regole e storico', `Analizzo ${lines.length} righe della fattura`)
   const step1 = await callEdge('classify-v2-deterministic', {
     ...commonBody,
     lines: lines.map(l => ({
@@ -269,15 +329,20 @@ export async function runClassificationPipeline(
     })),
   }, token, signal)
 
-  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+  throwIfAborted(signal)
 
   const resolved: DeterministicResult[] = step1.resolved || []
   const unresolved: UnresolvedLine[] = step1.unresolved || []
+  if (step1._debug) {
+    debugSteps.push({ step: 'deterministic', extra: step1._debug })
+  }
+  reporter.finishStage(
+    'Ricerca regole e storico',
+    `Ricerca regole e storico: ${resolved.length} righe risolte, ${unresolved.length} da approfondire`,
+  )
 
-  // Merge deterministic results into final format
   const lineResults = new Map<string, PipelineResult['lines'][0]>()
   for (const r of resolved) {
-    // Use fiscal_flags from rule if available, otherwise defaults
     const defaultFlags = {
       ritenuta_acconto: null,
       reverse_charge: false,
@@ -309,28 +374,67 @@ export async function runClassificationPipeline(
 
   let aiClassifiedCount = 0
 
-  // ─── Steps 2+3: AI Classification (only for unresolved) ──
   if (unresolved.length > 0) {
-    // Step 2: Understand
+    reporter.beginStage('Comprensione righe', `Comprendo ${unresolved.length} righe non risolte`)
     const step2 = await callEdge('classify-v2-understand', {
       ...commonBody,
       lines: unresolved,
     }, token, signal)
 
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+    throwIfAborted(signal)
 
     const understandings: Understanding[] = step2.understandings || []
+    if (step2._debug) {
+      debugSteps.push({
+        step: 'understand',
+        prompt_sent: step2._debug.prompt_sent,
+        raw_response: step2._debug.raw_response,
+        model_used: step2._debug.model_used,
+        agent_config_loaded: step2._debug.agent_config_loaded,
+        agent_rules_count: step2._debug.agent_rules_count,
+        kb_rules_count: step2._debug.kb_rules_count,
+        kb_rules_titles: step2._debug.kb_rules_titles,
+        company_ateco: step2._debug.company_ateco,
+        extra: {
+          counterparty_info: step2._debug.counterparty_info,
+        },
+      })
+    }
+    reporter.finishStage(
+      'Comprensione righe',
+      `Comprensione righe: completata su ${understandings.length} righe`,
+    )
 
-    // Step 3: Classify (with understanding context)
+    reporter.beginStage('Classificazione righe', `Classifico ${unresolved.length} righe con AI`)
     const step3 = await callEdge('classify-v2-classify', {
       ...commonBody,
       lines: unresolved,
       understandings,
     }, token, signal)
 
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+    throwIfAborted(signal)
 
     const classifications: ClassifyResult[] = step3.classifications || []
+    if (step3._debug) {
+      debugSteps.push({
+        step: 'classify',
+        prompt_sent: step3._debug.prompt_sent,
+        raw_response: step3._debug.raw_response,
+        model_used: step3._debug.model_used,
+        agent_config_loaded: step3._debug.agent_config_loaded,
+        agent_rules_count: step3._debug.agent_rules_count,
+        kb_rules_count: step3._debug.kb_rules_count,
+        kb_rules_titles: step3._debug.kb_rules_titles,
+        company_ateco: step3._debug.company_ateco,
+        accounts_shown: step3.accounts_shown,
+        accounts_by_section: step3._debug.accounts_by_section,
+        understandings: step3._debug.understandings_received,
+        extra: {
+          history_count: step3._debug.history_count,
+          memory_facts_count: step3._debug.memory_facts_count,
+        },
+      })
+    }
 
     for (const c of classifications) {
       lineResults.set(c.line_id, {
@@ -350,10 +454,19 @@ export async function runClassificationPipeline(
       })
       aiClassifiedCount++
     }
+    reporter.finishStage(
+      'Classificazione righe',
+      `Classificazione righe: ${classifications.length} suggerimenti AI prodotti`,
+    )
+  } else {
+    reporter.beginStage('Comprensione righe', 'Nessuna riga da approfondire')
+    reporter.finishStage('Comprensione righe', 'Comprensione righe: saltata, tutte le righe erano già risolte')
+    reporter.beginStage('Classificazione righe', 'Nessuna riga da classificare con AI')
+    reporter.finishStage('Classificazione righe', 'Classificazione righe: saltata, nessuna riga rimasta da classificare')
   }
 
-  // ─── Step 4: CdC Assignment (for ALL lines) ───────────
   let cdcAssigned = 0
+  reporter.beginStage('Attribuzione CdC', 'Assegno i centri di costo alle righe classificate')
   try {
     const allLineData = lines.map(l => {
       const lr = lineResults.get(l.line_id)
@@ -371,8 +484,11 @@ export async function runClassificationPipeline(
       lines: allLineData,
     }, token, signal)
 
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+    throwIfAborted(signal)
 
+    if (step4._debug) {
+      debugSteps.push({ step: 'cdc', extra: step4._debug })
+    }
     if (!step4.skipped) {
       const allocations: CdcAllocation[] = step4.allocations || []
       for (const a of allocations) {
@@ -382,17 +498,28 @@ export async function runClassificationPipeline(
           cdcAssigned++
         }
       }
+      reporter.finishStage(
+        'Attribuzione CdC',
+        `Attribuzione CdC: assegnazioni trovate per ${cdcAssigned} righe`,
+      )
+    } else {
+      reporter.finishStage(
+        'Attribuzione CdC',
+        'Attribuzione CdC: saltata, nessun centro di costo applicabile',
+      )
     }
   } catch (e) {
     console.warn('[pipeline] CdC step failed (non-blocking):', e)
+    reporter.finishStage(
+      'Attribuzione CdC',
+      `Attribuzione CdC: warning non bloccante (${e instanceof Error ? e.message : 'errore sconosciuto'})`,
+    )
   }
 
-  // ─── Step 5: Fiscal Review (ALL lines) ─────────────────
   let alerts: FiscalAlert[] = []
   let fiscalIssues = 0
+  reporter.beginStage('Revisore fiscale', 'Verifico fiscalità, detraibilità e possibili alert')
   try {
-    // Build review input from all classified lines
-    // For rule-confirmed lines, communicate their fiscal_flags_source
     const reviewLines = lines.map(l => {
       const lr = lineResults.get(l.line_id)
       const ruleResolved = resolved.find(r => r.line_id === l.line_id)
@@ -425,10 +552,29 @@ export async function runClassificationPipeline(
         lines: reviewLines,
       }, token, signal)
 
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+      throwIfAborted(signal)
 
       const reviews: ReviewResult[] = step5.reviews || []
       alerts = step5.alerts || []
+      if (step5._debug) {
+        debugSteps.push({
+          step: 'reviewer',
+          prompt_sent: step5._debug.prompt_sent,
+          raw_response: step5._debug.raw_response,
+          model_used: step5._debug.model_used,
+          agent_config_loaded: step5._debug.agent_config_loaded,
+          agent_rules_count: step5._debug.agent_rules_count,
+          kb_rules_count: step5._debug.kb_rules_count,
+          company_ateco: step5._debug.company_ateco,
+          extra: {
+            counterparty_ateco: step5._debug.counterparty_ateco,
+            counterparty_legal_type: step5._debug.counterparty_legal_type,
+            kb_source_table: step5._debug.kb_source_table,
+            pre_resolved_decisions: step5._debug.pre_resolved_decisions,
+            rule_confirmed_lines: step5._debug.rule_confirmed_lines,
+          },
+        })
+      }
 
       // Apply fiscal corrections
       for (const rev of reviews) {
@@ -439,9 +585,22 @@ export async function runClassificationPipeline(
         }
         if (rev.issues?.length) fiscalIssues += rev.issues.length
       }
+      reporter.finishStage(
+        'Revisore fiscale',
+        `Revisore fiscale: ${reviews.length} righe verificate, ${alerts.length} alert generati`,
+      )
+    } else {
+      reporter.finishStage(
+        'Revisore fiscale',
+        'Revisore fiscale: saltato, nessuna riga con confidenza sufficiente da revisionare',
+      )
     }
   } catch (e) {
     console.warn('[pipeline] Fiscal review failed (non-blocking):', e)
+    reporter.finishStage(
+      'Revisore fiscale',
+      `Revisore fiscale: warning non bloccante (${e instanceof Error ? e.message : 'errore sconosciuto'})`,
+    )
   }
 
   // ─── Build final result ─────────────────────────────────
@@ -473,10 +632,16 @@ export async function runClassificationPipeline(
       cdc_assigned: cdcAssigned,
       fiscal_issues: fiscalIssues,
     },
+    debug: debugSteps.length > 0 ? debugSteps : undefined,
   }
 
-  // ─── Persist to DB ────────────────────────────────────
-  await persistPipelineResults(companyId, invoiceId, pipelineResult)
+  reporter.beginStage('Salvataggio risultati', 'Persisto suggerimenti, alert e metadati in piattaforma')
+  throwIfAborted(signal)
+  await persistPipelineResults(companyId, invoiceId, pipelineResult, signal)
+  reporter.finishStage(
+    'Salvataggio risultati',
+    `Salvataggio risultati: completato su ${pipelineResult.lines.length} righe`,
+  )
 
   return pipelineResult
 }
