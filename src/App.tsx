@@ -23,6 +23,7 @@ import DocumentsPage from '@/pages/admin/DocumentsPage'
 import AgentConfigPage from '@/pages/admin/AgentConfigPage'
 import AgentRulesPage from '@/pages/admin/AgentRulesPage'
 import TestLabPage from '@/pages/admin/TestLabPage'
+import KeywordGroupsPage from '@/pages/admin/KeywordGroupsPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth()
