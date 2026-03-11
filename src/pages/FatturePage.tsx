@@ -645,9 +645,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   // Primary sections for each direction (mirrored from edge function constants)
   const DIR_SECTIONS: Record<string, { primary: CoaSection[]; allowed: CoaSection[] }> = {
     in:  { primary: ['cost_production','cost_personnel','depreciation','other_costs'],
-           allowed: ['cost_production','cost_personnel','depreciation','other_costs','financial','extraordinary','assets','liabilities'] },
+           allowed: ['cost_production','cost_personnel','depreciation','other_costs','financial','extraordinary','assets','liabilities','equity'] },
     out: { primary: ['revenue'],
-           allowed: ['revenue','financial','extraordinary'] },
+           allowed: ['revenue','financial','extraordinary','assets','liabilities','equity'] },
   };
   const DIR_CAT_TYPES: Record<string, CategoryType[]> = {
     in:  ['expense', 'both'],
@@ -2070,9 +2070,13 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       return dbLine?.id;
     }).filter(Boolean)
   );
-  const classifiedLineCount = Object.keys(lineClassifs)
-    .filter(lid => visibleLineIds.has(lid) && (lineClassifs[lid]?.category_id || lineClassifs[lid]?.account_id))
-    .length;
+  // Count classified lines: direct line-level values OR invoice-level header fallback
+  const hasInvoiceLevelClassif = !!(selCategoryId || selAccountId);
+  const classifiedLineCount = hasInvoiceLevelClassif
+    ? visibleLineCount  // all lines covered by header classification
+    : Object.keys(lineClassifs)
+        .filter(lid => visibleLineIds.has(lid) && (lineClassifs[lid]?.category_id || lineClassifs[lid]?.account_id))
+        .length;
 
   return (
     <div className="flex flex-col h-full" id="invoice-detail-print">
@@ -2220,7 +2224,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
             {/* AI Assistant Box — always visible, 3 states */}
             {(() => {
-              const hasAlerts = invoiceNotes.length > 0;
+              const hasAlerts = invoiceNotes.length > 0 || !!(invoice as any).has_fiscal_alerts;
               const isClassified = invoice.classification_status === 'ai_suggested' || invoice.classification_status === 'confirmed';
               const boxStyle = hasAlerts
                 ? 'border-amber-200 bg-amber-50'
@@ -2263,7 +2267,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                   {hasAlerts && (
                     <div className="mt-1 space-y-2">
                       <p className="text-[11px] text-amber-700 font-medium">
-                        {invoiceNotes.length} {invoiceNotes.length === 1 ? 'alert' : 'alert'} da verificare
+                        {invoiceNotes.length > 0
+                          ? `${invoiceNotes.length} alert da verificare`
+                          : 'Note fiscali presenti \u2014 riclassifica per visualizzarle'}
                       </p>
                       {invoiceNotes.map((alert, idx) => (
                         <div key={idx} className="bg-white border border-amber-200 rounded-lg px-3 py-2">

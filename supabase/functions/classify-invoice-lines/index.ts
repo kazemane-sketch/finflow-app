@@ -38,8 +38,9 @@ const SECTIONS_FOR_DIRECTION: Record<string, { primary: string[]; allowed: strin
   out: {
     // Active (sale) → revenue accounts primarily
     primary: ["revenue"],
-    // Also allowed: financial (72xxx proventi), extraordinary
-    allowed: ["revenue", "financial", "extraordinary"],
+    // Also allowed: financial (72xxx proventi), extraordinary, assets/liabilities
+    // for art. 15 advances, deposits, prepayments, accruals
+    allowed: ["revenue", "financial", "extraordinary", "assets", "liabilities"],
   },
 };
 // Which category types are valid for each direction
