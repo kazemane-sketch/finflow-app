@@ -76,7 +76,7 @@ export interface CounterpartyAnalytics {
 }
 
 export interface CounterpartyHeaderInfo {
-  atecoCode: string | null
+  atecoDescription: string | null
   provinceSigla: string | null
 }
 
@@ -407,14 +407,14 @@ export async function loadCounterparties(
 export async function loadCounterpartyHeaderInfo(counterpartyId: string): Promise<CounterpartyHeaderInfo> {
   const { data, error } = await supabase
     .from('counterparties')
-    .select('ateco_code, address')
+    .select('ateco_description, address')
     .eq('id', counterpartyId)
     .maybeSingle()
 
   if (error) throw new Error(error.message)
 
   return {
-    atecoCode: data?.ateco_code || null,
+    atecoDescription: data?.ateco_description || null,
     provinceSigla: extractProvinceSiglaFromAddress(data?.address || null),
   }
 }

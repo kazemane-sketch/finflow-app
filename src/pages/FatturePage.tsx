@@ -787,6 +787,13 @@ type FattureReturnContext = {
   sidebarScrollTop: number;
 };
 
+type PrefetchedInvoiceLoadResult = {
+  data: DBInvoice[];
+  count: number;
+  lastPageLength: number;
+  lastLoadedPageIndex: number;
+};
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
@@ -955,8 +962,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   const [notesText, setNotesText] = useState(invoice.notes || '');
   const [notesSaving, setNotesSaving] = useState(false);
   const notesDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const [counterpartyHeaderInfo, setCounterpartyHeaderInfo] = useState<{ atecoCode: string | null; provinceSigla: string | null }>({
-    atecoCode: null,
+  const [counterpartyHeaderInfo, setCounterpartyHeaderInfo] = useState<{ atecoDescription: string | null; provinceSigla: string | null }>({
+    atecoDescription: null,
     provinceSigla: extractProvinceSiglaFromAddress((invoice.counterparty as any)?.sede || null),
   });
 
@@ -1127,7 +1134,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   useEffect(() => {
     const fallbackProvince = extractProvinceSiglaFromAddress(counterpartyAddressFallback);
     if (!invoice.counterparty_id) {
-      setCounterpartyHeaderInfo({ atecoCode: null, provinceSigla: fallbackProvince });
+      setCounterpartyHeaderInfo({ atecoDescription: null, provinceSigla: fallbackProvince });
       return;
     }
 
@@ -1138,14 +1145,14 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       .then(info => {
         if (cancelled) return;
         setCounterpartyHeaderInfo({
-          atecoCode: info.atecoCode,
+          atecoDescription: info.atecoDescription,
           provinceSigla: info.provinceSigla || fallbackProvince,
         });
       })
       .catch(err => {
         if (cancelled) return;
         console.warn('[invoice-detail] counterparty header info error:', err);
-        setCounterpartyHeaderInfo({ atecoCode: null, provinceSigla: fallbackProvince });
+        setCounterpartyHeaderInfo({ atecoDescription: null, provinceSigla: fallbackProvince });
       });
 
     return () => { cancelled = true; };
@@ -2557,11 +2564,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 	      <div className="px-4 pt-3 pb-2 bg-white border-b flex-shrink-0">
 	        <div className="flex items-center justify-between">
 	          <div className="min-w-0">
-	            {(counterpartyHeaderInfo.atecoCode || counterpartyHeaderInfo.provinceSigla) && (
+	            {(counterpartyHeaderInfo.atecoDescription || counterpartyHeaderInfo.provinceSigla) && (
 	              <div className="flex items-center gap-1.5 mb-1 flex-wrap">
-	                {counterpartyHeaderInfo.atecoCode && (
+	                {counterpartyHeaderInfo.atecoDescription && (
 	                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-violet-50 text-violet-700 border border-violet-200">
-	                    ATECO {counterpartyHeaderInfo.atecoCode}
+	                    {counterpartyHeaderInfo.atecoDescription}
 	                  </span>
 	                )}
 	                {counterpartyHeaderInfo.provinceSigla && (
@@ -4112,22 +4119,43 @@ export default function FatturePage() {
     classificationStatus: aiSuggestedFilter ? 'ai_suggested' : undefined,
   }), [directionFilter, statusFilter, dateFrom, dateTo, debouncedQuery, aiResult?.candidateIds, amountMin, amountMax, counterpartyPattern, aiSuggestedFilter]);
 
-  const loadInvoicePagesUpTo = useCallback(async (filters: InvoiceFilters, lastPageIndex: number) => {
-    const pageIndexes = Array.from({ length: lastPageIndex + 1 }, (_, idx) => idx);
-    const results = await Promise.all(
-      pageIndexes.map(pageIndex => loadInvoices(companyId!, filters, { page: pageIndex, pageSize: PAGE_SIZE })),
-    );
+  const loadInvoicePagesUpTo = useCallback(async (
+    filters: InvoiceFilters,
+    lastPageIndex: number,
+    selectedInvoiceId?: string,
+  ): Promise<PrefetchedInvoiceLoadResult> => {
     const merged = new Map<string, DBInvoice>();
-    for (const result of results) {
+    let currentPage = 0;
+    let count = 0;
+    let lastPageLength = 0;
+    let lastLoadedPageIndex = 0;
+
+    while (true) {
+      const result = await loadInvoices(companyId!, filters, { page: currentPage, pageSize: PAGE_SIZE });
+      count = result.count;
+      lastPageLength = result.data.length;
+      lastLoadedPageIndex = currentPage;
+
       for (const invoice of result.data) {
         merged.set(invoice.id, invoice);
       }
+
+      const reachedRequestedPage = currentPage >= lastPageIndex;
+      const foundSelectedInvoice = !selectedInvoiceId || merged.has(selectedInvoiceId);
+      const reachedEnd = result.data.length < PAGE_SIZE || (currentPage + 1) * PAGE_SIZE >= count;
+
+      if ((reachedRequestedPage && foundSelectedInvoice) || reachedEnd) {
+        break;
+      }
+
+      currentPage += 1;
     }
-    const lastPageLength = results[results.length - 1]?.data.length ?? 0;
+
     return {
       data: Array.from(merged.values()),
-      count: results[0]?.count ?? 0,
+      count,
       lastPageLength,
+      lastLoadedPageIndex,
     };
   }, [companyId, PAGE_SIZE]);
 
@@ -4145,17 +4173,20 @@ export default function FatturePage() {
     try {
       const restoreContext = reset ? pendingReturnContextRef.current : null;
       const restoreTargetPage = restoreContext ? Math.max(0, restoreContext.loadedPageIndex) : 0;
-      const result = restoreContext
-        ? await loadInvoicePagesUpTo(filters, restoreTargetPage)
-        : await loadInvoices(companyId, filters, { page: currentPage, pageSize: PAGE_SIZE });
+      const prefetchedResult = restoreContext
+        ? await loadInvoicePagesUpTo(filters, restoreTargetPage, restoreContext.selectedInvoiceId)
+        : null;
+      const result = prefetchedResult
+        ?? await loadInvoices(companyId, filters, { page: currentPage, pageSize: PAGE_SIZE });
       if (reset) {
         setInvoices(result.data);
-        loadedPageRef.current = restoreContext ? restoreTargetPage : 0;
+        loadedPageRef.current = restoreContext ? (prefetchedResult?.lastLoadedPageIndex ?? restoreTargetPage) : 0;
         if (restoreContext) {
           pendingSidebarRestoreRef.current = restoreContext;
           pendingReturnContextRef.current = null;
           setSelectedId(restoreContext.selectedInvoiceId);
-          if (restoreTargetPage > 0) setPage(restoreTargetPage);
+          const restoredPage = prefetchedResult?.lastLoadedPageIndex ?? restoreTargetPage;
+          if (restoredPage > 0) setPage(restoredPage);
           if (result.data.length === 0) {
             pendingSidebarRestoreRef.current = null;
             consumeFattureReturnContextFromHistory();
