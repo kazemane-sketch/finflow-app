@@ -597,13 +597,14 @@ export default function KBDocumentsPage() {
       if (error) throw new Error(error.message || 'Errore invocazione')
       if (data?.error) throw new Error(data.error)
       toast.success(`Documento processato: ${data.chunks} chunk creati`)
-      // Reload detail
+      // Reload detail + list
       const { data: updatedDoc } = await supabase
         .from('kb_documents').select('*').eq('id', docId).single()
       if (updatedDoc) {
         setSelectedDoc(updatedDoc as any)
         loadDetail(updatedDoc as any)
       }
+      loadDocs()
     } catch (e: any) {
       toast.error('Errore processing: ' + e.message)
     }
@@ -623,13 +624,14 @@ export default function KBDocumentsPage() {
       const updated = data.fields_updated?.length || 0
       toast.success(`Classificazione completata: ${updated} campi aggiornati`)
 
-      // Reload document detail
+      // Reload document detail + list
       const { data: updatedDoc } = await supabase
         .from('kb_documents').select('*').eq('id', docId).single()
       if (updatedDoc) {
         setSelectedDoc(updatedDoc as any)
         loadDetail(updatedDoc as any)
       }
+      loadDocs()
 
       // Show suggested relations dialog if any
       const rels = data.suggested_relations || []
