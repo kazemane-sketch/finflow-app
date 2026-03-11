@@ -102,6 +102,7 @@ Deno.serve(async (req) => {
     direction?: string;
     counterparty_vat_key?: string;
     counterparty_name?: string;
+    contract_refs?: string[];
   };
   try {
     body = await req.json();
@@ -114,6 +115,7 @@ Deno.serve(async (req) => {
   const lines = body.lines || [];
   const direction = body.direction || "in";
   const counterpartyVatKey = body.counterparty_vat_key || null;
+  const contractRefs = body.contract_refs || [];
 
   if (!companyId) return json({ error: "company_id richiesto" }, 400);
   if (!invoiceId) return json({ error: "invoice_id richiesto" }, 400);
@@ -161,7 +163,7 @@ Deno.serve(async (req) => {
       ? await sql`
           SELECT id, description_pattern, direction, article_id, phase_id, category_id,
                  account_id, cost_center_allocations, confidence, fiscal_flags,
-                 operation_group_code, subject_keywords, times_confirmed
+                 operation_group_code, subject_keywords, times_confirmed, contract_ref
           FROM classification_rules
           WHERE company_id = ${companyId}
             AND active = true
@@ -169,12 +171,13 @@ Deno.serve(async (req) => {
             AND (direction = ${direction} OR direction IS NULL)
           ORDER BY
             CASE WHEN counterparty_vat_key IS NOT NULL THEN 0 ELSE 1 END,
+            CASE WHEN contract_ref IS NOT NULL THEN 0 ELSE 1 END,
             times_confirmed DESC
           LIMIT 200`
       : await sql`
           SELECT id, description_pattern, direction, article_id, phase_id, category_id,
                  account_id, cost_center_allocations, confidence, fiscal_flags,
-                 operation_group_code, subject_keywords, times_confirmed
+                 operation_group_code, subject_keywords, times_confirmed, contract_ref
           FROM classification_rules
           WHERE company_id = ${companyId}
             AND active = true
@@ -197,6 +200,13 @@ Deno.serve(async (req) => {
         // If both rule and line have operation groups, they must match
         if (rule.operation_group_code && lineGroupCode) {
           if (rule.operation_group_code !== lineGroupCode) continue;
+        }
+
+        // ── CHECK 1.5: Contract reference compatibility ──
+        // If the rule has a contract_ref, the invoice MUST have the same ref
+        // If the rule has NO contract_ref, it matches any invoice (generic rule)
+        if (rule.contract_ref) {
+          if (!contractRefs.includes(rule.contract_ref)) continue;
         }
 
         // ── CHECK 2: Jaccard word similarity >= 0.85 ──

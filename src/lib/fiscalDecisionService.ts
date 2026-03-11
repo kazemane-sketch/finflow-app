@@ -53,6 +53,8 @@ export async function saveFiscalDecision(
     chosen_option_label: string
     fiscal_override: Record<string, unknown>
   },
+  contractRef?: string | null,
+  accountId?: string | null,
 ): Promise<void> {
   const vatKey = normalizeVatKey(counterpartyVatKey)
   if (!vatKey) return
@@ -75,12 +77,14 @@ export async function saveFiscalDecision(
       alert_type: alert.type,
       chosen_option_label: alert.chosen_option_label,
       fiscal_override: alert.fiscal_override,
+      contract_ref: contractRef || null,
+      account_id: accountId || null,
       times_applied: 1,
       source_invoice_id: invoiceId,
       updated_at: new Date().toISOString(),
-    }, {
-      // Unique index: company_id, vat_key, op_group, direction, alert_type, description_pattern
-      onConflict: 'company_id,counterparty_vat_key,operation_group_code,direction,alert_type,description_pattern',
+    } as any, {
+      // Updated unique index idx_fd_dedup includes contract_ref + account_id
+      ignoreDuplicates: false,
     })
 
   if (error) {
@@ -104,7 +108,8 @@ export async function findMatchingFiscalDecisions(
   companyId: string,
   counterpartyVatKey: string,
   direction: 'in' | 'out',
-  lines: { id: string; description: string }[],
+  lines: { id: string; description: string; account_id?: string | null }[],
+  contractRefs?: string[],
 ): Promise<Map<string, FiscalDecision[]>> {
   const vatKey = normalizeVatKey(counterpartyVatKey)
   if (!vatKey) return new Map()
@@ -132,6 +137,18 @@ export async function findMatchingFiscalDecisions(
     for (const dec of decisions) {
       // Check 1: stesso operation group
       if (dec.operation_group_code !== lineOpGroup.group_code) continue
+
+      // Check 1.5: contract_ref compatibility
+      // If the decision has a contract_ref, the invoice MUST have the same ref
+      if ((dec as any).contract_ref) {
+        if (!contractRefs?.includes((dec as any).contract_ref)) continue
+      }
+
+      // Check 1.6: account_id compatibility
+      // If the decision has an account_id, the line MUST have the same account
+      if ((dec as any).account_id) {
+        if (line.account_id !== (dec as any).account_id) continue
+      }
 
       // Check 2: subject keywords overlap >= 80% (Jaccard)
       const decSubjectSet = new Set((dec.subject_keywords as string[]) || [])

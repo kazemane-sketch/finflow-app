@@ -1253,7 +1253,17 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
       // Create classification rules from confirmed line-level data (fire-and-forget)
       // v2: includes fiscal_flags for learning loop
+      // v3: includes contract_ref from DatiContratto.IdDocumento
       const cp = (invoice.counterparty || {}) as any;
+      let contractRefForRules: string | null = null;
+      try {
+        if (detail?.raw_xml) {
+          const px = parseXmlDetail(detail.raw_xml);
+          const b0 = px?.bodies?.[0];
+          if (b0?.contratti?.length) contractRefForRules = b0.contratti[0]?.id || null;
+        }
+      } catch { /* ignore */ }
+
       if (detail?.invoice_lines) {
         for (const line of detail.invoice_lines) {
           const lc = lineClassifs[line.id];
@@ -1271,6 +1281,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 cost_center_allocations: lineCdc,
                 fiscal_flags: lineFF },
               invoice.id,
+              contractRefForRules,
             ).catch(err => console.warn('[rules] error:', err));
           }
         }
@@ -1282,7 +1293,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     setClassifSaving(false);
   }, [company?.id, invoice?.id, selCategoryId, selAccountId, cdcRows, cdcMode, detail?.invoice_lines,
     lineClassifs, lineArticleMap, originalLineArticleMap, lineProjects, originalLineProjects,
-    invoice?.counterparty, invoice?.direction, onRefreshBadges, lineFiscalFlags]);
+    invoice?.counterparty, invoice?.direction, onRefreshBadges, lineFiscalFlags, detail?.raw_xml]);
 
   // Local CdC row management (no DB calls)
   const handleAddCdc = useCallback(() => {
@@ -1403,6 +1414,18 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     startSingleInvoiceJob(async (signal, updateProgress, appendLog) => {
       appendLog?.(`Avvio classificazione su ${lines.length} righe${skipRules ? ' (forzando AI)' : ''}`);
 
+      // Extract contract refs from XML (DatiContratto.IdDocumento)
+      let invoiceContractRefs: string[] = [];
+      try {
+        if (detail?.raw_xml) {
+          const parsedXml = parseXmlDetail(detail.raw_xml);
+          const body0 = parsedXml?.bodies?.[0];
+          if (body0?.contratti?.length) {
+            invoiceContractRefs = body0.contratti.map((c: any) => c.id).filter(Boolean);
+          }
+        }
+      } catch { /* ignore XML parse errors */ }
+
       const pipelineResult = await runClassificationPipeline(
         company.id,
         runInvoiceId,
@@ -1426,6 +1449,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           },
           onLog: (text) => appendLog?.(text),
         },
+        invoiceContractRefs,
       );
 
       if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -1814,7 +1838,17 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
       // 6. Create classification rules + company memory from confirmed data (fire-and-forget)
       // v2: rules now include fiscal_flags from lineFiscalFlags for learning loop
+      // v3: includes contract_ref from DatiContratto.IdDocumento
       const cp = (invoice.counterparty || {}) as any;
+      let contractRefForRules2: string | null = null;
+      try {
+        if (detail?.raw_xml) {
+          const px2 = parseXmlDetail(detail.raw_xml);
+          const b02 = px2?.bodies?.[0];
+          if (b02?.contratti?.length) contractRefForRules2 = b02.contratti[0]?.id || null;
+        }
+      } catch { /* ignore */ }
+
       if (detail?.invoice_lines) {
         for (const line of detail.invoice_lines) {
           const lc = lineClassifs[line.id];
@@ -1832,6 +1866,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                 cost_center_allocations: lineCdc,
                 fiscal_flags: lineFF },
               invoice.id,
+              contractRefForRules2,
             ).catch(err => console.warn('[rules] error:', err));
 
             // Company memory: create counterparty_pattern fact
@@ -1972,14 +2007,26 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         const dir = (invoice?.direction || 'in') as 'in' | 'out';
 
         // Save structured fiscal_decision (for deterministic pre-resolution)
+        // v3: includes contract_ref and account_id for per-contract matching
         if (vatKey) {
           const firstLineId = alert.affected_lines[0];
           const firstLine = detail?.invoice_lines?.find(l => l.id === firstLineId);
           if (firstLine) {
+            let fdContractRef: string | null = null;
+            try {
+              if (detail?.raw_xml) {
+                const pxFd = parseXmlDetail(detail.raw_xml);
+                const b0Fd = pxFd?.bodies?.[0];
+                if (b0Fd?.contratti?.length) fdContractRef = b0Fd.contratti[0]?.id || null;
+              }
+            } catch { /* ignore */ }
+            const fdAccountId = lineClassifs[firstLineId]?.account_id || null;
             saveFiscalDecision(
               company!.id, invoice!.id,
               firstLine.description, vatKey, dir,
               { type: alert.type, chosen_option_label: option.label, fiscal_override: option.fiscal_override },
+              fdContractRef,
+              fdAccountId,
             ).catch((e: unknown) => console.warn('[fiscal-decision] save error:', e));
           }
         }

@@ -305,6 +305,7 @@ export async function runClassificationPipeline(
   counterpartyName: string | null,
   signal?: AbortSignal,
   events?: PipelineEvents,
+  contractRefs?: string[],
 ): Promise<PipelineResult> {
   const reporter = createPipelineReporter(events)
   const token = await getValidAccessToken()
@@ -327,6 +328,7 @@ export async function runClassificationPipeline(
       unit_price: l.unit_price,
       total_price: l.total_price,
     })),
+    ...(contractRefs?.length ? { contract_refs: contractRefs } : {}),
   }, token, signal)
 
   throwIfAborted(signal)
@@ -550,6 +552,7 @@ export async function runClassificationPipeline(
       const step5 = await callEdge('fiscal-reviewer', {
         ...commonBody,
         lines: reviewLines,
+        ...(contractRefs?.length ? { contract_refs: contractRefs } : {}),
       }, token, signal)
 
       throwIfAborted(signal)

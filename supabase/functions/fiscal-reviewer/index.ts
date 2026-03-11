@@ -259,6 +259,7 @@ Deno.serve(async (req) => {
     direction?: string;
     counterparty_name?: string;
     counterparty_vat_key?: string;
+    contract_refs?: string[];
   };
   try { body = await req.json(); } catch { return json({ error: "Body JSON non valido" }, 400); }
 
@@ -268,6 +269,7 @@ Deno.serve(async (req) => {
   const direction = body.direction || "in";
   const counterpartyName = body.counterparty_name || "N.D.";
   const counterpartyVatKey = body.counterparty_vat_key || null;
+  const contractRefs = body.contract_refs || [];
 
   if (!companyId) return json({ error: "company_id richiesto" }, 400);
   if (!invoiceId) return json({ error: "invoice_id richiesto" }, 400);
@@ -362,7 +364,8 @@ Deno.serve(async (req) => {
     if (vatKey) {
       const fiscalDecisions = await sql`
         SELECT id, operation_group_code, subject_keywords, alert_type,
-               chosen_option_label, fiscal_override, times_applied
+               chosen_option_label, fiscal_override, times_applied,
+               contract_ref, account_id
         FROM fiscal_decisions
         WHERE company_id = ${companyId}
           AND counterparty_vat_key = ${vatKey}
@@ -384,6 +387,21 @@ Deno.serve(async (req) => {
 
           for (const dec of fiscalDecisions) {
             if (dec.operation_group_code !== lineGroupCode) continue;
+
+            // Contract ref compatibility: if the decision has a contract_ref,
+            // the invoice MUST have the same ref
+            if (dec.contract_ref) {
+              if (!contractRefs.includes(dec.contract_ref)) continue;
+            }
+
+            // Account ID compatibility: if the decision has an account_id,
+            // the line must have the same account
+            if (dec.account_id) {
+              const lineAccCode = line.account_code;
+              // We don't have account_id directly on the line, but we skip
+              // if the decision is account-specific (downstream will match via frontend)
+              // For now, skip this check in the edge function since we don't have line account_id
+            }
 
             const decSubjectSet = new Set((dec.subject_keywords as string[]) || []);
             const jaccard = jaccardSimilarity(lineSubjectSet, decSubjectSet);

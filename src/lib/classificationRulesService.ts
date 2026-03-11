@@ -324,6 +324,7 @@ export async function createRuleFromConfirmation(
     fiscal_flags?: Record<string, unknown> | null
   },
   sourceInvoiceId?: string | null,
+  contractRef?: string | null,
 ): Promise<void> {
   const normalizedDesc = normalizeDescription(lineDescription)
   if (normalizedDesc.length < 3) return
@@ -336,7 +337,7 @@ export async function createRuleFromConfirmation(
   // Estrai subject_keywords dalla descrizione
   const subjectKw = extractSubjectKeywords(lineDescription)
 
-  // Check if rule exists
+  // Check if rule exists (now includes contract_ref in the lookup)
   let query = supabase
     .from('classification_rules')
     .select('id, times_confirmed')
@@ -348,6 +349,14 @@ export async function createRuleFromConfirmation(
     query = query.eq('counterparty_vat_key', vatKey)
   } else {
     query = query.is('counterparty_vat_key', null)
+  }
+
+  // Contract ref: if provided, match only rules with same contract_ref
+  // If not provided, match only rules without contract_ref
+  if (contractRef) {
+    query = query.eq('contract_ref', contractRef)
+  } else {
+    query = query.is('contract_ref', null)
   }
 
   const { data: existing } = await query.maybeSingle()
@@ -364,6 +373,7 @@ export async function createRuleFromConfirmation(
       fiscal_flags: classification.fiscal_flags ?? null,
       operation_group_code: operationGroup?.group_code || null,
       subject_keywords: subjectKw,
+      contract_ref: contractRef || null,
       active: true, // Re-activate if it was deactivated
       updated_at: new Date().toISOString(),
     }
@@ -388,6 +398,7 @@ export async function createRuleFromConfirmation(
       fiscal_flags: classification.fiscal_flags ?? null,
       operation_group_code: operationGroup?.group_code || null,
       subject_keywords: subjectKw,
+      contract_ref: contractRef || null,
       confidence: 95,
       times_applied: 0,
       times_confirmed: 1,
