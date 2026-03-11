@@ -226,12 +226,13 @@ Deno.serve(async (req) => {
   const body = await req.json().catch(() => ({})) as {
     document_id?: string;
     company_id?: string;
+    pdf_base64?: string; // Admin upload: PDF data passed directly
   };
 
   const documentId = body.document_id;
-  const companyId = body.company_id;
-  if (!documentId || !companyId) {
-    return jsonResponse({ error: "document_id e company_id richiesti" }, 400);
+  const companyId = body.company_id || null; // null for admin platform-level documents
+  if (!documentId) {
+    return jsonResponse({ error: "document_id è richiesto" }, 400);
   }
 
   // Service client for internal operations
@@ -246,46 +247,85 @@ Deno.serve(async (req) => {
   });
 
   try {
-    // 1. Verify user is company member
-    const { data: membership } = await userClient
-      .from("company_members")
-      .select("user_id")
-      .eq("company_id", companyId)
-      .limit(1)
-      .single();
-    if (!membership) return jsonResponse({ error: "Non autorizzato per questa azienda" }, 403);
-
-    // 2. Get document record
-    const { data: doc, error: docErr } = await svc
-      .from("kb_documents")
-      .select("*")
-      .eq("id", documentId)
-      .eq("company_id", companyId)
-      .single();
-    if (docErr || !doc) return jsonResponse({ error: "Documento non trovato" }, 404);
-
-    // 3. Download file from storage
-    const { data: fileData, error: dlErr } = await svc
-      .storage
-      .from("kb-documents")
-      .download(doc.storage_path);
-    if (dlErr || !fileData) {
-      await svc.from("kb_documents").update({
-        status: "error",
-        error_message: `Download fallito: ${dlErr?.message || "file non trovato"}`,
-      }).eq("id", documentId);
-      return jsonResponse({ error: "Download file fallito" }, 500);
+    // 1. Verify authorization (company member OR platform admin)
+    if (companyId) {
+      // Company-scoped document: check company membership
+      const { data: membership } = await userClient
+        .from("company_members")
+        .select("user_id")
+        .eq("company_id", companyId)
+        .limit(1)
+        .single();
+      if (!membership) return jsonResponse({ error: "Non autorizzato per questa azienda" }, 403);
+    } else {
+      // Platform-level document (admin): check platform_admins
+      const { data: adminCheck } = await svc
+        .from("platform_admins")
+        .select("user_id")
+        .limit(1);
+      // Extract user_id from bearer token to verify admin status
+      let callerId: string | null = null;
+      try {
+        const payload = JSON.parse(atob(bearer.split(".")[1]));
+        callerId = payload.sub;
+      } catch { /* ignore */ }
+      const isAdmin = callerId && Array.isArray(adminCheck) && adminCheck.some((a: any) => a.user_id === callerId);
+      if (!isAdmin) return jsonResponse({ error: "Non sei un platform admin" }, 403);
     }
 
-    const fileBytes = new Uint8Array(await fileData.arrayBuffer());
+    // 2. Get document record
+    let docQuery = svc
+      .from("kb_documents")
+      .select("*")
+      .eq("id", documentId);
+    if (companyId) {
+      docQuery = docQuery.eq("company_id", companyId);
+    } else {
+      docQuery = docQuery.is("company_id", null);
+    }
+    const { data: doc, error: docErr } = await docQuery.single();
+    if (docErr || !doc) return jsonResponse({ error: "Documento non trovato" }, 404);
+
+    // 3. Get file bytes — from storage (company docs) or base64 (admin docs) or full_text
+    let fileBytes: Uint8Array | null = null;
+
+    if (body.pdf_base64) {
+      // Admin path: PDF passed as base64 in request body
+      const binaryString = atob(body.pdf_base64);
+      fileBytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        fileBytes[i] = binaryString.charCodeAt(i);
+      }
+    } else if (doc.storage_path) {
+      // Company path: download from storage bucket
+      const { data: fileData, error: dlErr } = await svc
+        .storage
+        .from("kb-documents")
+        .download(doc.storage_path);
+      if (dlErr || !fileData) {
+        await svc.from("kb_documents").update({
+          status: "error",
+          error_message: `Download fallito: ${dlErr?.message || "file non trovato"}`,
+        }).eq("id", documentId);
+        return jsonResponse({ error: "Download file fallito" }, 500);
+      }
+      fileBytes = new Uint8Array(await fileData.arrayBuffer());
+    }
 
     // 4. Extract text
     let fullText: string;
     try {
-      if (doc.file_type === "pdf") {
+      if (fileBytes && (doc.file_type === "pdf" || body.pdf_base64)) {
         fullText = await extractTextFromPdf(geminiKey, fileBytes);
-      } else {
+        // Save full_text on the document for admin docs
+        await svc.from("kb_documents").update({ full_text: fullText }).eq("id", documentId);
+      } else if (fileBytes) {
         fullText = extractTextFromPlain(fileBytes);
+      } else if (doc.full_text) {
+        // Text documents: full_text already saved on the record
+        fullText = doc.full_text;
+      } else {
+        throw new Error("Nessun file o testo disponibile per il processing");
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -330,7 +370,7 @@ Deno.serve(async (req) => {
     // 7. Insert chunks with embeddings
     const chunkRows = chunks.map((content, i) => ({
       document_id: documentId,
-      company_id: companyId,
+      company_id: companyId, // null for admin platform-level documents
       chunk_index: i,
       content,
       token_count: Math.ceil(content.split(/\s+/).length * 1.3), // rough estimate

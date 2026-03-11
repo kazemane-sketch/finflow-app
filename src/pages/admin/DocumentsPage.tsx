@@ -1,18 +1,29 @@
 // src/pages/admin/DocumentsPage.tsx
-import { useState, useEffect, useCallback } from 'react'
+// Document management with automatic processing via kb-process-document
+// Supports PDF upload with base64, text/URL documents, status polling, and chunk viewing
+
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import TagInput from '@/components/TagInput'
-import { supabase } from '@/integrations/supabase/client'
+import { supabase, SUPABASE_URL } from '@/integrations/supabase/client'
 import { toast } from 'sonner'
-import { Plus, X, Search, Loader2, FileText, Globe, Type, ChevronDown, ChevronUp, BookOpen } from 'lucide-react'
+import {
+  Plus, X, Search, Loader2, FileText, Globe, Type,
+  ChevronDown, ChevronUp, BookOpen, Upload, Hash
+} from 'lucide-react'
 
 interface KBDocument {
   id: string; title: string | null; source_type: string | null; source_url: string | null;
   issuer: string | null; publication_date: string | null; effective_date: string | null;
   status: string; chunk_count: number; full_text: string | null; tags: string[];
   active: boolean; created_at: string; file_name: string | null;
+}
+
+interface KBChunk {
+  id: string; chunk_index: number; content: string;
+  section_title: string | null; article_reference: string | null; token_count: number;
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -29,15 +40,39 @@ export default function DocumentsPage() {
   const [filterStatus, setFilterStatus] = useState('')
   const [showUpload, setShowUpload] = useState(false)
   const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [chunks, setChunks] = useState<Record<string, KBChunk[]>>({})
+  const [chunksLoading, setChunksLoading] = useState<string | null>(null)
 
   // Upload form
-  const [form, setForm] = useState({ title: '', source_type: 'text' as string, source_url: '', issuer: '', publication_date: '', effective_date: '', tags: [] as string[], text_content: '' })
+  const [form, setForm] = useState({
+    title: '', source_type: 'text' as string, source_url: '',
+    issuer: '', publication_date: '', effective_date: '',
+    tags: [] as string[], text_content: '',
+  })
+  const [pdfFile, setPdfFile] = useState<File | null>(null)
   const [uploading, setUploading] = useState(false)
+  const pdfRef = useRef<HTMLInputElement>(null)
+
+  // Status polling
+  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const pollingDocIdRef = useRef<string | null>(null)
+
+  const stopPolling = useCallback(() => {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current)
+      pollingRef.current = null
+    }
+    pollingDocIdRef.current = null
+  }, [])
+
+  // Cleanup on unmount
+  useEffect(() => () => stopPolling(), [stopPolling])
 
   const loadDocs = useCallback(async () => {
     setLoading(true)
-    let q = supabase.from('kb_documents').select('id, title, source_type, source_url, issuer, publication_date, effective_date, status, chunk_count, full_text, tags, active, created_at, file_name')
-      .eq('active', true).order('created_at', { ascending: false })
+    let q = supabase.from('kb_documents').select(
+      'id, title, source_type, source_url, issuer, publication_date, effective_date, status, chunk_count, full_text, tags, active, created_at, file_name'
+    ).eq('active', true).order('created_at', { ascending: false })
     if (filterStatus) q = q.eq('status', filterStatus)
     const { data } = await q
     setDocs((data as any[]) || [])
@@ -49,13 +84,54 @@ export default function DocumentsPage() {
   const filtered = docs.filter(d => {
     if (!search) return true
     const s = search.toLowerCase()
-    return (d.title || '').toLowerCase().includes(s) || (d.issuer || '').toLowerCase().includes(s) || (d.file_name || '').toLowerCase().includes(s)
+    return (d.title || '').toLowerCase().includes(s) ||
+           (d.issuer || '').toLowerCase().includes(s) ||
+           (d.file_name || '').toLowerCase().includes(s)
   })
+
+  // Start polling for a document
+  const startPolling = useCallback((docId: string) => {
+    stopPolling()
+    pollingDocIdRef.current = docId
+    pollingRef.current = setInterval(async () => {
+      const { data } = await supabase.from('kb_documents')
+        .select('status, chunk_count')
+        .eq('id', docId)
+        .single()
+      if (data && (data.status === 'ready' || data.status === 'error')) {
+        stopPolling()
+        loadDocs()
+        if (data.status === 'ready') {
+          toast.success(`Documento processato: ${data.chunk_count} chunks generati`)
+        } else {
+          toast.error('Errore nel processing del documento')
+        }
+      }
+    }, 5000)
+  }, [stopPolling, loadDocs])
+
+  // File to base64
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const result = reader.result as string
+        // Remove data URL prefix if present
+        const base64 = result.includes(',') ? result.split(',')[1] : result
+        resolve(base64)
+      }
+      reader.onerror = reject
+      reader.readAsDataURL(file)
+    })
+  }
 
   const handleUpload = async () => {
     if (!form.title.trim()) { toast.error('Il titolo è obbligatorio'); return }
+    if (form.source_type === 'pdf' && !pdfFile) { toast.error('Seleziona un file PDF'); return }
+    if (form.source_type === 'text' && !form.text_content.trim()) { toast.error('Inserisci il testo'); return }
     setUploading(true)
     try {
+      const isText = form.source_type === 'text'
       const payload: any = {
         title: form.title.trim(),
         source_type: form.source_type,
@@ -64,16 +140,62 @@ export default function DocumentsPage() {
         publication_date: form.publication_date || null,
         effective_date: form.effective_date || null,
         tags: form.tags,
-        status: form.source_type === 'text' ? 'ready' : 'pending',
-        full_text: form.source_type === 'text' ? form.text_content : null,
+        status: isText ? 'ready' : 'processing',
+        full_text: isText ? form.text_content : null,
+        file_name: pdfFile?.name || null,
+        file_type: form.source_type === 'pdf' ? 'pdf' : null,
         active: true,
         chunk_count: 0,
       }
-      const { error } = await supabase.from('kb_documents').insert(payload)
-      if (error) throw error
-      toast.success('Documento salvato. ' + (form.source_type !== 'text' ? 'Il processing dei chunk verrà eseguito automaticamente.' : ''))
+
+      const { data: newDoc, error: insertErr } = await supabase
+        .from('kb_documents')
+        .insert(payload)
+        .select('id')
+        .single()
+      if (insertErr) throw insertErr
+      const newDocId = (newDoc as any).id
+
+      // If PDF: trigger processing
+      if (form.source_type === 'pdf' && pdfFile) {
+        const base64Data = await fileToBase64(pdfFile)
+        const { data: { session } } = await supabase.auth.getSession()
+        const processRes = await fetch(`${SUPABASE_URL}/functions/v1/kb-process-document`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${session?.access_token}`,
+          },
+          body: JSON.stringify({
+            document_id: newDocId,
+            pdf_base64: base64Data,
+          }),
+        })
+        if (!processRes.ok) {
+          const errText = await processRes.text()
+          console.warn('Processing trigger failed:', errText)
+          toast.warning('Documento salvato ma processing fallito. Riprova più tardi.')
+        } else {
+          startPolling(newDocId)
+        }
+      } else if (form.source_type === 'text' && form.text_content.trim()) {
+        // For text: also trigger processing to generate chunks+embeddings
+        const { data: { session } } = await supabase.auth.getSession()
+        // Update full_text first, then trigger
+        await fetch(`${SUPABASE_URL}/functions/v1/kb-process-document`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${session?.access_token}`,
+          },
+          body: JSON.stringify({ document_id: newDocId }),
+        }).catch(e => console.warn('Text processing trigger failed:', e))
+      }
+
+      toast.success('Documento salvato' + (form.source_type === 'pdf' ? '. Processing in corso...' : ''))
       setShowUpload(false)
       setForm({ title: '', source_type: 'text', source_url: '', issuer: '', publication_date: '', effective_date: '', tags: [], text_content: '' })
+      setPdfFile(null)
       loadDocs()
     } catch (e: any) {
       toast.error(e.message)
@@ -85,6 +207,29 @@ export default function DocumentsPage() {
     await supabase.from('kb_documents').update({ status: 'superseded', updated_at: new Date().toISOString() } as any).eq('id', id)
     toast.success('Documento segnato come superato')
     loadDocs()
+  }
+
+  // Load chunks for expanded document
+  const loadChunks = async (docId: string) => {
+    if (chunks[docId]) return // already loaded
+    setChunksLoading(docId)
+    const { data } = await supabase.from('kb_chunks')
+      .select('id, chunk_index, content, section_title, article_reference, token_count')
+      .eq('document_id', docId)
+      .order('chunk_index')
+    setChunks(prev => ({ ...prev, [docId]: (data as any[]) || [] }))
+    setChunksLoading(null)
+  }
+
+  const handleExpand = (docId: string) => {
+    const isExpanding = expandedId !== docId
+    setExpandedId(isExpanding ? docId : null)
+    if (isExpanding) {
+      const doc = docs.find(d => d.id === docId)
+      if (doc && doc.status === 'ready' && doc.chunk_count > 0) {
+        loadChunks(docId)
+      }
+    }
   }
 
   return (
@@ -127,9 +272,12 @@ export default function DocumentsPage() {
           {filtered.map(doc => {
             const SrcIcon = SOURCE_ICONS[doc.source_type || 'text'] || Type
             const expanded = expandedId === doc.id
+            const isPolling = pollingDocIdRef.current === doc.id
+            const docChunks = chunks[doc.id]
+
             return (
               <div key={doc.id} className="border rounded-lg bg-white">
-                <div className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-slate-50/50" onClick={() => setExpandedId(expanded ? null : doc.id)}>
+                <div className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-slate-50/50" onClick={() => handleExpand(doc.id)}>
                   <SrcIcon className="h-4 w-4 text-slate-400 shrink-0" />
                   <div className="flex-1 min-w-0">
                     <p className="text-sm font-medium text-slate-800 truncate">{doc.title || doc.file_name || 'Senza titolo'}</p>
@@ -138,11 +286,16 @@ export default function DocumentsPage() {
                       {doc.publication_date && <span className="text-[10px] text-slate-400">{doc.publication_date}</span>}
                     </div>
                   </div>
-                  <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded shrink-0 ${STATUS_COLORS[doc.status] || 'bg-gray-100'}`}>
-                    {doc.status}
-                  </span>
-                  <span className="text-xs text-slate-400 shrink-0">{doc.chunk_count} chunks</span>
-                  {expanded ? <ChevronUp className="h-4 w-4 text-slate-400" /> : <ChevronDown className="h-4 w-4 text-slate-400" />}
+                  <div className="flex items-center gap-2 shrink-0">
+                    {(doc.status === 'processing' || isPolling) && (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-500" />
+                    )}
+                    <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${STATUS_COLORS[doc.status] || 'bg-gray-100'}`}>
+                      {doc.status}
+                    </span>
+                    <span className="text-xs text-slate-400">{doc.chunk_count} chunks</span>
+                    {expanded ? <ChevronUp className="h-4 w-4 text-slate-400" /> : <ChevronDown className="h-4 w-4 text-slate-400" />}
+                  </div>
                 </div>
                 {expanded && (
                   <div className="px-4 pb-4 pt-1 border-t space-y-3">
@@ -163,8 +316,48 @@ export default function DocumentsPage() {
                         <pre className="mt-2 max-h-60 overflow-y-auto bg-slate-50 rounded p-3 text-[11px] whitespace-pre-wrap">{doc.full_text}</pre>
                       </details>
                     )}
+
+                    {/* Chunks viewer */}
+                    {doc.status === 'ready' && doc.chunk_count > 0 && (
+                      <div className="space-y-2">
+                        <p className="text-xs font-semibold text-slate-600 flex items-center gap-1">
+                          <Hash className="h-3 w-3" /> Chunks ({doc.chunk_count})
+                        </p>
+                        {chunksLoading === doc.id ? (
+                          <div className="flex items-center gap-2 py-2">
+                            <Loader2 className="h-3.5 w-3.5 animate-spin text-slate-400" />
+                            <span className="text-xs text-slate-400">Caricamento chunks...</span>
+                          </div>
+                        ) : docChunks && docChunks.length > 0 ? (
+                          <div className="space-y-1.5 max-h-80 overflow-y-auto">
+                            {docChunks.map(ch => (
+                              <div key={ch.id} className="bg-slate-50 rounded-lg px-3 py-2 text-[11px]">
+                                <div className="flex items-center gap-2 mb-1">
+                                  <span className="text-[9px] font-bold bg-slate-200 text-slate-600 px-1 py-0.5 rounded">
+                                    #{ch.chunk_index}
+                                  </span>
+                                  {ch.section_title && (
+                                    <span className="text-[9px] text-purple-600 font-medium">{ch.section_title}</span>
+                                  )}
+                                  {ch.article_reference && (
+                                    <span className="text-[9px] text-sky-600">{ch.article_reference}</span>
+                                  )}
+                                  <span className="text-[9px] text-slate-400 ml-auto">{ch.token_count} tokens</span>
+                                </div>
+                                <p className="text-slate-700 line-clamp-3">
+                                  {ch.content.split(/\s+/).slice(0, 30).join(' ')}{ch.content.split(/\s+/).length > 30 ? '...' : ''}
+                                </p>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-[10px] text-slate-400">Nessun chunk trovato</p>
+                        )}
+                      </div>
+                    )}
+
                     <div className="flex gap-2">
-                      <Button size="sm" variant="outline" onClick={() => toast.info('Funzionalità in arrivo nella Fase 2')}>
+                      <Button size="sm" variant="outline" onClick={() => toast.info('Funzionalità in arrivo. Crea le regole manualmente dalla Knowledge Base.')}>
                         <BookOpen className="h-3.5 w-3.5 mr-1" /> Estrai regole
                       </Button>
                       <Button size="sm" variant="outline" onClick={() => markSuperseded(doc.id)}>
@@ -185,7 +378,7 @@ export default function DocumentsPage() {
           <div className="bg-white rounded-xl shadow-2xl p-6 max-w-lg w-full mx-4 space-y-4">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-bold text-slate-900">Carica documento</h2>
-              <button onClick={() => setShowUpload(false)} className="text-slate-400 hover:text-slate-600"><X className="h-5 w-5" /></button>
+              <button onClick={() => { setShowUpload(false); setPdfFile(null) }} className="text-slate-400 hover:text-slate-600"><X className="h-5 w-5" /></button>
             </div>
 
             <div>
@@ -199,7 +392,7 @@ export default function DocumentsPage() {
                 {(['pdf', 'url', 'text'] as const).map(t => (
                   <label key={t} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md border cursor-pointer text-sm ${form.source_type === t ? 'border-sky-500 bg-sky-50 text-sky-700' : 'border-gray-200 text-gray-600'}`}>
                     <input type="radio" name="source_type" value={t} checked={form.source_type === t}
-                      onChange={() => setForm(f => ({ ...f, source_type: t }))} className="sr-only" />
+                      onChange={() => { setForm(f => ({ ...f, source_type: t })); setPdfFile(null) }} className="sr-only" />
                     {t === 'pdf' ? 'PDF' : t === 'url' ? 'URL' : 'Testo'}
                   </label>
                 ))}
@@ -207,8 +400,31 @@ export default function DocumentsPage() {
             </div>
 
             {form.source_type === 'pdf' && (
-              <div className="bg-amber-50 rounded-lg px-3 py-2 text-xs text-amber-700">
-                ⚠ Upload PDF: il processing dei chunk verrà implementato nella Fase 2. Per ora il documento verrà salvato con status "pending".
+              <div className="space-y-2">
+                <div
+                  onClick={() => pdfRef.current?.click()}
+                  className="border-2 border-dashed rounded-lg p-6 text-center cursor-pointer hover:border-sky-400 hover:bg-sky-50/30 transition-colors"
+                >
+                  {pdfFile ? (
+                    <div className="flex items-center justify-center gap-2">
+                      <FileText className="h-5 w-5 text-emerald-500" />
+                      <span className="text-sm font-medium text-slate-700">{pdfFile.name}</span>
+                      <span className="text-[10px] text-slate-400">({(pdfFile.size / 1024).toFixed(0)} KB)</span>
+                    </div>
+                  ) : (
+                    <>
+                      <Upload className="h-6 w-6 text-slate-400 mx-auto mb-1" />
+                      <p className="text-xs text-slate-500">Clicca per selezionare un PDF</p>
+                    </>
+                  )}
+                  <input
+                    ref={pdfRef}
+                    type="file"
+                    accept=".pdf"
+                    className="hidden"
+                    onChange={e => { const f = e.target.files?.[0]; if (f) setPdfFile(f) }}
+                  />
+                </div>
               </div>
             )}
 
@@ -248,7 +464,7 @@ export default function DocumentsPage() {
             </div>
 
             <div className="flex gap-2 justify-end pt-2 border-t">
-              <Button variant="outline" onClick={() => setShowUpload(false)}>Annulla</Button>
+              <Button variant="outline" onClick={() => { setShowUpload(false); setPdfFile(null) }}>Annulla</Button>
               <Button onClick={handleUpload} disabled={uploading}>
                 {uploading ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : null}
                 Salva

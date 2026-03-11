@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import TagInput from '@/components/TagInput'
-import { supabase } from '@/integrations/supabase/client'
+import { supabase, SUPABASE_URL } from '@/integrations/supabase/client'
 import { toast } from 'sonner'
 import { Plus, X, Search, Loader2, Pencil, Trash2, BookOpen } from 'lucide-react'
 
@@ -111,6 +111,24 @@ export default function KnowledgeBasePage() {
     return r.title.toLowerCase().includes(s) || r.content.toLowerCase().includes(s)
   })
 
+  // Trigger embedding generation for a KB rule (fire-and-forget)
+  const triggerEmbedding = async (ruleId: string) => {
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      await fetch(`${SUPABASE_URL}/functions/v1/admin-embed-kb-rule`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session?.access_token}`,
+        },
+        body: JSON.stringify({ rule_id: ruleId }),
+      })
+    } catch (e) {
+      console.warn('Embedding generation failed:', e)
+      // Non-blocking: embedding is nice-to-have
+    }
+  }
+
   const handleSave = async () => {
     if (!editRule) return
     if (!editRule.title?.trim() || !editRule.content?.trim()) {
@@ -137,15 +155,20 @@ export default function KnowledgeBasePage() {
       updated_at: new Date().toISOString(),
     }
     try {
+      let savedId: string | null = null
       if (editRule.id) {
         const { error } = await supabase.from('knowledge_base').update(payload as any).eq('id', editRule.id)
         if (error) throw error
+        savedId = editRule.id
         toast.success('Regola aggiornata')
       } else {
-        const { error } = await supabase.from('knowledge_base').insert(payload as any)
+        const { data, error } = await supabase.from('knowledge_base').insert(payload as any).select('id').single()
         if (error) throw error
+        savedId = (data as any)?.id
         toast.success('Regola creata')
       }
+      // Trigger embedding generation (fire-and-forget)
+      if (savedId) triggerEmbedding(savedId)
       setEditRule(null)
       loadRules()
     } catch (e: any) {
