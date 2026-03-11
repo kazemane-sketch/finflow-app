@@ -484,6 +484,10 @@ ${rulesCtx || "(nessuna)"}
 
 Restituisci un JSON con questa struttura:
 {
+  "category": "string — una tra: normativa_fiscale, principi_contabili, principi_revisione, prassi_interpretativa, normativa_periodica, giurisprudenza, tabelle_operative, normativa_lavoro, normativa_societaria",
+
+  "source_type": "string — una tra: legge, decreto_legislativo, decreto_ministeriale, circolare_ade, risoluzione_ade, interpello, principio_contabile_oic, principio_contabile_ias, principio_revisione, sentenza, ordinanza, prassi_interna, tabella, guida_operativa, altro",
+
   "subcategory": "string — sottocategoria tematica (es. 'ammortamento', 'reverse_charge', 'leasing', 'veicoli', 'rappresentanza')",
 
   "tax_area": ["array di aree fiscali tra: imposte_dirette, iva, irap, ritenute, imu, imposta_registro"],
@@ -601,6 +605,8 @@ REGOLE DI CLASSIFICAZIONE:
     }
   }
 
+  maybeUpdate("category", doc.category, classification.category);
+  maybeUpdate("source_type", doc.source_type, classification.source_type);
   maybeUpdate("subcategory", doc.subcategory, classification.subcategory);
   maybeUpdate("tax_area", doc.tax_area, classification.tax_area);
   maybeUpdate("accounting_area", doc.accounting_area, classification.accounting_area);

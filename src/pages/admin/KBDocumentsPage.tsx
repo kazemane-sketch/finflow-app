@@ -445,7 +445,6 @@ export default function KBDocumentsPage() {
   // ── Save document ──
   const handleSave = async () => {
     if (!form.title?.trim()) { toast.error('Il titolo è obbligatorio'); return }
-    if (!form.category) { toast.error('La categoria è obbligatoria'); return }
 
     setSaving(true)
     try {
