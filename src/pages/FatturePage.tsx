@@ -1,6 +1,6 @@
 // src/pages/FatturePage.tsx — v6
 // Tab layout redesign: Classification-first UX with Documento/Pagamenti/Note tabs
-import React, { useState, useCallback, useRef, useEffect, useMemo, useSyncExternalStore } from 'react';
+import React, { startTransition, useState, useCallback, useRef, useEffect, useMemo, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { processInvoiceFile, TIPO, MP, REG, mpLabel, tpLabel } from '@/lib/invoiceParser';
@@ -30,7 +30,7 @@ import {
   loadArticlesWithPhases, assignArticleToLine, removeLineAssignment, recordAssignmentFeedback, loadLearnedRules,
   type Article, type ArticleWithPhases, type ArticlePhase, type MatchResult,
 } from '@/lib/articlesService';
-import { matchWithLearnedRules, extractLocation } from '@/lib/articleMatching';
+import { matchWithLearnedRules, extractLocation, type LearnedRule } from '@/lib/articleMatching';
 import {
   loadCategories, loadProjects, loadChartOfAccounts,
   loadInvoiceClassification, saveInvoiceClassification, deleteInvoiceClassification,
@@ -526,20 +526,45 @@ function SingleInvoiceAIProgressCard({ job, onStop }: { job: AIJob; onStop: () =
 // ============================================================
 // SIDEBAR CARD
 // ============================================================
-function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, isMatched, suggestionScore, meta, rowRef }: { inv: DBInvoice; selected: boolean; checked: boolean; selectMode: boolean; onSelect: () => void; onCheck: () => void; isMatched?: boolean; suggestionScore?: number; meta?: InvoiceClassificationMeta; rowRef?: (node: HTMLDivElement | null) => void }) {
+function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, onPrefetch, isMatched, suggestionScore, meta, rowRef }: { inv: DBInvoice; selected: boolean; checked: boolean; selectMode: boolean; onSelect: () => void; onCheck: () => void; onPrefetch?: () => void; isMatched?: boolean; suggestionScore?: number; meta?: InvoiceClassificationMeta; rowRef?: (node: HTMLDivElement | null) => void }) {
   const nc = inv.doc_type === 'TD04' || inv.doc_type === 'TD05';
   const cp = (inv.counterparty || {}) as any;
   const displayName = cp?.denom || inv.source_filename || 'Sconosciuto';
+  const prefetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Classification started = at least one field present on at least one line
   const hasAnyField = meta && (
     meta.lines_with_category > 0 || meta.lines_with_account > 0 ||
     meta.lines_with_cdc > 0 || meta.lines_with_article > 0
   );
   const needsClassification = !hasAnyField && inv.classification_status !== 'ai_suggested';
+  const schedulePrefetch = () => {
+    if (!onPrefetch) return;
+    if (prefetchTimerRef.current) clearTimeout(prefetchTimerRef.current);
+    prefetchTimerRef.current = setTimeout(() => onPrefetch(), 120);
+  };
+  const cancelPrefetch = () => {
+    if (!prefetchTimerRef.current) return;
+    clearTimeout(prefetchTimerRef.current);
+    prefetchTimerRef.current = null;
+  };
+
+  useEffect(() => cancelPrefetch, []);
+
   return (
     <div
       ref={rowRef}
       data-invoice-id={inv.id}
+      tabIndex={0}
+      onMouseEnter={schedulePrefetch}
+      onMouseLeave={cancelPrefetch}
+      onFocus={schedulePrefetch}
+      onBlur={cancelPrefetch}
+      onKeyDown={e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onSelect();
+        }
+      }}
       className={`flex items-start gap-2 px-3 py-2.5 cursor-pointer border-b border-gray-100 transition-all ${checked ? 'bg-blue-50 border-l-4 border-l-blue-500' : selected ? 'bg-sky-50 border-l-4 border-l-sky-500' : 'border-l-4 border-l-transparent hover:bg-gray-50'}`}
     >
       {selectMode && <input type="checkbox" checked={checked} onChange={onCheck} className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />}
@@ -955,6 +980,106 @@ function buildAggregatedNotes(
   return alerts;
 }
 
+type InvoiceDetailPhase = 'idle' | 'loading' | 'ready' | 'refreshing';
+
+type InvoiceLineArticleAssignmentRow = {
+  invoice_line_id: string
+  article_id: string
+  phase_id: string | null
+  assigned_by: string
+  verified: boolean
+  location: string | null
+  confidence: number | null
+  article: {
+    id: string
+    code: string
+    name: string
+    unit?: string | null
+    keywords?: string[]
+  } | null
+}
+
+type InvoiceDetailBundle = {
+  invoiceId: string
+  detail: DBInvoiceDetail | null
+  installments: InvoiceInstallment[]
+  classification: InvoiceClassification | null
+  invoiceProjects: InvoiceProjectAssignment[]
+  lineClassifs: Record<string, LineClassification>
+  lineFiscalFlags: Record<string, any>
+  lineConfidences: Record<string, number>
+  lineReviewFlags: Record<string, boolean>
+  lineProjects: Record<string, LineProjectAssignment[]>
+  invoiceNotes: FiscalAlert[]
+  lineAssignments: InvoiceLineArticleAssignmentRow[]
+}
+
+type InvoiceReferenceData = {
+  articles: ArticleWithPhases[]
+  learnedRules: LearnedRule[]
+  categories: Category[]
+  projects: Project[]
+  accounts: ChartAccount[]
+}
+
+const EMPTY_INVOICE_REFERENCE_DATA: InvoiceReferenceData = {
+  articles: [],
+  learnedRules: [],
+  categories: [],
+  projects: [],
+  accounts: [],
+};
+
+async function loadInvoiceLineAssignments(invoiceId: string): Promise<InvoiceLineArticleAssignmentRow[]> {
+  const { data, error } = await supabase
+    .from('invoice_line_articles')
+    .select('invoice_line_id, article_id, phase_id, assigned_by, verified, location, confidence, article:articles!inner(id, code, name, unit, keywords)')
+    .eq('invoice_id', invoiceId);
+  if (error) throw error;
+  return (data || []) as unknown as InvoiceLineArticleAssignmentRow[];
+}
+
+async function loadInvoiceDetailBundle(companyId: string, invoiceId: string): Promise<InvoiceDetailBundle> {
+  const [
+    detail,
+    installments,
+    classification,
+    invoiceProjects,
+    lineClfResult,
+    lineProjects,
+    invoiceNotes,
+    lineAssignments,
+  ] = await Promise.all([
+    loadInvoiceDetail(invoiceId),
+    listInstallmentsForInvoice(companyId, invoiceId),
+    loadInvoiceClassification(invoiceId),
+    loadInvoiceProjects(invoiceId),
+    loadLineClassifications(invoiceId),
+    loadLineProjects(invoiceId),
+    loadInvoiceNotes(invoiceId),
+    loadInvoiceLineAssignments(invoiceId),
+  ]);
+
+  return {
+    invoiceId,
+    detail,
+    installments,
+    classification,
+    invoiceProjects,
+    lineClassifs: lineClfResult.classifs,
+    lineFiscalFlags: lineClfResult.fiscalFlags,
+    lineConfidences: lineClfResult.confidences,
+    lineReviewFlags: lineClfResult.reviewFlags,
+    lineProjects,
+    invoiceNotes,
+    lineAssignments,
+  };
+}
+
+function hasAnyLineProjects(lineProjects: Record<string, LineProjectAssignment[]>): boolean {
+  return Object.values(lineProjects).some(assignments => assignments.length > 0);
+}
+
 type PendingFiscalChoice = {
   first_line_id: string
   alert_type: string
@@ -967,8 +1092,13 @@ type PendingFiscalChoice = {
   account_id: string | null
 }
 
-function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, onDelete, onReload, onPatchInvoice, onRefreshBadges, onOpenCounterparty, onOpenScadenzario, onNavigateCounterparty }: {
-  invoice: DBInvoice; detail: DBInvoiceDetail | null; installments: InvoiceInstallment[]; loadingDetail: boolean;
+function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, referenceDataLoading, onInvalidateBundle, onEdit, onDelete, onReload, onPatchInvoice, onRefreshBadges, onOpenCounterparty, onOpenScadenzario, onNavigateCounterparty }: {
+  invoice: DBInvoice;
+  detailBundle: InvoiceDetailBundle | null;
+  detailPhase: InvoiceDetailPhase;
+  referenceData: InvoiceReferenceData;
+  referenceDataLoading: boolean;
+  onInvalidateBundle: (invoiceId: string) => void;
   onEdit: (u: InvoiceUpdate) => Promise<void>; onDelete: () => void; onReload: () => void;
   onPatchInvoice: (invoiceId: string, patch: Partial<DBInvoice>) => void;
   onRefreshBadges: (invoiceId: string) => void;
@@ -977,6 +1107,9 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   onNavigateCounterparty: () => void;
 }) {
   const { company } = useCompany();
+  const activeDetailBundle = detailBundle?.invoiceId === invoice.id ? detailBundle : null;
+  const detail = activeDetailBundle?.detail ?? null;
+  const installments = activeDetailBundle?.installments ?? [];
   const [activeTab, setActiveTab] = useState<DetailTab>('classificazione');
   const [editing, setEditing] = useState(false);
   const [showXml, setShowXml] = useState(false);
@@ -991,16 +1124,16 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   });
 
   // ─── Article assignment state ───
-  const [articles, setArticles] = useState<ArticleWithPhases[]>([]);
+  const [articles, setArticles] = useState<ArticleWithPhases[]>(referenceData.articles);
   const [lineArticleMap, setLineArticleMap] = useState<Record<string, LineArticleInfo>>({});
   const [aiSuggestions, setAiSuggestions] = useState<Record<string, MatchResult>>({});
   // Track dismissed AI article suggestions — triggers dirty state so Salva persists the removal
   const [dismissedArticleLineIds, setDismissedArticleLineIds] = useState<Set<string>>(new Set());
 
   // ─── Classification state ───
-  const [allCategories, setAllCategories] = useState<Category[]>([]);
-  const [allProjects, setAllProjects] = useState<Project[]>([]);
-  const [allAccounts, setAllAccounts] = useState<ChartAccount[]>([]);
+  const [allCategories, setAllCategories] = useState<Category[]>(referenceData.categories);
+  const [allProjects, setAllProjects] = useState<Project[]>(referenceData.projects);
+  const [allAccounts, setAllAccounts] = useState<ChartAccount[]>(referenceData.accounts);
   const [classification, setClassification] = useState<InvoiceClassification | null>(null);
   const [invProjects, setInvProjects] = useState<InvoiceProjectAssignment[]>([]);
   const [selCategoryId, setSelCategoryId] = useState<string | null>(null);
@@ -1125,8 +1258,14 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
   } | null>(null);
   // Clear all classification dialog
   const [showClearDialog, setShowClearDialog] = useState(false);
+  const [clearPending, setClearPending] = useState(false);
   // Original line CdC snapshot for dirty-state tracking
   const [originalLineProjects, setOriginalLineProjects] = useState<Record<string, LineProjectAssignment[]>>({});
+  const [originalInvoiceProjects, setOriginalInvoiceProjects] = useState<InvoiceProjectAssignment[]>([]);
+  const [originalClassificationSnapshot, setOriginalClassificationSnapshot] = useState<{ category_id: string | null; account_id: string | null }>({
+    category_id: null,
+    account_id: null,
+  });
   // Hide zero-amount lines toggle
   const [showZeroLines, setShowZeroLines] = useState(false);
   const isConfirmed = invoice.classification_status === 'confirmed';
@@ -1230,135 +1369,128 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     return classifDirty;
   }, [dismissedArticleLineIds, pendingFiscalChoices, lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap, lineProjects, originalLineProjects, classifDirty]);
 
-  // Load articles + existing assignments when invoice changes
+  const persistedHasData = useMemo(() => (
+    !!originalClassificationSnapshot.category_id
+    || !!originalClassificationSnapshot.account_id
+    || Object.keys(originalLineClassifs).length > 0
+    || Object.keys(originalLineArticleMap).length > 0
+    || hasAnyLineProjects(originalLineProjects)
+    || originalInvoiceProjects.length > 0
+  ), [originalClassificationSnapshot, originalLineClassifs, originalLineArticleMap, originalLineProjects, originalInvoiceProjects]);
+
+  const draftHasData = useMemo(() => (
+    !!classification
+    || Object.keys(lineClassifs).length > 0
+    || Object.keys(lineArticleMap).length > 0
+    || Object.keys(aiSuggestions).length > 0
+    || hasAnyLineProjects(lineProjects)
+    || cdcRows.length > 0
+    || invProjects.length > 0
+  ), [classification, lineClassifs, lineArticleMap, aiSuggestions, lineProjects, cdcRows, invProjects]);
+
   useEffect(() => {
-    const companyId = company?.id;
-    if (!companyId || !invoice?.id) { setArticles([]); setLineArticleMap({}); setAiSuggestions({}); setDismissedArticleLineIds(new Set()); setBulkArticleId(null); setBulkPhaseId(null); return; }
-    let cancelled = false;
+    setArticles(referenceData.articles);
+  }, [referenceData.articles]);
 
-    (async () => {
-      // Load articles + learned rules for this company
-      const [arts, rules] = await Promise.all([
-        loadArticlesWithPhases(companyId, { activeOnly: true }),
-        loadLearnedRules(companyId),
-      ]);
-      if (cancelled) return;
-      setArticles(arts);
+  useEffect(() => {
+    setAllCategories(referenceData.categories);
+  }, [referenceData.categories]);
 
-      // Load existing assignments for this invoice (include phase_id + phase relation)
-      const { data: assignments } = await supabase
-        .from('invoice_line_articles')
-        .select('invoice_line_id, article_id, phase_id, assigned_by, verified, location, confidence, article:articles!inner(id, code, name, unit, keywords)')
-        .eq('invoice_id', invoice.id);
+  useEffect(() => {
+    setAllProjects(referenceData.projects);
+  }, [referenceData.projects]);
 
-      if (cancelled) return;
-      const map: Record<string, LineArticleInfo> = {};
-      const dbSuggestions: Record<string, MatchResult> = {};
+  useEffect(() => {
+    setAllAccounts(referenceData.accounts);
+  }, [referenceData.accounts]);
 
-      for (const a of (assignments || [])) {
-        const art = a.article as any;
-        // Resolve phase info from pre-loaded articles
-        const fullArtWithPhases = arts.find(ar => ar.id === a.article_id);
-        const phase = a.phase_id ? fullArtWithPhases?.phases?.find(p => p.id === a.phase_id) : null;
-        if (a.verified) {
-          // Confirmed assignment → green badge
-          map[a.invoice_line_id] = {
-            article_id: a.article_id, code: art?.code || '', name: art?.name || '',
-            assigned_by: a.assigned_by, verified: a.verified, location: a.location,
-            phase_id: a.phase_id || null, phase_code: phase?.code || null, phase_name: phase?.name || null,
-          };
-        } else {
-          // AI suggestion from DB → orange badge (preserve phase_id from AI classification)
-          const fullArt = arts.find(ar => ar.id === a.article_id);
-          if (fullArt) {
-            dbSuggestions[a.invoice_line_id] = {
-              article: fullArt,
-              confidence: Number(a.confidence) || 50,
-              matchedKeywords: [],
-              totalKeywords: fullArt.keywords.length,
-              source: 'deterministic',
-              phase_id: a.phase_id || null,
-            };
-          }
+  // Apply a ready invoice bundle in a single state swap to avoid flicker and stale interleaving.
+  useEffect(() => {
+    if (!activeDetailBundle) return;
+
+    const map: Record<string, LineArticleInfo> = {};
+    const dbSuggestions: Record<string, MatchResult> = {};
+
+    for (const assignment of activeDetailBundle.lineAssignments) {
+      const art = assignment.article as any;
+      const fullArt = articles.find(article => article.id === assignment.article_id);
+      const phase = assignment.phase_id ? fullArt?.phases?.find(p => p.id === assignment.phase_id) : null;
+      if (assignment.verified) {
+        map[assignment.invoice_line_id] = {
+          article_id: assignment.article_id,
+          code: art?.code || '',
+          name: art?.name || '',
+          assigned_by: assignment.assigned_by,
+          verified: assignment.verified,
+          location: assignment.location,
+          phase_id: assignment.phase_id || null,
+          phase_code: phase?.code || null,
+          phase_name: phase?.name || null,
+        };
+        continue;
+      }
+      if (fullArt) {
+        dbSuggestions[assignment.invoice_line_id] = {
+          article: fullArt,
+          confidence: Number(assignment.confidence) || 50,
+          matchedKeywords: [],
+          totalKeywords: fullArt.keywords.length,
+          source: 'deterministic',
+          phase_id: assignment.phase_id || null,
+        };
+      }
+    }
+
+    const runtimeSuggestions: Record<string, MatchResult> = {};
+    if (activeDetailBundle.detail?.invoice_lines && articles.length > 0) {
+      for (const line of activeDetailBundle.detail.invoice_lines) {
+        if (map[line.id] || dbSuggestions[line.id]) continue;
+        const match = matchWithLearnedRules(line.description, articles, referenceData.learnedRules);
+        if (match && match.confidence >= 70) {
+          runtimeSuggestions[line.id] = match;
         }
       }
+    }
+
+    startTransition(() => {
+      setClassification(activeDetailBundle.classification);
+      setInvProjects(activeDetailBundle.invoiceProjects);
+      setOriginalInvoiceProjects(activeDetailBundle.invoiceProjects);
+      setOriginalClassificationSnapshot({
+        category_id: activeDetailBundle.classification?.category_id || null,
+        account_id: activeDetailBundle.classification?.account_id || null,
+      });
+      setInvoiceNotes(buildAggregatedNotes(activeDetailBundle.invoiceNotes, activeDetailBundle.lineFiscalFlags));
+      setLineClassifs(activeDetailBundle.lineClassifs);
+      setOriginalLineClassifs(activeDetailBundle.lineClassifs);
+      setLineProjects(activeDetailBundle.lineProjects);
+      setOriginalLineProjects(activeDetailBundle.lineProjects);
+      setLineFiscalFlags(activeDetailBundle.lineFiscalFlags);
+      setLineConfidences(activeDetailBundle.lineConfidences);
+      setLineReviewFlags(activeDetailBundle.lineReviewFlags);
+      setPendingFiscalChoices([]);
+      setCdcRows(activeDetailBundle.invoiceProjects.map(ip => ({
+        project_id: ip.project_id,
+        percentage: Number(ip.percentage),
+        amount: ip.amount ?? null,
+      })));
+      setSelCategoryId(activeDetailBundle.classification?.category_id || null);
+      setSelAccountId(activeDetailBundle.classification?.account_id || null);
+      setClassifDirty(false);
+      setClearPending(false);
       setLineArticleMap(map);
       setOriginalLineArticleMap(map);
-
-      // Compute AI suggestions for lines with NO DB record at all
-      // (runtime matching — learned rules first, then keyword fallback)
-      if (detail?.invoice_lines && arts.length > 0) {
-        const runtimeSuggestions: Record<string, MatchResult> = {};
-        for (const line of detail.invoice_lines) {
-          if (map[line.id]) continue;           // already confirmed
-          if (dbSuggestions[line.id]) continue;  // already has DB suggestion
-          const match = matchWithLearnedRules(line.description, arts, rules);
-          if (match && match.confidence >= 70) {
-            runtimeSuggestions[line.id] = match;
-          }
-        }
-        // Merge: DB suggestions take priority, then runtime
-        setAiSuggestions({ ...runtimeSuggestions, ...dbSuggestions });
-      } else {
-        setAiSuggestions(dbSuggestions);
-      }
-    })();
-
-    return () => { cancelled = true; };
-  }, [company?.id, invoice?.id, detail?.invoice_lines]);
-
-  // Load classification data (categories, projects, accounts, invoice assignments)
-  useEffect(() => {
-    const companyId = company?.id;
-    if (!companyId || !invoice?.id) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const [cats, projs, accs, classif, iProjs, lineClfResult, lineProj, fiscalAlerts] = await Promise.all([
-          loadCategories(companyId, true),
-          loadProjects(companyId, true),
-          loadChartOfAccounts(companyId),
-          loadInvoiceClassification(invoice.id),
-          loadInvoiceProjects(invoice.id),
-          loadLineClassifications(invoice.id),
-          loadLineProjects(invoice.id),
-          loadInvoiceNotes(invoice.id),
-        ]);
-        if (cancelled) return;
-        setAllCategories(cats);
-        setAllProjects(projs);
-        setAllAccounts(accs.filter(a => !a.is_header && a.active));
-        setClassification(classif);
-        setInvProjects(iProjs);
-        setInvoiceNotes(buildAggregatedNotes(fiscalAlerts, lineClfResult.fiscalFlags));
-        setLineClassifs(lineClfResult.classifs);
-        setOriginalLineClassifs(lineClfResult.classifs);
-        setLineProjects(lineProj);
-        setOriginalLineProjects(lineProj);
-        // Load fiscal flags + review metadata from DB (persisted by AI classification)
-        setLineFiscalFlags(lineClfResult.fiscalFlags);
-        setLineConfidences(lineClfResult.confidences);
-        setLineReviewFlags(lineClfResult.reviewFlags);
-        setPendingFiscalChoices([]);
-        // Initialize local CdC rows from DB assignments
-        setCdcRows(iProjs.map(ip => ({
-          project_id: ip.project_id,
-          percentage: Number(ip.percentage),
-          amount: ip.amount ?? null,
-        })));
-        setSelCategoryId(classif?.category_id || null);
-        setSelAccountId(classif?.account_id || null);
-        setClassifDirty(false);
-        // Reset transient AI state from previous invoice
-        setAiClassifResult(null);
-        setAiClassifStatus('idle');
-        setPipelineDebug(null);
-        setLineSuggestions({});
-        setDismissedSuggestions(new Set());
-      } catch (e) { console.error('Classification load error:', e); }
-    })();
-    return () => { cancelled = true; };
-  }, [company?.id, invoice?.id]);
+      setAiSuggestions({ ...runtimeSuggestions, ...dbSuggestions });
+      setDismissedArticleLineIds(new Set());
+      setAiClassifResult(null);
+      setAiClassifStatus('idle');
+      setPipelineDebug(null);
+      setLineSuggestions({});
+      setDismissedSuggestions(new Set());
+      setBulkArticleId(null);
+      setBulkPhaseId(null);
+    });
+  }, [activeDetailBundle, invoice.id, articles, referenceData.learnedRules]);
 
   // Unified save: classification + CdC rows (batch)
   const handleSaveClassification = useCallback(async () => {
@@ -1664,6 +1796,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setAiClassifStatus('done');
       if (pipelineResult.debug) setPipelineDebug(pipelineResult.debug);
       onPatchInvoice(runInvoiceId, { classification_status: 'ai_suggested' } as Partial<DBInvoice>);
+      onInvalidateBundle(runInvoiceId);
 
       const flags: Record<string, any> = {};
       for (const lr of mergedLines) {
@@ -1839,7 +1972,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         console.warn('[AI classification] post-sync warning:', syncErr);
       }
     }, 6);
-  }, [invoice?.id, invoice?.counterparty, invoice?.direction, invoice?.total_amount, company?.id, detail?.invoice_lines, selCategoryId, selAccountId, onPatchInvoice, startSingleInvoiceJob, articles]);
+  }, [invoice?.id, invoice?.counterparty, invoice?.direction, invoice?.total_amount, company?.id, detail?.invoice_lines, selCategoryId, selAccountId, onPatchInvoice, onInvalidateBundle, startSingleInvoiceJob, articles]);
 
   // Confirm AI suggestion — set verified=true on invoice_classifications + line-level records
   // NOTE: handleConfirmAiClassification, handleRejectAiClassification, handleConfirmExistingClassification
@@ -1887,6 +2020,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
         setAllAccounts(freshAccs.filter(a => !a.is_header && a.active));
         // Refresh sidebar badges
         onRefreshBadges(invoice!.id);
+        onInvalidateBundle(invoice!.id);
       }
 
       // Dismiss this suggestion
@@ -1895,7 +2029,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       toast.error(`Errore: ${err.message}`);
     }
     setCreatingSuggestion(null);
-  }, [company?.id, invoice?.id, lineSuggestions, lineClassifs, onRefreshBadges]);
+  }, [company?.id, invoice?.id, lineSuggestions, lineClassifs, onRefreshBadges, onInvalidateBundle]);
 
   // Handle "Ignora" for AI-suggested new account/category
   const handleDismissSuggestion = useCallback((lineId: string) => {
@@ -2144,8 +2278,14 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
       setOriginalLineClassifs({ ...lineClassifs });
       setOriginalLineArticleMap({ ...lineArticleMap });
       setOriginalLineProjects({ ...lineProjects });
+      setOriginalInvoiceProjects([...invProjects]);
+      setOriginalClassificationSnapshot({
+        category_id: selCategoryId || null,
+        account_id: selAccountId || null,
+      });
       setDismissedArticleLineIds(new Set());
       setClassifDirty(false);
+      setClearPending(false);
 
       // 6. Persist updated fiscal flags for lines that were modified by fiscal review
       for (const [lineId, ff] of Object.entries(lineFiscalFlags)) {
@@ -2161,6 +2301,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
       // 8. Refresh badges in sidebar
       onRefreshBadges(invoice.id);
+      onInvalidateBundle(invoice.id);
       if (learningWarnings.length > 0) {
         toast.warning(`Modifiche salvate con ${learningWarnings.length} warning di apprendimento`);
       } else {
@@ -2175,7 +2316,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     isConfirmed, classification, classifDirty, selCategoryId, selAccountId, cdcRows, cdcMode,
     lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap,
     lineProjects, originalLineProjects, dismissedArticleLineIds,
-    detail?.invoice_lines, onPatchInvoice, onRefreshBadges, allAccounts, allCategories,
+    detail?.invoice_lines, onPatchInvoice, onRefreshBadges, onInvalidateBundle, allAccounts, allCategories,
     lineFiscalFlags, invoiceNotes, pendingFiscalChoices, primaryContractRef]);
 
   // Copy classification from a line
@@ -2228,6 +2369,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     setSelCategoryId(null);
     setSelAccountId(null);
     setCdcRows([]);
+    setInvProjects([]);
     setLineClassifs({});
     setLineProjects({});
     setLineArticleMap({});
@@ -2237,9 +2379,13 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     setInvoiceNotes([]);
     setPendingFiscalChoices([]);
     setAiSuggestions({});
+    setLineSuggestions({});
+    setDismissedSuggestions(new Set());
     setDismissedArticleLineIds(new Set());
     setAiClassifResult(null);
     setAiClassifStatus('idle');
+    setPipelineDebug(null);
+    setClearPending(true);
     // Mark invoice-level as dirty so Save button detects the change
     setClassifDirty(true);
     // NOTE: Do NOT reset originals — we want isPostConfirmDirty = true → Save appears
@@ -2267,7 +2413,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
     } catch (e) {
       console.warn('[clear] Error deactivating invoice memory facts:', e);
     }
-  }, [invoice?.id]);
+    onInvalidateBundle(invoice.id);
+  }, [invoice?.id, onInvalidateBundle]);
 
   // ─── Fiscal Review: handle user choice on an alert ─────
   const handleFiscalChoice = useCallback((alertIdx: number, option: FiscalAlertOption | null) => {
@@ -2629,8 +2776,11 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
 
   // Compute whether classification tab has an unconfirmed indicator
   const classifNeedsAttention = invoice.classification_status === 'ai_suggested' || (!classification && aiClassifStatus === 'idle');
-
-  if (loadingDetail) return <div className="text-center py-16 text-gray-400">Caricamento dettaglio...</div>;
+  const showDetailSkeleton = referenceDataLoading
+    || detailPhase === 'loading'
+    || detailPhase === 'refreshing'
+    || (detailBundle != null && detailBundle.invoiceId !== invoice.id)
+    || (detailPhase !== 'ready' && !detailBundle);
 
   const nc = invoice.doc_type === 'TD04' || invoice.doc_type === 'TD05';
   const d = parsed;
@@ -2773,6 +2923,42 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
           </div>
         )}
 
+        {showDetailSkeleton ? (
+          <div className="p-4 space-y-4 animate-pulse">
+            <div className="flex items-center gap-3">
+              <div className="h-10 w-36 rounded-lg bg-purple-100" />
+              <div className="h-4 w-28 rounded bg-gray-200" />
+            </div>
+            <div className="border rounded-xl bg-white p-4 space-y-3">
+              <div className="h-4 w-28 rounded bg-gray-200" />
+              <div className="h-3 w-4/5 rounded bg-gray-100" />
+              <div className="h-10 w-full rounded-lg bg-gray-100" />
+            </div>
+            <div className="border rounded-xl bg-white overflow-hidden">
+              <div className="px-4 py-3 border-b bg-gray-50">
+                <div className="h-5 w-40 rounded bg-gray-200" />
+              </div>
+              <div className="divide-y">
+                {Array.from({ length: 3 }).map((_, idx) => (
+                  <div key={idx} className="grid grid-cols-[minmax(0,1fr)_90px_90px_80px_90px_180px_180px_140px] gap-3 px-4 py-4">
+                    <div className="space-y-2">
+                      <div className="h-4 w-3/4 rounded bg-gray-200" />
+                      <div className="h-3 w-1/2 rounded bg-gray-100" />
+                    </div>
+                    <div className="h-4 rounded bg-gray-100" />
+                    <div className="h-4 rounded bg-gray-100" />
+                    <div className="h-4 rounded bg-gray-100" />
+                    <div className="h-4 rounded bg-gray-100" />
+                    <div className="h-8 rounded-lg bg-blue-50" />
+                    <div className="h-8 rounded-lg bg-gray-100" />
+                    <div className="h-8 rounded-lg bg-emerald-50" />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <>
         {/* ═══ TAB: CLASSIFICAZIONE ═══ */}
         {activeTab === 'classificazione' && (
           <div className="p-4 space-y-4">
@@ -2831,7 +3017,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
               )}
 
               {/* Dirty indicator */}
-              {classifDirty && (
+              {isPostConfirmDirty && (
                 <span className="text-[10px] text-amber-600 italic flex items-center gap-1 ml-auto">
                   <span>{'\u26A0'}</span> Non salvato
                 </span>
@@ -3500,7 +3686,7 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
                           : 'Nessuna classificazione'}
                   </span>
                   {/* "Cancella tutto" — clears entire classification (always visible when there's data) */}
-                  {(classification || Object.keys(lineClassifs).length > 0 || Object.keys(lineArticleMap).length > 0 || Object.keys(aiSuggestions).length > 0 || cdcRows.length > 0 || invProjects.length > 0) && (
+                  {(persistedHasData || draftHasData || clearPending) && (
                     <button onClick={() => setShowClearDialog(true)}
                       className="px-2 py-1 text-[10px] font-semibold rounded-md border border-red-200 text-red-500 hover:bg-red-50 transition-colors">
                       {'\uD83D\uDDD1'} Cancella tutto
@@ -3934,6 +4120,8 @@ function InvoiceDetail({ invoice, detail, installments, loadingDetail, onEdit, o
             )}
           </div>
         )}
+          </>
+        )}
       </div>
     </div>
   );
@@ -3965,10 +4153,14 @@ export default function FatturePage() {
   const initialReturnFilters = initialReturnContextRef.current?.filters;
   const [invoices, setInvoices] = useState<DBInvoice[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(initialReturnContextRef.current?.selectedInvoiceId || null);
-  const [detail, setDetail] = useState<DBInvoiceDetail | null>(null);
-  const [installments, setInstallments] = useState<InvoiceInstallment[]>([]);
-  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [detailBundle, setDetailBundle] = useState<InvoiceDetailBundle | null>(null);
+  const [detailPhase, setDetailPhase] = useState<InvoiceDetailPhase>('idle');
+  const [referenceData, setReferenceData] = useState<InvoiceReferenceData>(EMPTY_INVOICE_REFERENCE_DATA);
+  const [referenceDataLoading, setReferenceDataLoading] = useState(false);
   const [loadingList, setLoadingList] = useState(false);
+  const invoiceBundleCacheRef = useRef<Map<string, InvoiceDetailBundle>>(new Map());
+  const invoiceBundleInFlightRef = useRef<Map<string, Promise<InvoiceDetailBundle>>>(new Map());
+  const detailRequestTokenRef = useRef(0);
 
   // Pagination
   const PAGE_SIZE = 50;
@@ -4019,6 +4211,93 @@ export default function FatturePage() {
       });
     } catch (err) { console.error('refreshClassifMeta error:', err); }
   }, [companyId]);
+
+  useEffect(() => {
+    invoiceBundleCacheRef.current.clear();
+    invoiceBundleInFlightRef.current.clear();
+    if (!companyId) {
+      setReferenceData(EMPTY_INVOICE_REFERENCE_DATA);
+      setReferenceDataLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setReferenceDataLoading(true);
+    Promise.all([
+      loadArticlesWithPhases(companyId, { activeOnly: true }),
+      loadLearnedRules(companyId),
+      loadCategories(companyId, true),
+      loadProjects(companyId, true),
+      loadChartOfAccounts(companyId),
+    ])
+      .then(([articles, learnedRules, categories, projects, accounts]) => {
+        if (cancelled) return;
+        setReferenceData({
+          articles,
+          learnedRules,
+          categories,
+          projects,
+          accounts: accounts.filter(account => !account.is_header && account.active),
+        });
+        setReferenceDataLoading(false);
+      })
+      .catch(error => {
+        if (cancelled) return;
+        console.error('Reference data load error:', error);
+        setReferenceData(EMPTY_INVOICE_REFERENCE_DATA);
+        setReferenceDataLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [companyId]);
+
+  const invalidateInvoiceBundle = useCallback((invoiceId: string) => {
+    invoiceBundleCacheRef.current.delete(invoiceId);
+    invoiceBundleInFlightRef.current.delete(invoiceId);
+  }, []);
+
+  const loadCachedInvoiceBundle = useCallback(async (invoiceId: string, options?: { force?: boolean }) => {
+    if (!companyId) throw new Error('Company non disponibile');
+    const force = options?.force === true;
+    if (!force) {
+      const cached = invoiceBundleCacheRef.current.get(invoiceId);
+      if (cached) return cached;
+      const inFlight = invoiceBundleInFlightRef.current.get(invoiceId);
+      if (inFlight) return inFlight;
+    }
+
+    const request = loadInvoiceDetailBundle(companyId, invoiceId)
+      .then(bundle => {
+        invoiceBundleCacheRef.current.set(invoiceId, bundle);
+        invoiceBundleInFlightRef.current.delete(invoiceId);
+        return bundle;
+      })
+      .catch(error => {
+        invoiceBundleInFlightRef.current.delete(invoiceId);
+        throw error;
+      });
+
+    invoiceBundleInFlightRef.current.set(invoiceId, request);
+    return request;
+  }, [companyId]);
+
+  const prefetchInvoiceBundle = useCallback((invoiceId: string) => {
+    if (!companyId) return;
+    if (invoiceBundleCacheRef.current.has(invoiceId) || invoiceBundleInFlightRef.current.has(invoiceId)) return;
+    void loadCachedInvoiceBundle(invoiceId).catch(error => {
+      console.warn('[fatture] prefetch bundle error:', error);
+    });
+  }, [companyId, loadCachedInvoiceBundle]);
+
+  const handleSelectInvoice = useCallback((invoiceId: string) => {
+    const cached = invoiceBundleCacheRef.current.get(invoiceId) || null;
+    setSelectedId(invoiceId);
+    if (cached) {
+      setDetailBundle(cached);
+      setDetailPhase('ready');
+      return;
+    }
+    setDetailBundle(null);
+    setDetailPhase('loading');
+  }, []);
 
   // ── AI search (BancaPage-style: filter + analysis modes) ──
   const [aiResult, setAiResult] = useState<InvoiceAiResult | null>(null);
@@ -4406,26 +4685,42 @@ export default function FatturePage() {
   }, [companyId, invoices]);
 
   useEffect(() => {
-    if (!selectedId || !companyId) { setDetail(null); setInstallments([]); return; }
-    let c = false; setLoadingDetail(true);
-    Promise.all([
-      loadInvoiceDetail(selectedId),
-      listInstallmentsForInvoice(companyId, selectedId),
-    ]).then(([d, inst]) => {
-      if (!c) {
-        setDetail(d);
-        setInstallments(inst);
-        setLoadingDetail(false);
-      }
-    }).catch(() => {
-      if (!c) {
-        setDetail(null);
-        setInstallments([]);
-        setLoadingDetail(false);
-      }
-    });
-    return () => { c = true; };
-  }, [selectedId, companyId]);
+    if (!selectedId || !companyId) {
+      setDetailBundle(null);
+      setDetailPhase('idle');
+      return;
+    }
+
+    const cached = invoiceBundleCacheRef.current.get(selectedId);
+    const requestToken = detailRequestTokenRef.current + 1;
+    detailRequestTokenRef.current = requestToken;
+
+    if (cached) {
+      startTransition(() => {
+        setDetailBundle(cached);
+        setDetailPhase('ready');
+      });
+      return;
+    }
+
+    setDetailBundle(null);
+    setDetailPhase('loading');
+
+    loadCachedInvoiceBundle(selectedId)
+      .then(bundle => {
+        if (detailRequestTokenRef.current !== requestToken) return;
+        startTransition(() => {
+          setDetailBundle(bundle);
+          setDetailPhase('ready');
+        });
+      })
+      .catch(error => {
+        if (detailRequestTokenRef.current !== requestToken) return;
+        console.error('Invoice detail load error:', error);
+        setDetailBundle(null);
+        setDetailPhase('ready');
+      });
+  }, [selectedId, companyId, loadCachedInvoiceBundle]);
 
   useEffect(() => {
     const invoiceIdParam = searchParams.get('invoiceId');
@@ -4433,7 +4728,7 @@ export default function FatturePage() {
 
     // If already in current list, select it and clean up URL
     if (invoices.some(inv => inv.id === invoiceIdParam)) {
-      setSelectedId(invoiceIdParam);
+      handleSelectInvoice(invoiceIdParam);
       searchParams.delete('invoiceId');
       setSearchParams(searchParams, { replace: true });
       return;
@@ -4453,13 +4748,13 @@ export default function FatturePage() {
         // DB stores 'in' (passive) or 'out' (active) — same values as directionFilter
         const neededDir = data.direction as 'in' | 'out';
         // Set selectedId immediately so detail loading effect starts
-        setSelectedId(invoiceIdParam);
+        handleSelectInvoice(invoiceIdParam);
         if (neededDir !== directionFilter) {
           setDirectionFilter(neededDir);
           // Tab switch triggers reload → invoices update → effect re-runs → invoice found → URL cleaned
         }
       });
-  }, [searchParams, invoices, companyId, directionFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [searchParams, invoices, companyId, directionFilter, handleSelectInvoice]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── AI Search handler — edge function handles all filtering server-side ──
   const handleAISearch = useCallback(async () => {
@@ -4551,13 +4846,19 @@ export default function FatturePage() {
   const handleDeleteConfirm = useCallback(async (_pw: string) => {
     const ids = deleteModal.ids; setDeleteModal({ open: false, ids: [] });
     try { await deleteInvoices(ids); } catch {}
+    ids.forEach(id => invalidateInvoiceBundle(id));
     setChecked(new Set()); setSelectMode(false);
     if (ids.includes(selectedId || '')) setSelectedId(null);
     setPage(0); setAllLoaded(false); setInvoices([]);
     await reload(true);
-  }, [deleteModal.ids, selectedId, reload]);
+  }, [deleteModal.ids, selectedId, reload, invalidateInvoiceBundle]);
 
-  const handleEdit = useCallback(async (u: InvoiceUpdate) => { if (!selectedId) return; await updateInvoice(selectedId, u); await reload(true); }, [selectedId, reload]);
+  const handleEdit = useCallback(async (u: InvoiceUpdate) => {
+    if (!selectedId) return;
+    await updateInvoice(selectedId, u);
+    invalidateInvoiceBundle(selectedId);
+    await reload(true);
+  }, [selectedId, reload, invalidateInvoiceBundle]);
 
   // Lightweight patch: update a single invoice in-place without full reload (preserves selection + scroll)
   const patchInvoice = useCallback((invoiceId: string, patch: Partial<DBInvoice>) => {
@@ -4588,7 +4889,8 @@ export default function FatturePage() {
   };
   // Use invoice from list if available, otherwise fall back to detail loaded by ID
   // (handles deep-link case where invoice isn't in the visible page of results)
-  const selectedInvoice = invoices.find(i => i.id === selectedId) ?? (selectedId && detail ? detail : null);
+  const selectedInvoice = invoices.find(i => i.id === selectedId)
+    ?? (selectedId && detailBundle?.invoiceId === selectedId && detailBundle.detail ? detailBundle.detail : null);
   const allFilteredChecked = invoices.length > 0 && invoices.every(i => checked.has(i.id));
   const navigateToCounterparty = useCallback((mode?: 'verify' | 'edit') => {
     const returnContext: FattureReturnContext | null = selectedInvoice ? {
@@ -4649,7 +4951,7 @@ export default function FatturePage() {
       setPageEntity(null);
     }
     return () => setPageEntity(null);
-  }, [selectedId, detail?.id, setPageEntity]);
+  }, [selectedInvoice, setPageEntity]);
 
   return (
     <div className="h-full flex flex-col bg-gray-50">
@@ -4791,7 +5093,7 @@ export default function FatturePage() {
 	            {loadingList || companyLoading ? <div className="text-center py-8 text-gray-400 text-sm">Caricamento...</div>
 	              : invoices.length === 0 ? <div className="text-center py-8 text-gray-400 text-sm">Nessun risultato</div>
 	              : <>
-	                {invoices.map(inv => <InvoiceCard key={inv.id} inv={inv} selected={selectedId === inv.id} checked={checked.has(inv.id)} selectMode={selectMode} onSelect={() => setSelectedId(inv.id)} onCheck={() => toggleCheck(inv.id)} isMatched={matchedInvoiceIds.has(inv.id)} suggestionScore={invoiceScores.get(inv.id)} meta={classifMeta.get(inv.id)} rowRef={(node) => { invoiceRowRefs.current[inv.id] = node; }} />)}
+	                {invoices.map(inv => <InvoiceCard key={inv.id} inv={inv} selected={selectedId === inv.id} checked={checked.has(inv.id)} selectMode={selectMode} onSelect={() => handleSelectInvoice(inv.id)} onCheck={() => toggleCheck(inv.id)} onPrefetch={() => prefetchInvoiceBundle(inv.id)} isMatched={matchedInvoiceIds.has(inv.id)} suggestionScore={invoiceScores.get(inv.id)} meta={classifMeta.get(inv.id)} rowRef={(node) => { invoiceRowRefs.current[inv.id] = node; }} />)}
 	                {!allLoaded && <div ref={bottomRef} className="py-4 text-center text-xs text-gray-400">{loadingMore ? 'Caricamento...' : ''}</div>}
 	              </>}
 	          </div>
@@ -4800,9 +5102,11 @@ export default function FatturePage() {
         <div className="flex-1 flex flex-col overflow-hidden bg-gray-50">
           {selectedInvoice ? <InvoiceDetail
             invoice={selectedInvoice}
-            detail={detail}
-            installments={installments}
-            loadingDetail={loadingDetail}
+            detailBundle={detailBundle}
+            detailPhase={detailPhase}
+            referenceData={referenceData}
+            referenceDataLoading={referenceDataLoading}
+            onInvalidateBundle={invalidateInvoiceBundle}
             onEdit={handleEdit}
             onDelete={() => setDeleteModal({ open: true, ids: [selectedInvoice.id] })}
             onReload={reload}
