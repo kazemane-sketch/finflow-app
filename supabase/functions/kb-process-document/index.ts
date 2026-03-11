@@ -555,9 +555,6 @@ REGOLE DI CLASSIFICAZIONE:
           maxOutputTokens: 8192,
           responseMimeType: "application/json",
         },
-        thinkingConfig: {
-          thinkingBudget: 8192,
-        },
       }),
     },
   );
