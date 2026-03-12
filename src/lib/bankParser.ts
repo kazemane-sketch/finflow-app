@@ -4,6 +4,7 @@
 
 import { supabase } from '@/integrations/supabase/client';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client';
+import { getValidAccessToken } from '@/lib/getValidAccessToken';
 
 // ============================================================
 // TYPES
@@ -1004,6 +1005,9 @@ export async function updateBankTransactionDirection(
     .eq('id', txId)
     .eq('company_id', companyId);
   if (error) throw new Error(error.message);
+
+  await markBankTransactionsEmbeddingPending(companyId, [txId]);
+  void triggerBankTransactionEmbeddings(companyId, [txId]);
 }
 
 // ─── Generic field update (full edit mode) ───────────────────────
@@ -1055,6 +1059,50 @@ export async function updateBankTransaction(
     .eq('id', txId)
     .eq('company_id', companyId);
   if (error) throw new Error(error.message);
+
+  await markBankTransactionsEmbeddingPending(companyId, [txId]);
+  void triggerBankTransactionEmbeddings(companyId, [txId]);
+}
+
+async function markBankTransactionsEmbeddingPending(companyId: string, ids: string[]): Promise<void> {
+  const batch = ids.filter(Boolean);
+  if (batch.length === 0) return;
+  const { error } = await supabase
+    .from('bank_transactions')
+    .update({
+      embedding_status: 'pending',
+      embedding_error: null,
+      embedding_updated_at: new Date().toISOString(),
+    })
+    .eq('company_id', companyId)
+    .in('id', batch);
+  if (error) {
+    console.warn('[bankParser] markBankTransactionsEmbeddingPending error:', error.message);
+  }
+}
+
+export async function triggerBankTransactionEmbeddings(companyId: string, ids: string[]): Promise<void> {
+  const batchIds = Array.from(new Set(ids.filter(Boolean))).slice(0, 50);
+  if (batchIds.length === 0) return;
+
+  try {
+    const token = await getValidAccessToken();
+    fetch(`${SUPABASE_URL}/functions/v1/bank-embed-transactions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        company_id: companyId,
+        batch_ids: batchIds,
+        skip_claim: true,
+      }),
+    }).catch((err) => console.warn('[bankParser] triggerBankTransactionEmbeddings fetch error:', err));
+  } catch (err) {
+    console.warn('[bankParser] triggerBankTransactionEmbeddings token error:', err);
+  }
 }
 
 // ─── Bulk verify (clear direction_needs_review) ──────────────────

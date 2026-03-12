@@ -221,9 +221,25 @@ function uniqueStrings(values: Array<string | null | undefined>): string[] {
   return Array.from(new Set(values.map(v => String(v || '').trim()).filter(Boolean)))
 }
 
-function extractClientContractRefs(refs: Record<string, unknown> | null): string[] {
+function extractClientContractRefsFromRawText(rawText: string | null | undefined): string[] {
+  const source = String(rawText || '')
+  if (!source) return []
   const values: string[] = []
-  if (!refs || typeof refs.error === 'string') return values
+  for (const pattern of [
+    /(?:CONTRATTO|CONTR\.?|LEASING\s+N\.?)\s*[:#=\-]?\s*([A-Z0-9\/.\-]{3,})/gi,
+    /\b(?:N\.?\s*)?([A-Z]{0,4}\d{3,}[A-Z0-9\/.\-]*)\b/g,
+  ]) {
+    for (const m of source.matchAll(pattern)) {
+      const normalized = normalizeComparableRef(m[1])
+      if (normalized.length >= 5) values.push(normalized)
+    }
+  }
+  return Array.from(new Set(values))
+}
+
+function extractClientContractRefs(refs: Record<string, unknown> | null, rawText: string | null): string[] {
+  const values: string[] = []
+  if (!refs || typeof refs.error === 'string') return extractClientContractRefsFromRawText(rawText)
   for (const field of ['contract_refs', 'contract_numbers', 'numeri_contratto', 'riferimenti_contratto']) {
     const val = refs[field]
     if (Array.isArray(val)) {
@@ -238,7 +254,8 @@ function extractClientContractRefs(refs: Record<string, unknown> | null): string
     const normalized = normalizeComparableRef(typeof val === 'string' ? val : null)
     if (normalized.length >= 3) values.push(normalized)
   }
-  return Array.from(new Set(values))
+  const unique = Array.from(new Set(values))
+  return unique.length > 0 ? unique : extractClientContractRefsFromRawText(rawText)
 }
 
 function extractClientMandateId(refs: Record<string, unknown> | null): string | null {
@@ -791,7 +808,7 @@ export default function RiconciliazionePage() {
         const suggestionData = suggestion.suggestion_data || {}
         const invoiceContracts = Array.isArray(inv?.contract_refs) ? inv?.contract_refs : []
         const txContractRefs = uniqueStrings([
-          ...extractClientContractRefs(tx.extracted_refs || null),
+          ...extractClientContractRefs(tx.extracted_refs || null, tx.raw_text || null),
           ...(Array.isArray(suggestionData?.tx_contract_refs) ? suggestionData?.tx_contract_refs as string[] : []),
         ])
         const invoiceContractRefs = uniqueStrings([

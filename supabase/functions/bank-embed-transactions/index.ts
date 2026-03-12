@@ -42,6 +42,8 @@ type EmbedRequestBody = {
   company_id?: string;
   batch_ids?: unknown;
   skip_claim?: boolean;
+  mode?: string;
+  batch_size?: number;
 };
 
 function jsonResponse(body: unknown, requestId: string, status = 200): Response {
@@ -94,6 +96,36 @@ function isServiceRoleToken(token: string | null, expectedServiceRoleKey: string
   if (!token) return false;
   if (expectedServiceRoleKey && token === expectedServiceRoleKey) return true;
   return parseJwtRole(token) === "service_role";
+}
+
+function isUserToken(token: string | null): boolean {
+  if (!token) return false;
+  const role = parseJwtRole(token);
+  return !!role && role !== "anon" && role !== "service_role";
+}
+
+async function requireCompanyAccess(
+  userClient: ReturnType<typeof createClient>,
+  token: string,
+  companyId: string,
+): Promise<void> {
+  const role = parseJwtRole(token);
+  if (role === "anon") {
+    throw new Error("Token anon non valido per questa operazione");
+  }
+
+  const { data: membership, error } = await userClient
+    .from("company_members")
+    .select("company_id")
+    .eq("company_id", companyId)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Errore verifica permessi azienda: ${error.message}`);
+  }
+  if (!membership) {
+    throw new Error("Permesso negato per questa azienda");
+  }
 }
 
 function toVectorLiteral(values: number[]): string {
@@ -188,22 +220,27 @@ async function callGeminiEmbeddingSingle(apiKey: string, text: string): Promise<
 
 async function countRows(
   serviceClient: ReturnType<typeof createClient>,
+  companyId?: string,
   status?: "ready" | "processing" | "pending" | "error",
 ): Promise<number> {
   let query = serviceClient.from("bank_transactions").select("id", { count: "exact", head: true });
+  if (companyId) query = query.eq("company_id", companyId);
   if (status) query = query.eq("embedding_status", status);
   const { count, error } = await query;
   if (error) throw new Error(`Count ${status ?? "total"} failed: ${error.message}`);
   return Number(count || 0);
 }
 
-async function fetchGlobalHealth(serviceClient: ReturnType<typeof createClient>): Promise<GlobalHealth> {
+async function fetchGlobalHealth(
+  serviceClient: ReturnType<typeof createClient>,
+  companyId?: string,
+): Promise<GlobalHealth> {
   const [total_rows, ready_rows, processing_rows, pending_rows, error_rows] = await Promise.all([
-    countRows(serviceClient),
-    countRows(serviceClient, "ready"),
-    countRows(serviceClient, "processing"),
-    countRows(serviceClient, "pending"),
-    countRows(serviceClient, "error"),
+    countRows(serviceClient, companyId),
+    countRows(serviceClient, companyId, "ready"),
+    countRows(serviceClient, companyId, "processing"),
+    countRows(serviceClient, companyId, "pending"),
+    countRows(serviceClient, companyId, "error"),
   ]);
 
   return {
@@ -278,6 +315,46 @@ async function fetchBatchRowsWithOptionalNotes(
   return { data, error };
 }
 
+async function fetchPendingRowsWithOptionalNotes(
+  serviceClient: ReturnType<typeof createClient>,
+  companyId: string,
+  batchSize: number,
+) {
+  let query = serviceClient
+    .from("bank_transactions")
+    .select("id,company_id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,notes,direction,raw_text,extracted_refs,embedding_status")
+    .eq("company_id", companyId)
+    .or("embedding.is.null,embedding_status.eq.pending,embedding_status.eq.error")
+    .order("embedding_updated_at", { ascending: true, nullsFirst: true })
+    .limit(batchSize);
+
+  let { data, error } = await query;
+
+  if (error && /notes/i.test(error.message)) {
+    const fallback = await serviceClient
+      .from("bank_transactions")
+      .select("id,company_id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,direction,raw_text,extracted_refs,embedding_status")
+      .eq("company_id", companyId)
+      .or("embedding.is.null,embedding_status.eq.pending,embedding_status.eq.error")
+      .order("embedding_updated_at", { ascending: true, nullsFirst: true })
+      .limit(batchSize);
+
+    if (!fallback.error) {
+      return {
+        data: (Array.isArray(fallback.data) ? fallback.data : []).map((row) => ({
+          ...row,
+          notes: null,
+        })),
+        error: null,
+      };
+    }
+
+    return { data: fallback.data, error: fallback.error };
+  }
+
+  return { data, error };
+}
+
 Deno.serve(async (req) => {
   const requestId = crypto.randomUUID();
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
@@ -288,6 +365,7 @@ Deno.serve(async (req) => {
   const supabaseUrl = resolveSupabaseUrl(req);
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   const expectedServiceRoleKey = (Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "").trim();
+  const anonKey = (req.headers.get("apikey") ?? Deno.env.get("SUPABASE_ANON_KEY") ?? "").trim();
   const bearer = getBearerToken(req);
 
   if (!supabaseUrl) {
@@ -296,10 +374,12 @@ Deno.serve(async (req) => {
   if (!geminiKey) {
     return jsonResponse({ error: "GEMINI_API_KEY non configurata", request_id: requestId }, requestId, 503);
   }
-  if (!isServiceRoleToken(bearer, expectedServiceRoleKey)) {
+  const serviceRoleAuth = isServiceRoleToken(bearer, expectedServiceRoleKey);
+  const userAuth = isUserToken(bearer);
+  if (!serviceRoleAuth && !userAuth) {
     return jsonResponse({
-      error: "Richiesta non autorizzata: service_role required",
-      error_code: "AUTH_SERVICE_ROLE_REQUIRED",
+      error: "Richiesta non autorizzata",
+      error_code: "AUTH_USER_OR_SERVICE_ROLE_REQUIRED",
       request_id: requestId,
     }, requestId, 401);
   }
@@ -314,7 +394,8 @@ Deno.serve(async (req) => {
   }
 
   const batchIds = parseBatchIds(body?.batch_ids);
-  if (!batchIds.length) {
+  const mode = body?.mode === "backfill" ? "backfill" : "skip_claim";
+  if (mode !== "backfill" && !batchIds.length) {
     return jsonResponse({
       error: "batch_ids vuoto o non valido",
       error_code: "EMBED_BATCH_IDS_REQUIRED",
@@ -323,16 +404,25 @@ Deno.serve(async (req) => {
   }
 
   const companyId = typeof body?.company_id === "string" ? body.company_id.trim() : "";
-  const serviceRoleKey = bearer as string;
-  const serviceClient = createClient(supabaseUrl, serviceRoleKey, {
+  const serviceClient = createClient(supabaseUrl, expectedServiceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
+  const userClient = userAuth && bearer && anonKey
+    ? createClient(supabaseUrl, anonKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+      global: { headers: { Authorization: `Bearer ${bearer}` } },
+    })
+    : null;
 
   try {
-    const { data: rows, error: rowsError } = await fetchBatchRowsWithOptionalNotes(
-      serviceClient,
-      batchIds,
-    );
+    if (userClient && bearer) {
+      await requireCompanyAccess(userClient, bearer, companyId);
+    }
+
+    const batchSize = Math.max(1, Math.min(Number(body?.batch_size || 50) || 50, 100));
+    const { data: rows, error: rowsError } = mode === "backfill"
+      ? await fetchPendingRowsWithOptionalNotes(serviceClient, companyId, batchSize)
+      : await fetchBatchRowsWithOptionalNotes(serviceClient, batchIds);
 
     if (rowsError) {
       return jsonResponse({
@@ -343,7 +433,7 @@ Deno.serve(async (req) => {
 
     const txRows = (Array.isArray(rows) ? rows : []) as EmbeddingTx[];
     const byId = new Map(txRows.map((tx) => [tx.id, tx]));
-    const missingIds = batchIds.filter((id) => !byId.has(id));
+    const missingIds = mode === "backfill" ? [] : batchIds.filter((id) => !byId.has(id));
 
     let ready = 0;
     let errors = 0;
@@ -389,14 +479,18 @@ Deno.serve(async (req) => {
       }
     });
 
-    const health = await fetchGlobalHealth(serviceClient);
+    const health = await fetchGlobalHealth(serviceClient, companyId || undefined);
+    const remaining = mode === "backfill"
+      ? await countRows(serviceClient, companyId || undefined, "pending") + await countRows(serviceClient, companyId || undefined, "error")
+      : 0;
     return jsonResponse({
       status: "completed",
-      mode: "skip_claim",
+      mode,
       processed: txRows.length,
       requested: batchIds.length,
       ready,
       errors,
+      remaining,
       health,
       request_id: requestId,
     }, requestId, 200);

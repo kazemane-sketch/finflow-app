@@ -280,8 +280,27 @@ function normalizeComparableRef(value: string | null | undefined): string {
     .replace(/[^A-Z0-9]/g, "");
 }
 
-function extractContractRefs(refs: Record<string, unknown> | null): string[] {
-  if (!refs || typeof refs.error === "string") return [];
+function extractContractRefsFromRawText(rawText: string | null | undefined): string[] {
+  const source = String(rawText || "");
+  if (!source) return [];
+  const values = new Set<string>();
+  const patterns = [
+    /(?:CONTRATTO|CONTR\.?|LEASING\s+N\.?)\s*[:#=\-]?\s*([A-Z0-9\/.\-]{3,})/gi,
+    /\b(?:N\.?\s*)?([A-Z]{0,4}\d{3,}[A-Z0-9\/.\-]*)\b/g,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const normalized = normalizeComparableRef(match[1]);
+      if (normalized.length >= 5) values.add(normalized);
+    }
+  }
+
+  return [...values];
+}
+
+function extractContractRefs(refs: Record<string, unknown> | null, rawText?: string | null): string[] {
+  if (!refs || typeof refs.error === "string") return extractContractRefsFromRawText(rawText);
   const values: string[] = [];
   const arrayFields = [
     "contract_refs",
@@ -310,7 +329,8 @@ function extractContractRefs(refs: Record<string, unknown> | null): string[] {
     const normalized = normalizeComparableRef(typeof val === "string" ? val : null);
     if (normalized.length >= 3) values.push(normalized);
   }
-  return [...new Set(values)];
+  const unique = [...new Set(values)];
+  return unique.length > 0 ? unique : extractContractRefsFromRawText(rawText);
 }
 
 function extractInvoiceContractRefs(row: MatchRow): string[] {
@@ -399,7 +419,7 @@ function applyContextSignals(
   const extra: Record<string, unknown> = {};
   let scoreDelta = 0;
 
-  const txContractRefs = extractContractRefs(tx.extracted_refs);
+  const txContractRefs = extractContractRefs(tx.extracted_refs, tx.raw_text);
   const invoiceContractRefs = extractInvoiceContractRefs(match);
   const txNotes = parseNoteSignals(tx.notes);
   const invoiceNotes = parseNoteSignals(match.notes);
@@ -1147,7 +1167,7 @@ async function matchByRules(
     const ruleCounterparty = rd.counterparty_pattern as string | null;
     const ruleType = rd.transaction_type as string | null;
     const ruleContractRef = rd.contract_ref as string | null;
-    const txContractRefs = extractContractRefs(tx.extracted_refs);
+    const txContractRefs = extractContractRefs(tx.extracted_refs, tx.raw_text);
 
     // Counterparty must match
     if (ruleCounterparty && !counterpartyMatches(tx.counterparty_name, ruleCounterparty)) continue;
@@ -1515,7 +1535,7 @@ async function ragBoostSuggestions(
 
   try {
     // Embed the transaction description
-    const extractedContractRefs = extractContractRefs(tx.extracted_refs);
+    const extractedContractRefs = extractContractRefs(tx.extracted_refs, tx.raw_text);
     const txTextParts = [
       `TX: ${tx.counterparty_name || ""} ${tx.date || ""} ${Math.abs(Number(tx.amount))} EUR`,
       tx.description || "",
