@@ -50,7 +50,7 @@ import {
 import { toast } from 'sonner';
 import { createRuleFromConfirmation, findMatchingRules, deactivateRulesForInvoice, handleRuleCorrection, type RuleSuggestion } from '@/lib/classificationRulesService';
 import { runClassificationPipeline, type PipelineStepDebug } from '@/lib/classificationPipelineService';
-import { createMemoryFromClassification, createMemoryFromFiscalChoice, deactivateInvoiceMemoryFacts } from '@/lib/companyMemoryService';
+import { createMemoryFromClassification, createMemoryFromFiscalChoice, deleteInvoiceMemoryFacts } from '@/lib/companyMemoryService';
 import { extractProvinceSiglaFromAddress, loadCounterpartyHeaderInfo } from '@/lib/counterpartyService';
 import { deleteFiscalDecisionsForInvoice, saveFiscalDecision } from '@/lib/fiscalDecisionService';
 import ExportDialog from '@/components/ExportDialog';
@@ -2222,7 +2222,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
           pushLearningWarning('revoca decisioni fiscali', error);
         }
         try {
-          await deactivateInvoiceMemoryFacts(invoice.id);
+          await deleteInvoiceMemoryFacts(invoice.id);
         } catch (error) {
           pushLearningWarning('revoca memoria fattura', error);
         }
@@ -2250,7 +2250,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
           pushLearningWarning('riallineamento regole classificazione', error);
         }
         try {
-          await deactivateInvoiceMemoryFacts(invoice.id, ['invoice_classification']);
+          await deleteInvoiceMemoryFacts(invoice.id, ['invoice_classification']);
         } catch (error) {
           pushLearningWarning('riallineamento memoria classificazione', error);
         }
@@ -2261,7 +2261,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
             pushLearningWarning('reset decisioni fiscali precedenti', error);
           }
           try {
-            await deactivateInvoiceMemoryFacts(invoice.id, ['invoice_fiscal_choice']);
+            await deleteInvoiceMemoryFacts(invoice.id, ['invoice_fiscal_choice']);
           } catch (error) {
             pushLearningWarning('riallineamento memoria fiscale', error);
           }
@@ -2525,7 +2525,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       console.warn('[clear] Error deleting fiscal decisions:', e);
     }
     try {
-      await deactivateInvoiceMemoryFacts(invoice.id);
+      await deleteInvoiceMemoryFacts(invoice.id);
     } catch (e) {
       console.warn('[clear] Error deactivating invoice memory facts:', e);
     }

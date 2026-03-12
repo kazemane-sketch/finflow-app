@@ -10,7 +10,9 @@
  *   2. triggerMemoryEmbed() → fire-and-forget POST a memory-embed edge function
  *   3. classify-invoice-lines → search_company_memory() pgvector search
  *
- * Soft-delete: active = false (mai DELETE fisico).
+ * La memoria generale resta soft-delete (`active = false`), ma i facts
+ * tracciabili a una singola fattura vengono rimossi fisicamente quando
+ * quella classificazione viene cancellata, per evitare accumulo inutile.
  */
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 import { getValidAccessToken } from '@/lib/getValidAccessToken'
@@ -538,6 +540,36 @@ export async function deactivateInvoiceMemoryFacts(
   }
 
   return deactivated
+}
+
+export async function deleteInvoiceMemoryFacts(
+  invoiceId: string,
+  origins?: InvoiceMemoryOrigin[],
+): Promise<number> {
+  const originList = origins && origins.length > 0 ? origins : [null]
+  let deleted = 0
+
+  for (const origin of originList) {
+    let query = supabase
+      .from('company_memory')
+      .delete()
+      .contains('metadata', { source_invoice_id: invoiceId })
+
+    if (origin) {
+      query = query.contains('metadata', { origin })
+    }
+
+    const { data, error } = await query.select('id')
+
+    if (error) {
+      console.error('[companyMemory] deleteInvoiceMemoryFacts error:', error.message)
+      throw error
+    }
+
+    deleted += data?.length || 0
+  }
+
+  return deleted
 }
 
 export async function deactivateReconciliationMemoryFacts(
