@@ -514,6 +514,9 @@ function BankReferenceReextractCard({ companyId }: { companyId: string }) {
           Riestrae da zero i riferimenti strutturati di tutti i movimenti banca già analizzati,
           così lo storico usa il parser nuovo anche sui record già in stato <code>ready</code>.
         </p>
+        <p className="text-[11px] text-gray-400">
+          Il primo aggiornamento può richiedere qualche decina di secondi: i contatori si muovono a fine batch.
+        </p>
 
         <Button
           onClick={handleRun}

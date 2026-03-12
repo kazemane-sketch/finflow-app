@@ -29,7 +29,7 @@ export interface ReconciliationBackfillResult {
 
 const CONTRACT_BATCH_SIZE = 100
 const EMBEDDING_BATCH_SIZE = 50
-const BANK_REF_BATCH_SIZE = 50
+const BANK_REF_BATCH_SIZE = 10
 const MAX_ROUNDS = 40
 
 async function callEdge<T>(path: string, payload: Record<string, unknown>): Promise<T> {
