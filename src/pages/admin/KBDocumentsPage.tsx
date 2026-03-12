@@ -29,12 +29,11 @@ async function invokeCancellable(
   signal: AbortSignal,
 ): Promise<any> {
   if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
-  const promise = supabase.functions.invoke(functionName, { body })
   return new Promise((resolve, reject) => {
     signal.addEventListener('abort', () => {
       reject(new DOMException('Aborted', 'AbortError'))
     }, { once: true })
-    promise.then(resolve).catch(reject)
+    supabase.functions.invoke(functionName, { body }).then(resolve, reject)
   })
 }
 
@@ -734,7 +733,10 @@ export default function KBDocumentsPage() {
               }
               if (r.target_type === 'document') payload.target_document_id = r.target_id
               if (r.target_type === 'rule') payload.target_rule_id = r.target_id
-              try { await supabase.from('kb_document_relations').insert(payload) } catch { /* ignore duplicates */ }
+              const { error: relError } = await supabase.from('kb_document_relations').insert(payload)
+              if (relError) {
+                // Ignore duplicates or relation rows already created in previous runs.
+              }
             }
           }
         } catch (e: any) {
