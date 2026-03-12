@@ -219,6 +219,40 @@ function uniqueStrings(values: Array<string | null | undefined>): string[] {
   return Array.from(new Set(values.map(v => String(v || '').trim()).filter(Boolean)))
 }
 
+function extractClientContractRefs(refs: Record<string, unknown> | null): string[] {
+  const values: string[] = []
+  if (!refs || typeof refs.error === 'string') return values
+  for (const field of ['contract_refs', 'contract_numbers', 'numeri_contratto', 'riferimenti_contratto']) {
+    const val = refs[field]
+    if (Array.isArray(val)) {
+      for (const item of val) {
+        const normalized = normalizeComparableRef(typeof item === 'string' ? item : null)
+        if (normalized.length >= 3) values.push(normalized)
+      }
+    }
+  }
+  for (const field of ['contract_ref', 'contract_number', 'numero_contratto', 'contratto']) {
+    const val = refs[field]
+    const normalized = normalizeComparableRef(typeof val === 'string' ? val : null)
+    if (normalized.length >= 3) values.push(normalized)
+  }
+  return Array.from(new Set(values))
+}
+
+function extractClientMandateId(refs: Record<string, unknown> | null): string | null {
+  if (!refs || typeof refs.error === 'string') return null
+  for (const field of ['mandate_id', 'codice_mandato_sdd', 'mandato_sdd']) {
+    const val = refs[field]
+    if (typeof val === 'string' && val.trim().length >= 3) return val.trim()
+  }
+  const arr = refs.codici_mandato_sdd
+  if (Array.isArray(arr)) {
+    const first = arr.find(v => typeof v === 'string' && v.trim().length >= 3)
+    if (typeof first === 'string') return first.trim()
+  }
+  return null
+}
+
 /**
  * STRICT check if an invoice number matches a ref.
  * Uses the same logic as the edge function's parseInvoiceRef:
@@ -396,8 +430,8 @@ export default function RiconciliazionePage() {
       .select(`
         id, bank_transaction_id, installment_id, invoice_id,
         match_score, match_reason, proposed_by, rule_id, suggestion_data, status, created_at,
-        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount, reconciled_amount, tx_nature, notes),
-        invoice:invoices(id, number, counterparty, total_amount, date, notes, primary_contract_ref, contract_refs),
+        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount, reconciled_amount, tx_nature),
+        invoice:invoices(id, number, counterparty, total_amount, date, notes),
         installment:invoice_installments(id, installment_no, due_date, amount_due, paid_amount, status, direction)
       `)
       .eq('company_id', companyId)
@@ -417,7 +451,7 @@ export default function RiconciliazionePage() {
     if (!companyId) return
     const { data } = await supabase
       .from('bank_transactions')
-      .select('id, date, amount, counterparty_name, description, transaction_type, direction, notes, raw_text, extraction_status, commission_amount, extracted_refs, reconciled_amount, reconciliation_status')
+      .select('id, date, amount, counterparty_name, description, transaction_type, direction, raw_text, extraction_status, commission_amount, extracted_refs, reconciled_amount, reconciliation_status')
       .eq('company_id', companyId)
       .in('reconciliation_status', ['unmatched', 'partial'])
       .order('date', { ascending: false })
@@ -432,7 +466,7 @@ export default function RiconciliazionePage() {
       .from('invoice_installments')
       .select(`
         id, invoice_id, installment_no, due_date, amount_due, paid_amount, status, direction,
-        invoice:invoices(number, counterparty, notes, primary_contract_ref, contract_refs)
+        invoice:invoices(number, counterparty, notes)
       `)
       .eq('company_id', companyId)
       .in('status', ['pending', 'overdue', 'partial'])
@@ -452,8 +486,8 @@ export default function RiconciliazionePage() {
         invoice_number: d.invoice?.number || null,
         counterparty_name: d.invoice?.counterparty?.denom || null,
         invoice_notes: d.invoice?.notes || null,
-        primary_contract_ref: d.invoice?.primary_contract_ref || null,
-        contract_refs: Array.isArray(d.invoice?.contract_refs) ? d.invoice.contract_refs : [],
+        primary_contract_ref: null,
+        contract_refs: [],
       })))
     }
   }, [companyId])
@@ -1381,7 +1415,7 @@ export default function RiconciliazionePage() {
           .from('invoice_installments')
           .select(`
             id, invoice_id, installment_no, due_date, amount_due, paid_amount, status, direction,
-            invoice:invoices(number, counterparty, notes, primary_contract_ref, contract_refs)
+            invoice:invoices(number, counterparty, notes)
           `)
           .eq('company_id', companyId)
           .in('invoice_id', ids)
@@ -1400,8 +1434,8 @@ export default function RiconciliazionePage() {
             invoice_number: d.invoice?.number || null,
             counterparty_name: d.invoice?.counterparty?.denom || null,
             invoice_notes: d.invoice?.notes || null,
-            primary_contract_ref: d.invoice?.primary_contract_ref || null,
-            contract_refs: Array.isArray(d.invoice?.contract_refs) ? d.invoice.contract_refs : [],
+            primary_contract_ref: null,
+            contract_refs: [],
           })))
         }
       }

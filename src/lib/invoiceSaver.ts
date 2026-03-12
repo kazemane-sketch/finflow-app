@@ -313,7 +313,7 @@ export async function saveInvoicesToDB(
 // ============================================================
 // LOAD — carica lista fatture con filtri e paginazione
 // ============================================================
-const INVOICE_LIST_COLS = 'id, company_id, counterparty_id, counterparty_status_snapshot, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, paid_date, payment_status, reconciliation_status, sdi_id, notes, primary_contract_ref, contract_refs, source_filename, parse_method, xml_hash, extraction_status, classification_status, has_fiscal_alerts, created_at';
+const INVOICE_LIST_COLS = 'id, company_id, counterparty_id, counterparty_status_snapshot, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, paid_date, payment_status, reconciliation_status, sdi_id, notes, source_filename, parse_method, xml_hash, extraction_status, classification_status, has_fiscal_alerts, created_at';
 
 export interface InvoiceFilters {
   direction?: 'all' | 'in' | 'out';
