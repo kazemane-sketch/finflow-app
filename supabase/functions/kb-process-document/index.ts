@@ -523,22 +523,25 @@ async function handleProcess(
       const sourceUrl = doc.source_url as string;
       if (!sourceUrl) throw new Error("URL fonte mancante");
 
-      // Step 1: Try Jina Reader (clean text, no nav/footer)
-      console.log(`[process] Step 1a: Jina Reader for URL: ${sourceUrl}`);
+      // Step 1: Extract text (Jina primary, direct fetch fallback)
+      console.log(`[process] Step 1: Jina Reader for URL: ${sourceUrl}`);
       const jina = await fetchWithJina(sourceUrl);
 
       if (jina.usedJina && jina.text) {
-        fullText = sanitizeHtmlEntities(sanitizeText(jina.text));
-        console.log(`[process] Jina extraction OK: ${fullText.length} chars`);
+        fullText = jina.text;
+        console.log(`[process] Jina extraction: ${fullText.length} chars`);
       } else {
-        // Step 2 fallback: direct fetch + stripHtml + Gemini Flash cleanup
-        console.log(`[process] Step 1b: Jina failed, using direct fetch + AI cleanup`);
-        const rawText = await extractTextFromUrl(apiKey, sourceUrl);
-        fullText = sanitizeHtmlEntities(sanitizeText(
-          await cleanExtractedText(apiKey, rawText, doc.title || "Documento")
-        ));
-        console.log(`[process] Fallback extraction: ${fullText.length} chars`);
+        console.log(`[process] Jina failed, using direct fetch + stripHtml`);
+        fullText = await extractTextFromUrl(apiKey, sourceUrl);
+        console.log(`[process] Direct extraction: ${fullText.length} chars`);
       }
+
+      // Step 2: ALWAYS AI cleanup (both Jina and stripHtml leave nav/footer)
+      console.log(`[process] Step 2: AI cleanup (${fullText.length} chars)...`);
+      fullText = sanitizeHtmlEntities(sanitizeText(
+        await cleanExtractedText(apiKey, fullText, doc.title || "Documento")
+      ));
+      console.log(`[process] Cleaned: ${fullText.length} chars`);
 
       // Save extracted text
       await svc
@@ -683,21 +686,23 @@ async function handleReprocess(
     const inputType = doc.source_input_type || doc.file_type || "text";
 
     if (inputType === "url" && doc.source_url) {
-      // Try Jina first, fallback to direct fetch + AI cleanup
+      // Step 1: Extract (Jina primary, direct fetch fallback)
       console.log(`[reprocess] Re-extracting from URL via Jina: ${doc.source_url}`);
       const jina = await fetchWithJina(doc.source_url);
       if (jina.usedJina && jina.text) {
         fullText = jina.text;
-        console.log(`[reprocess] Jina extraction OK: ${fullText.length} chars`);
+        console.log(`[reprocess] Jina extraction: ${fullText.length} chars`);
       } else {
-        console.log(`[reprocess] Jina failed, using direct fetch + AI cleanup`);
-        const rawText = await extractTextFromUrl(apiKey, doc.source_url);
-        fullText = await cleanExtractedText(apiKey, rawText, doc.title || "Documento");
-        console.log(`[reprocess] Fallback extraction: ${fullText.length} chars`);
+        console.log(`[reprocess] Jina failed, using direct fetch`);
+        fullText = await extractTextFromUrl(apiKey, doc.source_url);
       }
+      // Step 2: ALWAYS AI cleanup
+      console.log(`[reprocess] AI cleanup (${fullText.length} chars)...`);
+      fullText = await cleanExtractedText(apiKey, fullText, doc.title || "Documento");
+      console.log(`[reprocess] Cleaned: ${fullText.length} chars`);
     }
 
-    // AI cleanup for PDF sources only (URL already handled above)
+    // AI cleanup for PDF sources only
     if (inputType === "pdf") {
       console.log(`[reprocess] AI cleanup for PDF (${fullText!.length} chars)...`);
       fullText = await cleanExtractedText(apiKey, fullText!, doc.title || "Documento");
