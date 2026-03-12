@@ -11,6 +11,7 @@ import {
   ArrowLeft,
   Library,
 } from 'lucide-react'
+import AIJobIndicator from '@/components/AIJobIndicator'
 
 const adminNav = [
   { to: '/admin', icon: LayoutDashboard, label: 'Dashboard', end: true },
@@ -59,6 +60,9 @@ export default function AdminLayout() {
             </NavLink>
           ))}
         </nav>
+
+        {/* AI Job progress (admin operations) */}
+        <AIJobIndicator />
 
         <div className="h-px bg-slate-700 mx-3" />
 
