@@ -78,6 +78,7 @@ export interface CounterpartyAnalytics {
 export interface CounterpartyHeaderInfo {
   atecoDescription: string | null
   provinceSigla: string | null
+  status: CounterpartyStatus | null
 }
 
 export interface CounterpartyInstallmentFlowRow {
@@ -407,7 +408,7 @@ export async function loadCounterparties(
 export async function loadCounterpartyHeaderInfo(counterpartyId: string): Promise<CounterpartyHeaderInfo> {
   const { data, error } = await supabase
     .from('counterparties')
-    .select('ateco_description, address')
+    .select('ateco_description, address, status')
     .eq('id', counterpartyId)
     .maybeSingle()
 
@@ -416,6 +417,7 @@ export async function loadCounterpartyHeaderInfo(counterpartyId: string): Promis
   return {
     atecoDescription: data?.ateco_description || null,
     provinceSigla: extractProvinceSiglaFromAddress(data?.address || null),
+    status: (data?.status as CounterpartyStatus | null) || null,
   }
 }
 

@@ -1121,9 +1121,10 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   const [notesText, setNotesText] = useState(invoice.notes || '');
   const [notesSaving, setNotesSaving] = useState(false);
   const notesDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const [counterpartyHeaderInfo, setCounterpartyHeaderInfo] = useState<{ atecoDescription: string | null; provinceSigla: string | null }>({
+  const [counterpartyHeaderInfo, setCounterpartyHeaderInfo] = useState<{ atecoDescription: string | null; provinceSigla: string | null; status: 'pending' | 'verified' | 'rejected' | null }>({
     atecoDescription: null,
     provinceSigla: extractProvinceSiglaFromAddress((invoice.counterparty as any)?.sede || null),
+    status: null,
   });
 
   // ─── Article assignment state ───
@@ -1303,7 +1304,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   useEffect(() => {
     const fallbackProvince = extractProvinceSiglaFromAddress(counterpartyAddressFallback);
     if (!invoice.counterparty_id) {
-      setCounterpartyHeaderInfo({ atecoDescription: null, provinceSigla: fallbackProvince });
+      setCounterpartyHeaderInfo({ atecoDescription: null, provinceSigla: fallbackProvince, status: null });
       return;
     }
 
@@ -1316,12 +1317,13 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         setCounterpartyHeaderInfo({
           atecoDescription: info.atecoDescription,
           provinceSigla: info.provinceSigla || fallbackProvince,
+          status: info.status,
         });
       })
       .catch(err => {
         if (cancelled) return;
         console.warn('[invoice-detail] counterparty header info error:', err);
-        setCounterpartyHeaderInfo({ atecoDescription: null, provinceSigla: fallbackProvince });
+        setCounterpartyHeaderInfo({ atecoDescription: null, provinceSigla: fallbackProvince, status: null });
       });
 
     return () => { cancelled = true; };
@@ -2800,7 +2802,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   const d = parsed;
   const b = d?.bodies?.[0];
   const cp = (invoice.counterparty || {}) as any;
-  const cpStatus = String(invoice.counterparty_status_snapshot || '').toLowerCase();
+  const cpStatus = String(counterpartyHeaderInfo.status || invoice.counterparty_status_snapshot || '').toLowerCase();
   const showCounterpartyAlert = cpStatus === 'pending' || cpStatus === 'rejected' || !invoice.counterparty_id;
   const hasRefs = b?.contratti?.length > 0 || b?.ordini?.length > 0 || b?.convenzioni?.length > 0;
 
