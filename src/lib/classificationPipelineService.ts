@@ -126,6 +126,12 @@ export interface PipelineResult {
     rule_id?: string | null
     suggest_new_account?: Record<string, string> | null
     suggest_new_category?: Record<string, string> | null
+    // Separated reasoning fields (populated after steps 3 + 5)
+    classification_reasoning?: string | null
+    classification_thinking?: string | null
+    fiscal_reasoning?: string | null
+    fiscal_thinking?: string | null
+    fiscal_confidence?: number | null
   }[]
   alerts: FiscalAlert[]
   stats: {
@@ -229,6 +235,11 @@ async function persistPipelineResults(
       await supabase.from('invoice_lines').update({
         ai_confidence: Math.round(lr.confidence),
         needs_review: true,
+        classification_reasoning: lr.classification_reasoning || null,
+        classification_thinking: lr.classification_thinking || null,
+        fiscal_reasoning: lr.fiscal_reasoning || null,
+        fiscal_thinking: lr.fiscal_thinking || null,
+        fiscal_confidence: lr.fiscal_confidence != null ? Math.round(lr.fiscal_confidence) : null,
       } as any).eq('id', lr.line_id)
       continue
     }
@@ -246,6 +257,11 @@ async function persistPipelineResults(
         classification_status: 'ai_suggested',
         ai_confidence: Math.round(lr.confidence),
         needs_review: needsReview,
+        classification_reasoning: lr.classification_reasoning || null,
+        classification_thinking: lr.classification_thinking || null,
+        fiscal_reasoning: lr.fiscal_reasoning || null,
+        fiscal_thinking: lr.fiscal_thinking || null,
+        fiscal_confidence: lr.fiscal_confidence != null ? Math.round(lr.fiscal_confidence) : null,
       } as any).eq('id', lr.line_id).is('category_id', null)
     }
 
@@ -399,6 +415,8 @@ export async function runClassificationPipeline(
       fiscal_flags: fiscalFlags,
       source: r.source,
       rule_id: r.rule_id || null,
+      classification_reasoning: r.reasoning,
+      classification_thinking: null, // deterministic has no AI thinking
     })
   }
 
@@ -445,6 +463,7 @@ export async function runClassificationPipeline(
     throwIfAborted(signal)
 
     const classifications: ClassifyResult[] = step3.classifications || []
+    const classifyThinking: string | null = step3.thinking || null
     if (step3._debug) {
       debugSteps.push({
         step: 'classify',
@@ -481,6 +500,8 @@ export async function runClassificationPipeline(
         source: 'ai',
         suggest_new_account: c.suggest_new_account,
         suggest_new_category: c.suggest_new_category,
+        classification_reasoning: c.reasoning,
+        classification_thinking: classifyThinking,
       })
       aiClassifiedCount++
     }
@@ -588,6 +609,7 @@ export async function runClassificationPipeline(
 
       const reviews: ReviewResult[] = step5.reviews || []
       alerts = step5.alerts || []
+      const fiscalThinking: string | null = step5.thinking || null
       if (step5._debug) {
         debugSteps.push({
           step: 'reviewer',
@@ -608,12 +630,17 @@ export async function runClassificationPipeline(
         })
       }
 
-      // Apply fiscal corrections
+      // Apply fiscal corrections + reasoning
       for (const rev of reviews) {
         const lr = lineResults.get(rev.line_id)
         if (lr && rev.fiscal_flags_corrected) {
           lr.fiscal_flags = rev.fiscal_flags_corrected
           lr.confidence = Math.max(0, Math.min(100, lr.confidence + (rev.confidence_adjustment || 0)))
+        }
+        if (lr) {
+          lr.fiscal_reasoning = rev.issues?.length ? rev.issues.join('; ') : 'Nessun problema fiscale rilevato'
+          lr.fiscal_thinking = fiscalThinking
+          lr.fiscal_confidence = lr.confidence
         }
         if (rev.issues?.length) fiscalIssues += rev.issues.length
       }

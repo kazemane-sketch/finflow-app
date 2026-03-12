@@ -615,7 +615,11 @@ Rispondi con JSON array (no markdown):
     const data = await resp.json();
     const gParts = (data as any)?.candidates?.[0]?.content?.parts || [];
     let responseText = "";
-    for (const part of gParts) { if (part.text && !part.thought) responseText += part.text; }
+    let thinkingText = "";
+    for (const part of gParts) {
+      if (part.thought && part.text) thinkingText += part.text;
+      else if (part.text) responseText += part.text;
+    }
 
     let results: ClassifyResult[] = [];
     const jsonStr = extractFirstJsonArray(responseText);
@@ -663,6 +667,7 @@ Rispondi con JSON array (no markdown):
 
     return json({
       classifications: results,
+      thinking: thinkingText || null,
       prompt_length: prompt.length,
       accounts_shown: accounts.length,
       categories_shown: categories.length,

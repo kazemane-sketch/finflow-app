@@ -1904,6 +1904,25 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       setLineSuggestions(suggestions);
       setDismissedSuggestions(new Set());
 
+      // Immediately populate lineDetails from pipeline result (instant display before DB reload)
+      const freshDetails: Record<string, LineDetailData> = {};
+      for (const lr of (result.lines || [])) {
+        const lid = lr.line_id || (lr as any).invoice_line_id;
+        if (lid) {
+          freshDetails[lid] = {
+            classification_reasoning: (lr as any).classification_reasoning || lr.reasoning || null,
+            classification_thinking: (lr as any).classification_thinking || null,
+            fiscal_reasoning: (lr as any).fiscal_reasoning || null,
+            fiscal_thinking: (lr as any).fiscal_thinking || null,
+            fiscal_confidence: (lr as any).fiscal_confidence ?? null,
+            line_note: null,
+            line_note_source: null,
+            line_note_updated_at: null,
+          };
+        }
+      }
+      setLineDetails(prev => ({ ...prev, ...freshDetails }));
+
       try {
         const [classif, lineClfResult, lineProj, freshInvProjs, freshAssignments] = await Promise.all([
           loadInvoiceClassification(runInvoiceId),

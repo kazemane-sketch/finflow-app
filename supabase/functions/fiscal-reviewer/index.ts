@@ -720,7 +720,11 @@ Se nessun alert: []`);
     const data = await resp.json();
     const gParts = (data as any)?.candidates?.[0]?.content?.parts || [];
     let responseText = "";
-    for (const part of gParts) { if (part.text && !part.thought) responseText += part.text; }
+    let thinkingText = "";
+    for (const part of gParts) {
+      if (part.thought && part.text) thinkingText += part.text;
+      else if (part.text) responseText += part.text;
+    }
 
     // Parse reviews — balanced extractor first, extractJson fallback
     let reviews: ReviewResult[] = [];
@@ -788,6 +792,7 @@ Se nessun alert: []`);
     return json({
       reviews,
       alerts,
+      thinking: thinkingText || null,
       pre_resolved_count: preResolvedFiscal.size,
       prompt_length: prompt.length,
       model_used: model,
