@@ -777,6 +777,14 @@ async function matchByInvoiceRefs(
       WHERE i.company_id = $1
         AND i.direction = $2
         AND (${matchClauses.join(" OR ")})
+        AND (
+          ii.id IS NOT NULL
+          OR NOT EXISTS (
+            SELECT 1
+            FROM invoice_installments iix
+            WHERE iix.invoice_id = i.id
+          )
+        )
         ${yearClause}
         ${dateClause}
       ORDER BY i.date DESC
@@ -1871,6 +1879,28 @@ async function generateForTransaction(
     invoiceRefs = parseRawTextForRefs(tx.raw_text);
   }
 
+  const existingReconciliations = await sql`
+    SELECT invoice_id, installment_id
+    FROM reconciliations
+    WHERE company_id = ${companyId}
+      AND bank_transaction_id = ${tx.id}
+  `;
+  const alreadyMatchedInstallmentIds = new Set<string>();
+  const alreadyMatchedInvoiceIds = new Set<string>();
+  for (const row of existingReconciliations) {
+    if (row.installment_id) alreadyMatchedInstallmentIds.add(String(row.installment_id));
+    if (row.invoice_id) alreadyMatchedInvoiceIds.add(String(row.invoice_id));
+  }
+  const excludeAlreadyMatched = (suggestion: Suggestion): boolean => {
+    if (suggestion.installment_id && alreadyMatchedInstallmentIds.has(suggestion.installment_id)) {
+      return false;
+    }
+    if (!suggestion.installment_id && suggestion.invoice_id && alreadyMatchedInvoiceIds.has(suggestion.invoice_id)) {
+      return false;
+    }
+    return true;
+  };
+
   const collected: Suggestion[] = [];
 
   // ── Level 1: Match by invoice refs (highest priority, score 75-98) ──
@@ -1894,13 +1924,13 @@ async function generateForTransaction(
   collected.push(...await matchByCounterpartyAmount(
     sql, companyId, tx, remainingAmount, mode,
   ));
-  let results = dedup(collected, 12);
+  let results = dedup(collected, 12).filter(excludeAlreadyMatched);
 
   // ── Level 3.5: Cumulative payments (Miglioria 1) ──
   if (results.length === 0 && !invoiceRefs.length && !mandateId) {
     const cumulative = await matchCumulativePayment(sql, companyId, tx, remainingAmount, mode);
     if (cumulative.length > 0) {
-      results = cumulative;
+      results = cumulative.filter(excludeAlreadyMatched);
     }
   }
 
@@ -1910,7 +1940,7 @@ async function generateForTransaction(
     results = await ragBoostSuggestions(sql, companyId, tx, results, geminiKey);
   }
 
-  return results;
+  return results.filter(excludeAlreadyMatched);
 }
 
 /* ─── main handler ────────────────────── */

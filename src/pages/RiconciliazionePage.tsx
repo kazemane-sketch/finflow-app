@@ -139,6 +139,16 @@ interface ReconciledRow {
   } | null
 }
 
+interface TxReconHistoryEntry {
+  reconciliationId: string
+  invoiceId: string
+  installmentId: string | null
+  invoiceNumber: string | null
+  invoiceTotal: number | null
+  amount: number
+  date: string
+}
+
 interface KpiData {
   unmatched: number
   partial: number
@@ -1638,19 +1648,42 @@ export default function RiconciliazionePage() {
 
   // Lookup: bank_transaction_id → reconciliation info (for showing partial match history)
   const txReconHistory = useMemo(() => {
-    const map = new Map<string, { invoiceNumber: string | null; amount: number; date: string }[]>()
+    const map = new Map<string, TxReconHistoryEntry[]>()
     for (const r of reconciledRows) {
       const txId = r.bank_transaction_id
       if (!map.has(txId)) map.set(txId, [])
       const invNum = (r.invoice as any)?.number || null
       map.get(txId)!.push({
+        reconciliationId: r.id,
+        invoiceId: r.invoice_id,
+        installmentId: r.installment_id,
         invoiceNumber: invNum,
+        invoiceTotal: r.invoice?.total_amount != null ? Number(r.invoice.total_amount) : null,
         amount: Number(r.reconciled_amount || 0),
         date: r.confirmed_at || r.created_at,
       })
     }
     return map
   }, [reconciledRows])
+
+  const selectedTxMatchedHistory = useMemo(
+    () => (selectedTxId ? txReconHistory.get(selectedTxId) || [] : []),
+    [selectedTxId, txReconHistory],
+  )
+
+  const selectedTxMatchedInstallmentIds = useMemo(
+    () => new Set(
+      selectedTxMatchedHistory
+        .map(item => item.installmentId)
+        .filter((value): value is string => typeof value === 'string' && value.length > 0),
+    ),
+    [selectedTxMatchedHistory],
+  )
+
+  const selectedTxMatchedInvoiceIds = useMemo(
+    () => new Set(selectedTxMatchedHistory.map(item => item.invoiceId)),
+    [selectedTxMatchedHistory],
+  )
 
   // ─── filtered unmatched for assisted tab ───
   const partialCount = useMemo(() => unmatchedTxs.filter(tx => tx.reconciliation_status === 'partial').length, [unmatchedTxs])
@@ -1813,6 +1846,7 @@ export default function RiconciliazionePage() {
       if (remaining <= 0) return false
       // Direction filter: only show invoices matching the expected direction
       if (inst.direction !== expectedDirection) return false
+      if (selectedTxMatchedInstallmentIds.has(inst.id)) return false
       return true
     })
 
@@ -1862,14 +1896,27 @@ export default function RiconciliazionePage() {
     }
 
     return enriched.slice(0, 50)
-  }, [selectedTxId, unmatchedTxs, openInstallments, candidateSearch, candidateAiResult, candidateAiInstallments])
+  }, [
+    selectedTxId,
+    unmatchedTxs,
+    openInstallments,
+    candidateSearch,
+    candidateAiResult,
+    candidateAiInstallments,
+    selectedTxMatchedInstallmentIds,
+  ])
 
   const selectedTxSuggestions = useMemo(() => {
     if (!selectedTxId) return []
     return suggestions
       .filter(s => s.bank_transaction_id === selectedTxId)
+      .filter(s => {
+        if (s.installment_id && selectedTxMatchedInstallmentIds.has(s.installment_id)) return false
+        if (!s.installment_id && s.invoice_id && selectedTxMatchedInvoiceIds.has(s.invoice_id)) return false
+        return true
+      })
       .sort((a, b) => b.match_score - a.match_score)
-  }, [selectedTxId, suggestions])
+  }, [selectedTxId, suggestions, selectedTxMatchedInstallmentIds, selectedTxMatchedInvoiceIds])
 
   // Filtered reconciled rows
   const filteredReconciled = useMemo(() => {
@@ -2498,6 +2545,56 @@ export default function RiconciliazionePage() {
                       )}
                       Ricalcola AI
                     </button>
+                  </div>
+                </div>
+              )}
+              {selectedTxPartialInfo && selectedTxMatchedHistory.length > 0 && (
+                <div className="border-b bg-amber-50/40">
+                  <div className="px-3 py-2 flex items-center gap-2">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-amber-700" />
+                    <span className="text-[11px] font-semibold text-amber-900">
+                      Gia abbinate su questo movimento
+                    </span>
+                    <span className="text-[10px] text-amber-700 ml-auto">{selectedTxMatchedHistory.length}</span>
+                  </div>
+                  <div className="divide-y divide-amber-100">
+                    {selectedTxMatchedHistory.map((item) => (
+                      <div
+                        key={item.reconciliationId}
+                        className="px-3 py-2.5 flex items-center justify-between gap-3 hover:bg-white/60 transition-colors cursor-pointer"
+                        onDoubleClick={() => setDetailPopup({ type: 'invoice', id: item.invoiceId })}
+                        title="Doppio click per dettaglio fattura"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-xs font-medium text-gray-800">
+                              {item.invoiceNumber ? `Fatt. ${item.invoiceNumber}` : 'Fattura'}
+                            </span>
+                            {item.invoiceTotal != null && (
+                              <span className="text-[10px] text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded font-medium">
+                                Totale {fmtEur(item.invoiceTotal)}
+                              </span>
+                            )}
+                            <span className="text-[10px] text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded font-medium">
+                              Gia abbinata {fmtEur(item.amount)}
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-gray-500 mt-0.5">
+                            {fmtDate(item.date)}
+                          </p>
+                        </div>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setDetailPopup({ type: 'invoice', id: item.invoiceId })
+                          }}
+                          className="p-1.5 rounded-md text-gray-400 hover:text-blue-600 hover:bg-blue-50 transition-colors shrink-0"
+                          title="Apri dettaglio fattura"
+                        >
+                          <ExternalLink className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 </div>
               )}

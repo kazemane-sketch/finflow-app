@@ -55,6 +55,7 @@ import { extractProvinceSiglaFromAddress, loadCounterpartyHeaderInfo } from '@/l
 import { deleteFiscalDecisionsForInvoice, saveFiscalDecision } from '@/lib/fiscalDecisionService';
 import ExportDialog from '@/components/ExportDialog';
 import SearchableSelect from '@/components/SearchableSelect';
+import { ConfidenceBadge, ReasoningBox, FiscalBox, NoteBox } from '@/components/invoice';
 
 // ============================================================
 // LOOKUPS
@@ -1136,6 +1137,23 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   // Notes tab state
   const [notesText, setNotesText] = useState(invoice.notes || '');
   const [notesSaving, setNotesSaving] = useState(false);
+  // Expandable line detail state
+  const [expandedLines, setExpandedLines] = useState<Record<string, boolean>>({});
+  const toggleLineExpand = useCallback((lineId: string) => {
+    setExpandedLines(prev => ({ ...prev, [lineId]: !prev[lineId] }));
+  }, []);
+  const handleSaveLineNote = useCallback(async (lineId: string, note: string) => {
+    const { error } = await supabase
+      .from('invoice_lines')
+      .update({
+        line_note: note,
+        line_note_source: 'user',
+        line_note_updated_at: new Date().toISOString(),
+      })
+      .eq('id', lineId);
+    if (error) toast.error('Errore salvataggio nota');
+    else toast.success('Nota salvata');
+  }, []);
   const notesDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [counterpartyHeaderInfo, setCounterpartyHeaderInfo] = useState<{ atecoDescription: string | null; provinceSigla: string | null; status: 'pending' | 'verified' | 'rejected' | null }>({
     atecoDescription: null,
