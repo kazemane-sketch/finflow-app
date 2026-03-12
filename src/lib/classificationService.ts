@@ -708,6 +708,15 @@ export async function saveLineProjects(
   if (error) throw error;
 }
 
+/** Clear all line-level CdC allocations for an invoice. */
+export async function clearAllLineProjects(invoiceId: string): Promise<void> {
+  const { error } = await supabase
+    .from('invoice_line_projects')
+    .delete()
+    .eq('invoice_id', invoiceId);
+  if (error) throw error;
+}
+
 // ─── AI Suggestion Types & Helpers ────────────────────────
 
 export interface AccountSuggestion {

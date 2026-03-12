@@ -7,7 +7,7 @@ import {
   Send, Plus, MessageSquare, Search, Sparkles,
   BarChart3, FileText, Landmark, Link2, ChevronDown, ChevronRight,
   Loader2, MoreHorizontal, Trash2, Pencil, Check, X,
-  Upload, BookOpen, AlertCircle,
+  Upload, BookOpen, AlertCircle, RefreshCw,
   Zap, Brain,
 } from 'lucide-react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
@@ -324,6 +324,28 @@ export default function AiChatPage() {
     setKbDocs(prev => prev.filter(d => d.id !== docId))
   }
 
+  const reprocessKbDoc = async (docId: string) => {
+    try {
+      // Set status to processing in UI immediately
+      setKbDocs(prev => prev.map(d => d.id === docId ? { ...d, status: 'processing' } : d))
+      const token = await getValidAccessToken()
+      await fetch(`${SUPABASE_URL}/functions/v1/kb-process-document`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ document_id: docId, action: 'reprocess' }),
+      })
+      // Reload docs to get updated status
+      void loadKbDocs()
+    } catch (err: unknown) {
+      alert('Errore rigenerazione: ' + (err instanceof Error ? err.message : String(err)))
+      void loadKbDocs()
+    }
+  }
+
   // ─── send message (wraps context) ──────
   const handleSend = async (text?: string) => {
     const msg = (text || input).trim()
@@ -498,13 +520,24 @@ export default function AiChatPage() {
                       )}
                     </div>
                   </div>
-                  <button
-                    onClick={() => deleteKbDoc(doc.id)}
-                    className="opacity-0 group-hover:opacity-100 p-0.5 text-slate-400 hover:text-red-500 transition-opacity"
-                    title="Elimina documento"
-                  >
-                    <Trash2 className="h-3 w-3" />
-                  </button>
+                  <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                    {doc.status === 'ready' && (
+                      <button
+                        onClick={() => reprocessKbDoc(doc.id)}
+                        className="p-0.5 text-slate-400 hover:text-blue-500"
+                        title="Rigenera chunks (sanitizza e ri-embedda)"
+                      >
+                        <RefreshCw className="h-3 w-3" />
+                      </button>
+                    )}
+                    <button
+                      onClick={() => deleteKbDoc(doc.id)}
+                      className="p-0.5 text-slate-400 hover:text-red-500"
+                      title="Elimina documento"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </button>
+                  </div>
                 </div>
               ))}
 

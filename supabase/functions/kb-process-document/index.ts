@@ -72,6 +72,52 @@ function sanitizeText(text: string): string {
     .trim();
 }
 
+/** Decode HTML entities that Gemini PDF extraction sometimes leaves in text */
+function sanitizeHtmlEntities(text: string): string {
+  return text
+    // Named entities — common ones
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&ordm;/g, "º")
+    .replace(/&laquo;/g, "«")
+    .replace(/&raquo;/g, "»")
+    .replace(/&euro;/g, "€")
+    .replace(/&ndash;/g, "–")
+    .replace(/&mdash;/g, "—")
+    .replace(/&hellip;/g, "…")
+    .replace(/&bull;/g, "•")
+    .replace(/&copy;/g, "©")
+    .replace(/&reg;/g, "®")
+    // Italian accented vowels
+    .replace(/&agrave;/g, "à")
+    .replace(/&egrave;/g, "è")
+    .replace(/&eacute;/g, "é")
+    .replace(/&igrave;/g, "ì")
+    .replace(/&ograve;/g, "ò")
+    .replace(/&ugrave;/g, "ù")
+    .replace(/&Agrave;/g, "À")
+    .replace(/&Egrave;/g, "È")
+    .replace(/&Eacute;/g, "É")
+    // Numeric entities: &#39; &#x27; etc.
+    .replace(/&#(\d+);/g, (_m, code) => {
+      const n = parseInt(code, 10);
+      return n > 0 && n < 0x10000 ? String.fromCharCode(n) : "";
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) => {
+      const n = parseInt(hex, 16);
+      return n > 0 && n < 0x10000 ? String.fromCharCode(n) : "";
+    })
+    // Catch-all: any remaining &xxx; entities → strip
+    .replace(/&[a-zA-Z]{2,8};/g, "")
+    // Collapse multiple spaces (but preserve newlines)
+    .replace(/[^\S\n]+/g, " ")
+    .trim();
+}
+
 /* ─── Gemini URL builders ───────────────────────── */
 function geminiUrl(model: string, method: string, apiKey: string): string {
   return `https://generativelanguage.googleapis.com/v1beta/models/${model}:${method}?key=${apiKey}`;
@@ -333,7 +379,7 @@ async function handleProcess(
 
     if (inputType === "text") {
       // full_text should already be set — sanitize it
-      if (fullText) fullText = sanitizeText(fullText);
+      if (fullText) fullText = sanitizeHtmlEntities(sanitizeText(fullText));
       if (!fullText || fullText.length < 10) {
         throw new Error("Nessun testo disponibile. Inserisci il testo nel campo full_text.");
       }
@@ -342,7 +388,7 @@ async function handleProcess(
       const sourceUrl = doc.source_url as string;
       if (!sourceUrl) throw new Error("URL fonte mancante");
       console.log(`[process] Fetching URL: ${sourceUrl}`);
-      fullText = sanitizeText(await extractTextFromUrl(apiKey, sourceUrl));
+      fullText = sanitizeHtmlEntities(sanitizeText(await extractTextFromUrl(apiKey, sourceUrl)));
       // Save extracted text
       await svc
         .from("kb_documents")
@@ -362,7 +408,7 @@ async function handleProcess(
       }
       const fileBytes = new Uint8Array(await fileData.arrayBuffer());
       console.log(`[process] PDF downloaded: ${fileBytes.length} bytes, extracting text...`);
-      fullText = sanitizeText(await extractTextFromPdf(apiKey, fileBytes));
+      fullText = sanitizeHtmlEntities(sanitizeText(await extractTextFromPdf(apiKey, fileBytes)));
       // Save extracted text
       await svc
         .from("kb_documents")
@@ -398,7 +444,7 @@ async function handleProcess(
       const { error: insertErr } = await svc.from("kb_chunks").insert({
         document_id: documentId,
         chunk_index: i,
-        content: sanitizeText(chunk.content),
+        content: sanitizeHtmlEntities(sanitizeText(chunk.content)),
         section_title: chunk.section_title,
         embedding: toVectorLiteral(embedding),
       } as any);
@@ -436,6 +482,99 @@ async function handleProcess(
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[process] Error: ${msg}`);
     // Cleanup partial chunks
+    await svc.from("kb_chunks").delete().eq("document_id", documentId);
+    await markError(svc, documentId, msg);
+    return jsonResponse({ error: msg }, 500);
+  }
+}
+
+// ══════════════════════════════════════════════════
+// ACTION: REPROCESS — re-sanitize full_text, delete old chunks, re-chunk + re-embed
+// (No re-extraction from source — uses already-saved full_text)
+// ══════════════════════════════════════════════════
+async function handleReprocess(
+  svc: ReturnType<typeof createClient>,
+  apiKey: string,
+  documentId: string,
+): Promise<Response> {
+  // 1. Get document
+  const { data: doc, error: docErr } = await svc
+    .from("kb_documents")
+    .select("*")
+    .eq("id", documentId)
+    .single();
+  if (docErr || !doc) return jsonResponse({ error: "Documento non trovato" }, 404);
+
+  let fullText = doc.full_text as string | null;
+  if (!fullText || fullText.length < 10) {
+    return jsonResponse({ error: "Nessun full_text salvato. Usa action: process per estrarre il testo." }, 400);
+  }
+
+  // 2. Set status → processing
+  await svc
+    .from("kb_documents")
+    .update({ status: "processing", processing_error: null, error_message: null } as any)
+    .eq("id", documentId);
+
+  try {
+    // 3. Re-sanitize full_text (apply new sanitizeHtmlEntities)
+    fullText = sanitizeHtmlEntities(sanitizeText(fullText));
+    await svc
+      .from("kb_documents")
+      .update({ full_text: fullText, status: "chunking" } as any)
+      .eq("id", documentId);
+    console.log(`[reprocess] Sanitized full_text: ${fullText.length} chars`);
+
+    // 4. Re-chunk
+    const chunks = chunkText(fullText);
+    console.log(`[reprocess] Created ${chunks.length} chunks`);
+
+    // 5. Delete old chunks
+    await svc.from("kb_chunks").delete().eq("document_id", documentId);
+
+    // 6. Embed + insert each chunk
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      console.log(`[reprocess] Embedding chunk ${i + 1}/${chunks.length}...`);
+      const embedding = await embedSingle(apiKey, sanitizeHtmlEntities(sanitizeText(chunk.content)));
+
+      const { error: insertErr } = await svc.from("kb_chunks").insert({
+        document_id: documentId,
+        chunk_index: i,
+        content: sanitizeHtmlEntities(sanitizeText(chunk.content)),
+        section_title: chunk.section_title,
+        embedding: toVectorLiteral(embedding),
+      } as any);
+
+      if (insertErr) {
+        throw new Error(`Insert chunk ${i} fallito: ${insertErr.message}`);
+      }
+
+      if (i < chunks.length - 1) await sleep(500);
+    }
+
+    // 7. Finalize
+    await svc
+      .from("kb_documents")
+      .update({
+        status: "ready",
+        chunk_count: chunks.length,
+        processing_error: null,
+        error_message: null,
+      } as any)
+      .eq("id", documentId);
+
+    console.log(`[reprocess] Document ${documentId} reprocessed: ${chunks.length} chunks`);
+
+    return jsonResponse({
+      status: "ok",
+      document_id: documentId,
+      chunks: chunks.length,
+      text_length: fullText.length,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[reprocess] Error: ${msg}`);
     await svc.from("kb_chunks").delete().eq("document_id", documentId);
     await markError(svc, documentId, msg);
     return jsonResponse({ error: msg }, 500);
@@ -721,12 +860,12 @@ Deno.serve(async (req) => {
     document_id?: string;
   };
 
-  const action = body.action;
+  const action = body.action || "process"; // default to process for backward compatibility
   const documentId = body.document_id;
 
   if (!documentId) return jsonResponse({ error: "document_id è richiesto" }, 400);
-  if (!action || !["process", "classify"].includes(action)) {
-    return jsonResponse({ error: "action deve essere 'process' o 'classify'" }, 400);
+  if (!["process", "classify", "reprocess"].includes(action)) {
+    return jsonResponse({ error: "action deve essere 'process', 'classify' o 'reprocess'" }, 400);
   }
 
   // Service client for all DB operations
@@ -737,6 +876,8 @@ Deno.serve(async (req) => {
   try {
     if (action === "process") {
       return await handleProcess(svc, apiKey, documentId);
+    } else if (action === "reprocess") {
+      return await handleReprocess(svc, apiKey, documentId);
     } else {
       return await handleClassify(svc, apiKey, documentId);
     }

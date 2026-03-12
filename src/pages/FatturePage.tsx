@@ -36,7 +36,7 @@ import {
   loadInvoiceClassification, saveInvoiceClassification, deleteInvoiceClassification,
   loadInvoiceProjects, saveInvoiceProjects,
   loadLineClassifications, saveLineCategoryAndAccount, clearAllLineClassifications,
-  loadLineProjects, saveLineProjects,
+  loadLineProjects, saveLineProjects, clearAllLineProjects,
   loadInvoiceNotes, clearInvoiceNotes, saveLineFiscalFlags,
   promoteLineToClassify,
   CATEGORY_TYPE_LABELS, SECTION_LABELS,
@@ -2124,6 +2124,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
 
       if (!hasAnyData) {
         // User cleared everything → delete classification and set status 'none'
+        await clearAllLineProjects(invoice.id);
         await deleteInvoiceClassification(invoice.id);
         await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
         onPatchInvoice(invoice.id, { classification_status: 'none' } as Partial<DBInvoice>);
@@ -2403,6 +2404,11 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       await clearAllLineClassifications(invoice.id);
     } catch (e) {
       console.warn('[clear] Error clearing fiscal_flags from DB:', e);
+    }
+    try {
+      await clearAllLineProjects(invoice.id);
+    } catch (e) {
+      console.warn('[clear] Error clearing line projects from DB:', e);
     }
     // Revoke learning artifacts immediately as well, so legacy rules/decisions
     // do not survive while the invoice is visually cleared in the UI.
