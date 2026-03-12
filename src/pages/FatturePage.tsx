@@ -1024,6 +1024,21 @@ type InvoiceReferenceData = {
   accounts: ChartAccount[]
 }
 
+const EMPTY_INVOICE_CLASSIF_META: InvoiceClassificationMeta = {
+  line_count: 0,
+  assigned_count: 0,
+  lines_with_category: 0,
+  lines_with_account: 0,
+  lines_with_cdc: 0,
+  lines_with_article: 0,
+  lines_with_complete_article: 0,
+  review_count: 0,
+  has_category: false,
+  has_account: false,
+  has_cost_center: false,
+  has_article: false,
+}
+
 const EMPTY_INVOICE_REFERENCE_DATA: InvoiceReferenceData = {
   articles: [],
   learnedRules: [],
@@ -1095,7 +1110,7 @@ type PendingFiscalChoice = {
   account_id: string | null
 }
 
-function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, referenceDataLoading, onInvalidateBundle, onEdit, onDelete, onReload, onPatchInvoice, onRefreshBadges, onOpenCounterparty, onOpenScadenzario, onNavigateCounterparty }: {
+function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, referenceDataLoading, onInvalidateBundle, onEdit, onDelete, onReload, onPatchInvoice, onRefreshBadges, onSetClassifMeta, onOpenCounterparty, onOpenScadenzario, onNavigateCounterparty }: {
   invoice: DBInvoice;
   detailBundle: InvoiceDetailBundle | null;
   detailPhase: InvoiceDetailPhase;
@@ -1105,6 +1120,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   onEdit: (u: InvoiceUpdate) => Promise<void>; onDelete: () => void; onReload: () => void;
   onPatchInvoice: (invoiceId: string, patch: Partial<DBInvoice>) => void;
   onRefreshBadges: (invoiceId: string) => void;
+  onSetClassifMeta: (invoiceId: string, meta: InvoiceClassificationMeta | null) => void;
   onOpenCounterparty: (mode: 'verify' | 'edit') => void;
   onOpenScadenzario: () => void;
   onNavigateCounterparty: () => void;
@@ -1497,6 +1513,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       setDismissedSuggestions(new Set());
       setBulkArticleId(null);
       setBulkPhaseId(null);
+      setShowZeroLines(false);
     });
   }, [activeDetailBundle, invoice.id, articles, referenceData.learnedRules]);
 
@@ -2058,9 +2075,15 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         const message = error instanceof Error ? error.message : String(error ?? 'errore sconosciuto');
         learningWarnings.push(`${label}: ${message}`);
       };
+      const hasAnyData = !!(
+        selCategoryId ||
+        selAccountId ||
+        Object.values(lineClassifs).some(lc => lc?.category_id || lc?.account_id) ||
+        Object.keys(lineArticleMap).length > 0
+      );
 
       // 1. Save invoice-level classification (category, account, CdC) if dirty
-      if (classifDirty) {
+      if (classifDirty && hasAnyData) {
         await saveInvoiceClassification(companyId, invoice.id, selCategoryId, selAccountId);
         const total = Math.abs(invoice.total_amount || 0);
         const rowsToSave = cdcRows.map(r => ({
@@ -2120,16 +2143,19 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       }
 
       // 4. Determine and apply classification status
-      const hasAnyData = selCategoryId || selAccountId ||
-        Object.values(lineClassifs).some(lc => lc?.category_id || lc?.account_id) ||
-        Object.keys(lineArticleMap).length > 0;
-
       if (!hasAnyData) {
         // User cleared everything → delete classification and set status 'none'
         await clearAllLineProjects(invoice.id);
         await deleteInvoiceClassification(invoice.id);
         await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
         onPatchInvoice(invoice.id, { classification_status: 'none' } as Partial<DBInvoice>);
+        onSetClassifMeta(invoice.id, EMPTY_INVOICE_CLASSIF_META);
+        setClassification(null);
+        setSelCategoryId(null);
+        setSelAccountId(null);
+        setInvProjects([]);
+        setCdcRows([]);
+        setShowZeroLines(false);
 
         try {
           await deactivateRulesForInvoice(invoice.id);
@@ -2326,7 +2352,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     isConfirmed, classification, classifDirty, selCategoryId, selAccountId, cdcRows, cdcMode,
     lineClassifs, originalLineClassifs, lineArticleMap, originalLineArticleMap,
     lineProjects, originalLineProjects, dismissedArticleLineIds,
-    detail?.invoice_lines, onPatchInvoice, onRefreshBadges, onInvalidateBundle, allAccounts, allCategories,
+    detail?.invoice_lines, onPatchInvoice, onRefreshBadges, onSetClassifMeta, onInvalidateBundle, allAccounts, allCategories,
     lineFiscalFlags, invoiceNotes, pendingFiscalChoices, primaryContractRef]);
 
   // Copy classification from a line
@@ -2396,6 +2422,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     setAiClassifResult(null);
     setAiClassifStatus('idle');
     setPipelineDebug(null);
+    setShowZeroLines(false);
     setClearPending(true);
     // Mark invoice-level as dirty so Save button detects the change
     setClassifDirty(true);
@@ -3158,10 +3185,10 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                 <div className="flex items-center gap-2">
                   <span className="text-[11px] text-emerald-600 font-medium">
                     {visibleLineCount} righe
-                    {hiddenLineCount > 0 && (
+                    {(hiddenLineCount > 0 || showZeroLines) && (
                       <button onClick={() => setShowZeroLines(!showZeroLines)}
                         className="ml-1 text-gray-400 hover:text-gray-600 underline">
-                        {showZeroLines ? 'nascondi' : `+${hiddenLineCount} a zero`}
+                        {showZeroLines ? 'nascondi righe a zero' : `+${hiddenLineCount} a zero`}
                       </button>
                     )}
                   </span>
@@ -4361,6 +4388,7 @@ export default function FatturePage() {
   const [loadingList, setLoadingList] = useState(false);
   const invoiceBundleCacheRef = useRef<Map<string, InvoiceDetailBundle>>(new Map());
   const invoiceBundleInFlightRef = useRef<Map<string, Promise<InvoiceDetailBundle>>>(new Map());
+  const invoiceBundleVersionRef = useRef<Map<string, number>>(new Map());
   const detailRequestTokenRef = useRef(0);
 
   // Pagination
@@ -4413,9 +4441,19 @@ export default function FatturePage() {
     } catch (err) { console.error('refreshClassifMeta error:', err); }
   }, [companyId]);
 
+  const setInvoiceClassifMeta = useCallback((invoiceId: string, meta: InvoiceClassificationMeta | null) => {
+    setClassifMeta(prev => {
+      const next = new Map(prev);
+      if (meta) next.set(invoiceId, meta);
+      else next.delete(invoiceId);
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     invoiceBundleCacheRef.current.clear();
     invoiceBundleInFlightRef.current.clear();
+    invoiceBundleVersionRef.current.clear();
     if (!companyId) {
       setReferenceData(EMPTY_INVOICE_REFERENCE_DATA);
       setReferenceDataLoading(false);
@@ -4453,11 +4491,14 @@ export default function FatturePage() {
   const invalidateInvoiceBundle = useCallback((invoiceId: string) => {
     invoiceBundleCacheRef.current.delete(invoiceId);
     invoiceBundleInFlightRef.current.delete(invoiceId);
+    const currentVersion = invoiceBundleVersionRef.current.get(invoiceId) || 0;
+    invoiceBundleVersionRef.current.set(invoiceId, currentVersion + 1);
   }, []);
 
   const loadCachedInvoiceBundle = useCallback(async (invoiceId: string, options?: { force?: boolean }) => {
     if (!companyId) throw new Error('Company non disponibile');
     const force = options?.force === true;
+    const requestVersion = invoiceBundleVersionRef.current.get(invoiceId) || 0;
     if (!force) {
       const cached = invoiceBundleCacheRef.current.get(invoiceId);
       if (cached) return cached;
@@ -4467,7 +4508,9 @@ export default function FatturePage() {
 
     const request = loadInvoiceDetailBundle(companyId, invoiceId)
       .then(bundle => {
-        invoiceBundleCacheRef.current.set(invoiceId, bundle);
+        if ((invoiceBundleVersionRef.current.get(invoiceId) || 0) === requestVersion) {
+          invoiceBundleCacheRef.current.set(invoiceId, bundle);
+        }
         invoiceBundleInFlightRef.current.delete(invoiceId);
         return bundle;
       })
@@ -5313,6 +5356,7 @@ export default function FatturePage() {
             onReload={reload}
 	            onPatchInvoice={patchInvoice}
 	            onRefreshBadges={refreshClassifMeta}
+	            onSetClassifMeta={setInvoiceClassifMeta}
 	            onOpenCounterparty={(mode) => navigateToCounterparty(mode)}
 	            onOpenScadenzario={() => {
 	              const tab = selectedInvoice.direction === 'out' ? 'incassi' : 'pagamenti';

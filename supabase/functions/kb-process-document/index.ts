@@ -63,6 +63,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Robust JSON extractor: handles markdown fences, arrays, and objects */
+function extractJson(text: string): any {
+  let clean = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+  try { return JSON.parse(clean); } catch { /* continue */ }
+  const arrMatch = clean.match(/\[[\s\S]*\]/);
+  if (arrMatch) try { return JSON.parse(arrMatch[0]); } catch { /* continue */ }
+  const objMatch = clean.match(/\{[\s\S]*\}/);
+  if (objMatch) try { return JSON.parse(objMatch[0]); } catch { /* continue */ }
+  throw new Error("Cannot parse JSON from Gemini response");
+}
+
 /** Strip null bytes, escaped null bytes, and control chars (except \t \n \r) */
 function sanitizeText(text: string): string {
   return text
@@ -770,19 +781,8 @@ REGOLE DI CLASSIFICAZIONE:
 
     if (!responseText) throw new Error("No text in response");
 
-    // Strip markdown fences and parse JSON
-    const cleanText = responseText.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-    try {
-      classification = JSON.parse(cleanText);
-    } catch {
-      // Try extracting JSON object from the text
-      const objMatch = cleanText.match(/\{[\s\S]*\}/);
-      if (objMatch) {
-        classification = JSON.parse(objMatch[0]);
-      } else {
-        throw new Error("No JSON object found in response");
-      }
-    }
+    // Parse JSON from text using robust extractJson utility
+    classification = extractJson(responseText);
   } catch (e) {
     console.error("[classify] Failed to parse JSON response:", e);
     return jsonResponse({ error: "AI non ha restituito JSON valido" }, 500);

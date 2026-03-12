@@ -221,6 +221,17 @@ function extractFirstJsonArray(text: string): string | null {
   return null;
 }
 
+/** Robust JSON extractor: handles markdown fences, arrays, and objects */
+function extractJson(text: string): any {
+  let clean = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+  try { return JSON.parse(clean); } catch { /* continue */ }
+  const arrMatch = clean.match(/\[[\s\S]*\]/);
+  if (arrMatch) try { return JSON.parse(arrMatch[0]); } catch { /* continue */ }
+  const objMatch = clean.match(/\{[\s\S]*\}/);
+  if (objMatch) try { return JSON.parse(objMatch[0]); } catch { /* continue */ }
+  throw new Error("Cannot parse JSON from Gemini response");
+}
+
 /* ─── Subject keyword extraction (mirrors frontend) ── */
 
 const STOPWORDS = new Set([
@@ -711,11 +722,18 @@ Se nessun alert: []`);
     let responseText = "";
     for (const part of gParts) { if (part.text && !part.thought) responseText += part.text; }
 
-    // Parse reviews
-    const reviewStr = extractFirstJsonArray(responseText);
+    // Parse reviews — balanced extractor first, extractJson fallback
     let reviews: ReviewResult[] = [];
+    const reviewStr = extractFirstJsonArray(responseText);
     if (reviewStr) {
       try { reviews = JSON.parse(reviewStr); } catch { /* ignore */ }
+    }
+    if (reviews.length === 0) {
+      try {
+        const fallback = extractJson(responseText);
+        reviews = Array.isArray(fallback) ? fallback : [fallback];
+        console.warn(`[fiscal-reviewer] extractFirstJsonArray failed, extractJson fallback OK: ${reviews.length} items`);
+      } catch { /* both failed */ }
     }
 
     // Apply pre-resolved fiscal overrides to reviews

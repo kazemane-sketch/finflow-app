@@ -225,6 +225,17 @@ function extractFirstJsonArray(text: string): string | null {
   return null;
 }
 
+/** Robust JSON extractor: handles markdown fences, arrays, and objects */
+function extractJson(text: string): any {
+  let clean = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+  try { return JSON.parse(clean); } catch { /* continue */ }
+  const arrMatch = clean.match(/\[[\s\S]*\]/);
+  if (arrMatch) try { return JSON.parse(arrMatch[0]); } catch { /* continue */ }
+  const objMatch = clean.match(/\{[\s\S]*\}/);
+  if (objMatch) try { return JSON.parse(objMatch[0]); } catch { /* continue */ }
+  throw new Error("Cannot parse JSON from Gemini response");
+}
+
 /* ─── Main ───────────────────────────────── */
 
 Deno.serve(async (req) => {
@@ -606,14 +617,21 @@ Rispondi con JSON array (no markdown):
     let responseText = "";
     for (const part of gParts) { if (part.text && !part.thought) responseText += part.text; }
 
-    const jsonStr = extractFirstJsonArray(responseText);
     let results: ClassifyResult[] = [];
+    const jsonStr = extractFirstJsonArray(responseText);
     if (jsonStr) {
       try {
         results = JSON.parse(jsonStr);
       } catch (e) {
         console.error("[classify-v2] JSON parse error:", e);
       }
+    }
+    if (results.length === 0) {
+      try {
+        const fallback = extractJson(responseText);
+        results = Array.isArray(fallback) ? fallback : [fallback];
+        console.warn(`[classify-v2] extractFirstJsonArray failed, extractJson fallback OK: ${results.length} items`);
+      } catch { /* both failed */ }
     }
 
     // Validate UUIDs — ensure account_id and category_id exist in our loaded data

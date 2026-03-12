@@ -503,10 +503,16 @@ async function runComprehension(
 
   try {
     const cleanText = result.text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+    let parsed: ComprehensionResult[];
     const jsonStr = extractFirstJsonArray(cleanText);
-    if (!jsonStr) throw new Error("No JSON array in comprehension response");
-
-    const parsed = JSON.parse(jsonStr) as ComprehensionResult[];
+    if (jsonStr) {
+      parsed = JSON.parse(jsonStr);
+    } else {
+      // Fallback: use extractJson
+      const fallback = extractJson(cleanText);
+      parsed = Array.isArray(fallback) ? fallback : [fallback];
+      console.warn(`[comprehension] extractFirstJsonArray failed, extractJson fallback OK`);
+    }
     // Validate and normalize
     const validLineIds = new Set(lines.map(l => l.line_id));
     const normalized = parsed
@@ -1160,7 +1166,23 @@ async function persistResults(
   }
 }
 
-/* ─── Extract first balanced JSON array from text ──── */
+/* ─── Robust JSON extractor: handles markdown fences, arrays, and objects ──── */
+function extractJson(text: string): any {
+  // 1. Strip markdown fences
+  let clean = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+  // 2. Try direct parse
+  try { return JSON.parse(clean); } catch { /* continue */ }
+  // 3. Try extracting a JSON array
+  const arrMatch = clean.match(/\[[\s\S]*\]/);
+  if (arrMatch) try { return JSON.parse(arrMatch[0]); } catch { /* continue */ }
+  // 4. Try extracting a JSON object
+  const objMatch = clean.match(/\{[\s\S]*\}/);
+  if (objMatch) try { return JSON.parse(objMatch[0]); } catch { /* continue */ }
+  // 5. Give up
+  throw new Error("Cannot parse JSON from Gemini response");
+}
+
+/* ─── Extract first balanced JSON array from text (legacy, more precise) ──── */
 function extractFirstJsonArray(text: string): string | null {
   const start = text.indexOf("[");
   if (start < 0) return null;
@@ -1628,22 +1650,29 @@ Deno.serve(async (req) => {
       classificationText = cleanText;
     }
 
-    // Parse classification JSON
+    // Parse classification JSON — try balanced extraction first, then robust fallback
+    let parsed: SonnetLineResult[];
     const jsonStr = extractFirstJsonArray(classificationText);
-    if (!jsonStr) {
-      console.error(`[classify] No JSON array in Gemini response. First 500: ${classificationText.slice(0, 500)}`);
-      return json({
-        error: "Gemini response: no JSON array found",
-        invoice_id: invoiceId,
-        lines: [],
-        invoice_notes: [],
-        invoice_level: { category_id: null, account_id: null, project_allocations: [], confidence: 0, reasoning: "Parse error" },
-        keywords: [],
-        stats: { total_lines: inputLines.length, classified: 0, model: GEMINI_MODEL, error: "no_json_array" },
-      }, 200);
+    if (jsonStr) {
+      parsed = JSON.parse(jsonStr);
+    } else {
+      try {
+        const fallback = extractJson(classificationText);
+        parsed = Array.isArray(fallback) ? fallback : [fallback];
+        console.warn(`[classify] extractFirstJsonArray failed, extractJson fallback OK: ${parsed.length} items`);
+      } catch (e) {
+        console.error(`[classify] No JSON in Gemini response. First 500: ${classificationText.slice(0, 500)}`);
+        return json({
+          error: "Gemini response: no JSON found",
+          invoice_id: invoiceId,
+          lines: [],
+          invoice_notes: [],
+          invoice_level: { category_id: null, account_id: null, project_allocations: [], confidence: 0, reasoning: "Parse error" },
+          keywords: [],
+          stats: { total_lines: inputLines.length, classified: 0, model: GEMINI_MODEL, error: "no_json" },
+        }, 200);
+      }
     }
-
-    const parsed: SonnetLineResult[] = JSON.parse(jsonStr);
     console.log(`[classify] Parsed ${parsed.length} lines from Gemini`);
 
     // Parse fiscal alerts

@@ -162,6 +162,17 @@ function extractFirstJsonArray(text: string): string | null {
   return null;
 }
 
+/** Robust JSON extractor: handles markdown fences, arrays, and objects */
+function extractJson(text: string): any {
+  let clean = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+  try { return JSON.parse(clean); } catch { /* continue */ }
+  const arrMatch = clean.match(/\[[\s\S]*\]/);
+  if (arrMatch) try { return JSON.parse(arrMatch[0]); } catch { /* continue */ }
+  const objMatch = clean.match(/\{[\s\S]*\}/);
+  if (objMatch) try { return JSON.parse(objMatch[0]); } catch { /* continue */ }
+  throw new Error("Cannot parse JSON from Gemini response");
+}
+
 /* ─── Main ───────────────────────────────── */
 
 Deno.serve(async (req) => {
@@ -392,22 +403,29 @@ ATTENZIONE AI GRUPPI KEYWORD: Se una riga ha GRUPPI_KEYWORD, quei gruppi ti dico
       if (part.text && !part.thought) responseText += part.text;
     }
 
-    // Parse response
-    const jsonStr = extractFirstJsonArray(responseText);
+    // Parse response — balanced extractor first, extractJson fallback
     let results: UnderstandingResult[] = [];
+    const jsonStr = extractFirstJsonArray(responseText);
+    const mapResult = (r: any) => ({
+      line_id: r.line_id,
+      operation_type: r.operation_type || "operazione generica",
+      account_sections: (r.account_sections || []).filter((s: string) => ALL_SECTIONS.includes(s)),
+      is_NOT: r.is_NOT || r.is_not || [],
+      reasoning: r.reasoning || "",
+    });
     if (jsonStr) {
       try {
-        const parsed = JSON.parse(jsonStr);
-        results = (parsed as any[]).map((r) => ({
-          line_id: r.line_id,
-          operation_type: r.operation_type || "operazione generica",
-          account_sections: (r.account_sections || []).filter((s: string) => ALL_SECTIONS.includes(s)),
-          is_NOT: r.is_NOT || r.is_not || [],
-          reasoning: r.reasoning || "",
-        }));
+        results = (JSON.parse(jsonStr) as any[]).map(mapResult);
       } catch (e) {
         console.error("[understand] JSON parse error:", e);
       }
+    }
+    if (results.length === 0) {
+      try {
+        const fallback = extractJson(responseText);
+        results = (Array.isArray(fallback) ? fallback : [fallback]).map(mapResult);
+        console.warn(`[understand] extractFirstJsonArray failed, extractJson fallback OK: ${results.length} items`);
+      } catch { /* both failed */ }
     }
 
     // Ensure all lines have a result (fallback for missing)
