@@ -38,11 +38,12 @@ import {
   loadLineClassifications, saveLineCategoryAndAccount, clearAllLineClassifications,
   loadLineProjects, saveLineProjects,
   loadInvoiceNotes, clearInvoiceNotes, saveLineFiscalFlags,
+  promoteLineToClassify,
   CATEGORY_TYPE_LABELS, SECTION_LABELS,
   createAccountFromSuggestion, createCategoryFromSuggestion,
   type Category, type Project, type ChartAccount, type CoaSection, type CategoryType,
   type InvoiceClassification, type InvoiceProjectAssignment,
-  type LineClassification, type LineProjectAssignment,
+  type LineClassification, type LineProjectAssignment, type LineActionMeta,
   type AccountSuggestion, type CategorySuggestion,
   type FiscalAlert, type FiscalAlertOption,
 } from '@/lib/classificationService';
@@ -1009,6 +1010,7 @@ type InvoiceDetailBundle = {
   lineFiscalFlags: Record<string, any>
   lineConfidences: Record<string, number>
   lineReviewFlags: Record<string, boolean>
+  lineActions: Record<string, import('@/lib/classificationService').LineActionMeta>
   lineProjects: Record<string, LineProjectAssignment[]>
   invoiceNotes: FiscalAlert[]
   lineAssignments: InvoiceLineArticleAssignmentRow[]
@@ -1070,6 +1072,7 @@ async function loadInvoiceDetailBundle(companyId: string, invoiceId: string): Pr
     lineFiscalFlags: lineClfResult.fiscalFlags,
     lineConfidences: lineClfResult.confidences,
     lineReviewFlags: lineClfResult.reviewFlags,
+    lineActions: lineClfResult.lineActions,
     lineProjects,
     invoiceNotes,
     lineAssignments,
@@ -1232,6 +1235,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   // AI confidence + review flags per line (for "Da revisionare" badges)
   const [lineConfidences, setLineConfidences] = useState<Record<string, number>>({});
   const [lineReviewFlags, setLineReviewFlags] = useState<Record<string, boolean>>({});
+  // Line action metadata (skip/group informational lines)
+  const [lineActions, setLineActions] = useState<Record<string, LineActionMeta>>({});
   // Fiscal review alerts from Sonnet escalation
   const [invoiceNotes, setInvoiceNotes] = useState<FiscalAlert[]>([]);
   const [pendingFiscalChoices, setPendingFiscalChoices] = useState<PendingFiscalChoice[]>([]);
@@ -1468,6 +1473,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       setLineFiscalFlags(activeDetailBundle.lineFiscalFlags);
       setLineConfidences(activeDetailBundle.lineConfidences);
       setLineReviewFlags(activeDetailBundle.lineReviewFlags);
+      setLineActions(activeDetailBundle.lineActions);
       setPendingFiscalChoices([]);
       setCdcRows(activeDetailBundle.invoiceProjects.map(ip => ({
         project_id: ip.project_id,
@@ -1875,6 +1881,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         setLineFiscalFlags(prev => ({ ...lineClfResult.fiscalFlags, ...prev }));
         setLineConfidences(prev => ({ ...lineClfResult.confidences, ...prev }));
         setLineReviewFlags(prev => ({ ...lineClfResult.reviewFlags, ...prev }));
+        setLineActions(prev => ({ ...prev, ...lineClfResult.lineActions }));
 
         const freshMap: Record<string, LineArticleInfo> = {};
         const freshDbSugg: Record<string, MatchResult> = {};
@@ -2376,6 +2383,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     setLineFiscalFlags({});
     setLineConfidences({});
     setLineReviewFlags({});
+    setLineActions({});
     setInvoiceNotes([]);
     setPendingFiscalChoices([]);
     setAiSuggestions({});
@@ -2821,6 +2829,11 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     .filter(lid => visibleLineIds.has(lid) && (lineClassifs[lid]?.category_id || lineClassifs[lid]?.account_id))
     .length;
 
+  // Informational line counts for the counter
+  const skippedLineCount = Object.values(lineActions).filter(a => a.line_action === 'skip').length;
+  const groupedLineCount = Object.values(lineActions).filter(a => a.line_action === 'group').length;
+  const informationalTotal = skippedLineCount + groupedLineCount;
+
   return (
     <div className="flex flex-col h-full" id="invoice-detail-print">
 	      {/* HEADER STRIP */}
@@ -3144,7 +3157,14 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       </button>
                     )}
                   </span>
-                  <span className="text-[11px] text-gray-400">{classifiedLineCount}/{visibleLineCount} classificate</span>
+                  <span className="text-[11px] text-gray-400">
+                    {classifiedLineCount}/{visibleLineCount - informationalTotal} classificate
+                    {informationalTotal > 0 && (
+                      <span className="ml-1 text-gray-300">
+                        ({groupedLineCount > 0 ? `${groupedLineCount} rif.` : ''}{groupedLineCount > 0 && skippedLineCount > 0 ? ', ' : ''}{skippedLineCount > 0 ? `${skippedLineCount} info` : ''})
+                      </span>
+                    )}
+                  </span>
                 </div>
               </div>
               <div className="overflow-x-auto">
@@ -3185,14 +3205,111 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                     {(allCategories.length > 0 || allAccounts.length > 0) && <th className="text-center px-0.5 py-2 text-gray-400 font-normal w-12"></th>}
                   </tr></thead>
                   <tbody>
-                    {visibleXmlLines.map((l: any, i: number) => {
-                      const dbLine = detail?.invoice_lines?.find(dl => dl.line_number === parseInt(l.numero || String(i + 1)));
+                    {/* Sort lines: classify lines first (with grouped children after parent), then skip lines */}
+                    {(() => {
+                      // Build sorted line list: parent → children → ... → skip at end
+                      const allLines = visibleXmlLines.map((l: any, i: number) => ({
+                        xml: l,
+                        idx: i,
+                        dbLine: detail?.invoice_lines?.find((dl: any) => dl.line_number === parseInt(l.numero || String(i + 1))),
+                      }));
+
+                      const sorted: typeof allLines = [];
+                      const groupedByParent = new Map<string, typeof allLines>();
+
+                      // Collect grouped lines by parent ID
+                      for (const item of allLines) {
+                        const lineId = item.dbLine?.id;
+                        const action = lineId ? lineActions[lineId] : null;
+                        if (action?.line_action === 'group' && action.grouped_with_line_id) {
+                          const arr = groupedByParent.get(action.grouped_with_line_id) || [];
+                          arr.push(item);
+                          groupedByParent.set(action.grouped_with_line_id, arr);
+                        }
+                      }
+
+                      // Add classify lines (with their grouped children after each)
+                      for (const item of allLines) {
+                        const lineId = item.dbLine?.id;
+                        const action = lineId ? lineActions[lineId] : null;
+                        if (!action || action.line_action === 'classify') {
+                          sorted.push(item);
+                          if (lineId) {
+                            const children = groupedByParent.get(lineId) || [];
+                            sorted.push(...children);
+                          }
+                        }
+                      }
+
+                      // Add skip lines at the end
+                      for (const item of allLines) {
+                        const lineId = item.dbLine?.id;
+                        const action = lineId ? lineActions[lineId] : null;
+                        if (action?.line_action === 'skip') {
+                          sorted.push(item);
+                        }
+                      }
+
+                      return sorted;
+                    })().map(({ xml: l, idx: i, dbLine }: { xml: any; idx: number; dbLine: any }) => {
                       const lineId = dbLine?.id;
+                      const lineAction = lineId ? lineActions[lineId] : null;
+                      const isSkip = lineAction?.line_action === 'skip';
+                      const isGroup = lineAction?.line_action === 'group';
+                      const isInformational = isSkip || isGroup;
                       const lineCat = lineId ? lineClassifs[lineId]?.category_id : null;
                       const lineAcc = lineId ? lineClassifs[lineId]?.account_id : null;
                       const ff = lineId ? lineFiscalFlags[lineId] : null;
-                      const hasFiscalFlags = ff && (ff.ritenuta_acconto || ff.reverse_charge || ff.split_payment || ff.bene_strumentale || (ff.deducibilita_pct != null && ff.deducibilita_pct < 100) || (ff.iva_detraibilita_pct != null && ff.iva_detraibilita_pct < 100));
+                      const hasFiscalFlags = !isInformational && ff && (ff.ritenuta_acconto || ff.reverse_charge || ff.split_payment || ff.bene_strumentale || (ff.deducibilita_pct != null && ff.deducibilita_pct < 100) || (ff.iva_detraibilita_pct != null && ff.iva_detraibilita_pct < 100));
                       const colCount = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0);
+
+                      // ─── Skip/Group informational lines: special rendering ───
+                      if (isInformational) {
+                        return (
+                          <React.Fragment key={`info-${i}`}>
+                            <tr className={`border-b border-gray-50 ${isSkip ? 'bg-gray-50/50 opacity-50' : 'bg-blue-50/20'}`}>
+                              <td className="text-left px-3 py-1.5 max-w-[200px]">
+                                {isGroup && <span className="text-gray-400 mr-1">{'\u21B3'}</span>}
+                                <span className={`${isSkip ? 'text-gray-400 line-through' : 'text-gray-500 italic'}`}>
+                                  {l.descrizione || '\u2014'}
+                                </span>
+                                <span className={`ml-1.5 inline-flex items-center text-[9px] px-1.5 py-0.5 rounded-full ${isSkip ? 'bg-gray-100 text-gray-400' : 'bg-blue-50 text-blue-400 border border-blue-100'}`}>
+                                  {lineAction?.skip_reason || (isSkip ? 'Informativa' : 'Raggruppata')}
+                                </span>
+                                {/* Promote button: user can override AI's decision */}
+                                {lineId && (
+                                  <button
+                                    onClick={async () => {
+                                      try {
+                                        await promoteLineToClassify(lineId);
+                                        setLineActions(prev => { const next = { ...prev }; delete next[lineId]; return next; });
+                                        toast.success('Riga promossa a contabile');
+                                      } catch (e) {
+                                        toast.error('Errore nel promuovere la riga');
+                                      }
+                                    }}
+                                    title="Classifica questa riga (override AI)"
+                                    className="ml-1.5 text-[9px] text-gray-400 hover:text-blue-600 hover:underline cursor-pointer"
+                                  >
+                                    Classifica
+                                  </button>
+                                )}
+                              </td>
+                              <td className="text-right px-2 py-1.5 text-gray-300">{l.quantita ? fmtNum(safeFloat(l.quantita)) : ''}</td>
+                              <td className="text-right px-2 py-1.5 text-gray-300">{safeFloat(l.prezzoUnitario) ? fmtNum(safeFloat(l.prezzoUnitario)) : ''}</td>
+                              <td className="text-right px-2 py-1.5 text-gray-300">{safeFloat(l.aliquotaIVA) ? `${fmtNum(safeFloat(l.aliquotaIVA))}%` : ''}</td>
+                              <td className="text-right px-2 py-1.5 text-gray-300">{safeFloat(l.prezzoTotale) ? fmtNum(safeFloat(l.prezzoTotale)) : '0,00'}</td>
+                              {/* Empty cells for category/cdc/account/actions columns */}
+                              {allCategories.length > 0 && <td></td>}
+                              {allProjects.length > 0 && <td></td>}
+                              {allAccounts.length > 0 && <td></td>}
+                              {(allCategories.length > 0 || allAccounts.length > 0) && <td></td>}
+                            </tr>
+                          </React.Fragment>
+                        );
+                      }
+
+                      // ─── Normal classify line rendering ───
                       return (
                       <React.Fragment key={i}>
                       <tr className="border-b border-gray-50 hover:bg-gray-50/50">
@@ -3399,12 +3516,87 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       );
                     })}
                     {/* Fallback: DB line items when XML not parsed */}
-                    {!b?.linee?.length && visibleDbLines.map((l, i) => {
+                    {!b?.linee?.length && (() => {
+                      // Sort DB lines: classify first (with grouped children), skip at end
+                      const allDbItems = visibleDbLines.map((l: any, i: number) => ({ line: l, idx: i }));
+                      const sortedDb: typeof allDbItems = [];
+                      const dbGroupedByParent = new Map<string, typeof allDbItems>();
+
+                      for (const item of allDbItems) {
+                        const action = lineActions[item.line.id];
+                        if (action?.line_action === 'group' && action.grouped_with_line_id) {
+                          const arr = dbGroupedByParent.get(action.grouped_with_line_id) || [];
+                          arr.push(item);
+                          dbGroupedByParent.set(action.grouped_with_line_id, arr);
+                        }
+                      }
+                      for (const item of allDbItems) {
+                        const action = lineActions[item.line.id];
+                        if (!action || action.line_action === 'classify') {
+                          sortedDb.push(item);
+                          const children = dbGroupedByParent.get(item.line.id) || [];
+                          sortedDb.push(...children);
+                        }
+                      }
+                      for (const item of allDbItems) {
+                        const action = lineActions[item.line.id];
+                        if (action?.line_action === 'skip') sortedDb.push(item);
+                      }
+
+                      return sortedDb.map(({ line: l, idx: i }) => {
+                      const lineAction = lineActions[l.id];
+                      const isSkip = lineAction?.line_action === 'skip';
+                      const isGroup = lineAction?.line_action === 'group';
+                      const isInformational = isSkip || isGroup;
                       const lineCat = lineClassifs[l.id]?.category_id;
                       const lineAcc = lineClassifs[l.id]?.account_id;
                       const ff2 = lineFiscalFlags[l.id];
-                      const hasFf2 = ff2 && (ff2.ritenuta_acconto || ff2.reverse_charge || ff2.split_payment || ff2.bene_strumentale || (ff2.deducibilita_pct != null && ff2.deducibilita_pct < 100) || (ff2.iva_detraibilita_pct != null && ff2.iva_detraibilita_pct < 100));
+                      const hasFf2 = !isInformational && ff2 && (ff2.ritenuta_acconto || ff2.reverse_charge || ff2.split_payment || ff2.bene_strumentale || (ff2.deducibilita_pct != null && ff2.deducibilita_pct < 100) || (ff2.iva_detraibilita_pct != null && ff2.iva_detraibilita_pct < 100));
                       const colCount2 = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0);
+
+                      // ─── Skip/Group informational lines: special rendering ───
+                      if (isInformational) {
+                        return (
+                          <React.Fragment key={`db-info-${i}`}>
+                            <tr className={`border-b border-gray-50 ${isSkip ? 'bg-gray-50/50 opacity-50' : 'bg-blue-50/20'}`}>
+                              <td className="text-left px-3 py-1.5">
+                                {isGroup && <span className="text-gray-400 mr-1">{'\u21B3'}</span>}
+                                <span className={`${isSkip ? 'text-gray-400 line-through' : 'text-gray-500 italic'}`}>
+                                  {l.description || '\u2014'}
+                                </span>
+                                <span className={`ml-1.5 inline-flex items-center text-[9px] px-1.5 py-0.5 rounded-full ${isSkip ? 'bg-gray-100 text-gray-400' : 'bg-blue-50 text-blue-400 border border-blue-100'}`}>
+                                  {lineAction?.skip_reason || (isSkip ? 'Informativa' : 'Raggruppata')}
+                                </span>
+                                <button
+                                  onClick={async () => {
+                                    try {
+                                      await promoteLineToClassify(l.id);
+                                      setLineActions(prev => { const next = { ...prev }; delete next[l.id]; return next; });
+                                      toast.success('Riga promossa a contabile');
+                                    } catch (e) {
+                                      toast.error('Errore nel promuovere la riga');
+                                    }
+                                  }}
+                                  title="Classifica questa riga (override AI)"
+                                  className="ml-1.5 text-[9px] text-gray-400 hover:text-blue-600 hover:underline cursor-pointer"
+                                >
+                                  Classifica
+                                </button>
+                              </td>
+                              <td className="text-right px-2 py-1.5 text-gray-300">{fmtNum(l.quantity)}</td>
+                              <td className="text-right px-2 py-1.5 text-gray-300">{l.unit_price ? fmtNum(l.unit_price) : ''}</td>
+                              <td className="text-right px-2 py-1.5 text-gray-300">{l.vat_rate ? `${fmtNum(l.vat_rate)}%` : ''}</td>
+                              <td className="text-right px-2 py-1.5 text-gray-300">{l.total_price ? fmtNum(l.total_price) : '0,00'}</td>
+                              {allCategories.length > 0 && <td></td>}
+                              {allProjects.length > 0 && <td></td>}
+                              {allAccounts.length > 0 && <td></td>}
+                              {(allCategories.length > 0 || allAccounts.length > 0) && <td></td>}
+                            </tr>
+                          </React.Fragment>
+                        );
+                      }
+
+                      // ─── Normal classify line rendering ───
                       return (
                       <React.Fragment key={i}>
                       <tr className="border-b border-gray-50 hover:bg-gray-50/50">
@@ -3586,7 +3778,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       )}
                       </React.Fragment>
                       );
-                    })}
+                    });
+                    })()}
                   </tbody>
                 </table>
               </div>

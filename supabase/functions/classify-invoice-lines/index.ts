@@ -179,6 +179,25 @@ interface FiscalKBRule {
   fiscal_values: Record<string, unknown> | null;
 }
 
+/* ─── Comprehension result (line triage) ── */
+
+interface ComprehensionResult {
+  line_id: string;
+  action: 'classify' | 'skip' | 'group';
+  group_with: string | null;
+  skip_reason: string | null;
+  understanding: string;
+}
+
+interface KBChunkResult {
+  id: string;
+  content: string;
+  document_title: string;
+  legal_reference: string | null;
+  section_title: string | null;
+  similarity: number;
+}
+
 /* ─── Gemini embedding (for RAG) ────────── */
 
 function toVectorLiteral(values: number[]): string {
@@ -374,6 +393,201 @@ async function searchFiscalKB(
   }
 }
 
+/* ─── KB Chunks search (normative context from documents) ── */
+
+async function searchKBChunks(
+  sql: SqlClient,
+  companyId: string,
+  queryVec: number[],
+  atecoPrefix: string,
+): Promise<KBChunkResult[]> {
+  try {
+    const vecLiteral = toVectorLiteral(queryVec);
+    const rows = await sql.unsafe(
+      `SELECT * FROM match_kb_chunks($1::halfvec(3072), 0.40, 5, $2::uuid, $3)`,
+      [vecLiteral, companyId, atecoPrefix || null],
+    );
+    const results = (rows as KBChunkResult[]).map(r => ({
+      id: r.id,
+      content: r.content,
+      document_title: r.document_title,
+      legal_reference: r.legal_reference,
+      section_title: r.section_title,
+      similarity: r.similarity,
+    }));
+    console.log(`[kb-chunks] Found ${results.length} relevant KB chunks`);
+    return results;
+  } catch (err) {
+    console.warn("[kb-chunks] Search failed:", err);
+    return [];
+  }
+}
+
+/* ─── Comprehension step (line triage: classify/skip/group) ── */
+
+function buildComprehensionPrompt(lines: InputLine[]): string {
+  const lineEntries = lines.map((l, i) =>
+    `${i + 1}. [${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} unit=${l.unit_price ?? "N/D"} tot=${l.total_price ?? "N/D"}`
+  ).join("\n");
+
+  return `Sei un commercialista italiano. Analizza queste righe fattura e determina per ciascuna se è un MOVIMENTO CONTABILE REALE o una RIGA INFORMATIVA.
+
+Una riga è INFORMATIVA (non contabile) se soddisfa UNA delle seguenti condizioni:
+- Ha importo totale = 0 E la descrizione è un riferimento a DDT (es. "Rif. DDT...", "DDT n.", "Documento di trasporto...")
+- Ha importo totale = 0 E la descrizione è vuota, un trattino "-", o solo punteggiatura
+- Ha importo totale = 0 E la descrizione contiene solo informazioni di trasporto/consegna (es. "Franco Destino...", "Peso Totale Ton...", "n.X viaggi...")
+- Ha importo totale = 0 E la descrizione contiene indicazioni di resa merce (es. "Resa Franco...", "Materiale reso...")
+
+ATTENZIONE: NON tutte le righe a importo 0 sono informative! Esempi di righe a importo 0 che SONO contabili:
+- Omaggi (cessione gratuita di beni)
+- Campioni gratuiti
+- Scorporo IVA
+- Abbuoni e sconti
+- Righe con natura IVA N1-N7 (escluse/non imponibili)
+- Righe di rettifica/storno
+
+Per le righe informative, indica:
+- "action": "skip" se è una riga vuota/separatore senza contesto utile
+- "action": "group" se è un riferimento DDT, nota trasporto, o nota consegna che accompagna una riga materiale
+- "group_with": line_id della riga contabile più vicina (solo se action=group)
+- "skip_reason": motivazione breve in italiano (es. "Riferimento DDT", "Riga separatore", "Nota trasporto", "Indicazione resa merce")
+
+Per le righe contabili:
+- "action": "classify"
+- "group_with": null
+- "skip_reason": null
+
+RIGHE:
+${lineEntries}
+
+FORMATO OUTPUT: JSON array, no markdown.
+[{"line_id":"uuid","action":"classify"|"skip"|"group","group_with":null|"uuid","skip_reason":null|"stringa","understanding":"breve descrizione operazione"}]`;
+}
+
+async function runComprehension(
+  apiKey: string,
+  lines: InputLine[],
+  model: string,
+  thinkingBudget: number,
+): Promise<ComprehensionResult[]> {
+  // Skip comprehension if all lines have non-zero amounts (optimization)
+  const hasZeroLines = lines.some(l => l.total_price === 0 || l.total_price === null);
+  if (!hasZeroLines) {
+    console.log(`[comprehension] All lines have non-zero amounts, skipping triage`);
+    return lines.map(l => ({
+      line_id: l.line_id,
+      action: 'classify' as const,
+      group_with: null,
+      skip_reason: null,
+      understanding: '',
+    }));
+  }
+
+  const prompt = buildComprehensionPrompt(lines);
+  console.log(`[comprehension] Calling ${model} for ${lines.length} lines (${prompt.length} chars)`);
+
+  // Use lower thinking budget for comprehension (it's simpler)
+  const comprBudget = Math.min(thinkingBudget, 2048);
+  const result = await callGemini(apiKey, prompt, model, comprBudget, 8192);
+
+  if (result.error || !result.text) {
+    console.warn(`[comprehension] Failed: ${result.error}, treating all as classify`);
+    return lines.map(l => ({
+      line_id: l.line_id,
+      action: 'classify' as const,
+      group_with: null,
+      skip_reason: null,
+      understanding: '',
+    }));
+  }
+
+  try {
+    const cleanText = result.text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+    const jsonStr = extractFirstJsonArray(cleanText);
+    if (!jsonStr) throw new Error("No JSON array in comprehension response");
+
+    const parsed = JSON.parse(jsonStr) as ComprehensionResult[];
+    // Validate and normalize
+    const validLineIds = new Set(lines.map(l => l.line_id));
+    const normalized = parsed
+      .filter(r => validLineIds.has(r.line_id))
+      .map(r => ({
+        line_id: r.line_id,
+        action: (['classify', 'skip', 'group'].includes(r.action) ? r.action : 'classify') as 'classify' | 'skip' | 'group',
+        group_with: r.action === 'group' && r.group_with && validLineIds.has(r.group_with) ? r.group_with : null,
+        skip_reason: r.skip_reason || null,
+        understanding: r.understanding || '',
+      }));
+
+    // Add any missing lines as classify
+    for (const l of lines) {
+      if (!normalized.find(n => n.line_id === l.line_id)) {
+        normalized.push({
+          line_id: l.line_id,
+          action: 'classify',
+          group_with: null,
+          skip_reason: null,
+          understanding: '',
+        });
+      }
+    }
+
+    // Validate group_with references: if group_with points to a non-classify line, fix it
+    const classifyIds = new Set(normalized.filter(n => n.action === 'classify').map(n => n.line_id));
+    for (const n of normalized) {
+      if (n.action === 'group' && n.group_with && !classifyIds.has(n.group_with)) {
+        // Find nearest classify line
+        const nearestClassify = normalized.find(c => c.action === 'classify');
+        n.group_with = nearestClassify?.line_id || null;
+        if (!n.group_with) {
+          n.action = 'skip'; // No classify lines to group with
+        }
+      }
+    }
+
+    const classifyCount = normalized.filter(n => n.action === 'classify').length;
+    const skipCount = normalized.filter(n => n.action === 'skip').length;
+    const groupCount = normalized.filter(n => n.action === 'group').length;
+    console.log(`[comprehension] Triage: ${classifyCount} classify, ${skipCount} skip, ${groupCount} group`);
+
+    return normalized;
+  } catch (e) {
+    console.warn(`[comprehension] Parse error: ${e}, treating all as classify`);
+    return lines.map(l => ({
+      line_id: l.line_id,
+      action: 'classify' as const,
+      group_with: null,
+      skip_reason: null,
+      understanding: '',
+    }));
+  }
+}
+
+/* ─── Persist informational lines (skip/group) ── */
+
+async function persistInformationalLines(
+  sql: SqlClient,
+  results: ComprehensionResult[],
+): Promise<void> {
+  const informational = results.filter(r => r.action !== 'classify');
+  if (informational.length === 0) return;
+
+  for (const line of informational) {
+    try {
+      await sql`
+        UPDATE invoice_lines
+        SET line_action = ${line.action},
+            grouped_with_line_id = ${line.group_with},
+            skip_reason = ${line.skip_reason},
+            classification_status = 'confirmed'
+        WHERE id = ${line.line_id}`;
+    } catch (e) {
+      console.warn(`[persist-info] Line ${line.line_id} update failed:`, e);
+    }
+  }
+  console.log(`[persist-info] Saved ${informational.length} informational lines`);
+}
+
 /* ─── Build Gemini prompt (classification + fiscal) ─── */
 
 function buildGeminiPrompt(
@@ -392,6 +606,7 @@ function buildGeminiPrompt(
   kbRules: FiscalKBRule[],
   company: CompanyContext | undefined,
   invoiceNotes?: string,
+  kbChunks?: KBChunkResult[],
 ): string {
   // Build phases-by-article map
   const phasesByArticle = new Map<string, ArticlePhaseRow[]>();
@@ -474,6 +689,17 @@ function buildGeminiPrompt(
     kbSection += `\n===\n`;
   }
 
+  // KB chunks (normative context from documents)
+  let kbChunksSection = "";
+  if (kbChunks && kbChunks.length > 0) {
+    kbChunksSection = `\n=== CONTESTO NORMATIVO (da Knowledge Base Documenti) ===\n`;
+    for (const chunk of kbChunks) {
+      kbChunksSection += `[${chunk.document_title}${chunk.legal_reference ? ' — ' + chunk.legal_reference : ''}${chunk.section_title ? ' § ' + chunk.section_title : ''}]\n`;
+      kbChunksSection += `${chunk.content}\n\n`;
+    }
+    kbChunksSection += `===\n`;
+  }
+
   // Lines
   const lineEntries = lines
     .map((l, i) =>
@@ -515,7 +741,7 @@ REGOLA D'ORO: l'utente finale NON è un esperto contabile. Accetterà qualsiasi 
 ${companySection}
 ${userInstructionsBlock}
 ${memoryBlock}
-${kbSection}
+${kbSection}${kbChunksSection}
 
 COMPETENZE FONDAMENTALI:
 
@@ -595,8 +821,8 @@ REGOLE CLASSIFICAZIONE:
 - category_id e account_id: assegna SEMPRE (UUID esatti dalla lista sopra).
 - Coerenza: trasporto→conti trasporto, noleggio→conti noleggio.
 - confidence 0-100. Se dubbio, confidence bassa.
-- Righe con importo zero (tot=0): sono INFORMATIVE/CONTESTO. Per la riga zero: confidence 30-50, reasoning "Riga informativa/contesto".
 - Se NESSUNA categoria corrisponde bene, scegli la più vicina con confidence bassa (50-65).
+- NOTA: le righe informative (DDT, note trasporto, righe vuote) sono già state filtrate. Classifica SOLO le righe qui presenti.
 - CdC: assegna SOLO con segnale chiaro. Se non sei sicuro, lascia vuoto.
 
 REGOLE FISCALI (per OGNI riga):
@@ -1258,21 +1484,82 @@ Deno.serve(async (req) => {
     // Build memory block for prompt
     const memoryBlock = getCompanyMemoryBlock(memoryFacts);
 
-    // ─── Step 8: Fiscal KB RAG ─────────────────────────────────
+    // ─── Step 8: Fiscal KB RAG + KB Chunks ─────────────────────
     let kbRules: FiscalKBRule[] = [];
+    let kbChunks: KBChunkResult[] = [];
     if (queryVec) {
       // Collect account codes from preflight for trigger matching
       const accCodes = preflightAccounts.map(a => a.code);
-      kbRules = await searchFiscalKB(
-        sql,
-        queryVec,
-        counterpartyAtecoFull,
-        counterpartyLegalType,
-        accCodes,
-      );
+      const atecoPrefix = counterpartyAtecoFull ? counterpartyAtecoFull.slice(0, 2) : "";
+      // Run both KB searches in parallel
+      const [fiscalRules, docChunks] = await Promise.all([
+        searchFiscalKB(sql, queryVec, counterpartyAtecoFull, counterpartyLegalType, accCodes),
+        searchKBChunks(sql, companyId, queryVec, atecoPrefix),
+      ]);
+      kbRules = fiscalRules;
+      kbChunks = docChunks;
     }
 
-    // ─── Step 9: Single Gemini call (classification + fiscal) ──
+    // ─── Step 8b: Comprehension (line triage) ────────────────────
+    // First, reset any previous skip/group on re-classification
+    try {
+      await sql`
+        UPDATE invoice_lines
+        SET line_action = 'classify', grouped_with_line_id = NULL, skip_reason = NULL
+        WHERE invoice_id = ${invoiceId} AND line_action != 'classify'`;
+    } catch (e) {
+      console.warn(`[classify] Reset informational lines failed:`, e);
+    }
+
+    const comprehension = await runComprehension(geminiKey, inputLines, GEMINI_MODEL, THINKING_BUDGET);
+
+    // Persist skip/group lines immediately
+    await persistInformationalLines(sql, comprehension);
+
+    // Filter: only classify lines go to the main classification call
+    const classifyLineIds = new Set(
+      comprehension.filter(c => c.action === 'classify').map(c => c.line_id)
+    );
+    const linesToClassify = inputLines.filter(l => classifyLineIds.has(l.line_id));
+    const skippedCount = comprehension.filter(c => c.action === 'skip').length;
+    const groupedCount = comprehension.filter(c => c.action === 'group').length;
+
+    console.log(`[classify] After comprehension: ${linesToClassify.length} to classify, ${skippedCount} skipped, ${groupedCount} grouped`);
+
+    // If ALL lines are informational, return early
+    if (linesToClassify.length === 0) {
+      // Mark invoice as classified with special reasoning
+      try {
+        await sql`
+          UPDATE invoices
+          SET classification_status = 'ai_suggested'
+          WHERE id = ${invoiceId} AND classification_status != 'confirmed'`;
+      } catch (e) {
+        console.warn(`[classify] Update invoice status failed:`, e);
+      }
+
+      return json({
+        invoice_id: invoiceId,
+        lines: comprehension.map(c => ({
+          line_id: c.line_id,
+          action: c.action,
+          grouped_with_line_id: c.group_with,
+          skip_reason: c.skip_reason,
+        })),
+        invoice_notes: [],
+        invoice_level: { category_id: null, account_id: null, project_allocations: [], confidence: 100, reasoning: "Tutte le righe sono informative (DDT, note trasporto)" },
+        keywords: [],
+        stats: {
+          total_lines: inputLines.length,
+          classified: 0,
+          skipped: skippedCount,
+          grouped: groupedCount,
+          model: GEMINI_MODEL,
+        },
+      });
+    }
+
+    // ─── Step 9: Classification Gemini call (only classify lines) ──
     const prompt = buildGeminiPrompt(
       preflightArticles,
       preflightCategories,
@@ -1284,15 +1571,16 @@ Deno.serve(async (req) => {
       articleHistory,
       memoryBlock,
       direction,
-      inputLines,
+      linesToClassify,
       userInstructionsBlock,
       kbRules,
       companyContext,
       invoiceNotes || undefined,
+      kbChunks,
     );
 
     console.log(
-      `[classify] Calling ${GEMINI_MODEL} for ${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}, thinking=${THINKING_BUDGET}`,
+      `[classify] Calling ${GEMINI_MODEL} for ${linesToClassify.length}/${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}, thinking=${THINKING_BUDGET}`,
     );
 
     const geminiResult = await callGemini(geminiKey, prompt, GEMINI_MODEL, THINKING_BUDGET, MAX_OUTPUT_TOKENS);
@@ -1626,10 +1914,19 @@ Deno.serve(async (req) => {
       }
     }
 
-    // ─── Compose invoice-level ─────────────────────────────────
-    const invoiceLevel = composeInvoiceLevel(lineResults, inputLines);
+    // ─── Compose invoice-level (only from classified lines) ────
+    const invoiceLevel = composeInvoiceLevel(lineResults, linesToClassify);
 
     // ─── Persist to DB ─────────────────────────────────────────
+    // Also reset line_action to 'classify' for classified lines (in case of re-run)
+    for (const lr of lineResults) {
+      try {
+        await sql`
+          UPDATE invoice_lines SET line_action = 'classify'
+          WHERE id = ${lr.line_id} AND line_action != 'classify'`;
+      } catch { /* ignore */ }
+    }
+
     await persistResults(
       sql,
       companyId,
@@ -1659,30 +1956,47 @@ Deno.serve(async (req) => {
     const phaseResolution = new Map<string, string>();
     for (const p of phases) phaseResolution.set(`${p.article_id}:${p.code}`, p.id);
 
+    // Build response: classified lines + informational lines
+    const classifiedLineResults = lineResults.map((lr) => {
+      const articleId = lr.article_code ? codeToId.get(lr.article_code) || null : null;
+      const phaseId = articleId && lr.phase_code
+        ? phaseResolution.get(`${articleId}:${lr.phase_code}`) || null
+        : null;
+      return {
+        ...lr,
+        action: 'classify' as const,
+        article_id: articleId,
+        phase_id: phaseId,
+      };
+    });
+
+    // Add informational lines to the response
+    const informationalLines = comprehension
+      .filter(c => c.action !== 'classify')
+      .map(c => ({
+        line_id: c.line_id,
+        action: c.action,
+        grouped_with_line_id: c.group_with,
+        skip_reason: c.skip_reason,
+      }));
+
     return json({
       invoice_id: invoiceId,
-      lines: lineResults.map((lr) => {
-        const articleId = lr.article_code ? codeToId.get(lr.article_code) || null : null;
-        const phaseId = articleId && lr.phase_code
-          ? phaseResolution.get(`${articleId}:${lr.phase_code}`) || null
-          : null;
-        return {
-          ...lr,
-          article_id: articleId,
-          phase_id: phaseId,
-        };
-      }),
+      lines: [...classifiedLineResults, ...informationalLines],
       invoice_notes: fiscalAlerts,
       invoice_level: invoiceLevel,
       keywords,
       stats: {
         total_lines: inputLines.length,
         classified: lineResults.filter((r) => r.confidence >= MIN_CONFIDENCE).length,
+        skipped: skippedCount,
+        grouped: groupedCount,
         history_count: history.length,
         article_history_patterns: articleHistory.length,
         memory_facts_count: memoryFacts.length,
         model: GEMINI_MODEL,
         kb_rules_found: kbRules.length,
+        kb_chunks_found: kbChunks.length,
         fiscal_alerts: fiscalAlerts.length,
       },
     });
