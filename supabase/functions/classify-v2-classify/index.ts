@@ -254,6 +254,8 @@ Deno.serve(async (req) => {
   const direction = body.direction || "in";
   const counterpartyName = body.counterparty_name || "N.D.";
   const counterpartyVatKey = body.counterparty_vat_key || null;
+  const invoiceNotes = body.invoice_notes || null;
+  const invoiceCausale = body.invoice_causale || null;
 
   if (!companyId) return json({ error: "company_id richiesto" }, 400);
   if (!invoiceId) return json({ error: "invoice_id richiesto" }, 400);
@@ -521,6 +523,16 @@ Deno.serve(async (req) => {
     promptParts.push(`DIREZIONE: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}`);
     promptParts.push("");
 
+    // 4b. Invoice notes + causale context
+    if (invoiceNotes || invoiceCausale) {
+      promptParts.push("=== INFORMAZIONI AGGIUNTIVE FATTURA ===");
+      if (invoiceCausale) promptParts.push(`Causale fattura (dall'XML): ${invoiceCausale}`);
+      if (invoiceNotes) promptParts.push(`Note utente: ${invoiceNotes}`);
+      promptParts.push("Usa queste informazioni per capire meglio la natura dell'operazione.");
+      promptParts.push("===");
+      promptParts.push("");
+    }
+
     // 5. User instructions + memory
     if (userInstructionsBlock) promptParts.push(userInstructionsBlock);
     if (memoryBlock) promptParts.push(memoryBlock);
@@ -661,6 +673,8 @@ Rispondi con JSON array (no markdown):
         })),
         history_count: historySection ? historySection.split("\n").length : 0,
         memory_facts_count: memoryBlock ? memoryBlock.split("\n").length : 0,
+        invoice_notes: invoiceNotes ? invoiceNotes.slice(0, 200) : null,
+        invoice_causale: invoiceCausale ? invoiceCausale.slice(0, 200) : null,
         document_chunks_found: documentChunksDebug.length,
         document_chunks: documentChunksDebug,
       },

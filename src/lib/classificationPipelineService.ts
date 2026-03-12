@@ -310,12 +310,40 @@ export async function runClassificationPipeline(
   const reporter = createPipelineReporter(events)
   const token = await getValidAccessToken()
   const debugSteps: PipelineStepDebug[] = []
+
+  // ─── Load invoice notes + causale ──────────────────
+  let invoiceNotes = ''
+  let invoiceCausale = ''
+  try {
+    const { data: inv } = await supabase
+      .from('invoices')
+      .select('notes, raw_xml')
+      .eq('id', invoiceId)
+      .single()
+
+    if (inv?.notes) invoiceNotes = inv.notes
+
+    // Extract causale from raw_xml
+    if (inv?.raw_xml) {
+      try {
+        const { reparseXml } = await import('@/lib/invoiceParser')
+        const parsed = reparseXml(inv.raw_xml)
+        const body = parsed.bodies?.[0]
+        if (body?.causali?.length) {
+          invoiceCausale = body.causali.filter(Boolean).join(' | ')
+        }
+      } catch { /* ignore parse errors */ }
+    }
+  } catch { /* ignore */ }
+
   const commonBody = {
     company_id: companyId,
     invoice_id: invoiceId,
     direction,
     counterparty_vat_key: counterpartyVatKey,
     counterparty_name: counterpartyName,
+    invoice_notes: invoiceNotes || null,
+    invoice_causale: invoiceCausale || null,
   }
 
   reporter.beginStage('Ricerca regole e storico', `Analizzo ${lines.length} righe della fattura`)

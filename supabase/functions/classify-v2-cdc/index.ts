@@ -77,6 +77,8 @@ Deno.serve(async (req) => {
   const lines = body.lines || [];
   const direction = body.direction || "in";
   const counterpartyName = body.counterparty_name || "N.D.";
+  const invoiceNotes = body.invoice_notes || null;
+  const invoiceCausale = body.invoice_causale || null;
 
   if (!companyId) return json({ error: "company_id richiesto" }, 400);
   if (lines.length === 0) return json({ error: "lines vuote" }, 400);
@@ -113,11 +115,20 @@ Deno.serve(async (req) => {
       `${i + 1}. [${l.line_id}] "${l.description}" tot=${l.total_price ?? "N/D"}${l.category_name ? ` cat:${l.category_name}` : ""}${l.account_code ? ` conto:${l.account_code}` : ""}`
     ).join("\n");
 
+    // Invoice notes + causale context
+    let invoiceContextBlock = "";
+    if (invoiceNotes || invoiceCausale) {
+      invoiceContextBlock = "\n=== INFORMAZIONI AGGIUNTIVE FATTURA ===\n";
+      if (invoiceCausale) invoiceContextBlock += `Causale fattura (dall'XML): ${invoiceCausale}\n`;
+      if (invoiceNotes) invoiceContextBlock += `Note utente: ${invoiceNotes}\n`;
+      invoiceContextBlock += "Usa queste informazioni per capire meglio la natura dell'operazione.\n===\n";
+    }
+
     const prompt = `Sei un controller di gestione. Assegna i centri di costo (CdC) alle righe di questa fattura.
 
 CONTROPARTE: ${counterpartyName}
 DIREZIONE: ${direction === "in" ? "Acquisto" : "Vendita"}
-
+${invoiceContextBlock}
 CdC DISPONIBILI:
 ${projectList}
 
@@ -179,7 +190,14 @@ Rispondi con JSON array (no markdown):
     });
 
     await sql.end();
-    return json({ allocations: finalResults, skipped: false });
+    return json({
+      allocations: finalResults,
+      skipped: false,
+      _debug: {
+        invoice_notes: invoiceNotes ? invoiceNotes.slice(0, 200) : null,
+        invoice_causale: invoiceCausale ? invoiceCausale.slice(0, 200) : null,
+      },
+    });
   } catch (err) {
     await sql.end().catch(() => {});
     const msg = err instanceof Error ? err.message : String(err);

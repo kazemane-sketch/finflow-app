@@ -188,6 +188,8 @@ Deno.serve(async (req) => {
   const direction = body.direction || "in";
   const counterpartyName = body.counterparty_name || "N.D.";
   const counterpartyVatKey = body.counterparty_vat_key || null;
+  const invoiceNotes = body.invoice_notes || null;
+  const invoiceCausale = body.invoice_causale || null;
 
   if (!companyId) return json({ error: "company_id richiesto" }, 400);
   if (lines.length === 0) return json({ error: "lines vuote" }, 400);
@@ -325,6 +327,16 @@ Deno.serve(async (req) => {
     promptParts.push(`DIREZIONE FATTURA: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}`);
     promptParts.push(`SEZIONI VALIDE: ${validSections.join(", ")}`);
     promptParts.push("");
+
+    // Invoice notes + causale context
+    if (invoiceNotes || invoiceCausale) {
+      promptParts.push("=== INFORMAZIONI AGGIUNTIVE FATTURA ===");
+      if (invoiceCausale) promptParts.push(`Causale fattura (dall'XML): ${invoiceCausale}`);
+      if (invoiceNotes) promptParts.push(`Note utente: ${invoiceNotes}`);
+      promptParts.push("Usa queste informazioni per capire meglio la natura dell'operazione.");
+      promptParts.push("===");
+      promptParts.push("");
+    }
     promptParts.push(`IL TUO COMPITO: CAPIRE ogni riga di fattura — NON classificarla.
 
 Per ogni riga, determina:
@@ -431,6 +443,8 @@ ATTENZIONE AI GRUPPI KEYWORD: Se una riga ha GRUPPI_KEYWORD, quei gruppi ti dico
         company_ateco: companyAteco,
         company_sector: companyName,
         counterparty_info: counterpartyInfo,
+        invoice_notes: invoiceNotes ? invoiceNotes.slice(0, 200) : null,
+        invoice_causale: invoiceCausale ? invoiceCausale.slice(0, 200) : null,
       },
     });
   } catch (err) {
