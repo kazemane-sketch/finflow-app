@@ -16,11 +16,16 @@ interface ReconciliationResult {
  * Run bank-extract-refs in a loop until no pending remain.
  */
 async function runExtractRefs(companyId: string): Promise<number> {
+  const token = await getValidAccessToken()
   let totalProcessed = 0
   while (true) {
     const res = await fetch(`${SUPABASE_URL}/functions/v1/bank-extract-refs`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${token}`,
+      },
       body: JSON.stringify({ company_id: companyId, batch_size: 50 }),
     })
     if (!res.ok) throw new Error(`extract-refs HTTP ${res.status}`)

@@ -825,11 +825,16 @@ export default function BancaPage() {
   const runExtraction = useCallback(() => {
     if (!companyId) return
     extractionStartOrStop(async (signal, updateProgress) => {
+      const token = await getValidAccessToken()
       let totalProcessed = 0
       while (!signal.aborted) {
         const res = await fetch(`${SUPABASE_URL}/functions/v1/bank-extract-refs`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'apikey': SUPABASE_ANON_KEY },
+          headers: {
+            'Content-Type': 'application/json',
+            'apikey': SUPABASE_ANON_KEY,
+            'Authorization': `Bearer ${token}`,
+          },
           body: JSON.stringify({ company_id: companyId, batch_size: 50 }),
           signal,
         })
