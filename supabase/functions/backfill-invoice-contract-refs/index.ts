@@ -113,9 +113,17 @@ Deno.serve(async (req) => {
        FROM invoices i
        WHERE i.company_id = $1
          AND i.raw_xml IS NOT NULL
+         AND i.raw_xml ~* '<[^>]*DatiContratto'
+         AND i.raw_xml ~* '<[^>]*IdDocumento'
          AND (
            coalesce(to_jsonb(i)->>'primary_contract_ref', '') = ''
-           OR coalesce(jsonb_array_length(coalesce(to_jsonb(i)->'contract_refs', '[]'::jsonb)), 0) = 0
+           OR (
+             CASE
+               WHEN jsonb_typeof(coalesce(to_jsonb(i)->'contract_refs', '[]'::jsonb)) = 'array'
+                 THEN jsonb_array_length(coalesce(to_jsonb(i)->'contract_refs', '[]'::jsonb))
+               ELSE 0
+             END
+           ) = 0
          )
        ORDER BY i.date DESC, i.created_at DESC
        LIMIT $2`,
@@ -145,9 +153,17 @@ Deno.serve(async (req) => {
        FROM invoices i
        WHERE i.company_id = $1
          AND i.raw_xml IS NOT NULL
+         AND i.raw_xml ~* '<[^>]*DatiContratto'
+         AND i.raw_xml ~* '<[^>]*IdDocumento'
          AND (
            coalesce(to_jsonb(i)->>'primary_contract_ref', '') = ''
-           OR coalesce(jsonb_array_length(coalesce(to_jsonb(i)->'contract_refs', '[]'::jsonb)), 0) = 0
+           OR (
+             CASE
+               WHEN jsonb_typeof(coalesce(to_jsonb(i)->'contract_refs', '[]'::jsonb)) = 'array'
+                 THEN jsonb_array_length(coalesce(to_jsonb(i)->'contract_refs', '[]'::jsonb))
+               ELSE 0
+             END
+           ) = 0
          )`,
       [companyId],
     );
