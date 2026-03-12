@@ -134,6 +134,7 @@ export default function AiChatPage() {
   const [kbDocs, setKbDocs] = useState<KbDocument[]>([])
   const [kbExpanded, setKbExpanded] = useState(false)
   const [kbUploading, setKbUploading] = useState(false)
+  const [kbReprocessing, setKbReprocessing] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Refs
@@ -346,6 +347,41 @@ export default function AiChatPage() {
     }
   }
 
+  const reprocessAllKbDocs = async () => {
+    const readyDocs = kbDocs.filter(d => d.status === 'ready')
+    if (readyDocs.length === 0) return
+    if (!confirm(`Riprocessare tutti i ${readyDocs.length} documenti? I chunk verranno rigenerati con pulizia AI.`)) return
+    setKbReprocessing(true)
+    try {
+      const token = await getValidAccessToken()
+      for (let i = 0; i < readyDocs.length; i++) {
+        const doc = readyDocs[i]
+        console.log(`[reprocess-batch] ${i + 1}/${readyDocs.length}: ${doc.file_name}`)
+        setKbDocs(prev => prev.map(d => d.id === doc.id ? { ...d, status: 'processing' } : d))
+        try {
+          await fetch(`${SUPABASE_URL}/functions/v1/kb-process-document`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'apikey': SUPABASE_ANON_KEY,
+              'Authorization': `Bearer ${token}`,
+            },
+            body: JSON.stringify({ document_id: doc.id, action: 'reprocess' }),
+          })
+        } catch (err: unknown) {
+          console.error(`[reprocess-batch] Error on ${doc.file_name}:`, err)
+        }
+        // Small pause between documents
+        if (i < readyDocs.length - 1) await new Promise(r => setTimeout(r, 1000))
+      }
+      void loadKbDocs()
+    } catch (err: unknown) {
+      alert('Errore batch: ' + (err instanceof Error ? err.message : String(err)))
+    } finally {
+      setKbReprocessing(false)
+    }
+  }
+
   // ─── send message (wraps context) ──────
   const handleSend = async (text?: string) => {
     const msg = (text || input).trim()
@@ -499,6 +535,20 @@ export default function AiChatPage() {
                   e.target.value = ''
                 }}
               />
+
+              {kbDocs.filter(d => d.status === 'ready').length > 0 && (
+                <button
+                  onClick={reprocessAllKbDocs}
+                  disabled={kbReprocessing}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-blue-700 bg-blue-50 border border-dashed border-blue-200 rounded-md hover:bg-blue-100 transition-colors disabled:opacity-50"
+                >
+                  {kbReprocessing
+                    ? <Loader2 className="h-3 w-3 animate-spin" />
+                    : <RefreshCw className="h-3 w-3" />
+                  }
+                  {kbReprocessing ? 'Riprocessamento...' : `Riprocessa tutti (${kbDocs.filter(d => d.status === 'ready').length})`}
+                </button>
+              )}
 
               {kbDocs.map(doc => (
                 <div key={doc.id} className="group flex items-center gap-2 px-2 py-1.5 rounded-md text-xs hover:bg-slate-100 transition-colors">

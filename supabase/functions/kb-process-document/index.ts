@@ -129,6 +129,93 @@ function sanitizeHtmlEntities(text: string): string {
     .trim();
 }
 
+/* ─── AI Text Cleanup ──────────────────────────── */
+async function cleanExtractedText(
+  apiKey: string,
+  rawText: string,
+  documentTitle: string,
+): Promise<string> {
+  // Skip cleanup for short texts (manual input)
+  if (rawText.length < 500) {
+    console.log('[clean] Text too short, skipping AI cleanup');
+    return rawText;
+  }
+
+  const cleanUrl = `https://generativelanguage.googleapis.com/v1beta/models/${FLASH_MODEL}:generateContent?key=${apiKey}`;
+
+  const cleanPrompt = `Sei un sistema di pulizia testi. Ti viene dato il testo grezzo estratto da una pagina web che contiene un documento normativo/legale italiano.
+
+COMPITO: Estrai e restituisci SOLO il contenuto normativo/legale. Rimuovi TUTTO il resto.
+
+RIMUOVI COMPLETAMENTE:
+- Menu di navigazione del sito (es. "Scegli fonte:", "Codice Civile", "Codice Penale", link a sezioni)
+- Sidebar e breadcrumb (es. "Tu sei qui: Fonti > Testo unico IVA > Titolo I")
+- Footer del sito (copyright, link, informazioni aziendali)
+- Form e call-to-action (es. "Sei un avvocato?", "Hai un problema legale?", "Iscriviti alla newsletter")
+- Riferimenti a tesi di laurea, consulenze, servizi a pagamento
+- Pubblicità e banner
+- Link di navigazione (es. "Art. precedente", "Art. successivo", "Torna su")
+- Metadati della pagina web (es. "Brocardi.it - L'avvocato in un click!")
+- Intestazioni ripetute del sito
+
+MANTIENI INTEGRALMENTE:
+- Il titolo dell'articolo/norma
+- Il testo completo dell'articolo con tutti i commi, lettere, numeri
+- Le note a piè di pagina (es. "(1) Lettera abrogata dalla L. ...")
+- I riferimenti normativi interni (es. "articolo 19, comma 5")
+- Le date di aggiornamento del testo normativo
+- Massime giurisprudenziali SE sono direttamente correlate all'articolo
+
+REGOLE:
+- NON riassumere — restituisci il testo integrale della norma
+- NON aggiungere commenti o spiegazioni tue
+- Mantieni la formattazione originale (newline tra commi, lettere indentate)
+- Se non riesci a distinguere il contenuto normativo dalla spazzatura, restituisci tutto il testo
+
+TITOLO DOCUMENTO: ${documentTitle}
+
+TESTO GREZZO:
+${rawText.substring(0, 100000)}`;
+
+  try {
+    const resp = await fetch(cleanUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: cleanPrompt }] }],
+        generationConfig: {
+          maxOutputTokens: 65536,
+          temperature: 0,
+        },
+      }),
+    });
+
+    if (!resp.ok) {
+      console.warn(`[clean] Gemini Flash failed (${resp.status}), using raw text`);
+      return rawText;
+    }
+
+    const data = await resp.json();
+    const parts = (data as any)?.candidates?.[0]?.content?.parts || [];
+    const cleanText = parts
+      .filter((p: any) => p.text && !p.thought)
+      .map((p: any) => p.text)
+      .join('\n')
+      .trim();
+
+    if (cleanText.length < rawText.length * 0.1) {
+      console.warn(`[clean] Cleaned text too short (${cleanText.length} vs ${rawText.length}), using raw`);
+      return rawText;
+    }
+
+    console.log(`[clean] Cleaned: ${rawText.length} → ${cleanText.length} chars (${Math.round(100 - (cleanText.length / rawText.length * 100))}% removed)`);
+    return cleanText;
+  } catch (e: any) {
+    console.warn(`[clean] Error: ${e.message}, using raw text`);
+    return rawText;
+  }
+}
+
 /* ─── Gemini URL builders ───────────────────────── */
 function geminiUrl(model: string, method: string, apiKey: string): string {
   return `https://generativelanguage.googleapis.com/v1beta/models/${model}:${method}?key=${apiKey}`;
@@ -434,7 +521,19 @@ async function handleProcess(
       throw new Error("Testo estratto vuoto o troppo corto");
     }
 
-    // 5. Chunking
+    // 5. AI text cleanup (only for URL and PDF sources — text input is already clean)
+    if (inputType === "url" || inputType === "pdf") {
+      console.log(`[process] Step 2: AI text cleanup (${fullText.length} chars)...`);
+      fullText = await cleanExtractedText(apiKey, fullText, doc.title || "Documento");
+      fullText = sanitizeHtmlEntities(sanitizeText(fullText));
+      // Save cleaned text
+      await svc
+        .from("kb_documents")
+        .update({ full_text: fullText } as any)
+        .eq("id", documentId);
+    }
+
+    // 6. Chunking
     await svc
       .from("kb_documents")
       .update({ status: "chunking" } as any)
@@ -500,8 +599,8 @@ async function handleProcess(
 }
 
 // ══════════════════════════════════════════════════
-// ACTION: REPROCESS — re-sanitize full_text, delete old chunks, re-chunk + re-embed
-// (No re-extraction from source — uses already-saved full_text)
+// ACTION: REPROCESS — AI cleanup + re-sanitize full_text, delete old chunks, re-chunk + re-embed
+// For URL/PDF: re-extracts from source then AI-cleans. For text: re-sanitizes only.
 // ══════════════════════════════════════════════════
 async function handleReprocess(
   svc: ReturnType<typeof createClient>,
@@ -528,13 +627,27 @@ async function handleReprocess(
     .eq("id", documentId);
 
   try {
-    // 3. Re-sanitize full_text (apply new sanitizeHtmlEntities)
-    fullText = sanitizeHtmlEntities(sanitizeText(fullText));
+    // 3. Re-extract from source for URL/PDF, then AI-clean
+    const inputType = doc.source_input_type || doc.file_type || "text";
+
+    if (inputType === "url" && doc.source_url) {
+      console.log(`[reprocess] Re-extracting from URL: ${doc.source_url}`);
+      fullText = sanitizeHtmlEntities(sanitizeText(await extractTextFromUrl(apiKey, doc.source_url)));
+      console.log(`[reprocess] URL text re-extracted: ${fullText.length} chars`);
+    }
+
+    // AI cleanup for URL/PDF sources
+    if (inputType === "url" || inputType === "pdf") {
+      console.log(`[reprocess] AI cleanup (${fullText!.length} chars)...`);
+      fullText = await cleanExtractedText(apiKey, fullText!, doc.title || "Documento");
+    }
+
+    fullText = sanitizeHtmlEntities(sanitizeText(fullText!));
     await svc
       .from("kb_documents")
       .update({ full_text: fullText, status: "chunking" } as any)
       .eq("id", documentId);
-    console.log(`[reprocess] Sanitized full_text: ${fullText.length} chars`);
+    console.log(`[reprocess] Cleaned full_text: ${fullText.length} chars`);
 
     // 4. Re-chunk
     const chunks = chunkText(fullText);
