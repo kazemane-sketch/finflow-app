@@ -6,17 +6,45 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { supabase } from '@/integrations/supabase/client'
 import { toast } from 'sonner'
-import { Bot, Loader2, Save } from 'lucide-react'
+import { Bot, Loader2, Save, Brain, Cpu, Zap } from 'lucide-react'
 
 interface AgentConfig {
   id: string; agent_type: string; display_name: string; description: string | null;
   system_prompt: string; model: string; model_escalation: string | null;
-  temperature: number; thinking_level: string; max_output_tokens: number;
-  version: number; updated_at: string;
+  temperature: number; thinking_level: string; thinking_budget: number | null;
+  max_output_tokens: number; version: number; updated_at: string;
 }
 
-const MODELS = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3.1-pro-preview']
-const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high']
+const MODEL_OPTIONS = [
+  { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', desc: 'Stabile, thinking controllabile, 1000 RPD' },
+  { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', desc: 'Economico, veloce' },
+  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro Preview', desc: 'Top qualita, RPD basso (250)' },
+  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview', desc: 'Veloce, economico' },
+]
+
+const THINKING_BUDGET_OPTIONS = [
+  { value: 0, label: 'Disattivato', desc: 'Nessun ragionamento interno' },
+  { value: 1024, label: '1K', desc: 'Minimo (task semplici)' },
+  { value: 4096, label: '4K', desc: 'Moderato (classificazione fatture)' },
+  { value: 8192, label: '8K', desc: 'Buono (analisi documenti)' },
+  { value: 16384, label: '16K', desc: 'Profondo (revisione fiscale)' },
+  { value: 32768, label: '32K', desc: 'Massimo (interpretazione norme complesse)' },
+]
+
+// Models that DON'T support explicit thinkingConfig
+const NO_THINKING_CONFIG_MODELS = ['gemini-3.1-pro-preview', 'gemini-3.1-pro-preview-customtools']
+
+const AGENT_COLORS: Record<string, string> = {
+  commercialista: 'sky',
+  revisore: 'violet',
+  kb_classifier: 'emerald',
+}
+
+const AGENT_ICONS: Record<string, typeof Bot> = {
+  commercialista: Cpu,
+  revisore: Brain,
+  kb_classifier: Zap,
+}
 
 export default function AgentConfigPage() {
   const [agents, setAgents] = useState<AgentConfig[]>([])
@@ -58,6 +86,7 @@ export default function AgentConfigPage() {
         model_escalation: edit.model_escalation || null,
         temperature: Number(edit.temperature ?? agent.temperature),
         thinking_level: edit.thinking_level || agent.thinking_level,
+        thinking_budget: edit.thinking_budget != null ? Number(edit.thinking_budget) : null,
         max_output_tokens: Number(edit.max_output_tokens ?? agent.max_output_tokens),
         version: agent.version + 1,
         updated_at: new Date().toISOString(),
@@ -81,20 +110,30 @@ export default function AgentConfigPage() {
         <h1 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
           <Bot className="h-6 w-6 text-sky-600" /> Agent Config
         </h1>
-        <p className="text-sm text-slate-500 mt-1">System prompt e parametri per ciascun agent AI</p>
+        <p className="text-sm text-slate-500 mt-1">System prompt, modello AI e parametri di ragionamento per ciascun agent</p>
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
         {agents.map(agent => {
           const edit = getEdit(agent.id)
           const isSaving = saving === agent.id
-          const color = agent.agent_type === 'commercialista' ? 'sky' : 'violet'
+          const color = AGENT_COLORS[agent.agent_type] || 'slate'
+          const IconComponent = AGENT_ICONS[agent.agent_type] || Bot
+          const thinkingBudget = edit.thinking_budget ?? 0
+          const modelSupportsThinking = !NO_THINKING_CONFIG_MODELS.includes(edit.model || agent.model)
+          const costPerCall = thinkingBudget > 0 && modelSupportsThinking
+            ? (thinkingBudget / 1_000_000 * 10).toFixed(3)
+            : '0.000'
+
           return (
             <Card key={agent.id} className="flex flex-col">
               <CardHeader className="pb-3">
                 <CardTitle className="text-base flex items-center gap-2">
-                  <Bot className={`h-4 w-4 text-${color}-600`} />
+                  <IconComponent className={`h-4 w-4 text-${color}-600`} />
                   <span className="flex-1">{agent.display_name}</span>
+                  <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded bg-${color}-50 text-${color}-700`}>
+                    {agent.agent_type}
+                  </span>
                   <span className="text-[10px] font-mono bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">v{agent.version}</span>
                 </CardTitle>
               </CardHeader>
@@ -110,6 +149,78 @@ export default function AgentConfigPage() {
                   </div>
                 </div>
 
+                {/* ── Model + Thinking Section ── */}
+                <div className="border rounded-lg p-3 space-y-3 bg-slate-50/50">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Modello e Ragionamento</p>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <Label className="text-xs">Modello primario</Label>
+                      <select value={edit.model || ''} onChange={e => updateField(agent.id, 'model', e.target.value)}
+                        className="mt-1 w-full h-9 border rounded-md px-2 text-xs bg-white">
+                        {MODEL_OPTIONS.map(m => (
+                          <option key={m.value} value={m.value}>{m.label} — {m.desc}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <Label className="text-xs">Modello escalation</Label>
+                      <select value={edit.model_escalation || ''} onChange={e => updateField(agent.id, 'model_escalation', e.target.value || null)}
+                        className="mt-1 w-full h-9 border rounded-md px-2 text-xs bg-white">
+                        <option value="">Nessuno</option>
+                        {MODEL_OPTIONS.map(m => (
+                          <option key={m.value} value={m.value}>{m.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <Label className="text-xs">Thinking Budget</Label>
+                      <select
+                        value={thinkingBudget}
+                        onChange={e => updateField(agent.id, 'thinking_budget', Number(e.target.value))}
+                        className="mt-1 w-full h-9 border rounded-md px-2 text-xs bg-white"
+                        disabled={!modelSupportsThinking}
+                      >
+                        {THINKING_BUDGET_OPTIONS.map(o => (
+                          <option key={o.value} value={o.value}>{o.label} — {o.desc}</option>
+                        ))}
+                      </select>
+                      {!modelSupportsThinking && (
+                        <p className="text-[10px] text-amber-600 mt-1">
+                          {edit.model || agent.model} non supporta thinkingConfig esplicito
+                        </p>
+                      )}
+                      {modelSupportsThinking && thinkingBudget > 0 && (
+                        <p className="text-[10px] text-slate-500 mt-1">
+                          Costo thinking max/chiamata: ~&euro;{costPerCall}
+                        </p>
+                      )}
+                    </div>
+                    <div className="space-y-2">
+                      <div>
+                        <Label className="text-xs">Temperature</Label>
+                        <div className="flex items-center gap-2 mt-1">
+                          <input type="range" min="0" max="1" step="0.05"
+                            value={edit.temperature ?? 0.1}
+                            onChange={e => updateField(agent.id, 'temperature', Number(e.target.value))}
+                            className="flex-1 h-1.5 accent-sky-500" />
+                          <span className="text-xs font-mono w-8 text-right">{(edit.temperature ?? 0.1).toFixed(2)}</span>
+                        </div>
+                      </div>
+                      <div>
+                        <Label className="text-xs">Max output tokens</Label>
+                        <Input type="number" value={edit.max_output_tokens ?? 65536}
+                          onChange={e => updateField(agent.id, 'max_output_tokens', Number(e.target.value))}
+                          className="mt-1 w-full text-xs h-8" />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── System Prompt ── */}
                 <div className="flex-1 flex flex-col">
                   <Label className="text-xs flex items-center gap-2">
                     System prompt
@@ -118,50 +229,8 @@ export default function AgentConfigPage() {
                   <textarea
                     value={edit.system_prompt || ''}
                     onChange={e => updateField(agent.id, 'system_prompt', e.target.value)}
-                    className="mt-1 flex-1 w-full border rounded-md px-3 py-2 text-xs font-mono min-h-[400px] resize-y leading-relaxed"
+                    className="mt-1 flex-1 w-full border rounded-md px-3 py-2 text-xs font-mono min-h-[350px] resize-y leading-relaxed"
                   />
-                </div>
-
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  <div>
-                    <Label className="text-xs">Modello primario</Label>
-                    <select value={edit.model || ''} onChange={e => updateField(agent.id, 'model', e.target.value)}
-                      className="mt-1 w-full h-8 border rounded-md px-1.5 text-xs">
-                      {MODELS.map(m => <option key={m} value={m}>{m}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <Label className="text-xs">Modello escalation</Label>
-                    <select value={edit.model_escalation || ''} onChange={e => updateField(agent.id, 'model_escalation', e.target.value || null)}
-                      className="mt-1 w-full h-8 border rounded-md px-1.5 text-xs">
-                      <option value="">Nessuno</option>
-                      {MODELS.map(m => <option key={m} value={m}>{m}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <Label className="text-xs">Temperature</Label>
-                    <div className="flex items-center gap-2 mt-1">
-                      <input type="range" min="0" max="1" step="0.05"
-                        value={edit.temperature ?? 0.1}
-                        onChange={e => updateField(agent.id, 'temperature', Number(e.target.value))}
-                        className="flex-1 h-1.5 accent-sky-500" />
-                      <span className="text-xs font-mono w-8 text-right">{(edit.temperature ?? 0.1).toFixed(2)}</span>
-                    </div>
-                  </div>
-                  <div>
-                    <Label className="text-xs">Thinking level</Label>
-                    <select value={edit.thinking_level || 'medium'} onChange={e => updateField(agent.id, 'thinking_level', e.target.value)}
-                      className="mt-1 w-full h-8 border rounded-md px-1.5 text-xs">
-                      {THINKING_LEVELS.map(l => <option key={l} value={l}>{l}</option>)}
-                    </select>
-                  </div>
-                </div>
-
-                <div>
-                  <Label className="text-xs">Max output tokens</Label>
-                  <Input type="number" value={edit.max_output_tokens ?? 65536}
-                    onChange={e => updateField(agent.id, 'max_output_tokens', Number(e.target.value))}
-                    className="mt-1 w-32 text-sm" />
                 </div>
 
                 <div className="flex items-center justify-between pt-2 border-t">

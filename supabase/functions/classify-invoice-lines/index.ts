@@ -21,10 +21,15 @@ const corsHeaders = {
 };
 
 /* ─── Model constants ────────────────────── */
-const GEMINI_MODEL = "gemini-3.1-pro-preview";
+// GEMINI_MODEL is now loaded from agent_config at runtime (see callGemini)
+const DEFAULT_GEMINI_MODEL = "gemini-2.5-pro";
+const DEFAULT_THINKING_BUDGET = 4096;
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const EXPECTED_DIMS = 3072;
 const MIN_CONFIDENCE = 60;
+
+// Models that DON'T support explicit thinkingConfig
+const NO_THINKING_CONFIG_MODELS = ["gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools"];
 
 /* ─── Direction enforcement constants ────── */
 // Which CoA sections are valid for each invoice direction
@@ -618,27 +623,32 @@ Se NON ci sono dubbi fiscali: []
 ["kw1","kw2",...] (5-10 keywords per search)`;
 }
 
-/* ─── Call Gemini 3.1 Pro ─────────────────── */
+/* ─── Call Gemini (model + thinking configurable from DB) ─────────────────── */
 
 async function callGemini(
   apiKey: string,
   prompt: string,
-  thinkingLevel: "minimal" | "low" | "medium" | "high" = "high",
+  model: string = DEFAULT_GEMINI_MODEL,
+  thinkingBudget: number = DEFAULT_THINKING_BUDGET,
+  maxOutputTokens: number = 65536,
 ): Promise<{ text: string; thinkingText: string; error?: string }> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-  console.log(`[gemini] Calling ${GEMINI_MODEL}, prompt=${prompt.length} chars, thinking=${thinkingLevel}`);
+  console.log(`[gemini] Calling ${model}, prompt=${prompt.length} chars, thinking_budget=${thinkingBudget}`);
 
   try {
+    const genConfig: Record<string, unknown> = { maxOutputTokens };
+    // Add thinkingConfig only for models that support it and budget > 0
+    if (thinkingBudget > 0 && !NO_THINKING_CONFIG_MODELS.includes(model)) {
+      genConfig.thinkingConfig = { thinkingBudget };
+    }
+
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: {
-          maxOutputTokens: 65536,
-          thinkingConfig: { thinkingLevel },
-        },
+        generationConfig: genConfig,
       }),
     });
 
@@ -1000,13 +1010,21 @@ Deno.serve(async (req) => {
 
   try {
     // ─── Step 1: Load all context in parallel ───────────────────
-    const [articles, allCategories, allAccounts, projects, phases] = await Promise.all([
+    const [articles, allCategories, allAccounts, projects, phases, agentConfigRows] = await Promise.all([
       sql<ArticleRow[]>`SELECT id, code, name, description, keywords FROM articles WHERE company_id = ${companyId} AND active = true ORDER BY code`,
       sql<CategoryRow[]>`SELECT id, name, type FROM categories WHERE company_id = ${companyId} AND active = true ORDER BY sort_order, name`,
       sql<AccountRow[]>`SELECT id, code, name, section FROM chart_of_accounts WHERE company_id = ${companyId} AND active = true AND is_header = false ORDER BY code`,
       sql<ProjectRow[]>`SELECT id, code, name FROM projects WHERE company_id = ${companyId} AND status = 'active' ORDER BY code`,
       sql<ArticlePhaseRow[]>`SELECT id, article_id, code, name, phase_type, is_counting_point, invoice_direction FROM article_phases WHERE company_id = ${companyId} AND active = true ORDER BY article_id, sort_order`,
+      sql`SELECT model, thinking_budget, max_output_tokens FROM agent_config WHERE agent_type = 'commercialista' AND active = true LIMIT 1`,
     ]);
+
+    // ─── Agent config from DB ──────────────────────
+    const agentCfg = agentConfigRows[0] || {};
+    const GEMINI_MODEL = agentCfg.model || DEFAULT_GEMINI_MODEL;
+    const THINKING_BUDGET = agentCfg.thinking_budget ?? DEFAULT_THINKING_BUDGET;
+    const MAX_OUTPUT_TOKENS = agentCfg.max_output_tokens || 65536;
+    console.log(`[classify] Agent config: model=${GEMINI_MODEL}, thinking_budget=${THINKING_BUDGET}, max_output=${MAX_OUTPUT_TOKENS}`);
 
     // ─── Step 2: Filter categories and accounts by direction ────
     const dirSections = SECTIONS_FOR_DIRECTION[direction] || SECTIONS_FOR_DIRECTION["in"];
@@ -1273,15 +1291,11 @@ Deno.serve(async (req) => {
       invoiceNotes || undefined,
     );
 
-    // Thinking level: always "high" — with "medium" Gemini name-matches instead of
-    // reasoning about double-entry. Cost difference: ~$0.01/invoice, negligible.
-    const thinkingLevel = "high";
-
     console.log(
-      `[classify] Calling Gemini 3.1 Pro for ${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}, thinking=${thinkingLevel}`,
+      `[classify] Calling ${GEMINI_MODEL} for ${inputLines.length} lines, invoice=${invoiceId}, cp=${counterpartyName}, thinking=${THINKING_BUDGET}`,
     );
 
-    const geminiResult = await callGemini(geminiKey, prompt, thinkingLevel);
+    const geminiResult = await callGemini(geminiKey, prompt, GEMINI_MODEL, THINKING_BUDGET, MAX_OUTPUT_TOKENS);
 
     if (geminiResult.error || !geminiResult.text) {
       return json({

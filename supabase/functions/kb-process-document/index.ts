@@ -1,7 +1,7 @@
 // kb-process-document/index.ts
 // Two actions:
 //   process  — text extraction (PDF/URL/text) + chunking + embedding
-//   classify — AI metadata via Gemini 3.1 Pro Preview (fills taxonomy, applicability, relations)
+//   classify — AI metadata via Gemini (model from agent_config kb_classifier; fills taxonomy, applicability, relations)
 
 import { createClient } from "npm:@supabase/supabase-js@2";
 
@@ -13,11 +13,15 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-/* ─── Models (VERIFIED — DO NOT CHANGE) ─────────── */
+/* ─── Models ──────────────────────────────────────── */
 const EMBEDDING_MODEL = "gemini-embedding-001";
 const FLASH_MODEL = "gemini-2.5-flash";
-const PRO_MODEL = "gemini-3.1-pro-preview";
+const DEFAULT_PRO_MODEL = "gemini-2.5-pro";
+const DEFAULT_THINKING_BUDGET = 8192;
 const EMBEDDING_DIMS = 3072;
+
+// Models that crash if thinkingConfig is sent at all
+const NO_THINKING_CONFIG_MODELS = ["gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools"];
 const CHUNK_TARGET_CHARS = 3200; // ~800 tokens
 const CHUNK_OVERLAP_CHARS = 400; // ~100 tokens
 const MAX_CHUNKS = 200;
@@ -439,7 +443,7 @@ async function handleProcess(
 }
 
 // ══════════════════════════════════════════════════
-// ACTION: CLASSIFY — AI metadata via Gemini Pro
+// ACTION: CLASSIFY — AI metadata via Gemini (model from agent_config)
 // ══════════════════════════════════════════════════
 async function handleClassify(
   svc: ReturnType<typeof createClient>,
@@ -557,10 +561,39 @@ REGOLE DI CLASSIFICAZIONE:
 - suggested_relations: suggerisci SOLO relazioni chiare ed evidenti, non forzare connessioni deboli
 - Per documenti fiscali generali (es. art. 109 TUIR inerenza): applies_to_* tutto null perché si applica a tutti`;
 
-  // 5. Call Gemini 3.1 Pro Preview with thinking
-  console.log(`[classify] Calling Gemini Pro for document ${documentId}...`);
+  // 5. Read model + thinking config from agent_config (kb_classifier)
+  let classifyModel = DEFAULT_PRO_MODEL;
+  let thinkingBudget = DEFAULT_THINKING_BUDGET;
+  let maxOutputTokens = 8192;
+  try {
+    const { data: kbConfig } = await svc
+      .from("agent_config")
+      .select("model, thinking_budget, max_output_tokens")
+      .eq("agent_type", "kb_classifier")
+      .eq("active", true)
+      .single();
+    if (kbConfig) {
+      classifyModel = (kbConfig as any).model || DEFAULT_PRO_MODEL;
+      thinkingBudget = (kbConfig as any).thinking_budget ?? DEFAULT_THINKING_BUDGET;
+      maxOutputTokens = (kbConfig as any).max_output_tokens || 8192;
+    }
+  } catch (e) {
+    console.warn("[classify] agent_config read failed, using defaults:", e);
+  }
+
+  // Build generationConfig with optional thinkingConfig
+  const genConfig: Record<string, unknown> = {
+    temperature: 0.1,
+    maxOutputTokens,
+    responseMimeType: "application/json",
+  };
+  if (thinkingBudget > 0 && !NO_THINKING_CONFIG_MODELS.includes(classifyModel)) {
+    genConfig.thinkingConfig = { thinkingBudget };
+  }
+
+  console.log(`[classify] Calling ${classifyModel} (thinking=${thinkingBudget}) for document ${documentId}...`);
   const classifyRes = await fetch(
-    geminiUrl(PRO_MODEL, "generateContent", apiKey),
+    geminiUrl(classifyModel, "generateContent", apiKey),
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -569,11 +602,7 @@ REGOLE DI CLASSIFICAZIONE:
           role: "user",
           parts: [{ text: classificationPrompt }],
         }],
-        generationConfig: {
-          temperature: 0.1,
-          maxOutputTokens: 8192,
-          responseMimeType: "application/json",
-        },
+        generationConfig: genConfig,
       }),
     },
   );
@@ -581,7 +610,7 @@ REGOLE DI CLASSIFICAZIONE:
   const classifyPayload = await classifyRes.json();
   if (!classifyRes.ok) {
     const msg = classifyPayload?.error?.message || `HTTP ${classifyRes.status}`;
-    return jsonResponse({ error: `Gemini Pro classification failed: ${msg}` }, 500);
+    return jsonResponse({ error: `Gemini ${classifyModel} classification failed: ${msg}` }, 500);
   }
 
   // 6. Parse JSON response (may have thinking parts before content)
