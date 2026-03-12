@@ -131,22 +131,20 @@ function sanitizeHtmlEntities(text: string): string {
 }
 
 /* ─── AI Text Cleanup ──────────────────────────── */
-async function cleanExtractedText(
+const CLEAN_SECTION_SIZE = 25000;
+const CLEAN_BATCH_SIZE = 3;
+
+/** Single-pass cleanup: sends one section to Gemini Flash */
+async function cleanSinglePass(
   apiKey: string,
-  rawText: string,
+  text: string,
   documentTitle: string,
 ): Promise<string> {
-  // Skip cleanup for short texts (manual input)
-  if (rawText.length < 500) {
-    console.log('[clean] Text too short, skipping AI cleanup');
-    return rawText;
-  }
-
   const cleanUrl = `https://generativelanguage.googleapis.com/v1beta/models/${FLASH_MODEL}:generateContent?key=${apiKey}`;
 
-  const cleanPrompt = `Sei un sistema di pulizia testi. Ti viene dato il testo grezzo estratto da una pagina web che contiene un documento normativo/legale italiano.
+  const cleanPrompt = `Sei un sistema di pulizia testi. Ti viene dato il testo grezzo estratto da una pagina web o PDF che contiene un documento normativo/legale/tecnico italiano.
 
-COMPITO: Estrai e restituisci SOLO il contenuto normativo/legale. Rimuovi TUTTO il resto.
+COMPITO: Estrai e restituisci SOLO il contenuto normativo/legale/tecnico. Rimuovi TUTTO il resto.
 
 RIMUOVI COMPLETAMENTE:
 - Menu di navigazione del sito (es. "Scegli fonte:", "Codice Civile", "Codice Penale", link a sezioni)
@@ -165,6 +163,7 @@ MANTIENI INTEGRALMENTE:
 - Le note a piè di pagina (es. "(1) Lettera abrogata dalla L. ...")
 - I riferimenti normativi interni (es. "articolo 19, comma 5")
 - Le date di aggiornamento del testo normativo
+- Tabelle con dati (coefficienti, aliquote, importi)
 - Massime giurisprudenziali SE sono direttamente correlate all'articolo
 
 REGOLE:
@@ -176,7 +175,7 @@ REGOLE:
 TITOLO DOCUMENTO: ${documentTitle}
 
 TESTO GREZZO:
-${rawText.substring(0, 100000)}`;
+${text}`;
 
   try {
     const resp = await fetch(cleanUrl, {
@@ -192,8 +191,8 @@ ${rawText.substring(0, 100000)}`;
     });
 
     if (!resp.ok) {
-      console.warn(`[clean] Gemini Flash failed (${resp.status}), using raw text`);
-      return rawText;
+      console.warn(`[clean] Gemini Flash failed (${resp.status}), using raw section`);
+      return text;
     }
 
     const data = await resp.json();
@@ -204,17 +203,66 @@ ${rawText.substring(0, 100000)}`;
       .join('\n')
       .trim();
 
-    if (cleanText.length < rawText.length * 0.1) {
-      console.warn(`[clean] Cleaned text too short (${cleanText.length} vs ${rawText.length}), using raw`);
-      return rawText;
+    if (cleanText.length < text.length * 0.1) {
+      console.warn(`[clean] Cleaned text too short (${cleanText.length} vs ${text.length}), using raw`);
+      return text;
     }
 
-    console.log(`[clean] Cleaned: ${rawText.length} → ${cleanText.length} chars (${Math.round(100 - (cleanText.length / rawText.length * 100))}% removed)`);
     return cleanText;
   } catch (e: any) {
-    console.warn(`[clean] Error: ${e.message}, using raw text`);
+    console.warn(`[clean] Error: ${e.message}, using raw section`);
+    return text;
+  }
+}
+
+/** Main cleanup: splits large documents into sections and cleans in parallel batches */
+async function cleanExtractedText(
+  apiKey: string,
+  rawText: string,
+  documentTitle: string,
+): Promise<string> {
+  if (rawText.length < 500) {
+    console.log('[clean] Text too short, skipping AI cleanup');
     return rawText;
   }
+
+  // Short documents: single pass
+  if (rawText.length < CLEAN_SECTION_SIZE) {
+    console.log(`[clean] Single pass cleanup (${rawText.length} chars)`);
+    const result = await cleanSinglePass(apiKey, rawText, documentTitle);
+    console.log(`[clean] Cleaned: ${rawText.length} → ${result.length} chars (${Math.round(100 - (result.length / rawText.length * 100))}% removed)`);
+    return result;
+  }
+
+  // Large documents: split into sections, clean in parallel batches
+  console.log(`[clean] Large document (${rawText.length} chars), splitting into ~${CLEAN_SECTION_SIZE} char sections...`);
+  const sections: string[] = [];
+  for (let i = 0; i < rawText.length; i += CLEAN_SECTION_SIZE) {
+    sections.push(rawText.slice(i, i + CLEAN_SECTION_SIZE));
+  }
+  console.log(`[clean] ${sections.length} sections, processing in batches of ${CLEAN_BATCH_SIZE}`);
+
+  const cleanedSections = new Array<string>(sections.length);
+  const totalBatches = Math.ceil(sections.length / CLEAN_BATCH_SIZE);
+
+  for (let i = 0; i < sections.length; i += CLEAN_BATCH_SIZE) {
+    const batch = sections.slice(i, i + CLEAN_BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map((section, idx) =>
+        cleanSinglePass(apiKey, section, `${documentTitle} (parte ${i + idx + 1}/${sections.length})`)
+      )
+    );
+    results.forEach((result, idx) => {
+      cleanedSections[i + idx] = result;
+    });
+    const batchNum = Math.floor(i / CLEAN_BATCH_SIZE) + 1;
+    console.log(`[clean] Batch ${batchNum}/${totalBatches} done`);
+    if (i + CLEAN_BATCH_SIZE < sections.length) await sleep(300);
+  }
+
+  const finalText = cleanedSections.join('\n\n');
+  console.log(`[clean] Reassembled: ${rawText.length} → ${finalText.length} chars (${Math.round(100 - (finalText.length / rawText.length * 100))}% removed)`);
+  return finalText;
 }
 
 /* ─── Gemini URL builders ───────────────────────── */
