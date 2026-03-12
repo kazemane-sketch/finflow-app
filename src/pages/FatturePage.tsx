@@ -2145,17 +2145,19 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       // 4. Determine and apply classification status
       if (!hasAnyData) {
         // User cleared everything → delete classification and set status 'none'
+        await clearInvoiceNotes(invoice.id);
         await saveInvoiceProjects(companyId, invoice.id, []);
         await clearAllLineProjects(invoice.id);
         await deleteInvoiceClassification(invoice.id);
         await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
-        onPatchInvoice(invoice.id, { classification_status: 'none' } as Partial<DBInvoice>);
+        onPatchInvoice(invoice.id, { classification_status: 'none', has_fiscal_alerts: false } as Partial<DBInvoice>);
         onSetClassifMeta(invoice.id, EMPTY_INVOICE_CLASSIF_META);
         setClassification(null);
         setSelCategoryId(null);
         setSelAccountId(null);
         setInvProjects([]);
         setCdcRows([]);
+        setInvoiceNotes([]);
         setShowZeroLines(false);
 
         try {
@@ -2439,6 +2441,12 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       await clearAllLineProjects(invoice.id);
     } catch (e) {
       console.warn('[clear] Error clearing line projects from DB:', e);
+    }
+    try {
+      await clearInvoiceNotes(invoice.id);
+      onPatchInvoice(invoice.id, { has_fiscal_alerts: false } as Partial<DBInvoice>);
+    } catch (e) {
+      console.warn('[clear] Error clearing invoice fiscal notes from DB:', e);
     }
     if (company?.id) {
       try {
