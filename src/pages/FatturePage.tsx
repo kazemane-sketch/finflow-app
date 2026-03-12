@@ -3034,93 +3034,86 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
 
   return (
     <div className="flex flex-col h-full" id="invoice-detail-print">
-	      {/* HEADER — Test Lab inspired */}
+	      {/* HEADER — Clean card inspired by TestLab */}
 	      <div className="bg-white border-b flex-shrink-0">
-	        {/* Top bar: actions */}
-	        <div className="flex items-center justify-between px-4 pt-3 pb-1">
-	          <div className="flex items-center gap-1.5 flex-wrap">
-	            {counterpartyHeaderInfo.atecoDescription && (
-	              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-200">
-	                {counterpartyHeaderInfo.atecoDescription}
-	              </span>
-	            )}
-	            {counterpartyHeaderInfo.provinceSigla && (
-	              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 border border-slate-200">
-	                {counterpartyHeaderInfo.provinceSigla}
-	              </span>
-	            )}
-	            <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${
-	              invoice.direction === 'in' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'
-	            }`}>
-	              {invoice.direction === 'in' ? 'Passiva' : 'Attiva'}
-	            </span>
-	            <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${STATUS_COLORS[invoice.payment_status] || 'bg-gray-100 text-gray-600'}`}>
-	              {getStatusLabel(invoice.payment_status, invoice.direction)}
-	            </span>
+	        {/* Top bar: badges + actions */}
+	        <div className="flex items-center justify-between px-5 pt-4 pb-2">
+	          <div className="flex items-center gap-3 min-w-0">
+	            <button
+	              onClick={onNavigateCounterparty}
+	              className="text-base font-bold text-slate-900 hover:text-blue-700 hover:underline cursor-pointer bg-transparent border-none p-0 text-left truncate max-w-[420px]"
+	              title="Vai alla controparte"
+	            >
+	              {cp?.denom || invoice.source_filename || 'Sconosciuto'}
+	            </button>
+	            {cp?.piva && <span className="text-[10px] text-slate-400 flex-shrink-0">P.IVA {cp.piva}</span>}
 	          </div>
-	          <div className="flex items-center gap-1">
+	          <div className="flex items-center gap-1.5 flex-shrink-0">
             {detail?.raw_xml && (
-              <button onClick={() => setShowXml(!showXml)} className={`w-8 h-8 flex items-center justify-center rounded-md border text-xs ${showXml ? 'bg-sky-600 text-white border-sky-600' : 'border-gray-200 hover:bg-gray-50 text-gray-500'}`} title="Vedi XML">&lt;/&gt;</button>
+              <button onClick={() => setShowXml(!showXml)} className={`w-7 h-7 flex items-center justify-center rounded-lg text-[10px] transition-colors ${showXml ? 'bg-sky-600 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-500'}`} title="Vedi XML">&lt;/&gt;</button>
             )}
             {detail?.raw_xml && (
-              <button onClick={downloadXml} className="w-8 h-8 flex items-center justify-center rounded-md border border-gray-200 hover:bg-gray-50 text-gray-500 text-sm" title="Scarica XML">{'\u2B07'}</button>
+              <button onClick={downloadXml} className="w-7 h-7 flex items-center justify-center rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs" title="Scarica XML">{'\u2B07'}</button>
             )}
-            <button onClick={() => window.print()} className="w-8 h-8 flex items-center justify-center rounded-md border border-gray-200 hover:bg-gray-50 text-gray-500 text-sm" title="Stampa PDF">{'\uD83D\uDDA8'}</button>
-            <button onClick={() => setEditing(!editing)} className={`w-8 h-8 flex items-center justify-center rounded-md border text-sm ${editing ? 'bg-blue-600 text-white border-blue-600' : 'border-gray-200 hover:bg-gray-50 text-gray-500'}`} title="Modifica">{'\u270F'}</button>
-            <button onClick={onOpenScadenzario} className="w-8 h-8 flex items-center justify-center rounded-md border border-gray-200 hover:bg-gray-50 text-gray-500 text-sm" title="Scadenzario">{'\uD83D\uDCC5'}</button>
-            <button onClick={onDelete} className="w-8 h-8 flex items-center justify-center rounded-md border border-red-200 hover:bg-red-50 text-red-400 text-sm" title="Elimina">{'\uD83D\uDDD1'}</button>
+            <button onClick={() => window.print()} className="w-7 h-7 flex items-center justify-center rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs" title="Stampa PDF">{'\uD83D\uDDA8'}</button>
+            <button onClick={() => setEditing(!editing)} className={`w-7 h-7 flex items-center justify-center rounded-lg text-xs transition-colors ${editing ? 'bg-blue-600 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-500'}`} title="Modifica">{'\u270F'}</button>
+            <button onClick={onOpenScadenzario} className="w-7 h-7 flex items-center justify-center rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs" title="Scadenzario">{'\uD83D\uDCC5'}</button>
+            <button onClick={onDelete} className="w-7 h-7 flex items-center justify-center rounded-lg bg-red-50 hover:bg-red-100 text-red-400 text-xs" title="Elimina">{'\uD83D\uDDD1'}</button>
           </div>
         </div>
-        {/* Counterparty + invoice summary */}
-        <div className="px-4 pb-2">
-          <button
-            onClick={onNavigateCounterparty}
-            className="text-lg font-bold text-gray-900 hover:text-blue-700 hover:underline cursor-pointer bg-transparent border-none p-0 text-left truncate max-w-[360px]"
-            title="Vai alla controparte"
-          >
-            {cp?.denom || invoice.source_filename || 'Sconosciuto'}
-          </button>
-          {cp?.piva && <span className="text-[10px] text-gray-400 ml-2">P.IVA {cp.piva}</span>}
-        </div>
-        {/* Structured data grid */}
-        <div className="grid grid-cols-6 gap-3 px-4 pb-3 text-[11px]">
+        {/* Metadata grid — clean 4-col like TestLab */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-2 px-5 pb-4 text-xs">
           <div>
-            <span className="text-gray-400 text-[10px] block">Tipo doc</span>
-            <p className="font-semibold text-gray-700">{tpLabel(invoice.doc_type) || invoice.doc_type}</p>
+            <span className="text-slate-400 text-[10px]">Tipo doc</span>
+            <p className="font-medium text-slate-700">{tpLabel(invoice.doc_type) || invoice.doc_type}</p>
           </div>
           <div>
-            <span className="text-gray-400 text-[10px] block">Numero</span>
-            <p className="font-semibold text-gray-700">{invoice.number || '\u2014'}</p>
+            <span className="text-slate-400 text-[10px]">Direzione</span>
+            <div className="flex items-center gap-1.5 mt-0.5">
+              <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${
+                invoice.direction === 'in' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'
+              }`}>
+                {invoice.direction === 'in' ? 'Passiva' : 'Attiva'}
+              </span>
+              <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${STATUS_COLORS[invoice.payment_status] || 'bg-slate-100 text-slate-600'}`}>
+                {getStatusLabel(invoice.payment_status, invoice.direction)}
+              </span>
+            </div>
           </div>
           <div>
-            <span className="text-gray-400 text-[10px] block">Data</span>
-            <p className="font-semibold text-gray-700">{fmtDate(invoice.date)}</p>
+            <span className="text-slate-400 text-[10px]">Controparte</span>
+            <p className="font-medium text-slate-700">{invoice.number || '\u2014'} {'\u2014'} {fmtDate(invoice.date)}</p>
+            <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+              {counterpartyHeaderInfo.atecoDescription && (
+                <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-blue-50 text-blue-600">
+                  {counterpartyHeaderInfo.atecoDescription}
+                </span>
+              )}
+              {counterpartyHeaderInfo.provinceSigla && (
+                <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">
+                  {counterpartyHeaderInfo.provinceSigla}
+                </span>
+              )}
+            </div>
           </div>
           <div>
-            <span className="text-gray-400 text-[10px] block">Totale</span>
-            <p className="font-bold text-gray-900">{fmtEur(invoice.total_amount)}</p>
-          </div>
-          <div>
-            <span className="text-gray-400 text-[10px] block">Scadenza</span>
-            <p className="font-semibold text-gray-700">{invoice.payment_due_date ? fmtDate(invoice.payment_due_date) : '\u2014'}</p>
-          </div>
-          <div>
-            <span className="text-gray-400 text-[10px] block">Stato</span>
-            <p className="font-semibold text-gray-700">{getStatusLabel(invoice.payment_status, invoice.direction)}</p>
+            <span className="text-slate-400 text-[10px]">Totale</span>
+            <p className="font-bold text-slate-900 text-sm">{fmtEur(invoice.total_amount)}</p>
+            <p className="text-[10px] text-slate-400">{invoice.payment_due_date ? `Scad. ${fmtDate(invoice.payment_due_date)}` : ''}</p>
           </div>
         </div>
       </div>
 
-      {/* TAB BAR */}
-      <div className="flex border-b bg-white flex-shrink-0 px-4">
+      {/* TAB BAR — clean underline style */}
+      <div className="flex border-b bg-white flex-shrink-0 px-5">
         {DETAIL_TABS.map(tab => (
           <button
             key={tab.key}
             onClick={() => setActiveTab(tab.key)}
             className={`flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold border-b-2 transition-colors ${
               activeTab === tab.key
-                ? 'text-blue-700 border-blue-600'
-                : 'text-gray-400 border-transparent hover:text-gray-600'
+                ? 'text-purple-700 border-purple-600'
+                : 'text-slate-400 border-transparent hover:text-slate-600'
             }`}
           >
             <span>{tab.icon}</span>
@@ -3296,11 +3289,14 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
             )}
 
             {/* Invoice lines table with classification */}
-            <div className="bg-white border rounded-xl overflow-hidden">
-              <div className="flex items-center justify-between px-4 py-2.5 border-b bg-gray-50">
-                <h3 className="text-sm font-bold text-gray-800">Righe fattura</h3>
+            <div className="border rounded-lg bg-white overflow-hidden">
+              <div className="flex items-center justify-between px-4 py-2.5 border-b bg-slate-50">
                 <div className="flex items-center gap-2">
-                  <span className="text-[11px] text-emerald-600 font-medium">
+                  <span className="text-purple-500 text-sm">{'\u2699\uFE0F'}</span>
+                  <h3 className="text-sm font-bold text-slate-800">Classificazione</h3>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] text-slate-400">
                     {visibleLineCount} righe
                     {(hiddenLineCount > 0 || showZeroLines) && (
                       <button onClick={() => setShowZeroLines(!showZeroLines)}
@@ -3309,7 +3305,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       </button>
                     )}
                   </span>
-                  <span className="text-[11px] text-gray-400">
+                  <span className="text-[10px] text-slate-400">
                     {classifiedLineCount}/{visibleLineCount - informationalTotal} classificate
                     {informationalTotal > 0 && (
                       <span className="ml-1 text-gray-300">
@@ -3320,13 +3316,14 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                 </div>
               </div>
               <div className="overflow-x-auto">
-                <table className="w-full border-collapse text-[11px]">
-                  <thead><tr className="bg-slate-50/50 border-b">
-                    <th className="text-left px-3 py-2 text-gray-600 font-semibold">Descrizione</th>
-                    <th className="text-right px-2 py-2 text-gray-600 font-semibold w-14">Qt{'\u00E0'}</th>
-                    <th className="text-right px-2 py-2 text-gray-600 font-semibold w-16">P. Unit.</th>
-                    <th className="text-right px-2 py-2 text-gray-600 font-semibold w-14">IVA</th>
-                    <th className="text-right px-2 py-2 text-gray-600 font-semibold w-16">Totale</th>
+                <table className="w-full text-[11px]">
+                  <thead className="bg-slate-50/50 text-left text-slate-500">
+                  <tr>
+                    <th className="text-left px-3 py-2 font-semibold min-w-[240px]">Descrizione</th>
+                    <th className="text-right px-2 py-2 font-semibold w-14">Qt{'\u00E0'}</th>
+                    <th className="text-right px-2 py-2 font-semibold w-16">P. Unit.</th>
+                    <th className="text-right px-2 py-2 font-semibold w-14">IVA</th>
+                    <th className="text-right px-2 py-2 font-semibold w-16">Totale</th>
                     {allCategories.length > 0 && (
                       <th className="text-center px-1 py-2 text-gray-600 font-semibold w-32">
                         <button data-header-dropdown-trigger onClick={(e) => openHeaderDropdown('category', e)}
@@ -3354,13 +3351,13 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                         </button>
                       </th>
                     )}
-                    {(allCategories.length > 0 || allAccounts.length > 0) && <th className="text-center px-0.5 py-2 text-gray-400 font-normal w-12"></th>}
-                    <th className="text-center px-2 py-2 text-gray-600 font-semibold w-14">Conf.</th>
-                    <th className="text-left px-2 py-2 text-gray-600 font-semibold w-40">R. Commercialista</th>
-                    <th className="text-left px-2 py-2 text-gray-600 font-semibold w-40">R. Revisore</th>
-                    <th className="text-left px-2 py-2 text-gray-600 font-semibold w-32">Note</th>
+                    {(allCategories.length > 0 || allAccounts.length > 0) && <th className="text-center px-0.5 py-2 font-normal w-10"></th>}
+                    <th className="text-center px-2 py-2 font-semibold w-14">Conf.</th>
+                    <th className="text-left px-2 py-2 font-semibold min-w-[140px]">R. Commercialista</th>
+                    <th className="text-left px-2 py-2 font-semibold min-w-[140px]">R. Revisore</th>
+                    <th className="text-left px-2 py-2 font-semibold min-w-[100px]">Note</th>
                   </tr></thead>
-                  <tbody>
+                  <tbody className="divide-y divide-slate-100">
                     {/* Sort lines: classify lines first (with grouped children after parent), then skip lines */}
                     {(() => {
                       // Build sorted line list: parent → children → ... → skip at end
@@ -3422,10 +3419,10 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       if (isInformational) {
                         return (
                           <React.Fragment key={`info-${i}`}>
-                            <tr className={`border-b border-gray-50 ${isSkip ? 'bg-gray-50/50 opacity-50' : 'bg-blue-50/20'}`}>
-                              <td className="text-left px-3 py-1.5 max-w-[200px]">
-                                {isGroup && <span className="text-gray-400 mr-1">{'\u21B3'}</span>}
-                                <span className={`${isSkip ? 'text-gray-400 line-through' : 'text-gray-500 italic'}`}>
+                            <tr className={`${isSkip ? 'bg-slate-50/50 opacity-50' : 'bg-blue-50/20'}`}>
+                              <td className="text-left px-3 py-1.5">
+                                {isGroup && <span className="text-slate-400 mr-1">{'\u21B3'}</span>}
+                                <span className={`${isSkip ? 'text-slate-400 line-through' : 'text-slate-500 italic'}`}>
                                   {l.descrizione || '\u2014'}
                                 </span>
                                 <span className={`ml-1.5 inline-flex items-center text-[9px] px-1.5 py-0.5 rounded-full ${isSkip ? 'bg-gray-100 text-gray-400' : 'bg-blue-50 text-blue-400 border border-blue-100'}`}>
@@ -3469,55 +3466,60 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       // ─── Normal classify line rendering ───
                       return (
                       <React.Fragment key={i}>
-                      <tr className="border-b border-slate-50 hover:bg-slate-50/50">
-                        <td className="text-left px-3 py-2 max-w-[200px]">
-                          <span className="text-slate-800">{l.descrizione}</span>
-                          {lineId && ff && <span className="ml-1.5"><FiscalFlagsBadges flags={ff} /></span>}
-                          {lineId && <ReviewBadge
-                            confidence={lineConfidences[lineId]}
-                            hasNote={!!(ff?.note && /verificar|controllare|dubbio/i.test(ff.note || ''))}
-                            needsReview={lineReviewFlags[lineId]}
-                          />}
-                          {/* Article badge + phase dropdown inline */}
-                          {lineId && articles.length > 0 && (
-                            <span className="ml-1.5 inline-flex items-center gap-1 align-middle flex-wrap">
-                              <ArticleDropdown
-                                articles={articles}
-                                current={lineArticleMap[lineId] || null}
-                                suggestion={aiSuggestions[lineId] || null}
-                                onAssign={(artId, sugPhaseId) => handleAssignArticle(lineId, artId, l.descrizione || '', {
-                                  quantity: safeFloat(l.quantita) || 1, unit_price: safeFloat(l.prezzoUnitario),
-                                  total_price: safeFloat(l.prezzoTotale), vat_rate: safeFloat(l.aliquotaIVA),
-                                }, sugPhaseId)}
-                                onRemove={() => handleRemoveArticle(lineId)}
-                                onDismissSuggestion={() => handleDismissArticleSuggestion(lineId)}
-                              />
-                              {/* Cascading phase dropdown — only for multi-step articles */}
-                              {(() => {
-                                const info = lineArticleMap[lineId];
-                                if (!info) return null;
-                                const artWithPhases = articles.find(a => a.id === info.article_id);
-                                if (!artWithPhases?.phases?.length) return null;
-                                return (
-                                  <PhaseDropdown
-                                    phases={artWithPhases.phases}
-                                    currentPhaseId={info.phase_id}
-                                    onSelect={(phaseId) => handleAssignPhase(lineId, phaseId)}
-                                  />
-                                );
-                              })()}
-                            </span>
-                          )}
+                      <tr className="hover:bg-slate-50/50">
+                        <td className="text-left px-3 py-2.5 min-w-[240px]">
+                          <div className="flex flex-col gap-1">
+                            <span className="text-slate-800 leading-snug">{l.descrizione}</span>
+                            {/* Badges row: fiscal flags + review badge + article */}
+                            {lineId && (ff || lineReviewFlags[lineId] || articles.length > 0) && (
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                {ff && <FiscalFlagsBadges flags={ff} />}
+                                <ReviewBadge
+                                  confidence={lineConfidences[lineId]}
+                                  hasNote={!!(ff?.note && /verificar|controllare|dubbio/i.test(ff.note || ''))}
+                                  needsReview={lineReviewFlags[lineId]}
+                                />
+                                {articles.length > 0 && (
+                                  <span className="inline-flex items-center gap-1 flex-wrap">
+                                    <ArticleDropdown
+                                      articles={articles}
+                                      current={lineArticleMap[lineId] || null}
+                                      suggestion={aiSuggestions[lineId] || null}
+                                      onAssign={(artId, sugPhaseId) => handleAssignArticle(lineId, artId, l.descrizione || '', {
+                                        quantity: safeFloat(l.quantita) || 1, unit_price: safeFloat(l.prezzoUnitario),
+                                        total_price: safeFloat(l.prezzoTotale), vat_rate: safeFloat(l.aliquotaIVA),
+                                      }, sugPhaseId)}
+                                      onRemove={() => handleRemoveArticle(lineId)}
+                                      onDismissSuggestion={() => handleDismissArticleSuggestion(lineId)}
+                                    />
+                                    {(() => {
+                                      const info = lineArticleMap[lineId];
+                                      if (!info) return null;
+                                      const artWithPhases = articles.find(a => a.id === info.article_id);
+                                      if (!artWithPhases?.phases?.length) return null;
+                                      return (
+                                        <PhaseDropdown
+                                          phases={artWithPhases.phases}
+                                          currentPhaseId={info.phase_id}
+                                          onSelect={(phaseId) => handleAssignPhase(lineId, phaseId)}
+                                        />
+                                      );
+                                    })()}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
                         </td>
-                        <td className={`text-right px-2 py-2 ${safeFloat(l.prezzoTotale) < 0 && lineId && lineArticleMap[lineId] ? 'text-gray-300 line-through' : 'text-gray-600'}`}>
+                        <td className={`text-right px-2 py-2.5 ${safeFloat(l.prezzoTotale) < 0 && lineId && lineArticleMap[lineId] ? 'text-slate-300 line-through' : 'text-slate-600'}`}>
                           {l.quantita ? fmtNum(safeFloat(l.quantita)) : '1'}
                           {safeFloat(l.prezzoTotale) < 0 && lineId && lineArticleMap[lineId] && (
                             <span title="Riga esclusa dal conteggio quantità (importo negativo — sconto/abbuono)" className="ml-0.5 text-red-400 text-[9px] cursor-help no-underline" style={{ textDecoration: 'none' }}>✕</span>
                           )}
                         </td>
-                        <td className="text-right px-2 py-2 text-gray-600">{fmtNum(safeFloat(l.prezzoUnitario))}</td>
-                        <td className="text-right px-2 py-2 text-gray-600">{fmtNum(safeFloat(l.aliquotaIVA))}%</td>
-                        <td className={`text-right px-2 py-2 font-bold ${safeFloat(l.prezzoTotale) < 0 ? 'text-red-600' : 'text-gray-800'}`}>{fmtNum(safeFloat(l.prezzoTotale))}</td>
+                        <td className="text-right px-2 py-2.5 text-slate-600">{fmtNum(safeFloat(l.prezzoUnitario))}</td>
+                        <td className="text-right px-2 py-2.5 text-slate-600">{fmtNum(safeFloat(l.aliquotaIVA))}%</td>
+                        <td className={`text-right px-2 py-2.5 font-medium ${safeFloat(l.prezzoTotale) < 0 ? 'text-red-600' : 'text-slate-800'}`}>{fmtNum(safeFloat(l.prezzoTotale))}</td>
                         {allCategories.length > 0 && <td className={`text-center px-1 py-1${lineId && lineConfidences[lineId] != null && lineConfidences[lineId] < 50 ? ' opacity-40' : ''}`}>
                           {lineId ? (
                             <SearchableSelect
@@ -3591,23 +3593,23 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                           )}
                         </td>}
                         {/* Conf. column */}
-                        <td className="text-center px-2 py-2">
+                        <td className="text-center px-2 py-2.5">
                           {lineId && <ConfidenceBadge value={lineConfidences[lineId]} />}
                         </td>
                         {/* R. Commercialista column */}
-                        <td className="text-left px-2 py-2 text-xs text-slate-600 max-w-[160px]">
+                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 min-w-[140px]">
                           {lineId && lineDetails[lineId]?.classification_reasoning && (
-                            <span className="line-clamp-3">{lineDetails[lineId].classification_reasoning}</span>
+                            <span className="line-clamp-3 leading-relaxed">{lineDetails[lineId].classification_reasoning}</span>
                           )}
                         </td>
                         {/* R. Revisore column */}
-                        <td className="text-left px-2 py-2 text-xs text-slate-600 max-w-[160px]">
+                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 min-w-[140px]">
                           {lineId && lineDetails[lineId]?.fiscal_reasoning && (
-                            <span className="line-clamp-3">{lineDetails[lineId].fiscal_reasoning}</span>
+                            <span className="line-clamp-3 leading-relaxed">{lineDetails[lineId].fiscal_reasoning}</span>
                           )}
                         </td>
                         {/* Note column — clickable inline edit */}
-                        <td className="text-left px-2 py-2 text-xs max-w-[140px]">
+                        <td className="text-left px-3 py-2.5 text-[11px] min-w-[100px]">
                           {lineId && editingNoteLineId === lineId ? (
                             <div className="flex flex-col gap-1">
                               <textarea
@@ -3731,10 +3733,10 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       if (isInformational) {
                         return (
                           <React.Fragment key={`db-info-${i}`}>
-                            <tr className={`border-b border-gray-50 ${isSkip ? 'bg-gray-50/50 opacity-50' : 'bg-blue-50/20'}`}>
+                            <tr className={`${isSkip ? 'bg-slate-50/50 opacity-50' : 'bg-blue-50/20'}`}>
                               <td className="text-left px-3 py-1.5">
-                                {isGroup && <span className="text-gray-400 mr-1">{'\u21B3'}</span>}
-                                <span className={`${isSkip ? 'text-gray-400 line-through' : 'text-gray-500 italic'}`}>
+                                {isGroup && <span className="text-slate-400 mr-1">{'\u21B3'}</span>}
+                                <span className={`${isSkip ? 'text-slate-400 line-through' : 'text-slate-500 italic'}`}>
                                   {l.description || '\u2014'}
                                 </span>
                                 <span className={`ml-1.5 inline-flex items-center text-[9px] px-1.5 py-0.5 rounded-full ${isSkip ? 'bg-gray-100 text-gray-400' : 'bg-blue-50 text-blue-400 border border-blue-100'}`}>
@@ -3774,47 +3776,52 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       // ─── Normal classify line rendering ───
                       return (
                       <React.Fragment key={i}>
-                      <tr className="border-b border-slate-50 hover:bg-slate-50/50">
-                        <td className="text-left px-3 py-2">
-                          <span className="text-slate-800">{l.description}</span>
-                          {ff2 && <span className="ml-1.5"><FiscalFlagsBadges flags={ff2} /></span>}
-                          <ReviewBadge
-                            confidence={lineConfidences[l.id]}
-                            hasNote={!!(ff2?.note && /verificar|controllare|dubbio/i.test(ff2.note || ''))}
-                            needsReview={lineReviewFlags[l.id]}
-                          />
-                          {articles.length > 0 && (
-                            <span className="ml-1.5 inline-flex items-center gap-1 align-middle flex-wrap">
-                              <ArticleDropdown articles={articles} current={lineArticleMap[l.id] || null} suggestion={aiSuggestions[l.id] || null}
-                                onAssign={(artId, sugPhaseId) => handleAssignArticle(l.id, artId, l.description, { quantity: l.quantity, unit_price: l.unit_price, total_price: l.total_price, vat_rate: l.vat_rate }, sugPhaseId)}
-                                onRemove={() => handleRemoveArticle(l.id)}
-                                onDismissSuggestion={() => handleDismissArticleSuggestion(l.id)} />
-                              {/* Cascading phase dropdown — only for multi-step articles */}
-                              {(() => {
-                                const info = lineArticleMap[l.id];
-                                if (!info) return null;
-                                const artWithPhases = articles.find(a => a.id === info.article_id);
-                                if (!artWithPhases?.phases?.length) return null;
-                                return (
-                                  <PhaseDropdown
-                                    phases={artWithPhases.phases}
-                                    currentPhaseId={info.phase_id}
-                                    onSelect={(phaseId) => handleAssignPhase(l.id, phaseId)}
-                                  />
-                                );
-                              })()}
-                            </span>
-                          )}
+                      <tr className="hover:bg-slate-50/50">
+                        <td className="text-left px-3 py-2.5 min-w-[240px]">
+                          <div className="flex flex-col gap-1">
+                            <span className="text-slate-800 leading-snug">{l.description}</span>
+                            {(ff2 || lineReviewFlags[l.id] || articles.length > 0) && (
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                {ff2 && <FiscalFlagsBadges flags={ff2} />}
+                                <ReviewBadge
+                                  confidence={lineConfidences[l.id]}
+                                  hasNote={!!(ff2?.note && /verificar|controllare|dubbio/i.test(ff2.note || ''))}
+                                  needsReview={lineReviewFlags[l.id]}
+                                />
+                                {articles.length > 0 && (
+                                  <span className="inline-flex items-center gap-1 flex-wrap">
+                                    <ArticleDropdown articles={articles} current={lineArticleMap[l.id] || null} suggestion={aiSuggestions[l.id] || null}
+                                      onAssign={(artId, sugPhaseId) => handleAssignArticle(l.id, artId, l.description, { quantity: l.quantity, unit_price: l.unit_price, total_price: l.total_price, vat_rate: l.vat_rate }, sugPhaseId)}
+                                      onRemove={() => handleRemoveArticle(l.id)}
+                                      onDismissSuggestion={() => handleDismissArticleSuggestion(l.id)} />
+                                    {(() => {
+                                      const info = lineArticleMap[l.id];
+                                      if (!info) return null;
+                                      const artWithPhases = articles.find(a => a.id === info.article_id);
+                                      if (!artWithPhases?.phases?.length) return null;
+                                      return (
+                                        <PhaseDropdown
+                                          phases={artWithPhases.phases}
+                                          currentPhaseId={info.phase_id}
+                                          onSelect={(phaseId) => handleAssignPhase(l.id, phaseId)}
+                                        />
+                                      );
+                                    })()}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
                         </td>
-                        <td className={`text-right px-2 py-2 ${(l.total_price ?? 0) < 0 && lineArticleMap[l.id] ? 'text-gray-300 line-through' : 'text-gray-600'}`}>
+                        <td className={`text-right px-2 py-2.5 ${(l.total_price ?? 0) < 0 && lineArticleMap[l.id] ? 'text-slate-300 line-through' : 'text-slate-600'}`}>
                           {fmtNum(l.quantity)}
                           {(l.total_price ?? 0) < 0 && lineArticleMap[l.id] && (
                             <span title="Riga esclusa dal conteggio quantità (importo negativo — sconto/abbuono)" className="ml-0.5 text-red-400 text-[9px] cursor-help no-underline" style={{ textDecoration: 'none' }}>✕</span>
                           )}
                         </td>
-                        <td className="text-right px-2 py-2 text-gray-600">{fmtNum(l.unit_price)}</td>
-                        <td className="text-right px-2 py-2 text-gray-600">{fmtNum(l.vat_rate)}%</td>
-                        <td className={`text-right px-2 py-2 font-bold ${(l.total_price ?? 0) < 0 ? 'text-red-600' : 'text-gray-800'}`}>{fmtNum(l.total_price)}</td>
+                        <td className="text-right px-2 py-2.5 text-slate-600">{fmtNum(l.unit_price)}</td>
+                        <td className="text-right px-2 py-2.5 text-slate-600">{fmtNum(l.vat_rate)}%</td>
+                        <td className={`text-right px-2 py-2.5 font-medium ${(l.total_price ?? 0) < 0 ? 'text-red-600' : 'text-slate-800'}`}>{fmtNum(l.total_price)}</td>
                         {allCategories.length > 0 && <td className={`text-center px-1 py-1${lineConfidences[l.id] != null && lineConfidences[l.id] < 50 ? ' opacity-40' : ''}`}>
                           <SearchableSelect
                             value={lineCat || null}
@@ -3873,23 +3880,23 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                           </div>
                         </td>}
                         {/* Conf. column */}
-                        <td className="text-center px-2 py-2">
+                        <td className="text-center px-2 py-2.5">
                           <ConfidenceBadge value={lineConfidences[l.id]} />
                         </td>
                         {/* R. Commercialista column */}
-                        <td className="text-left px-2 py-2 text-xs text-slate-600 max-w-[160px]">
+                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 min-w-[140px]">
                           {lineDetails[l.id]?.classification_reasoning && (
-                            <span className="line-clamp-3">{lineDetails[l.id].classification_reasoning}</span>
+                            <span className="line-clamp-3 leading-relaxed">{lineDetails[l.id].classification_reasoning}</span>
                           )}
                         </td>
                         {/* R. Revisore column */}
-                        <td className="text-left px-2 py-2 text-xs text-slate-600 max-w-[160px]">
+                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 min-w-[140px]">
                           {lineDetails[l.id]?.fiscal_reasoning && (
-                            <span className="line-clamp-3">{lineDetails[l.id].fiscal_reasoning}</span>
+                            <span className="line-clamp-3 leading-relaxed">{lineDetails[l.id].fiscal_reasoning}</span>
                           )}
                         </td>
                         {/* Note column — clickable inline edit */}
-                        <td className="text-left px-2 py-2 text-xs max-w-[140px]">
+                        <td className="text-left px-3 py-2.5 text-[11px] min-w-[100px]">
                           {editingNoteLineId === l.id ? (
                             <div className="flex flex-col gap-1">
                               <textarea
@@ -4059,7 +4066,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                 document.body
               )}
               {/* Footer */}
-              <div className="flex items-center justify-between px-4 py-2.5 border-t bg-gray-50">
+              <div className="flex items-center justify-between px-4 py-2.5 border-t bg-slate-50">
                 <div className="flex items-center gap-2">
                   <span className="text-[11px] text-gray-400">
                     {isPostConfirmDirty
