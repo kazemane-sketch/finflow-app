@@ -731,21 +731,14 @@ REGOLE DI CLASSIFICAZIONE:
     console.warn("[classify] agent_config read failed, using defaults:", e);
   }
 
-  // thinkingConfig MUST be a top-level sibling of generationConfig, NOT nested inside it
   // NOTE: responseMimeType: "application/json" silently disables thinking on Gemini 2.5 Pro!
-  // We parse JSON from text instead.
-  const classifyBody: Record<string, unknown> = {
-    contents: [{
-      role: "user",
-      parts: [{ text: classificationPrompt }],
-    }],
-    generationConfig: {
-      temperature: 0.1,
-      maxOutputTokens,
-    },
+  // We parse JSON from text instead. thinkingConfig goes INSIDE generationConfig.
+  const genConfig: Record<string, unknown> = {
+    temperature: 0.1,
+    maxOutputTokens,
   };
   if (thinkingBudget > 0 && !NO_THINKING_CONFIG_MODELS.includes(classifyModel)) {
-    classifyBody.thinkingConfig = { thinkingBudget };
+    genConfig.thinkingConfig = { thinkingBudget, includeThoughts: true };
   }
 
   console.log(`[classify] Calling ${classifyModel} (thinking=${thinkingBudget}) for document ${documentId}...`);
@@ -754,7 +747,13 @@ REGOLE DI CLASSIFICAZIONE:
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(classifyBody),
+      body: JSON.stringify({
+        contents: [{
+          role: "user",
+          parts: [{ text: classificationPrompt }],
+        }],
+        generationConfig: genConfig,
+      }),
     },
   );
 

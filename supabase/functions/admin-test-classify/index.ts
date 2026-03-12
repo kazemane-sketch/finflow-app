@@ -162,20 +162,20 @@ async function callGemini(
   };
   const budget = thinkingBudget[thinkingLevel] ?? 8192;
 
-  // thinkingConfig MUST be top-level, NOT nested inside generationConfig
   const requestBody: Record<string, unknown> = {
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: {
       temperature: config.temperature ?? 0.1,
       maxOutputTokens: config.max_output_tokens || 8192,
+      ...(budget > 0
+        ? {
+            thinkingConfig: {
+              thinkingBudget: budget,
+              includeThoughts: true,
+            },
+          }
+        : {}),
     },
-    ...(budget > 0
-      ? {
-          thinkingConfig: {
-            thinkingBudget: budget,
-          },
-        }
-      : {}),
   };
 
   const t0 = Date.now();

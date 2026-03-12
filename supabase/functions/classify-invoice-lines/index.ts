@@ -869,19 +869,18 @@ async function callGemini(
   console.log(`[gemini] Calling ${model}, prompt=${prompt.length} chars, thinking_budget=${thinkingBudget}`);
 
   try {
-    // thinkingConfig MUST be a top-level sibling of generationConfig, NOT nested inside it
-    const bodyObj: Record<string, unknown> = {
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens },
-    };
+    const genConfig: Record<string, unknown> = { maxOutputTokens };
     if (thinkingBudget > 0 && !NO_THINKING_CONFIG_MODELS.includes(model)) {
-      bodyObj.thinkingConfig = { thinkingBudget };
+      genConfig.thinkingConfig = { thinkingBudget, includeThoughts: true };
     }
 
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(bodyObj),
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: genConfig,
+      }),
     });
 
     if (!resp.ok) {

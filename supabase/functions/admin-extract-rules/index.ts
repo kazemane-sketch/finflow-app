@@ -167,9 +167,8 @@ Rispondi SOLO con il JSON array (no markdown, no commento):
         generationConfig: {
           maxOutputTokens: 16384,
           temperature: 0.2,
+          thinkingConfig: { thinkingBudget: 8192, includeThoughts: true },
         },
-        // thinkingConfig MUST be top-level, NOT nested inside generationConfig
-        thinkingConfig: { thinkingBudget: 8192 },
       }),
     });
 

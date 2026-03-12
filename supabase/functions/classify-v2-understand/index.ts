@@ -385,9 +385,8 @@ ATTENZIONE AI GRUPPI KEYWORD: Se una riga ha GRUPPI_KEYWORD, quei gruppi ti dico
         generationConfig: {
           maxOutputTokens: agentConfig?.max_output_tokens || 16384,
           temperature,
+          ...(budget > 0 ? { thinkingConfig: { thinkingBudget: budget, includeThoughts: true } } : {}),
         },
-        // thinkingConfig MUST be top-level, NOT nested inside generationConfig
-        ...(budget > 0 ? { thinkingConfig: { thinkingBudget: budget } } : {}),
       }),
     });
 
