@@ -16,7 +16,7 @@ import {
   Plus, X, Search, Loader2, FileText, Globe, Type, Trash2,
   ChevronDown, ChevronUp, ArrowLeft, Link2, BookOpen, Sparkles,
   Calendar, Shield, Building2, Eye, Pencil, ExternalLink, Upload,
-  Brain, CheckCircle2, Square, Zap,
+  Brain, CheckCircle2, Square, Zap, RefreshCw,
 } from 'lucide-react'
 
 // ════════════════════════════════════════════════
@@ -357,6 +357,7 @@ export default function KBDocumentsPage() {
   const { isRunning: classifyRunning, startOrStop: classifyStartOrStop } = useAIJob('kb-classify', 'Classificazione AI documento KB')
   const { isRunning: batchProcessRunning, progress: batchProcessProgress, startOrStop: batchProcessStartOrStop } = useAIJob('kb-process-batch', 'Processing batch KB')
   const { isRunning: batchClassifyRunning, progress: batchClassifyProgress, startOrStop: batchClassifyStartOrStop } = useAIJob('kb-classify-batch', 'Classificazione batch KB')
+  const { isRunning: batchReprocessRunning, progress: batchReprocessProgress, startOrStop: batchReprocessStartOrStop } = useAIJob('kb-reprocess-batch', 'Riprocessamento batch KB')
 
   // Upload state (not an AI job)
   const [uploading, setUploading] = useState(false)
@@ -751,6 +752,35 @@ export default function KBDocumentsPage() {
     }, ready.length)
   }
 
+  // ── Batch Reprocess all ready documents (AI cleanup + re-chunk + re-embed) ──
+  const handleBatchReprocess = () => {
+    const ready = docs.filter(d => d.status === 'ready')
+    if (ready.length === 0) { toast.info('Nessun documento da riprocessare'); return }
+    batchReprocessStartOrStop(async (signal, updateProgress, appendLog) => {
+      updateProgress(0, ready.length)
+      let ok = 0, fail = 0
+      for (let i = 0; i < ready.length; i++) {
+        if (signal.aborted) return
+        const doc = ready[i]
+        updateProgress(i, ready.length, { message: `${doc.title?.slice(0, 40)}...` })
+        try {
+          const result = await invokeCancellable('kb-process-document', { action: 'reprocess', document_id: doc.id }, signal)
+          const { data, error } = result
+          if (error || data?.error) throw new Error(error?.message || data?.error)
+          ok++
+          appendLog?.(`✓ ${doc.title?.slice(0, 50)} — ${data.chunks} chunk, ${data.text_length} chars`)
+        } catch (e: any) {
+          if (e.name === 'AbortError') return
+          fail++
+          appendLog?.(`✗ ${doc.title?.slice(0, 50)} — ${e.message}`)
+        }
+        updateProgress(i + 1, ready.length)
+      }
+      loadDocs()
+      toast.success(`Riprocessamento completato: ${ok} riprocessati, ${fail} errori`)
+    }, ready.length)
+  }
+
   // ── Approve suggested relations ──
   const approveSuggestedRels = async () => {
     const checked = suggestedRels.filter(r => r.checked)
@@ -853,6 +883,14 @@ export default function KBDocumentsPage() {
             {batchClassifyRunning
               ? <><Square className="h-3.5 w-3.5 mr-1" />Stop ({batchClassifyProgress.current}/{batchClassifyProgress.total})</>
               : <><Brain className="h-3.5 w-3.5 mr-1" />Classifica ready ({stats.unclassified})</>
+            }
+          </Button>
+          {/* Batch Reprocess */}
+          <Button variant={batchReprocessRunning ? 'destructive' : 'outline'} size="sm"
+            onClick={handleBatchReprocess}>
+            {batchReprocessRunning
+              ? <><Square className="h-3.5 w-3.5 mr-1" />Stop ({batchReprocessProgress.current}/{batchReprocessProgress.total})</>
+              : <><RefreshCw className="h-3.5 w-3.5 mr-1" />Riprocessa tutti ({stats.ready})</>
             }
           </Button>
           <Button onClick={() => openForm()}>
