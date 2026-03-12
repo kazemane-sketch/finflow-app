@@ -11,12 +11,32 @@ import MultiSelectChips from '@/components/ui/MultiSelectChips'
 import NullableMultiSelect from '@/components/ui/NullableMultiSelect'
 import { supabase } from '@/integrations/supabase/client'
 import { toast } from 'sonner'
+import { useAIJob } from '@/hooks/useAIJob'
 import {
   Plus, X, Search, Loader2, FileText, Globe, Type, Trash2,
   ChevronDown, ChevronUp, ArrowLeft, Link2, BookOpen, Sparkles,
   Calendar, Shield, Building2, Eye, Pencil, ExternalLink, Upload,
-  Brain, CheckCircle2,
+  Brain, CheckCircle2, Square, Zap,
 } from 'lucide-react'
+
+// ════════════════════════════════════════════════
+// Cancellable invoke wrapper (supabase.functions.invoke doesn't support AbortSignal)
+// ════════════════════════════════════════════════
+
+async function invokeCancellable(
+  functionName: string,
+  body: any,
+  signal: AbortSignal,
+): Promise<any> {
+  if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+  const promise = supabase.functions.invoke(functionName, { body })
+  return new Promise((resolve, reject) => {
+    signal.addEventListener('abort', () => {
+      reject(new DOMException('Aborted', 'AbortError'))
+    }, { once: true })
+    promise.then(resolve).catch(reject)
+  })
+}
 
 // ════════════════════════════════════════════════
 // Constants / Enums
@@ -333,9 +353,13 @@ export default function KBDocumentsPage() {
   const [generatedRules, setGeneratedRules] = useState<{ id: string; title: string; domain: string }[]>([])
   const [loadingDetail, setLoadingDetail] = useState(false)
 
-  // Processing / Classify state
-  const [processing, setProcessing] = useState(false)
-  const [classifying, setClassifying] = useState(false)
+  // AI Job hooks (global, persist across navigation)
+  const { isRunning: processRunning, startOrStop: processStartOrStop } = useAIJob('kb-process', 'Processing documento KB')
+  const { isRunning: classifyRunning, startOrStop: classifyStartOrStop } = useAIJob('kb-classify', 'Classificazione AI documento KB')
+  const { isRunning: batchProcessRunning, progress: batchProcessProgress, startOrStop: batchProcessStartOrStop } = useAIJob('kb-process-batch', 'Processing batch KB')
+  const { isRunning: batchClassifyRunning, progress: batchClassifyProgress, startOrStop: batchClassifyStartOrStop } = useAIJob('kb-classify-batch', 'Classificazione batch KB')
+
+  // Upload state (not an AI job)
   const [uploading, setUploading] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -588,15 +612,15 @@ export default function KBDocumentsPage() {
   }
 
   // ── Process document (text extraction + chunking + embedding) ──
-  const handleProcess = async (docId: string) => {
-    setProcessing(true)
-    try {
-      const { data, error } = await supabase.functions.invoke('kb-process-document', {
-        body: { action: 'process', document_id: docId },
-      })
+  const handleProcess = (docId: string) => {
+    processStartOrStop(async (signal, updateProgress) => {
+      updateProgress(0, 1, { message: 'Estrazione testo, chunking, embedding...' })
+      const result = await invokeCancellable('kb-process-document', { action: 'process', document_id: docId }, signal)
+      const { data, error } = result
       if (error) throw new Error(error.message || 'Errore invocazione')
       if (data?.error) throw new Error(data.error)
       toast.success(`Documento processato: ${data.chunks} chunk creati`)
+      updateProgress(1, 1, { message: `${data.chunks} chunk creati` })
       // Reload detail + list
       const { data: updatedDoc } = await supabase
         .from('kb_documents').select('*').eq('id', docId).single()
@@ -605,24 +629,21 @@ export default function KBDocumentsPage() {
         loadDetail(updatedDoc as any)
       }
       loadDocs()
-    } catch (e: any) {
-      toast.error('Errore processing: ' + e.message)
-    }
-    setProcessing(false)
+    }, 1)
   }
 
   // ── Classify document (AI metadata) ──
-  const handleClassify = async (docId: string) => {
-    setClassifying(true)
-    try {
-      const { data, error } = await supabase.functions.invoke('kb-process-document', {
-        body: { action: 'classify', document_id: docId },
-      })
+  const handleClassify = (docId: string) => {
+    classifyStartOrStop(async (signal, updateProgress) => {
+      updateProgress(0, 1, { message: 'Analisi con Gemini Pro in corso...' })
+      const result = await invokeCancellable('kb-process-document', { action: 'classify', document_id: docId }, signal)
+      const { data, error } = result
       if (error) throw new Error(error.message || 'Errore invocazione')
       if (data?.error) throw new Error(data.error)
 
       const updated = data.fields_updated?.length || 0
       toast.success(`Classificazione completata: ${updated} campi aggiornati`)
+      updateProgress(1, 1, { message: `${updated} campi aggiornati` })
 
       // Reload document detail + list
       const { data: updatedDoc } = await supabase
@@ -636,7 +657,6 @@ export default function KBDocumentsPage() {
       // Show suggested relations dialog if any
       const rels = data.suggested_relations || []
       if (rels.length > 0) {
-        // Resolve target titles
         const enriched = await Promise.all(rels.map(async (r: any) => {
           let title = '(sconosciuto)'
           if (r.target_type === 'document') {
@@ -653,10 +673,80 @@ export default function KBDocumentsPage() {
         setSuggestedRels(enriched)
         setShowSuggestedRels(true)
       }
-    } catch (e: any) {
-      toast.error('Errore classificazione: ' + e.message)
-    }
-    setClassifying(false)
+    }, 1)
+  }
+
+  // ── Batch Process all pending documents ──
+  const handleBatchProcess = () => {
+    const pending = docs.filter(d => d.status === 'pending' || d.status === 'error')
+    if (pending.length === 0) { toast.info('Nessun documento da processare'); return }
+    batchProcessStartOrStop(async (signal, updateProgress, appendLog) => {
+      updateProgress(0, pending.length)
+      let ok = 0, fail = 0
+      for (let i = 0; i < pending.length; i++) {
+        if (signal.aborted) return
+        const doc = pending[i]
+        updateProgress(i, pending.length, { message: `${doc.title?.slice(0, 40)}...` })
+        try {
+          const result = await invokeCancellable('kb-process-document', { action: 'process', document_id: doc.id }, signal)
+          const { data, error } = result
+          if (error || data?.error) throw new Error(error?.message || data?.error)
+          ok++
+          appendLog?.(`✓ ${doc.title?.slice(0, 50)} — ${data.chunks} chunk`)
+        } catch (e: any) {
+          if (e.name === 'AbortError') return
+          fail++
+          appendLog?.(`✗ ${doc.title?.slice(0, 50)} — ${e.message}`)
+        }
+        updateProgress(i + 1, pending.length)
+      }
+      loadDocs()
+      toast.success(`Batch completato: ${ok} processati, ${fail} errori`)
+    }, pending.length)
+  }
+
+  // ── Batch Classify all ready documents without summary ──
+  const handleBatchClassify = () => {
+    const ready = docs.filter(d => d.status === 'ready' && !d.summary)
+    if (ready.length === 0) { toast.info('Nessun documento da classificare'); return }
+    batchClassifyStartOrStop(async (signal, updateProgress, appendLog) => {
+      updateProgress(0, ready.length)
+      let ok = 0, fail = 0
+      for (let i = 0; i < ready.length; i++) {
+        if (signal.aborted) return
+        const doc = ready[i]
+        updateProgress(i, ready.length, { message: `${doc.title?.slice(0, 40)}...` })
+        try {
+          const result = await invokeCancellable('kb-process-document', { action: 'classify', document_id: doc.id }, signal)
+          const { data, error } = result
+          if (error || data?.error) throw new Error(error?.message || data?.error)
+          ok++
+          const fields = data.fields_updated?.length || 0
+          appendLog?.(`✓ ${doc.title?.slice(0, 50)} — ${fields} campi`)
+          // Auto-approve suggested relations in batch
+          const rels = data.suggested_relations || []
+          if (rels.length > 0) {
+            for (const r of rels) {
+              const payload: Record<string, any> = {
+                source_document_id: doc.id,
+                relation_type: r.relation_type,
+                note: r.note || null,
+              }
+              if (r.target_type === 'document') payload.target_document_id = r.target_id
+              if (r.target_type === 'rule') payload.target_rule_id = r.target_id
+              await supabase.from('kb_document_relations').insert(payload).catch(() => {})
+            }
+          }
+        } catch (e: any) {
+          if (e.name === 'AbortError') return
+          fail++
+          appendLog?.(`✗ ${doc.title?.slice(0, 50)} — ${e.message}`)
+        }
+        updateProgress(i + 1, ready.length)
+      }
+      loadDocs()
+      toast.success(`Batch completato: ${ok} classificati, ${fail} errori`)
+    }, ready.length)
   }
 
   // ── Approve suggested relations ──
@@ -744,9 +834,27 @@ export default function KBDocumentsPage() {
           </h1>
           <p className="text-sm text-gray-500 mt-0.5">Documenti normativi e fiscali della Knowledge Base</p>
         </div>
-        <Button onClick={() => openForm()}>
-          <Plus className="h-4 w-4 mr-1.5" />Nuovo Documento
-        </Button>
+        <div className="flex gap-2">
+          {/* Batch Process */}
+          <Button variant={batchProcessRunning ? 'destructive' : 'outline'} size="sm"
+            onClick={handleBatchProcess}>
+            {batchProcessRunning
+              ? <><Square className="h-3.5 w-3.5 mr-1" />Stop ({batchProcessProgress.current}/{batchProcessProgress.total})</>
+              : <><Zap className="h-3.5 w-3.5 mr-1" />Processa pending ({stats.total - stats.ready - stats.superseded})</>
+            }
+          </Button>
+          {/* Batch Classify */}
+          <Button variant={batchClassifyRunning ? 'destructive' : 'outline'} size="sm"
+            onClick={handleBatchClassify}>
+            {batchClassifyRunning
+              ? <><Square className="h-3.5 w-3.5 mr-1" />Stop ({batchClassifyProgress.current}/{batchClassifyProgress.total})</>
+              : <><Brain className="h-3.5 w-3.5 mr-1" />Classifica ready</>
+            }
+          </Button>
+          <Button onClick={() => openForm()}>
+            <Plus className="h-4 w-4 mr-1.5" />Nuovo Documento
+          </Button>
+        </div>
       </div>
 
       {/* Stats */}
@@ -927,17 +1035,19 @@ export default function KBDocumentsPage() {
               <Pencil className="h-3.5 w-3.5 mr-1" />Modifica
             </Button>
             {(doc.status === 'pending' || doc.status === 'error') && (
-              <Button size="sm" onClick={() => handleProcess(doc.id)} disabled={processing}>
-                {processing
-                  ? <><Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />Processando...</>
+              <Button size="sm" onClick={() => handleProcess(doc.id)}
+                variant={processRunning ? 'destructive' : 'default'}>
+                {processRunning
+                  ? <><Square className="h-3.5 w-3.5 mr-1" />Stop</>
                   : <><Sparkles className="h-3.5 w-3.5 mr-1" />Processa</>
                 }
               </Button>
             )}
             {doc.full_text && (
-              <Button variant="outline" size="sm" onClick={() => handleClassify(doc.id)} disabled={classifying}>
-                {classifying
-                  ? <><Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />Analisi AI...</>
+              <Button variant={classifyRunning ? 'destructive' : 'outline'} size="sm"
+                onClick={() => handleClassify(doc.id)}>
+                {classifyRunning
+                  ? <><Square className="h-3.5 w-3.5 mr-1" />Stop</>
                   : <><Brain className="h-3.5 w-3.5 mr-1" />Compila metadata con AI</>
                 }
               </Button>

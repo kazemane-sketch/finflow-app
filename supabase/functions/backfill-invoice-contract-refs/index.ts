@@ -70,6 +70,19 @@ function extractContractRefsFromXml(rawXml: string | null | undefined): string[]
 
 const OVERFETCH_MULTIPLIER = 10;
 
+const MISSING_CONTRACT_REFS_SQL = `
+  (
+    coalesce(i.primary_contract_ref, '') = ''
+    OR (
+      CASE
+        WHEN jsonb_typeof(coalesce(i.contract_refs, '[]'::jsonb)) = 'array'
+          THEN jsonb_array_length(coalesce(i.contract_refs, '[]'::jsonb))
+        ELSE 0
+      END
+    ) = 0
+  )
+`;
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   if (req.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
@@ -110,6 +123,35 @@ Deno.serve(async (req) => {
 
   const sql = postgres(dbUrl, { max: 1 });
   try {
+    // Repair rows already touched by older runs where primary_contract_ref exists
+    // but contract_refs is still empty or not stored as a proper jsonb array.
+    await sql.unsafe(
+      `UPDATE invoices i
+       SET contract_refs = to_jsonb(ARRAY[primary_contract_ref]),
+           updated_at = now()
+       WHERE i.company_id = $1
+         AND coalesce(i.primary_contract_ref, '') <> ''
+         AND (
+           CASE
+             WHEN jsonb_typeof(coalesce(i.contract_refs, '[]'::jsonb)) = 'array'
+               THEN jsonb_array_length(coalesce(i.contract_refs, '[]'::jsonb))
+             ELSE 0
+           END
+         ) = 0`,
+      [companyId],
+    );
+
+    const [{ remaining_before }] = await sql.unsafe(
+      `SELECT count(*)::int as remaining_before
+       FROM invoices i
+       WHERE i.company_id = $1
+         AND i.raw_xml IS NOT NULL
+         AND i.raw_xml ~* '<[^>]*DatiContratto'
+         AND i.raw_xml ~* '<[^>]*IdDocumento'
+         AND ${MISSING_CONTRACT_REFS_SQL}`,
+      [companyId],
+    );
+
     const scanLimit = Math.max(batchSize, batchSize * OVERFETCH_MULTIPLIER);
 
     const rows = await sql.unsafe(
@@ -119,16 +161,7 @@ Deno.serve(async (req) => {
          AND i.raw_xml IS NOT NULL
          AND i.raw_xml ~* '<[^>]*DatiContratto'
          AND i.raw_xml ~* '<[^>]*IdDocumento'
-         AND (
-           coalesce(to_jsonb(i)->>'primary_contract_ref', '') = ''
-           OR (
-             CASE
-               WHEN jsonb_typeof(coalesce(to_jsonb(i)->'contract_refs', '[]'::jsonb)) = 'array'
-                 THEN jsonb_array_length(coalesce(to_jsonb(i)->'contract_refs', '[]'::jsonb))
-               ELSE 0
-             END
-           ) = 0
-         )
+         AND ${MISSING_CONTRACT_REFS_SQL}
        ORDER BY i.date DESC, i.created_at DESC
        LIMIT $2`,
       [companyId, scanLimit],
@@ -149,10 +182,10 @@ Deno.serve(async (req) => {
       await sql.unsafe(
         `UPDATE invoices
          SET primary_contract_ref = $2,
-             contract_refs = $3::jsonb,
+             contract_refs = to_jsonb($3::text[]),
              updated_at = now()
          WHERE id = $1`,
-        [row.id, refs[0], JSON.stringify(refs)],
+        [row.id, refs[0], refs],
       );
       updated += 1;
     }
@@ -164,21 +197,13 @@ Deno.serve(async (req) => {
          AND i.raw_xml IS NOT NULL
          AND i.raw_xml ~* '<[^>]*DatiContratto'
          AND i.raw_xml ~* '<[^>]*IdDocumento'
-         AND (
-           coalesce(to_jsonb(i)->>'primary_contract_ref', '') = ''
-           OR (
-             CASE
-               WHEN jsonb_typeof(coalesce(to_jsonb(i)->'contract_refs', '[]'::jsonb)) = 'array'
-                 THEN jsonb_array_length(coalesce(to_jsonb(i)->'contract_refs', '[]'::jsonb))
-               ELSE 0
-             END
-           ) = 0
-         )`,
+         AND ${MISSING_CONTRACT_REFS_SQL}`,
       [companyId],
     );
 
     return jsonResponse({
       status: "completed",
+      remaining_before: Number(remaining_before || 0),
       processed,
       updated,
       skipped,
