@@ -498,6 +498,10 @@ export interface FiscalAlertOption {
   label: string;
   fiscal_override: Record<string, unknown>;
   is_default: boolean;
+  /** Whether this is the conservative/safe option (no note required) */
+  isConservative?: boolean;
+  /** AI-suggested note text for non-conservative choices */
+  suggestedNote?: string;
 }
 
 export interface FiscalAlert {

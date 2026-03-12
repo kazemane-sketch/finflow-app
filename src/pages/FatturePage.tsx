@@ -1156,6 +1156,14 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     if (error) toast.error('Errore salvataggio nota');
     else toast.success('Nota salvata');
   }, []);
+  // Required note dialog for non-conservative fiscal choices
+  const [requiredNoteDialog, setRequiredNoteDialog] = useState<{
+    alertIdx: number;
+    option: FiscalAlertOption;
+    suggestedNote: string;
+  } | null>(null);
+  const requiredNoteTextRef = useRef('');
+
   const notesDebounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const [counterpartyHeaderInfo, setCounterpartyHeaderInfo] = useState<{ atecoDescription: string | null; provinceSigla: string | null; status: 'pending' | 'verified' | 'rejected' | null }>({
     atecoDescription: null,
@@ -2520,41 +2528,57 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   }, [invoice?.id, onInvalidateBundle]);
 
   // ─── Fiscal Review: handle user choice on an alert ─────
-  const handleFiscalChoice = useCallback((alertIdx: number, option: FiscalAlertOption | null) => {
+  const applyFiscalChoice = useCallback((alertIdx: number, option: FiscalAlertOption) => {
     const alert = invoiceNotes[alertIdx];
     if (!alert) return;
 
-    if (option) {
-      // Apply fiscal_override to all affected lines
-      setLineFiscalFlags(prev => {
-        const updated = { ...prev };
-        for (const lineId of alert.affected_lines) {
-          updated[lineId] = { ...(updated[lineId] || {}), ...option.fiscal_override };
-        }
-        return updated;
-      });
-      setClassifDirty(true);
-      const firstLineId = alert.affected_lines[0];
-      const firstLine = detail?.invoice_lines?.find(l => l.id === firstLineId);
-      setPendingFiscalChoices(prev => [
-        ...prev.filter(choice => !(choice.first_line_id === firstLineId && choice.alert_type === alert.type)),
-        {
-          first_line_id: firstLineId,
-          alert_type: alert.type,
-          alert_title: alert.title,
-          chosen_option_label: option.label,
-          fiscal_override: option.fiscal_override,
-          affected_lines: [...alert.affected_lines],
-          line_description: firstLine?.description || alert.title,
-          contract_ref: primaryContractRef,
-          account_id: lineClassifs[firstLineId]?.account_id || null,
-        },
-      ]);
-    }
+    // Apply fiscal_override to all affected lines
+    setLineFiscalFlags(prev => {
+      const updated = { ...prev };
+      for (const lineId of alert.affected_lines) {
+        updated[lineId] = { ...(updated[lineId] || {}), ...option.fiscal_override };
+      }
+      return updated;
+    });
+    setClassifDirty(true);
+    const firstLineId = alert.affected_lines[0];
+    const firstLine = detail?.invoice_lines?.find(l => l.id === firstLineId);
+    setPendingFiscalChoices(prev => [
+      ...prev.filter(choice => !(choice.first_line_id === firstLineId && choice.alert_type === alert.type)),
+      {
+        first_line_id: firstLineId,
+        alert_type: alert.type,
+        alert_title: alert.title,
+        chosen_option_label: option.label,
+        fiscal_override: option.fiscal_override,
+        affected_lines: [...alert.affected_lines],
+        line_description: firstLine?.description || alert.title,
+        contract_ref: primaryContractRef,
+        account_id: lineClassifs[firstLineId]?.account_id || null,
+      },
+    ]);
 
-    // Remove resolved/skipped alert
+    // Remove resolved alert
     setInvoiceNotes(prev => prev.filter((_, i) => i !== alertIdx));
   }, [invoiceNotes, detail?.invoice_lines, lineClassifs, primaryContractRef]);
+
+  const handleFiscalChoice = useCallback((alertIdx: number, option: FiscalAlertOption | null) => {
+    if (!option) {
+      // Skip — just remove the alert
+      setInvoiceNotes(prev => prev.filter((_, i) => i !== alertIdx));
+      return;
+    }
+
+    // Non-conservative choice → require note
+    if (option.isConservative === false) {
+      requiredNoteTextRef.current = option.suggestedNote || '';
+      setRequiredNoteDialog({ alertIdx, option, suggestedNote: option.suggestedNote || '' });
+      return;
+    }
+
+    // Conservative or no metadata → apply directly
+    applyFiscalChoice(alertIdx, option);
+  }, [applyFiscalChoice]);
 
   const handleAssignArticle = useCallback(async (lineId: string, articleId: string, lineDesc: string, lineData: { quantity: number; unit_price: number; total_price: number; vat_rate: number }, suggestedPhaseId?: string | null) => {
     const companyId = company?.id;
@@ -2943,36 +2967,29 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
 
   return (
     <div className="flex flex-col h-full" id="invoice-detail-print">
-	      {/* HEADER STRIP */}
-	      <div className="px-4 pt-3 pb-2 bg-white border-b flex-shrink-0">
-	        <div className="flex items-center justify-between">
-	          <div className="min-w-0">
-	            {(counterpartyHeaderInfo.atecoDescription || counterpartyHeaderInfo.provinceSigla) && (
-	              <div className="flex items-center gap-1.5 mb-1 flex-wrap">
-	                {counterpartyHeaderInfo.atecoDescription && (
-	                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-violet-50 text-violet-700 border border-violet-200">
-	                    {counterpartyHeaderInfo.atecoDescription}
-	                  </span>
-	                )}
-	                {counterpartyHeaderInfo.provinceSigla && (
-	                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 border border-slate-200">
-	                    ({counterpartyHeaderInfo.provinceSigla})
-	                  </span>
-	                )}
-	              </div>
-	            )}
-	            <div className="flex items-center gap-2 min-w-0">
-	              <button
-	                onClick={onNavigateCounterparty}
-	                className="text-base font-bold text-blue-700 hover:text-blue-900 hover:underline cursor-pointer truncate max-w-[280px] bg-transparent border-none p-0 text-left"
-	                title="Vai alla controparte"
-	              >
-	                {cp?.denom || invoice.source_filename || 'Sconosciuto'}
-	              </button>
-	              <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${STATUS_COLORS[invoice.payment_status] || 'bg-gray-100 text-gray-600'}`}>
-	                {getStatusLabel(invoice.payment_status, invoice.direction)}
+	      {/* HEADER — Test Lab inspired */}
+	      <div className="bg-white border-b flex-shrink-0">
+	        {/* Top bar: actions */}
+	        <div className="flex items-center justify-between px-4 pt-3 pb-1">
+	          <div className="flex items-center gap-1.5 flex-wrap">
+	            {counterpartyHeaderInfo.atecoDescription && (
+	              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-200">
+	                {counterpartyHeaderInfo.atecoDescription}
 	              </span>
-	            </div>
+	            )}
+	            {counterpartyHeaderInfo.provinceSigla && (
+	              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 border border-slate-200">
+	                {counterpartyHeaderInfo.provinceSigla}
+	              </span>
+	            )}
+	            <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${
+	              invoice.direction === 'in' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'
+	            }`}>
+	              {invoice.direction === 'in' ? 'Passiva' : 'Attiva'}
+	            </span>
+	            <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${STATUS_COLORS[invoice.payment_status] || 'bg-gray-100 text-gray-600'}`}>
+	              {getStatusLabel(invoice.payment_status, invoice.direction)}
+	            </span>
 	          </div>
 	          <div className="flex items-center gap-1">
             {detail?.raw_xml && (
@@ -2987,8 +3004,43 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
             <button onClick={onDelete} className="w-8 h-8 flex items-center justify-center rounded-md border border-red-200 hover:bg-red-50 text-red-400 text-sm" title="Elimina">{'\uD83D\uDDD1'}</button>
           </div>
         </div>
-        <div className="text-xs text-gray-500 mt-0.5">
-          N. {invoice.number} {'\u2014'} {fmtDate(invoice.date)} {'\u2014'} <span className="font-bold text-gray-700">{fmtEur(invoice.total_amount)}</span>
+        {/* Counterparty + invoice summary */}
+        <div className="px-4 pb-2">
+          <button
+            onClick={onNavigateCounterparty}
+            className="text-lg font-bold text-gray-900 hover:text-blue-700 hover:underline cursor-pointer bg-transparent border-none p-0 text-left truncate max-w-[360px]"
+            title="Vai alla controparte"
+          >
+            {cp?.denom || invoice.source_filename || 'Sconosciuto'}
+          </button>
+          {cp?.piva && <span className="text-[10px] text-gray-400 ml-2">P.IVA {cp.piva}</span>}
+        </div>
+        {/* Structured data grid */}
+        <div className="grid grid-cols-6 gap-3 px-4 pb-3 text-[11px]">
+          <div>
+            <span className="text-gray-400 text-[10px] block">Tipo doc</span>
+            <p className="font-semibold text-gray-700">{tpLabel(invoice.doc_type) || invoice.doc_type}</p>
+          </div>
+          <div>
+            <span className="text-gray-400 text-[10px] block">Numero</span>
+            <p className="font-semibold text-gray-700">{invoice.number || '\u2014'}</p>
+          </div>
+          <div>
+            <span className="text-gray-400 text-[10px] block">Data</span>
+            <p className="font-semibold text-gray-700">{fmtDate(invoice.date)}</p>
+          </div>
+          <div>
+            <span className="text-gray-400 text-[10px] block">Totale</span>
+            <p className="font-bold text-gray-900">{fmtEur(invoice.total_amount)}</p>
+          </div>
+          <div>
+            <span className="text-gray-400 text-[10px] block">Scadenza</span>
+            <p className="font-semibold text-gray-700">{invoice.payment_due_date ? fmtDate(invoice.payment_due_date) : '\u2014'}</p>
+          </div>
+          <div>
+            <span className="text-gray-400 text-[10px] block">Stato</span>
+            <p className="font-semibold text-gray-700">{getStatusLabel(invoice.payment_status, invoice.direction)}</p>
+          </div>
         </div>
       </div>
 
@@ -3210,12 +3262,16 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                                     key={optIdx}
                                     onClick={() => handleFiscalChoice(idx, opt)}
                                     className={`text-[10px] px-2.5 py-1 rounded-md font-medium transition-colors ${
-                                      opt.is_default
-                                        ? 'bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200'
-                                        : 'bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200'
+                                      opt.isConservative === true || opt.is_default
+                                        ? 'bg-green-50 text-green-700 border border-green-300 hover:bg-green-100'
+                                        : opt.isConservative === false
+                                          ? 'bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200'
+                                          : opt.is_default
+                                            ? 'bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200'
+                                            : 'bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200'
                                     }`}
                                   >
-                                    {opt.label}
+                                    {opt.isConservative === true && '\u2705 '}{opt.label}
                                   </button>
                                 ))}
                                 <button
@@ -3421,7 +3477,17 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       <React.Fragment key={i}>
                       <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                         <td className="text-left px-3 py-2 max-w-[200px]">
+                          {lineId && (
+                            <button
+                              onClick={() => toggleLineExpand(lineId)}
+                              className="inline-flex items-center justify-center w-4 h-4 mr-1.5 rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 text-[9px] align-middle"
+                              title={expandedLines[lineId] ? 'Comprimi dettagli' : 'Espandi dettagli'}
+                            >
+                              {expandedLines[lineId] ? '▼' : '▶'}
+                            </button>
+                          )}
                           <span className="text-gray-800">{l.descrizione}</span>
+                          {lineId && <ConfidenceBadge value={lineConfidences[lineId]} />}
                           {lineId && <ReviewBadge
                             confidence={lineConfidences[lineId]}
                             hasNote={!!(ff?.note && /verificar|controllare|dubbio/i.test(ff.note || ''))}
@@ -3574,6 +3640,38 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                                   {'\u2139\uFE0F'} IVA detraibile al {ff.iva_detraibilita_pct}%
                                 </span>
                               )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      {/* Expandable detail row: Commercialista + Revisore + Note (XML lines) */}
+                      {lineId && expandedLines[lineId] && (
+                        <tr>
+                          <td colSpan={colCount} className="bg-slate-50/80 px-4 py-3 border-b border-slate-200">
+                            <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+                              <ReasoningBox
+                                icon="🏦"
+                                title="Commercialista"
+                                confidence={lineConfidences[lineId] ?? null}
+                                reasoning={lineDetails[lineId]?.classification_reasoning || null}
+                                thinking={lineDetails[lineId]?.classification_thinking || null}
+                                variant="blue"
+                              />
+                              <FiscalBox
+                                icon="⚖️"
+                                title="Revisore Fiscale"
+                                confidence={lineDetails[lineId]?.fiscal_confidence ?? null}
+                                reasoning={lineDetails[lineId]?.fiscal_reasoning || null}
+                                thinking={lineDetails[lineId]?.fiscal_thinking || null}
+                                fiscalFlags={ff || null}
+                              />
+                              <NoteBox
+                                lineId={lineId}
+                                note={lineDetails[lineId]?.line_note || null}
+                                noteSource={lineDetails[lineId]?.line_note_source || null}
+                                noteUpdatedAt={lineDetails[lineId]?.line_note_updated_at || null}
+                                onSave={(note) => handleSaveLineNote(lineId, note)}
+                              />
                             </div>
                           </td>
                         </tr>
@@ -4463,6 +4561,59 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
           </>
         )}
       </div>
+
+      {/* Required note dialog for non-conservative fiscal choices (section 3.9) */}
+      {requiredNoteDialog && createPortal(
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setRequiredNoteDialog(null)}>
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="px-5 pt-5 pb-3">
+              <h3 className="text-sm font-bold text-gray-900 mb-1">Motivazione richiesta</h3>
+              <p className="text-xs text-gray-500 mb-3">
+                Stai scegliendo una classificazione fiscale non conservativa.
+                La motivazione verr{'\u00E0'} salvata come nota sulla riga e inclusa nella prima nota.
+              </p>
+              <textarea
+                className="w-full text-xs border border-gray-200 rounded-lg p-3 min-h-[80px] focus:outline-none focus:ring-2 focus:ring-blue-300 resize-y"
+                defaultValue={requiredNoteDialog.suggestedNote}
+                onChange={e => { requiredNoteTextRef.current = e.target.value; }}
+                placeholder="Es: Cuffie wireless utilizzate per videoconferenze operative con cantieri..."
+                autoFocus
+              />
+            </div>
+            <div className="flex justify-end gap-2 px-5 pb-4">
+              <button
+                onClick={() => setRequiredNoteDialog(null)}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50"
+              >
+                Annulla
+              </button>
+              <button
+                onClick={() => {
+                  const noteText = requiredNoteTextRef.current || requiredNoteDialog.suggestedNote;
+                  if (!noteText?.trim()) {
+                    toast.error('La motivazione è obbligatoria per scelte non conservative');
+                    return;
+                  }
+                  // Save note on affected lines
+                  const alert = invoiceNotes[requiredNoteDialog.alertIdx];
+                  if (alert) {
+                    for (const lineId of alert.affected_lines) {
+                      handleSaveLineNote(lineId, noteText.trim());
+                    }
+                  }
+                  // Apply the fiscal decision
+                  applyFiscalChoice(requiredNoteDialog.alertIdx, requiredNoteDialog.option);
+                  setRequiredNoteDialog(null);
+                }}
+                className="px-4 py-1.5 text-xs font-bold rounded-lg bg-blue-600 text-white hover:bg-blue-700"
+              >
+                Conferma e applica
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
     </div>
   );
 }
