@@ -566,10 +566,15 @@ function BankReferenceReextractCard({ companyId }: { companyId: string }) {
                   <span className="text-gray-400">({result.remaining} rimanenti)</span>
                 )}
                 {result.errors > 0 && (
-                  <span className="text-amber-600">({result.errors} errori)</span>
+                  <span className="text-amber-600">({result.errors} senza riferimenti affidabili)</span>
                 )}
               </div>
             </div>
+            {result.errors > 0 && (
+              <p className="text-[10px] text-amber-600 pt-1 border-t border-emerald-100">
+                Questi movimenti non hanno prodotto riferimenti strutturati affidabili con i modelli AI e restano da rivedere.
+              </p>
+            )}
           </div>
         )}
       </CardContent>
