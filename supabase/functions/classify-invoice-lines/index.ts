@@ -1986,6 +1986,7 @@ Deno.serve(async (req) => {
       invoice_notes: fiscalAlerts,
       invoice_level: invoiceLevel,
       keywords,
+      thinking_text: geminiResult.thinkingText || null,
       stats: {
         total_lines: inputLines.length,
         classified: lineResults.filter((r) => r.confidence >= MIN_CONFIDENCE).length,
@@ -1998,6 +1999,7 @@ Deno.serve(async (req) => {
         kb_rules_found: kbRules.length,
         kb_chunks_found: kbChunks.length,
         fiscal_alerts: fiscalAlerts.length,
+        thinking_tokens: geminiResult.thinkingText?.length || 0,
       },
     });
   } catch (e: unknown) {

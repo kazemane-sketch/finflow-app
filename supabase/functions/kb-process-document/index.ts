@@ -721,10 +721,11 @@ REGOLE DI CLASSIFICAZIONE:
   }
 
   // Build generationConfig with optional thinkingConfig
+  // NOTE: responseMimeType: "application/json" silently disables thinking on Gemini 2.5 Pro!
+  // We parse JSON from text instead.
   const genConfig: Record<string, unknown> = {
     temperature: 0.1,
     maxOutputTokens,
-    responseMimeType: "application/json",
   };
   if (thinkingBudget > 0 && !NO_THINKING_CONFIG_MODELS.includes(classifyModel)) {
     genConfig.thinkingConfig = { thinkingBudget };
@@ -752,14 +753,36 @@ REGOLE DI CLASSIFICAZIONE:
     return jsonResponse({ error: `Gemini ${classifyModel} classification failed: ${msg}` }, 500);
   }
 
-  // 6. Parse JSON response (may have thinking parts before content)
+  // 6. Parse JSON response — extract thinking parts + parse JSON from text
   let classification: any;
   try {
     const parts = classifyPayload?.candidates?.[0]?.content?.parts || [];
-    // Find the text part (skip thinking parts)
-    const textPart = parts.find((p: any) => p.text !== undefined);
-    if (!textPart?.text) throw new Error("No text in response");
-    classification = JSON.parse(textPart.text);
+    // Separate thinking from content
+    const thinkingParts = parts.filter((p: any) => p.thought === true);
+    const textParts = parts.filter((p: any) => !p.thought && p.text);
+    const thinkingText = thinkingParts.map((p: any) => p.text || "").join("\n");
+    const responseText = textParts.map((p: any) => p.text || "").join("\n");
+
+    if (thinkingText) {
+      console.log(`[classify] Thinking: ${thinkingText.length} chars — ${thinkingText.slice(0, 200)}...`);
+    }
+    console.log(`[classify] Response text: ${responseText.length} chars`);
+
+    if (!responseText) throw new Error("No text in response");
+
+    // Strip markdown fences and parse JSON
+    const cleanText = responseText.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+    try {
+      classification = JSON.parse(cleanText);
+    } catch {
+      // Try extracting JSON object from the text
+      const objMatch = cleanText.match(/\{[\s\S]*\}/);
+      if (objMatch) {
+        classification = JSON.parse(objMatch[0]);
+      } else {
+        throw new Error("No JSON object found in response");
+      }
+    }
   } catch (e) {
     console.error("[classify] Failed to parse JSON response:", e);
     return jsonResponse({ error: "AI non ha restituito JSON valido" }, 500);
