@@ -1,5 +1,4 @@
-import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
-import { getValidAccessToken } from '@/lib/getValidAccessToken'
+import { postEdgeJsonWithAuthRetry } from '@/lib/edgeAuthFetch'
 
 export interface ContractRefBackfillResult {
   processed: number
@@ -25,22 +24,7 @@ const EMBEDDING_BATCH_SIZE = 50
 const MAX_ROUNDS = 40
 
 async function callEdge<T>(path: string, payload: Record<string, unknown>): Promise<T> {
-  const token = await getValidAccessToken()
-  const res = await fetch(`${SUPABASE_URL}/functions/v1/${path}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'apikey': SUPABASE_ANON_KEY,
-      'Authorization': `Bearer ${token}`,
-    },
-    body: JSON.stringify(payload),
-  })
-
-  const data = await res.json().catch(() => ({}))
-  if (!res.ok) {
-    throw new Error(typeof data?.error === 'string' ? data.error : `HTTP ${res.status}`)
-  }
-  return data as T
+  return await postEdgeJsonWithAuthRetry<T>(path, payload)
 }
 
 export async function triggerReconciliationHistoricalAlignment(

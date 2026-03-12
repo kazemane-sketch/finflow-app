@@ -11,6 +11,7 @@ import { toast } from 'sonner'
 import { useCompany } from '@/hooks/useCompany'
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 import { getValidAccessToken } from '@/lib/getValidAccessToken'
+import { postEdgeJsonWithAuthRetry } from '@/lib/edgeAuthFetch'
 import { fmtDate, fmtEur } from '@/lib/utils'
 import { mpLabel, tpLabel } from '@/lib/invoiceParser'
 import BankTxDetail, { txTypeLabel, txTypeBadge, txDirection } from '@/components/BankTxDetail'
@@ -574,20 +575,17 @@ export default function RiconciliazionePage() {
   const generateSuggestions = useCallback(() => {
     if (!companyId) return
     reconStartOrStop(async (signal) => {
-      const token = await getValidAccessToken()
       if (signal.aborted) return
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/reconciliation-generate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'apikey': SUPABASE_ANON_KEY,
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({ company_id: companyId, batch_size: 100, engine_mode: 'contextual' }),
+      const data = await postEdgeJsonWithAuthRetry<{
+        new_suggestions: number
+        processed: number
+      }>('reconciliation-generate', {
+        company_id: companyId,
+        batch_size: 100,
+        engine_mode: 'contextual',
+      }, {
         signal,
       })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
 
       toast.success(`${data.new_suggestions} nuovi suggerimenti generati (${data.processed} movimenti analizzati)`)
       await Promise.all([loadKpis(), loadSuggestions()])

@@ -3,8 +3,7 @@
 // Bank imports: extract refs first, then generate suggestions.
 // Invoice imports: generate suggestions directly.
 
-import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
-import { getValidAccessToken } from '@/lib/getValidAccessToken'
+import { postEdgeJsonWithAuthRetry } from '@/lib/edgeAuthFetch'
 import { toast } from 'sonner'
 
 interface ReconciliationResult {
@@ -16,20 +15,15 @@ interface ReconciliationResult {
  * Run bank-extract-refs in a loop until no pending remain.
  */
 async function runExtractRefs(companyId: string): Promise<number> {
-  const token = await getValidAccessToken()
   let totalProcessed = 0
   while (true) {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/bank-extract-refs`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${token}`,
-      },
-      body: JSON.stringify({ company_id: companyId, batch_size: 50 }),
+    const data = await postEdgeJsonWithAuthRetry<{
+      processed?: number
+      total_pending?: number
+    }>('bank-extract-refs', {
+      company_id: companyId,
+      batch_size: 50,
     })
-    if (!res.ok) throw new Error(`extract-refs HTTP ${res.status}`)
-    const data = await res.json()
     totalProcessed += (data.processed || 0)
     if ((data.total_pending || 0) <= 0) break
   }
@@ -41,22 +35,12 @@ async function runExtractRefs(companyId: string): Promise<number> {
  */
 async function runReconciliationGenerate(
   companyId: string,
-  token: string,
 ): Promise<ReconciliationResult> {
-  const res = await fetch(`${SUPABASE_URL}/functions/v1/reconciliation-generate`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'apikey': SUPABASE_ANON_KEY,
-      'Authorization': `Bearer ${token}`,
-    },
-    body: JSON.stringify({ company_id: companyId, batch_size: 100, engine_mode: 'contextual' }),
+  return await postEdgeJsonWithAuthRetry<ReconciliationResult>('reconciliation-generate', {
+    company_id: companyId,
+    batch_size: 100,
+    engine_mode: 'contextual',
   })
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}))
-    throw new Error(data.error || `HTTP ${res.status}`)
-  }
-  return await res.json()
 }
 
 export interface AutoReconcileOptions {
@@ -97,8 +81,7 @@ export function triggerAutoReconciliation(
       }
 
       // Phase 2: Generate reconciliation suggestions
-      const token = await getValidAccessToken()
-      const result = await runReconciliationGenerate(companyId, token)
+      const result = await runReconciliationGenerate(companyId)
 
       console.log(
         `[AutoReconcile] Done: ${result.new_suggestions} new suggestions from ${result.processed} transactions`,

@@ -27,6 +27,7 @@ import { verifyPassword } from '@/lib/invoiceSaver'
 import { triggerAutoReconciliation } from '@/lib/reconciliationTrigger'
 import { supabase, SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
 import { getValidAccessToken, type AccessTokenError } from '@/lib/getValidAccessToken'
+import { postEdgeJsonWithAuthRetry } from '@/lib/edgeAuthFetch'
 import { useReconciliationBadges } from '@/hooks/useReconciliationBadges'
 import { ReconciliationDot } from '@/components/ReconciliationIndicators'
 import { usePageEntity } from '@/contexts/PageEntityContext'
@@ -825,21 +826,17 @@ export default function BancaPage() {
   const runExtraction = useCallback(() => {
     if (!companyId) return
     extractionStartOrStop(async (signal, updateProgress) => {
-      const token = await getValidAccessToken()
       let totalProcessed = 0
       while (!signal.aborted) {
-        const res = await fetch(`${SUPABASE_URL}/functions/v1/bank-extract-refs`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'apikey': SUPABASE_ANON_KEY,
-            'Authorization': `Bearer ${token}`,
-          },
-          body: JSON.stringify({ company_id: companyId, batch_size: 50 }),
+        const data = await postEdgeJsonWithAuthRetry<{
+          processed?: number
+          total_pending?: number
+        }>('bank-extract-refs', {
+          company_id: companyId,
+          batch_size: 50,
+        }, {
           signal,
         })
-        const data = await res.json()
-        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
         // First response with nothing pending — already fully extracted
         if (totalProcessed === 0 && (data.processed || 0) === 0 && (data.total_pending || 0) <= 0) {
           setToast({ message: 'Tutti i riferimenti sono già stati estratti.', type: 'info' })
