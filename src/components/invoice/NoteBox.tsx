@@ -10,11 +10,12 @@ interface Props {
 }
 
 const SOURCE_LABELS: Record<string, string> = {
-  user: '👤 Utente',
-  ai_consultant: '🤖 Consulente AI',
-  ai_reviewer: '⚖️ Revisore',
+  user: 'Utente',
+  ai_consultant: 'Consulente AI',
+  ai_reviewer: 'Revisore',
 };
 
+/** Note card — Test Lab style */
 export default function NoteBox({ lineId, note, noteSource, noteUpdatedAt, onSave }: Props) {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(note || '');
@@ -31,13 +32,13 @@ export default function NoteBox({ lineId, note, noteSource, noteUpdatedAt, onSav
   };
 
   return (
-    <div className="border border-gray-200 rounded-lg overflow-hidden">
-      <div className="flex items-center justify-between px-3 py-2 bg-gray-50">
-        <span className="text-xs font-semibold">📝 Note</span>
+    <div className="border rounded-lg bg-white overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-2.5 bg-slate-50 border-b">
+        <span className="text-sm font-bold text-slate-800">Note</span>
         {noteSource && (
-          <span className="text-[10px] text-gray-400">
+          <span className="text-[10px] text-slate-400">
             {SOURCE_LABELS[noteSource] || noteSource}
-            {noteUpdatedAt && ` — ${fmtDate(noteUpdatedAt)}`}
+            {noteUpdatedAt && ` \u2014 ${fmtDate(noteUpdatedAt)}`}
           </span>
         )}
       </div>
@@ -45,7 +46,7 @@ export default function NoteBox({ lineId, note, noteSource, noteUpdatedAt, onSav
         {editing ? (
           <div>
             <textarea
-              className="w-full text-xs border border-gray-200 rounded p-2 min-h-[60px] focus:outline-none focus:ring-1 focus:ring-blue-300 resize-y"
+              className="w-full text-[11px] border border-slate-200 rounded-lg p-2 min-h-[60px] focus:outline-none focus:ring-1 focus:ring-purple-300 resize-y text-slate-700"
               value={text}
               onChange={(e) => setText(e.target.value)}
               placeholder="Motivazione inerenza, decisione fiscale, note operative..."
@@ -61,7 +62,7 @@ export default function NoteBox({ lineId, note, noteSource, noteUpdatedAt, onSav
               </button>
               <button
                 onClick={() => { setEditing(false); setText(note || ''); }}
-                className="px-2.5 py-1 text-[10px] font-semibold rounded border border-gray-200 text-gray-600 hover:bg-gray-50"
+                className="px-2.5 py-1 text-[10px] font-semibold rounded border border-slate-200 text-slate-600 hover:bg-slate-50"
               >
                 Annulla
               </button>
@@ -69,10 +70,10 @@ export default function NoteBox({ lineId, note, noteSource, noteUpdatedAt, onSav
           </div>
         ) : (
           <div
-            className="text-xs text-gray-600 cursor-pointer hover:bg-gray-50 rounded p-1 min-h-[36px] transition-colors"
+            className="text-[11px] text-slate-600 cursor-pointer hover:bg-slate-50/50 rounded p-1 min-h-[36px] transition-colors"
             onClick={() => setEditing(true)}
           >
-            {note || <span className="italic text-gray-400">Clicca per aggiungere una nota...</span>}
+            {note || <span className="italic text-slate-400">Clicca per aggiungere una nota...</span>}
           </div>
         )}
       </div>

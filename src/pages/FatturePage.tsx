@@ -55,7 +55,8 @@ import { extractProvinceSiglaFromAddress, loadCounterpartyHeaderInfo } from '@/l
 import { deleteFiscalDecisionsForInvoice, saveFiscalDecision } from '@/lib/fiscalDecisionService';
 import ExportDialog from '@/components/ExportDialog';
 import SearchableSelect from '@/components/SearchableSelect';
-import { ConfidenceBadge, ReasoningBox, FiscalBox, NoteBox } from '@/components/invoice';
+import { ConfidenceBadge, FiscalFlagsBadges, AIAssistantBanner } from '@/components/invoice';
+import type { BannerStatus, ChatMessage, ConsultantAction } from '@/components/invoice';
 
 // ============================================================
 // LOOKUPS
@@ -1139,11 +1140,15 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   // Notes tab state
   const [notesText, setNotesText] = useState(invoice.notes || '');
   const [notesSaving, setNotesSaving] = useState(false);
-  // Expandable line detail state
-  const [expandedLines, setExpandedLines] = useState<Record<string, boolean>>({});
-  const toggleLineExpand = useCallback((lineId: string) => {
-    setExpandedLines(prev => ({ ...prev, [lineId]: !prev[lineId] }));
-  }, []);
+  // AI banner + consultant chat state
+  const [aiBannerStatus, setAiBannerStatus] = useState<BannerStatus>('idle');
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatAlertContext, setChatAlertContext] = useState('');
+  const [chatLineIds, setChatLineIds] = useState<string[]>([]);
+  const [chatLoading, setChatLoading] = useState(false);
+  // Inline note editing in flat table
+  const [editingNoteLineId, setEditingNoteLineId] = useState<string | null>(null);
+  const [editingNoteText, setEditingNoteText] = useState('');
   const handleSaveLineNote = useCallback(async (lineId: string, note: string) => {
     const { error } = await supabase
       .from('invoice_lines')
@@ -1156,6 +1161,63 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     if (error) toast.error('Errore salvataggio nota');
     else toast.success('Nota salvata');
   }, []);
+
+  // ─── Chat with AI fiscal consultant ─────────────────────────
+  const handleStartChat = useCallback((alert: FiscalAlert) => {
+    setChatAlertContext(`${alert.title}: ${alert.description}`);
+    setChatLineIds(alert.affected_lines || []);
+    setChatMessages([]);
+    setAiBannerStatus('chat');
+  }, []);
+
+  const handleSendChatMessage = useCallback(async (text: string) => {
+    const newMessages: ChatMessage[] = [...chatMessages, { role: 'user', content: text }];
+    setChatMessages(newMessages);
+    setChatLoading(true);
+    try {
+      const { data, error } = await supabase.functions.invoke('ai-fiscal-consultant', {
+        body: {
+          invoice_id: invoice.id,
+          line_ids: chatLineIds,
+          alert_context: chatAlertContext,
+          messages: newMessages,
+          company_id: company?.id,
+        },
+      });
+      if (error) throw error;
+      setChatMessages([...newMessages, {
+        role: 'assistant',
+        content: data.message,
+        action: data.action || undefined,
+      }]);
+    } catch (e: any) {
+      toast.error('Errore consulente AI: ' + (e.message || 'sconosciuto'));
+      setChatMessages([...newMessages, { role: 'assistant', content: 'Mi dispiace, si è verificato un errore. Riprova.' }]);
+    } finally {
+      setChatLoading(false);
+    }
+  }, [chatMessages, chatLineIds, chatAlertContext, invoice.id, company?.id]);
+
+  const handleApplyConsultantAction = useCallback((action: ConsultantAction) => {
+    if (action.type === 'apply_fiscal_override' && action.affected_line_ids?.length) {
+      setLineFiscalFlags(prev => {
+        const updated = { ...prev };
+        for (const lid of action.affected_line_ids) {
+          updated[lid] = { ...(updated[lid] || {}), ...action.fiscal_override };
+        }
+        return updated;
+      });
+      // Save note on affected lines
+      for (const lid of action.affected_line_ids) {
+        if (action.note) {
+          handleSaveLineNote(lid, action.note);
+        }
+      }
+      setClassifDirty(true);
+      toast.success('Decisione fiscale applicata');
+    }
+  }, [handleSaveLineNote]);
+
   // Required note dialog for non-conservative fiscal choices
   const [requiredNoteDialog, setRequiredNoteDialog] = useState<{
     alertIdx: number;
@@ -3139,27 +3201,42 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         {/* ═══ TAB: CLASSIFICAZIONE ═══ */}
         {activeTab === 'classificazione' && (
           <div className="p-4 space-y-4">
-            {/* AI classification controls — compact bar */}
+            {/* AI Assistant Banner — unified 5-state component */}
+            <AIAssistantBanner
+              status={
+                aiBannerStatus === 'chat' ? 'chat' :
+                (aiClassifStatus === 'loading' || singleInvoiceJobRunning) ? 'processing' :
+                invoiceNotes.length > 0 ? 'alerts' :
+                (aiClassifResult || hasPersistedClassificationData || invoice.classification_status === 'confirmed') ? 'done' :
+                'idle'
+              }
+              onStartClassification={handleRequestAiClassification}
+              lineCount={detail?.invoice_lines?.length}
+              progressSteps={singleInvoiceJob ? [
+                { label: singleInvoiceJob.stage || 'Classificazione AI...', status: 'running' as const },
+              ] : undefined}
+              elapsedSeconds={singleInvoiceJobRunning ? Math.round((singleInvoiceJobProgress.pct || 0) / 10) : undefined}
+              alerts={invoiceNotes}
+              onAlertAction={(action) => {
+                if (action.option && 'type' in action.option && action.option.type === 'consult') {
+                  const alertIdx = parseInt(action.alertId.replace('alert-', ''), 10);
+                  const alert = invoiceNotes[alertIdx];
+                  if (alert) handleStartChat(alert);
+                } else {
+                  const alertIdx = parseInt(action.alertId.replace('alert-', ''), 10);
+                  handleFiscalChoice(alertIdx, action.option as FiscalAlertOption);
+                }
+              }}
+              chatMessages={chatMessages}
+              onSendMessage={handleSendChatMessage}
+              onApplyAction={handleApplyConsultantAction}
+              chatLoading={chatLoading}
+              chatAlertTitle={chatAlertContext}
+              summary={aiClassifResult ? `Classificate ${aiClassifResult.lines?.length || 0} righe` : invoice.classification_status === 'confirmed' ? 'Classificazione confermata' : undefined}
+              onRestart={handleRequestAiClassification}
+            />
+
             <div className="flex items-center gap-3 flex-wrap">
-              {/* AI Suggest button */}
-              {aiClassifStatus === 'idle' && !aiClassifResult && (
-                <button onClick={handleRequestAiClassification}
-                  className="flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 text-white hover:from-purple-700 hover:to-indigo-700 shadow-md transition-all">
-                  <span>{'\u2728'}</span> Suggerisci AI
-                </button>
-              )}
-              {aiClassifStatus === 'loading' && !singleInvoiceJobRunning && (
-                <div className="flex items-center gap-2 text-xs text-purple-600">
-                  <span className="animate-spin">{'\u21BB'}</span> Classificazione AI...
-                </div>
-              )}
-              {singleInvoiceJobRunning && singleInvoiceJob && (
-                <div className="flex items-center gap-2 text-xs text-purple-700">
-                  <span className="animate-spin">{'\u21BB'}</span>
-                  <span>{singleInvoiceJob.stage || 'Classificazione AI in corso'}</span>
-                  <span className="text-purple-500">{singleInvoiceJobProgress.pct}%</span>
-                </div>
-              )}
               {aiClassifStatus === 'error' && (
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-red-600">Errore AI</span>
@@ -3201,100 +3278,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
               )}
             </div>
 
-            {singleInvoiceJobRunning && singleInvoiceJob && (
-              <SingleInvoiceAIProgressCard job={singleInvoiceJob} onStop={stopSingleInvoiceJob} />
-            )}
-
-            {/* AI Assistant Box — always visible, 3 states */}
-            {(() => {
-              const hasAlerts = invoiceNotes.length > 0 || !!(invoice as any).has_fiscal_alerts;
-              const isClassified = invoice.classification_status === 'confirmed' || hasPersistedClassificationData || !!aiClassifResult;
-              const boxStyle = hasAlerts
-                ? 'border-amber-200 bg-amber-50'
-                : isClassified
-                  ? 'border-green-200 bg-green-50'
-                  : 'border-gray-200 bg-gray-50';
-              return (
-                <div className={`border rounded-xl px-4 py-3 mb-3 ${boxStyle}`}>
-                  {/* Header */}
-                  <div className="flex items-center justify-between mb-1">
-                    <div className="flex items-center gap-2">
-                      <span className="text-base">{'\uD83E\uDDE0'}</span>
-                      <span className="text-xs font-bold text-gray-700">Assistente AI</span>
-                    </div>
-                    {isClassified && !hasAlerts && (
-                      <span className="text-green-500 text-sm">{'\u2705'}</span>
-                    )}
-                    {hasAlerts && (
-                      <span className="text-amber-500 text-sm">{'\u26A0\uFE0F'}</span>
-                    )}
-                  </div>
-
-                  {/* State 1: No classification yet */}
-                  {!isClassified && !hasAlerts && (
-                    <p className="text-[11px] text-gray-500">
-                      Clicca "Suggerisci AI" per classificare questa fattura.
-                    </p>
-                  )}
-
-                  {/* State 2: Classified, no alerts */}
-                  {isClassified && !hasAlerts && (
-                    <p className="text-[11px] text-gray-500">
-                      {invoice.classification_status === 'confirmed'
-                        ? 'Classificazione confermata.'
-                        : 'Classificazione completata. Nessuna nota fiscale particolare.'}
-                    </p>
-                  )}
-
-                  {/* State 3: Classified with alerts */}
-                  {hasAlerts && (
-                    <div className="mt-1 space-y-2">
-                      <p className="text-[11px] text-amber-700 font-medium">
-                        {invoiceNotes.length > 0
-                          ? `${invoiceNotes.length} alert da verificare`
-                          : 'Note fiscali presenti \u2014 riclassifica per visualizzarle'}
-                      </p>
-                      {invoiceNotes.map((alert, idx) => (
-                        <div key={idx} className="bg-white border border-amber-200 rounded-lg px-3 py-2">
-                          <div className="flex items-start gap-2">
-                            <span className="text-amber-500 text-xs mt-0.5">{alert.severity === 'warning' ? '\u26A0\uFE0F' : '\u2139\uFE0F'}</span>
-                            <div className="flex-1 min-w-0">
-                              <p className="text-xs font-semibold text-gray-800">{alert.title}</p>
-                              <p className="text-[10px] text-gray-500 mt-0.5">{alert.description}</p>
-                              <div className="flex flex-wrap gap-1.5 mt-2">
-                                {alert.options.map((opt, optIdx) => (
-                                  <button
-                                    key={optIdx}
-                                    onClick={() => handleFiscalChoice(idx, opt)}
-                                    className={`text-[10px] px-2.5 py-1 rounded-md font-medium transition-colors ${
-                                      opt.isConservative === true || opt.is_default
-                                        ? 'bg-green-50 text-green-700 border border-green-300 hover:bg-green-100'
-                                        : opt.isConservative === false
-                                          ? 'bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200'
-                                          : opt.is_default
-                                            ? 'bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200'
-                                            : 'bg-gray-100 text-gray-700 border border-gray-200 hover:bg-gray-200'
-                                    }`}
-                                  >
-                                    {opt.isConservative === true && '\u2705 '}{opt.label}
-                                  </button>
-                                ))}
-                                <button
-                                  onClick={() => handleFiscalChoice(idx, null)}
-                                  className="text-[10px] px-2 py-1 text-gray-400 hover:text-gray-600 transition-colors"
-                                >
-                                  Salta
-                                </button>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              );
-            })()}
+            {/* (AI Assistant Box replaced by AIAssistantBanner above) */}
 
             {/* Pipeline Debug Panel — visible only after fresh classification */}
             {pipelineDebug && pipelineDebug.length > 0 && (
@@ -3337,7 +3321,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full border-collapse text-[11px]">
-                  <thead><tr className="bg-gray-50 border-b">
+                  <thead><tr className="bg-slate-50/50 border-b">
                     <th className="text-left px-3 py-2 text-gray-600 font-semibold">Descrizione</th>
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold w-14">Qt{'\u00E0'}</th>
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold w-16">P. Unit.</th>
@@ -3371,6 +3355,10 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       </th>
                     )}
                     {(allCategories.length > 0 || allAccounts.length > 0) && <th className="text-center px-0.5 py-2 text-gray-400 font-normal w-12"></th>}
+                    <th className="text-center px-2 py-2 text-gray-600 font-semibold w-14">Conf.</th>
+                    <th className="text-left px-2 py-2 text-gray-600 font-semibold w-40">R. Commercialista</th>
+                    <th className="text-left px-2 py-2 text-gray-600 font-semibold w-40">R. Revisore</th>
+                    <th className="text-left px-2 py-2 text-gray-600 font-semibold w-32">Note</th>
                   </tr></thead>
                   <tbody>
                     {/* Sort lines: classify lines first (with grouped children after parent), then skip lines */}
@@ -3428,8 +3416,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       const lineCat = lineId ? lineClassifs[lineId]?.category_id : null;
                       const lineAcc = lineId ? lineClassifs[lineId]?.account_id : null;
                       const ff = lineId ? lineFiscalFlags[lineId] : null;
-                      const hasFiscalFlags = !isInformational && ff && (ff.ritenuta_acconto || ff.reverse_charge || ff.split_payment || ff.bene_strumentale || (ff.deducibilita_pct != null && ff.deducibilita_pct < 100) || (ff.iva_detraibilita_pct != null && ff.iva_detraibilita_pct < 100));
-                      const colCount = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0);
+                      const colCount = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0) + 4;
 
                       // ─── Skip/Group informational lines: special rendering ───
                       if (isInformational) {
@@ -3472,6 +3459,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                               {allProjects.length > 0 && <td></td>}
                               {allAccounts.length > 0 && <td></td>}
                               {(allCategories.length > 0 || allAccounts.length > 0) && <td></td>}
+                              {/* Empty cells for Conf/Reasoning/Note columns */}
+                              <td></td><td></td><td></td><td></td>
                             </tr>
                           </React.Fragment>
                         );
@@ -3480,19 +3469,10 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       // ─── Normal classify line rendering ───
                       return (
                       <React.Fragment key={i}>
-                      <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                      <tr className="border-b border-slate-50 hover:bg-slate-50/50">
                         <td className="text-left px-3 py-2 max-w-[200px]">
-                          {lineId && (
-                            <button
-                              onClick={() => toggleLineExpand(lineId)}
-                              className="inline-flex items-center justify-center w-4 h-4 mr-1.5 rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 text-[9px] align-middle"
-                              title={expandedLines[lineId] ? 'Comprimi dettagli' : 'Espandi dettagli'}
-                            >
-                              {expandedLines[lineId] ? '▼' : '▶'}
-                            </button>
-                          )}
-                          <span className="text-gray-800">{l.descrizione}</span>
-                          {lineId && <ConfidenceBadge value={lineConfidences[lineId]} />}
+                          <span className="text-slate-800">{l.descrizione}</span>
+                          {lineId && ff && <span className="ml-1.5"><FiscalFlagsBadges flags={ff} /></span>}
                           {lineId && <ReviewBadge
                             confidence={lineConfidences[lineId]}
                             hasNote={!!(ff?.note && /verificar|controllare|dubbio/i.test(ff.note || ''))}
@@ -3610,77 +3590,61 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                             </div>
                           )}
                         </td>}
+                        {/* Conf. column */}
+                        <td className="text-center px-2 py-2">
+                          {lineId && <ConfidenceBadge value={lineConfidences[lineId]} />}
+                        </td>
+                        {/* R. Commercialista column */}
+                        <td className="text-left px-2 py-2 text-xs text-slate-600 max-w-[160px]">
+                          {lineId && lineDetails[lineId]?.classification_reasoning && (
+                            <span className="line-clamp-3">{lineDetails[lineId].classification_reasoning}</span>
+                          )}
+                        </td>
+                        {/* R. Revisore column */}
+                        <td className="text-left px-2 py-2 text-xs text-slate-600 max-w-[160px]">
+                          {lineId && lineDetails[lineId]?.fiscal_reasoning && (
+                            <span className="line-clamp-3">{lineDetails[lineId].fiscal_reasoning}</span>
+                          )}
+                        </td>
+                        {/* Note column — clickable inline edit */}
+                        <td className="text-left px-2 py-2 text-xs max-w-[140px]">
+                          {lineId && editingNoteLineId === lineId ? (
+                            <div className="flex flex-col gap-1">
+                              <textarea
+                                className="w-full text-[11px] border border-slate-200 rounded p-1.5 min-h-[40px] focus:outline-none focus:ring-1 focus:ring-purple-300 resize-y text-slate-700"
+                                value={editingNoteText}
+                                onChange={(e) => setEditingNoteText(e.target.value)}
+                                autoFocus
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' && !e.shiftKey) {
+                                    e.preventDefault();
+                                    handleSaveLineNote(lineId, editingNoteText);
+                                    setLineDetails(prev => ({ ...prev, [lineId]: { ...prev[lineId], line_note: editingNoteText, line_note_source: 'user', line_note_updated_at: new Date().toISOString() } }));
+                                    setEditingNoteLineId(null);
+                                  }
+                                  if (e.key === 'Escape') setEditingNoteLineId(null);
+                                }}
+                              />
+                              <div className="flex gap-1">
+                                <button onClick={() => { handleSaveLineNote(lineId, editingNoteText); setLineDetails(prev => ({ ...prev, [lineId]: { ...prev[lineId], line_note: editingNoteText, line_note_source: 'user', line_note_updated_at: new Date().toISOString() } })); setEditingNoteLineId(null); }}
+                                  className="px-2 py-0.5 text-[10px] font-semibold rounded bg-blue-600 text-white hover:bg-blue-700">Salva</button>
+                                <button onClick={() => setEditingNoteLineId(null)}
+                                  className="px-2 py-0.5 text-[10px] font-semibold rounded border border-slate-200 text-slate-600 hover:bg-slate-50">Annulla</button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div
+                              className="cursor-pointer hover:bg-slate-50 rounded p-1 min-h-[24px] text-slate-600"
+                              onClick={() => { if (lineId) { setEditingNoteLineId(lineId); setEditingNoteText(lineDetails[lineId]?.line_note || ''); } }}
+                              title="Clicca per editare"
+                            >
+                              {lineId && lineDetails[lineId]?.line_note
+                                ? <span className="line-clamp-3">{lineDetails[lineId].line_note}</span>
+                                : <span className="italic text-slate-300 text-[10px]">+ Nota</span>}
+                            </div>
+                          )}
+                        </td>
                       </tr>
-                      {hasFiscalFlags && (
-                        <tr>
-                          <td colSpan={colCount} className="px-3 py-1">
-                            <div className="flex flex-wrap gap-1.5">
-                              {ff.ritenuta_acconto && (
-                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u26A0\uFE0F'} Ritenuta d'acconto {ff.ritenuta_acconto.aliquota}% sull'imponibile
-                                </span>
-                              )}
-                              {ff.reverse_charge && (
-                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u26A0\uFE0F'} Possibile reverse charge art.17 c.6
-                                </span>
-                              )}
-                              {ff.split_payment && (
-                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u26A0\uFE0F'} Split payment — IVA versata dalla PA
-                                </span>
-                              )}
-                              {ff.bene_strumentale && (
-                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u26A0\uFE0F'} Possibile bene strumentale ({'>'}516{'\u20AC'}) — da ammortizzare
-                                </span>
-                              )}
-                              {ff.deducibilita_pct != null && ff.deducibilita_pct < 100 && (
-                                <span className="inline-flex items-center gap-1 bg-sky-50 border border-sky-200 text-sky-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u2139\uFE0F'} Costo deducibile al {ff.deducibilita_pct}%
-                                </span>
-                              )}
-                              {ff.iva_detraibilita_pct != null && ff.iva_detraibilita_pct < 100 && (
-                                <span className="inline-flex items-center gap-1 bg-sky-50 border border-sky-200 text-sky-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u2139\uFE0F'} IVA detraibile al {ff.iva_detraibilita_pct}%
-                                </span>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                      {/* Expandable detail row: Commercialista + Revisore + Note (XML lines) */}
-                      {lineId && expandedLines[lineId] && (
-                        <tr>
-                          <td colSpan={colCount} className="bg-slate-50/80 px-4 py-3 border-b border-slate-200">
-                            <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
-                              <ReasoningBox
-                                icon="🏦"
-                                title="Commercialista"
-                                confidence={lineConfidences[lineId] ?? null}
-                                reasoning={lineDetails[lineId]?.classification_reasoning || null}
-                                thinking={lineDetails[lineId]?.classification_thinking || null}
-                                variant="blue"
-                              />
-                              <FiscalBox
-                                icon="⚖️"
-                                title="Revisore Fiscale"
-                                confidence={lineDetails[lineId]?.fiscal_confidence ?? null}
-                                reasoning={lineDetails[lineId]?.fiscal_reasoning || null}
-                                thinking={lineDetails[lineId]?.fiscal_thinking || null}
-                                fiscalFlags={ff || null}
-                              />
-                              <NoteBox
-                                lineId={lineId}
-                                note={lineDetails[lineId]?.line_note || null}
-                                noteSource={lineDetails[lineId]?.line_note_source || null}
-                                noteUpdatedAt={lineDetails[lineId]?.line_note_updated_at || null}
-                                onSave={(note) => handleSaveLineNote(lineId, note)}
-                              />
-                            </div>
-                          </td>
-                        </tr>
-                      )}
                       {/* AI suggestion banner for new account/category */}
                       {lineId && lineSuggestions[lineId] && !dismissedSuggestions.has(lineId) && (
                         <tr>
@@ -3761,8 +3725,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       const lineCat = lineClassifs[l.id]?.category_id;
                       const lineAcc = lineClassifs[l.id]?.account_id;
                       const ff2 = lineFiscalFlags[l.id];
-                      const hasFf2 = !isInformational && ff2 && (ff2.ritenuta_acconto || ff2.reverse_charge || ff2.split_payment || ff2.bene_strumentale || (ff2.deducibilita_pct != null && ff2.deducibilita_pct < 100) || (ff2.iva_detraibilita_pct != null && ff2.iva_detraibilita_pct < 100));
-                      const colCount2 = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0);
+                      const colCount2 = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0) + 4;
 
                       // ─── Skip/Group informational lines: special rendering ───
                       if (isInformational) {
@@ -3801,6 +3764,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                               {allProjects.length > 0 && <td></td>}
                               {allAccounts.length > 0 && <td></td>}
                               {(allCategories.length > 0 || allAccounts.length > 0) && <td></td>}
+                              {/* Empty cells for Conf/Reasoning/Note columns */}
+                              <td></td><td></td><td></td><td></td>
                             </tr>
                           </React.Fragment>
                         );
@@ -3809,17 +3774,10 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       // ─── Normal classify line rendering ───
                       return (
                       <React.Fragment key={i}>
-                      <tr className="border-b border-gray-50 hover:bg-gray-50/50">
+                      <tr className="border-b border-slate-50 hover:bg-slate-50/50">
                         <td className="text-left px-3 py-2">
-                          <button
-                            onClick={() => toggleLineExpand(l.id)}
-                            className="inline-flex items-center justify-center w-4 h-4 mr-1.5 rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 text-[9px] align-middle"
-                            title={expandedLines[l.id] ? 'Comprimi dettagli' : 'Espandi dettagli'}
-                          >
-                            {expandedLines[l.id] ? '▼' : '▶'}
-                          </button>
-                          <span className="text-gray-800">{l.description}</span>
-                          <ConfidenceBadge value={lineConfidences[l.id]} />
+                          <span className="text-slate-800">{l.description}</span>
+                          {ff2 && <span className="ml-1.5"><FiscalFlagsBadges flags={ff2} /></span>}
                           <ReviewBadge
                             confidence={lineConfidences[l.id]}
                             hasNote={!!(ff2?.note && /verificar|controllare|dubbio/i.test(ff2.note || ''))}
@@ -3914,77 +3872,61 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                             )}
                           </div>
                         </td>}
+                        {/* Conf. column */}
+                        <td className="text-center px-2 py-2">
+                          <ConfidenceBadge value={lineConfidences[l.id]} />
+                        </td>
+                        {/* R. Commercialista column */}
+                        <td className="text-left px-2 py-2 text-xs text-slate-600 max-w-[160px]">
+                          {lineDetails[l.id]?.classification_reasoning && (
+                            <span className="line-clamp-3">{lineDetails[l.id].classification_reasoning}</span>
+                          )}
+                        </td>
+                        {/* R. Revisore column */}
+                        <td className="text-left px-2 py-2 text-xs text-slate-600 max-w-[160px]">
+                          {lineDetails[l.id]?.fiscal_reasoning && (
+                            <span className="line-clamp-3">{lineDetails[l.id].fiscal_reasoning}</span>
+                          )}
+                        </td>
+                        {/* Note column — clickable inline edit */}
+                        <td className="text-left px-2 py-2 text-xs max-w-[140px]">
+                          {editingNoteLineId === l.id ? (
+                            <div className="flex flex-col gap-1">
+                              <textarea
+                                className="w-full text-[11px] border border-slate-200 rounded p-1.5 min-h-[40px] focus:outline-none focus:ring-1 focus:ring-purple-300 resize-y text-slate-700"
+                                value={editingNoteText}
+                                onChange={(e) => setEditingNoteText(e.target.value)}
+                                autoFocus
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' && !e.shiftKey) {
+                                    e.preventDefault();
+                                    handleSaveLineNote(l.id, editingNoteText);
+                                    setLineDetails(prev => ({ ...prev, [l.id]: { ...prev[l.id], line_note: editingNoteText, line_note_source: 'user', line_note_updated_at: new Date().toISOString() } }));
+                                    setEditingNoteLineId(null);
+                                  }
+                                  if (e.key === 'Escape') setEditingNoteLineId(null);
+                                }}
+                              />
+                              <div className="flex gap-1">
+                                <button onClick={() => { handleSaveLineNote(l.id, editingNoteText); setLineDetails(prev => ({ ...prev, [l.id]: { ...prev[l.id], line_note: editingNoteText, line_note_source: 'user', line_note_updated_at: new Date().toISOString() } })); setEditingNoteLineId(null); }}
+                                  className="px-2 py-0.5 text-[10px] font-semibold rounded bg-blue-600 text-white hover:bg-blue-700">Salva</button>
+                                <button onClick={() => setEditingNoteLineId(null)}
+                                  className="px-2 py-0.5 text-[10px] font-semibold rounded border border-slate-200 text-slate-600 hover:bg-slate-50">Annulla</button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div
+                              className="cursor-pointer hover:bg-slate-50 rounded p-1 min-h-[24px] text-slate-600"
+                              onClick={() => { setEditingNoteLineId(l.id); setEditingNoteText(lineDetails[l.id]?.line_note || ''); }}
+                              title="Clicca per editare"
+                            >
+                              {lineDetails[l.id]?.line_note
+                                ? <span className="line-clamp-3">{lineDetails[l.id].line_note}</span>
+                                : <span className="italic text-slate-300 text-[10px]">+ Nota</span>}
+                            </div>
+                          )}
+                        </td>
                       </tr>
-                      {/* Expandable detail row: Commercialista + Revisore + Note */}
-                      {expandedLines[l.id] && (
-                        <tr>
-                          <td colSpan={colCount2} className="bg-slate-50/80 px-4 py-3 border-b border-slate-200">
-                            <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
-                              <ReasoningBox
-                                icon="🏦"
-                                title="Commercialista"
-                                confidence={lineConfidences[l.id] ?? null}
-                                reasoning={lineDetails[l.id]?.classification_reasoning || null}
-                                thinking={lineDetails[l.id]?.classification_thinking || null}
-                                variant="blue"
-                              />
-                              <FiscalBox
-                                icon="⚖️"
-                                title="Revisore Fiscale"
-                                confidence={lineDetails[l.id]?.fiscal_confidence ?? null}
-                                reasoning={lineDetails[l.id]?.fiscal_reasoning || null}
-                                thinking={lineDetails[l.id]?.fiscal_thinking || null}
-                                fiscalFlags={ff2 || null}
-                              />
-                              <NoteBox
-                                lineId={l.id}
-                                note={lineDetails[l.id]?.line_note || null}
-                                noteSource={lineDetails[l.id]?.line_note_source || null}
-                                noteUpdatedAt={lineDetails[l.id]?.line_note_updated_at || null}
-                                onSave={(note) => handleSaveLineNote(l.id, note)}
-                              />
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                      {hasFf2 && (
-                        <tr>
-                          <td colSpan={colCount2} className="px-3 py-1">
-                            <div className="flex flex-wrap gap-1.5">
-                              {ff2.ritenuta_acconto && (
-                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u26A0\uFE0F'} Ritenuta d'acconto {ff2.ritenuta_acconto.aliquota}% sull'imponibile
-                                </span>
-                              )}
-                              {ff2.reverse_charge && (
-                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u26A0\uFE0F'} Possibile reverse charge art.17 c.6
-                                </span>
-                              )}
-                              {ff2.split_payment && (
-                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u26A0\uFE0F'} Split payment — IVA versata dalla PA
-                                </span>
-                              )}
-                              {ff2.bene_strumentale && (
-                                <span className="inline-flex items-center gap-1 bg-amber-50 border border-amber-200 text-amber-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u26A0\uFE0F'} Possibile bene strumentale ({'>'}516{'\u20AC'}) — da ammortizzare
-                                </span>
-                              )}
-                              {ff2.deducibilita_pct != null && ff2.deducibilita_pct < 100 && (
-                                <span className="inline-flex items-center gap-1 bg-sky-50 border border-sky-200 text-sky-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u2139\uFE0F'} Costo deducibile al {ff2.deducibilita_pct}%
-                                </span>
-                              )}
-                              {ff2.iva_detraibilita_pct != null && ff2.iva_detraibilita_pct < 100 && (
-                                <span className="inline-flex items-center gap-1 bg-sky-50 border border-sky-200 text-sky-800 text-[10px] px-2 py-0.5 rounded">
-                                  {'\u2139\uFE0F'} IVA detraibile al {ff2.iva_detraibilita_pct}%
-                                </span>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      )}
                       {/* AI suggestion banner for new account/category (DB fallback lines) */}
                       {lineSuggestions[l.id] && !dismissedSuggestions.has(l.id) && (
                         <tr>
@@ -4331,7 +4273,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
               <h4 className="text-xs font-bold text-gray-700 px-4 py-2.5 border-b bg-gray-50">Dettaglio Beni e Servizi</h4>
               <div className="overflow-x-auto">
                 <table className="w-full border-collapse text-[11px]">
-                  <thead><tr className="bg-gray-50 border-b">
+                  <thead><tr className="bg-slate-50/50 border-b">
                     <th className="text-left px-3 py-2 text-gray-600 font-semibold">Descrizione</th>
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold">Qt{'\u00E0'}</th>
                     <th className="text-right px-2 py-2 text-gray-600 font-semibold">P. Unit.</th>
@@ -4416,7 +4358,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
               <div className="bg-white border rounded-xl overflow-hidden">
                 <h4 className="text-xs font-bold text-gray-700 px-4 py-2.5 border-b bg-gray-50">File Allegati</h4>
                 <table className="w-full border-collapse text-[11px]">
-                  <thead><tr className="bg-gray-50 border-b">
+                  <thead><tr className="bg-slate-50/50 border-b">
                     <th className="text-left px-3 py-1.5 text-gray-600 font-semibold">Nome</th>
                     <th className="text-left px-2 py-1.5 text-gray-600 font-semibold">Formato</th>
                     <th className="text-right px-2 py-1.5 text-gray-600 font-semibold">Dim.</th>
