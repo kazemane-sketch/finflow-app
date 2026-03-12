@@ -318,6 +318,7 @@ async function embeddingPreflight(
                   cm.counterparty_id,
                   src.primary_contract_ref AS source_primary_contract_ref,
                   src.contract_refs AS source_contract_refs,
+                  src.classification_status AS source_classification_status,
                   (1 - (cm.embedding <=> $1::halfvec(3072)))::float as similarity
                FROM company_memory cm
                LEFT JOIN invoices src
@@ -342,6 +343,7 @@ async function embeddingPreflight(
                   cm.counterparty_id,
                   src.primary_contract_ref AS source_primary_contract_ref,
                   src.contract_refs AS source_contract_refs,
+                  src.classification_status AS source_classification_status,
                   (1 - (cm.embedding <=> $1::halfvec(3072)))::float as similarity
                FROM company_memory cm
                LEFT JOIN invoices src

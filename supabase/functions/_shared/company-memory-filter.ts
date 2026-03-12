@@ -7,6 +7,7 @@ export interface CompanyMemoryQueryRow {
   metadata?: Record<string, unknown> | string | null;
   source_primary_contract_ref?: string | null;
   source_contract_refs?: unknown;
+  source_classification_status?: string | null;
   similarity?: number;
 }
 
@@ -90,6 +91,18 @@ function extractFactContractRefs(row: CompanyMemoryQueryRow): string[] {
   return [...refs];
 }
 
+function isTraceableInvoiceClassificationMemory(row: CompanyMemoryQueryRow): boolean {
+  const metadata = parseMetadata(row.metadata);
+  const origin = typeof metadata.origin === "string" ? metadata.origin.trim() : "";
+  const sourceInvoiceId = typeof metadata.source_invoice_id === "string" ? metadata.source_invoice_id.trim() : "";
+  const sourceStatus = (row.source_classification_status || "").trim().toLowerCase();
+
+  if (origin !== "invoice_classification") return false;
+  if (!sourceInvoiceId) return false;
+  if (!sourceStatus || sourceStatus === "none") return false;
+  return true;
+}
+
 export function filterCompanyMemoryForInvoiceClassification(
   rows: CompanyMemoryQueryRow[],
   lineDescriptions: string[],
@@ -109,6 +122,7 @@ export function filterCompanyMemoryForInvoiceClassification(
   return rows
     .filter((row) => {
       if ((row.source || "").toLowerCase() === "reconciliation") return false;
+      if (!isTraceableInvoiceClassificationMemory(row)) return false;
 
       const factLineDescription = extractFactLineDescription(row);
       const leasingLike = isLeasingText(row.fact_text) || isLeasingText(factLineDescription);
