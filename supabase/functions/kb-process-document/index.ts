@@ -561,7 +561,20 @@ async function handleProcess(
     let fullText = doc.full_text as string | null;
     const inputType = doc.source_input_type || doc.file_type || "text";
 
-    if (inputType === "text") {
+    // Fast path: if full_text already exists, skip extraction entirely
+    if (fullText && fullText.length > 100) {
+      console.log(`[process] full_text already exists (${fullText.length} chars), skipping extraction`);
+      // Still run AI cleanup for URL/PDF sources
+      if (inputType === "url" || inputType === "pdf") {
+        console.log(`[process] AI cleanup on existing text...`);
+        fullText = await cleanExtractedText(apiKey, fullText, doc.title || "Documento");
+      }
+      fullText = sanitizeHtmlEntities(sanitizeText(fullText));
+      await svc
+        .from("kb_documents")
+        .update({ full_text: fullText } as any)
+        .eq("id", documentId);
+    } else if (inputType === "text") {
       // full_text should already be set — sanitize it
       if (fullText) fullText = sanitizeHtmlEntities(sanitizeText(fullText));
       if (!fullText || fullText.length < 10) {
