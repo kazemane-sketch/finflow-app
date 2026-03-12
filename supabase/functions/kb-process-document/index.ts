@@ -59,6 +59,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Strip null bytes, escaped null bytes, and control chars (except \t \n \r) */
+function sanitizeText(text: string): string {
+  return text
+    .replace(/\u0000/g, "")
+    .replace(/\\u0000/g, "")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "")
+    .trim();
+}
+
 /* ─── Gemini URL builders ───────────────────────── */
 function geminiUrl(model: string, method: string, apiKey: string): string {
   return `https://generativelanguage.googleapis.com/v1beta/models/${model}:${method}?key=${apiKey}`;
@@ -310,7 +319,8 @@ async function handleProcess(
     const inputType = doc.source_input_type || doc.file_type || "text";
 
     if (inputType === "text") {
-      // full_text should already be set
+      // full_text should already be set — sanitize it
+      if (fullText) fullText = sanitizeText(fullText);
       if (!fullText || fullText.length < 10) {
         throw new Error("Nessun testo disponibile. Inserisci il testo nel campo full_text.");
       }
@@ -319,7 +329,7 @@ async function handleProcess(
       const sourceUrl = doc.source_url as string;
       if (!sourceUrl) throw new Error("URL fonte mancante");
       console.log(`[process] Fetching URL: ${sourceUrl}`);
-      fullText = await extractTextFromUrl(apiKey, sourceUrl);
+      fullText = sanitizeText(await extractTextFromUrl(apiKey, sourceUrl));
       // Save extracted text
       await svc
         .from("kb_documents")
@@ -339,7 +349,7 @@ async function handleProcess(
       }
       const fileBytes = new Uint8Array(await fileData.arrayBuffer());
       console.log(`[process] PDF downloaded: ${fileBytes.length} bytes, extracting text...`);
-      fullText = await extractTextFromPdf(apiKey, fileBytes);
+      fullText = sanitizeText(await extractTextFromPdf(apiKey, fileBytes));
       // Save extracted text
       await svc
         .from("kb_documents")
@@ -375,7 +385,7 @@ async function handleProcess(
       const { error: insertErr } = await svc.from("kb_chunks").insert({
         document_id: documentId,
         chunk_index: i,
-        content: chunk.content,
+        content: sanitizeText(chunk.content),
         section_title: chunk.section_title,
         embedding: toVectorLiteral(embedding),
       } as any);
