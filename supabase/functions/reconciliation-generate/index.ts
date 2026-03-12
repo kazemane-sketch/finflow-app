@@ -8,6 +8,7 @@ const corsHeaders = {
 
 const MAX_BATCH = 100;
 const EMBEDDING_MODEL = "gemini-embedding-001";
+const RERANK_MODEL = "gemini-3.1-pro-preview";
 const EXPECTED_DIMS = 3072;
 const RAG_BOOST_THRESHOLD = 0.80;
 
@@ -66,6 +67,12 @@ interface MatchRow {
   primary_contract_ref?: string | null;
   contract_refs?: unknown;
   raw_xml?: string | null;
+  is_estimated?: boolean | null;
+  estimate_source?: string | null;
+  estimate_days?: number | null;
+  payment_terms_days?: number | null;
+  dso_days_override?: number | null;
+  pso_days_override?: number | null;
 }
 
 type SqlClient = ReturnType<typeof postgres>;
@@ -85,6 +92,14 @@ type SqlClient = ReturnType<typeof postgres>;
  */
 function getExpectedInvoiceDirection(txAmount: number): string {
   return txAmount > 0 ? "out" : "in";
+}
+
+function diffDays(a: string | null | undefined, b: string | null | undefined): number | null {
+  if (!a || !b) return null;
+  const left = new Date(a).getTime();
+  const right = new Date(b).getTime();
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return null;
+  return (left - right) / 86400000;
 }
 
 /* ─── RULE 2: Counterparty matching ─── */
@@ -437,6 +452,100 @@ function applyContextSignals(
   return { scoreDelta, blocked: false, reasonParts, extra };
 }
 
+function applyTimingSignals(
+  tx: TxRow,
+  match: MatchRow,
+  strength: "strong" | "medium" | "weak",
+): { scoreDelta: number; blocked: boolean; reasonParts: string[]; extra: Record<string, unknown> } {
+  const reasonParts: string[] = [];
+  const extra: Record<string, unknown> = {};
+  let scoreDelta = 0;
+
+  const invoiceDiff = diffDays(tx.date, match.date);
+  const dueDiff = diffDays(tx.date, match.due_date);
+  const invoiceAfterTx = invoiceDiff !== null && invoiceDiff < 0;
+  const futureDays = invoiceAfterTx ? Math.abs(invoiceDiff || 0) : 0;
+  const dueDateIsEstimated = Boolean(match.is_estimated);
+  const dueDateSource = match.estimate_source || (match.due_date ? "explicit" : null);
+
+  extra.invoice_after_tx = invoiceAfterTx;
+  extra.days_from_invoice_date = invoiceDiff === null ? null : Math.round(Math.abs(invoiceDiff));
+  extra.invoice_date_relation = invoiceDiff === null
+    ? "unknown"
+    : invoiceAfterTx
+    ? "after"
+    : invoiceDiff <= 15
+    ? "same_window"
+    : "before";
+  extra.due_date_is_estimated = dueDateIsEstimated;
+  extra.due_date_source = dueDateSource;
+
+  if (invoiceAfterTx) {
+    const maxFutureDays = strength === "strong" ? 60 : 15;
+    if (futureDays > maxFutureDays) {
+      return {
+        scoreDelta: -999,
+        blocked: true,
+        reasonParts: [`fattura datata ${Math.round(futureDays)}gg dopo il movimento`],
+        extra: {
+          ...extra,
+          timing_confidence: "low",
+          timing_block: true,
+        },
+      };
+    }
+
+    if (strength === "strong") {
+      if (futureDays <= 7) scoreDelta -= 4;
+      else if (futureDays <= 15) scoreDelta -= 8;
+      else if (futureDays <= 30) scoreDelta -= 12;
+      else scoreDelta -= 18;
+    } else {
+      if (futureDays <= 7) scoreDelta -= 10;
+      else scoreDelta -= 16;
+    }
+    reasonParts.push(`fattura ${Math.round(futureDays)}gg dopo il movimento`);
+  }
+
+  if (dueDiff !== null && match.due_date) {
+    extra.days_from_due_date = Math.round(Math.abs(dueDiff));
+    if (dueDateIsEstimated) {
+      if (Math.abs(dueDiff) <= 7) {
+        scoreDelta += 1;
+      }
+      extra.timing_confidence = extra.timing_confidence || "low";
+      if (Math.abs(dueDiff) <= 15) {
+        reasonParts.push("vicino a scadenza stimata");
+      }
+    } else {
+      if (Math.abs(dueDiff) <= 7) {
+        scoreDelta += 4;
+        reasonParts.push("vicino a scadenza reale");
+      } else if (Math.abs(dueDiff) <= 15) {
+        scoreDelta += 2;
+        reasonParts.push("timing coerente con scadenza reale");
+      }
+      extra.timing_confidence = extra.timing_confidence || "high";
+    }
+  }
+
+  const expectedDays = Number(match.pso_days_override || match.dso_days_override || match.payment_terms_days || 0);
+  if (expectedDays > 0 && invoiceDiff !== null && !invoiceAfterTx) {
+    const deviation = Math.abs(invoiceDiff - expectedDays);
+    extra.expected_days = expectedDays;
+    if (deviation <= 10) {
+      scoreDelta += dueDateIsEstimated ? 0 : 1;
+      reasonParts.push(`finestra pagamento attesa ~${expectedDays}gg`);
+    }
+  }
+
+  if (!("timing_confidence" in extra)) {
+    extra.timing_confidence = dueDateIsEstimated ? "low" : "medium";
+  }
+
+  return { scoreDelta, blocked: false, reasonParts, extra };
+}
+
 /**
  * Parse raw_text for invoice references when AI extraction didn't capture them.
  */
@@ -561,10 +670,14 @@ async function matchByInvoiceRefs(
       paramIdx++;
     }
 
-    // Date filter: invoice must be issued BEFORE the payment date
-    const dateClause = tx.date ? ` AND i.date <= $${paramIdx}::date` : "";
+    // Strong refs can tolerate delayed invoice dating within a wider window.
+    const dateClause = tx.date
+      ? ` AND i.date <= ($${paramIdx}::date + ($${paramIdx + 1}::int * interval '1 day'))`
+      : "";
     if (tx.date) {
       params.push(tx.date);
+      params.push(60);
+      paramIdx++;
       paramIdx++;
     }
 
@@ -572,7 +685,8 @@ async function matchByInvoiceRefs(
       SELECT i.id as invoice_id, i.number, i.total_amount, i.date,
              i.counterparty->>'denom' as counterparty_name,
              i.notes, i.primary_contract_ref, i.contract_refs, i.raw_xml,
-             ii.id as installment_id, ii.amount_due, ii.paid_amount, ii.due_date, ii.status
+             ii.id as installment_id, ii.amount_due, ii.paid_amount, ii.due_date, ii.status,
+             ii.is_estimated, ii.estimate_source, ii.estimate_days
       FROM invoices i
       LEFT JOIN invoice_installments ii
         ON ii.invoice_id = i.id AND ii.status IN ('pending','overdue','partial')
@@ -594,6 +708,8 @@ async function matchByInvoiceRefs(
     for (const m of filteredMatches) {
       const context = applyContextSignals(tx, m as MatchRow);
       if (context.blocked) continue;
+      const timing = applyTimingSignals(tx, m as MatchRow, "strong");
+      if (timing.blocked) continue;
 
       const instRemaining = m.installment_id
         ? Math.abs(Number(m.amount_due) - Number(m.paid_amount || 0))
@@ -608,10 +724,13 @@ async function matchByInvoiceRefs(
       // If amount is WAY off (> 50% difference), lower confidence significantly
       // A ref match with wildly different amount is suspicious
       let score: number;
-      const daysDiff = tx.date && m.date
-        ? Math.max(0, (new Date(tx.date).getTime() - new Date(m.date as string).getTime()) / 86400000)
-        : null;
-      const temporalNote = daysDiff !== null ? `, fattura ${Math.round(daysDiff)}gg prima` : "";
+      const signedDaysDiff = diffDays(tx.date, m.date as string | null);
+      const daysDiff = signedDaysDiff === null ? null : Math.abs(signedDaysDiff);
+      const temporalNote = daysDiff !== null
+        ? signedDaysDiff !== null && signedDaysDiff < 0
+          ? `, fattura ${Math.round(daysDiff)}gg dopo`
+          : `, fattura ${Math.round(daysDiff)}gg prima`
+        : "";
       let reason = `Rif. fattura "${ref}" → Fatt. ${m.number} (${m.counterparty_name}${temporalNote})`;
 
       if (amountRatio < 0.05) {
@@ -628,15 +747,16 @@ async function matchByInvoiceRefs(
         score = 75;
         reason += ` (⚠ diff €${amountDiff.toFixed(2)} — importo molto diverso)`;
       }
-      if (context.reasonParts.length > 0) {
-        reason += ` — ${context.reasonParts.join(" · ")}`;
+      const combinedReasons = [...context.reasonParts, ...timing.reasonParts];
+      if (combinedReasons.length > 0) {
+        reason += ` — ${combinedReasons.join(" · ")}`;
       }
 
       suggestions.push({
         bank_transaction_id: tx.id,
         installment_id: (m.installment_id as string) || null,
         invoice_id: m.invoice_id as string,
-        match_score: Math.max(0, Math.min(98, score + context.scoreDelta)),
+        match_score: Math.max(0, Math.min(98, score + context.scoreDelta + timing.scoreDelta)),
         match_reason: reason,
         proposed_by: "deterministic",
         rule_id: null,
@@ -645,6 +765,7 @@ async function matchByInvoiceRefs(
           amount_diff: amountDiff,
           level: "invoice_ref",
           ...context.extra,
+          ...timing.extra,
         },
       });
     }
@@ -688,7 +809,7 @@ async function matchByMandate(
 
   const openInst = await sql.unsafe(
     `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
-            ii.amount_due, ii.paid_amount,
+            ii.amount_due, ii.paid_amount, ii.is_estimated, ii.estimate_source, ii.estimate_days,
             inv.number as invoice_number,
             inv.date as invoice_date,
             inv.counterparty->>'denom' as counterparty_name,
@@ -700,7 +821,7 @@ async function matchByMandate(
        AND ii.status IN ('pending','overdue','partial')
        AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
        AND abs(ii.amount_due - ii.paid_amount) BETWEEN $4 * 0.85 AND $4 * 1.15
-       AND ($5::date IS NULL OR inv.date <= $5::date)
+       AND ($5::date IS NULL OR inv.date <= ($5::date + (60 * interval '1 day')))
      ORDER BY inv.date DESC
      LIMIT 5`,
     [companyId, expectedDirection, cpWord, remainingAmount, tx.date || null],
@@ -716,34 +837,59 @@ async function matchByMandate(
       amount_due: Number(m.amount_due),
       paid_amount: Number(m.paid_amount),
       due_date: m.due_date as string | null,
+      is_estimated: Boolean(m.is_estimated),
+      estimate_source: (m.estimate_source as string | null) || null,
+      estimate_days: m.estimate_days == null ? null : Number(m.estimate_days),
       notes: (m.notes as string | null) || null,
       primary_contract_ref: (m.primary_contract_ref as string | null) || null,
       contract_refs: m.contract_refs,
       raw_xml: (m.raw_xml as string | null) || null,
     });
     if (context.blocked) continue;
+    const timing = applyTimingSignals(tx, {
+      invoice_id: m.invoice_id as string,
+      number: m.invoice_number as string | null,
+      date: m.invoice_date as string | null,
+      counterparty_name: m.counterparty_name as string | null,
+      installment_id: m.installment_id as string | null,
+      amount_due: Number(m.amount_due),
+      paid_amount: Number(m.paid_amount),
+      due_date: m.due_date as string | null,
+      is_estimated: Boolean(m.is_estimated),
+      estimate_source: (m.estimate_source as string | null) || null,
+      estimate_days: m.estimate_days == null ? null : Number(m.estimate_days),
+      notes: (m.notes as string | null) || null,
+      primary_contract_ref: (m.primary_contract_ref as string | null) || null,
+      contract_refs: m.contract_refs,
+      raw_xml: (m.raw_xml as string | null) || null,
+    }, "strong");
+    if (timing.blocked) continue;
 
     const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
     if (instRemaining < 0.01) continue;
     const amountDiff = Math.abs(remainingAmount - instRemaining);
 
     // Temporal scoring: recent invoices score higher
-    const daysDiff = tx.date && m.invoice_date
-      ? Math.max(0, (new Date(tx.date).getTime() - new Date(m.invoice_date).getTime()) / 86400000)
-      : 60; // default if no dates
+    const signedDaysDiff = diffDays(tx.date, m.invoice_date as string | null);
+    const daysDiff = signedDaysDiff === null ? 60 : Math.abs(signedDaysDiff);
     let score: number;
     if (daysDiff < 30) score = 88;
     else if (daysDiff > 120) score = 80;
     else score = 85;
 
-    const temporalNote = tx.date && m.invoice_date ? `, fattura ${Math.round(daysDiff)}gg prima` : "";
-    const contextNote = context.reasonParts.length > 0 ? ` — ${context.reasonParts.join(" · ")}` : "";
+    const temporalNote = tx.date && m.invoice_date
+      ? signedDaysDiff !== null && signedDaysDiff < 0
+        ? `, fattura ${Math.round(daysDiff)}gg dopo`
+        : `, fattura ${Math.round(daysDiff)}gg prima`
+      : "";
+    const reasonNoteParts = [...context.reasonParts, ...timing.reasonParts];
+    const contextNote = reasonNoteParts.length > 0 ? ` — ${reasonNoteParts.join(" · ")}` : "";
 
     suggestions.push({
       bank_transaction_id: tx.id,
       installment_id: m.installment_id,
       invoice_id: m.invoice_id,
-      match_score: Math.max(0, Math.min(98, score + context.scoreDelta)),
+      match_score: Math.max(0, Math.min(98, score + context.scoreDelta + timing.scoreDelta)),
       match_reason: `Mandato SDD "${mandateId}" → ${cpName} + importo simile${temporalNote}${contextNote}`,
       proposed_by: "deterministic",
       rule_id: null,
@@ -754,6 +900,7 @@ async function matchByMandate(
         days_diff: Math.round(daysDiff),
         level: "mandate",
         ...context.extra,
+        ...timing.extra,
       },
     });
   }
@@ -779,7 +926,7 @@ async function matchByCounterpartyAmount(
   // v2: wider tolerance 40%-115%, date filter, DSO/PSO join, ORDER BY inv.date DESC
   const cpMatches = await sql.unsafe(
     `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
-            ii.amount_due, ii.paid_amount, ii.status,
+            ii.amount_due, ii.paid_amount, ii.status, ii.is_estimated, ii.estimate_source, ii.estimate_days,
             inv.number as invoice_number,
             inv.date as invoice_date,
             inv.counterparty->>'denom' as counterparty_name,
@@ -795,7 +942,7 @@ async function matchByCounterpartyAmount(
        AND ii.status IN ('pending','overdue','partial')
        AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
        AND abs(ii.amount_due - ii.paid_amount) BETWEEN $4 * 0.40 AND $4 * 1.15
-       AND ($5::date IS NULL OR inv.date <= $5::date)
+       AND ($5::date IS NULL OR inv.date <= ($5::date + (15 * interval '1 day')))
      ORDER BY inv.date DESC
      LIMIT 10`,
     [companyId, expectedDirection, cpWord, remainingAmount, tx.date || null],
@@ -812,12 +959,37 @@ async function matchByCounterpartyAmount(
       paid_amount: Number(m.paid_amount),
       due_date: m.due_date as string | null,
       status: m.status as string | null,
+      is_estimated: Boolean(m.is_estimated),
+      estimate_source: (m.estimate_source as string | null) || null,
+      estimate_days: m.estimate_days == null ? null : Number(m.estimate_days),
       notes: (m.notes as string | null) || null,
       primary_contract_ref: (m.primary_contract_ref as string | null) || null,
       contract_refs: m.contract_refs,
       raw_xml: (m.raw_xml as string | null) || null,
     });
     if (context.blocked) continue;
+    const timing = applyTimingSignals(tx, {
+      invoice_id: m.invoice_id as string,
+      number: m.invoice_number as string | null,
+      date: m.invoice_date as string | null,
+      counterparty_name: m.counterparty_name as string | null,
+      installment_id: m.installment_id as string | null,
+      amount_due: Number(m.amount_due),
+      paid_amount: Number(m.paid_amount),
+      due_date: m.due_date as string | null,
+      status: m.status as string | null,
+      is_estimated: Boolean(m.is_estimated),
+      estimate_source: (m.estimate_source as string | null) || null,
+      estimate_days: m.estimate_days == null ? null : Number(m.estimate_days),
+      payment_terms_days: m.payment_terms_days == null ? null : Number(m.payment_terms_days),
+      dso_days_override: m.dso_days_override == null ? null : Number(m.dso_days_override),
+      pso_days_override: m.pso_days_override == null ? null : Number(m.pso_days_override),
+      notes: (m.notes as string | null) || null,
+      primary_contract_ref: (m.primary_contract_ref as string | null) || null,
+      contract_refs: m.contract_refs,
+      raw_xml: (m.raw_xml as string | null) || null,
+    }, "weak");
+    if (timing.blocked) continue;
 
     const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
     if (instRemaining < 0.01) continue;
@@ -825,9 +997,8 @@ async function matchByCounterpartyAmount(
     const amountRatio = remainingAmount > 0 ? amountDiff / remainingAmount : 1;
 
     // v2: daysDiff from INVOICE DATE (not due_date), always positive due to SQL filter
-    const daysDiff = tx.date && m.invoice_date
-      ? Math.max(0, (new Date(tx.date).getTime() - new Date(m.invoice_date).getTime()) / 86400000)
-      : 999;
+    const signedDaysDiff = diffDays(tx.date, m.invoice_date as string | null);
+    const daysDiff = signedDaysDiff === null ? 999 : Math.abs(signedDaysDiff);
 
     // ── v2 scoring formula ──
     // base = 50
@@ -861,8 +1032,8 @@ async function matchByCounterpartyAmount(
     // DSO/PSO bonus: payment within expected window
     let dsoBonus = 0;
     const expectedDays = Number(m.pso_days_override || m.dso_days_override || m.payment_terms_days || 0);
-    if (expectedDays > 0 && Math.abs(daysDiff - expectedDays) <= 15) {
-      dsoBonus = 5;
+    if (!Boolean(m.is_estimated) && expectedDays > 0 && Math.abs(daysDiff - expectedDays) <= 10) {
+      dsoBonus = 1;
     }
 
     const score = Math.min(98, base + amountPoints + temporalPoints + exactBonus + dsoBonus);
@@ -879,15 +1050,20 @@ async function matchByCounterpartyAmount(
     }
 
     // v2: rich match_reason with temporal + DSO info
-    const dsoNote = dsoBonus > 0 ? ` (in finestra pagamento ${expectedDays}gg)` : "";
-    const temporalNote = daysDiff < 999 ? ` — fattura ${Math.round(daysDiff)}gg prima${dsoNote}` : "";
-    const contextNote = context.reasonParts.length > 0 ? ` — ${context.reasonParts.join(" · ")}` : "";
+    const dsoNote = dsoBonus > 0 ? ` (in finestra pagamento attesa ${expectedDays}gg)` : "";
+    const temporalNote = daysDiff < 999
+      ? signedDaysDiff !== null && signedDaysDiff < 0
+        ? ` — fattura ${Math.round(daysDiff)}gg dopo${dsoNote}`
+        : ` — fattura ${Math.round(daysDiff)}gg prima${dsoNote}`
+      : "";
+    const reasonNoteParts = [...context.reasonParts, ...timing.reasonParts];
+    const contextNote = reasonNoteParts.length > 0 ? ` — ${reasonNoteParts.join(" · ")}` : "";
 
     suggestions.push({
       bank_transaction_id: tx.id,
       installment_id: m.installment_id,
       invoice_id: m.invoice_id,
-      match_score: Math.max(0, Math.min(98, score + context.scoreDelta)),
+      match_score: Math.max(0, Math.min(98, score + context.scoreDelta + timing.scoreDelta)),
       match_reason: `Controparte "${m.counterparty_name}" + importo ${amountRatio < 0.02 ? "esatto" : "simile"} (diff €${amountDiff.toFixed(2)})${temporalNote}${amountNote ? ` — ${amountNote}` : ""}${contextNote}`,
       proposed_by: "deterministic",
       rule_id: null,
@@ -899,6 +1075,7 @@ async function matchByCounterpartyAmount(
         ...(amountNote ? { amount_note: amountNote } : {}),
         ...(dsoBonus > 0 ? { dso_match: true, expected_days: expectedDays } : {}),
         ...context.extra,
+        ...timing.extra,
       },
     });
   }
@@ -954,7 +1131,7 @@ async function matchByRules(
 
     const ruleMatches = await sql.unsafe(
       `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
-              ii.amount_due, ii.paid_amount,
+              ii.amount_due, ii.paid_amount, ii.is_estimated, ii.estimate_source, ii.estimate_days,
               inv.number as invoice_number,
               inv.date as invoice_date,
               inv.counterparty->>'denom' as counterparty_name,
@@ -966,7 +1143,7 @@ async function matchByRules(
          AND ii.status IN ('pending','overdue','partial')
          AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
          AND abs(ii.amount_due - ii.paid_amount) BETWEEN $4 * 0.90 AND $4 * 1.10
-         AND ($5::date IS NULL OR inv.date <= $5::date)
+         AND ($5::date IS NULL OR inv.date <= ($5::date + (15 * interval '1 day')))
        ORDER BY abs(abs(ii.amount_due - ii.paid_amount) - $4) ASC
        LIMIT 3`,
       [companyId, expectedDirection, cpWord, remainingAmount, tx.date || null],
@@ -982,12 +1159,33 @@ async function matchByRules(
         amount_due: Number(m.amount_due),
         paid_amount: Number(m.paid_amount),
         due_date: m.due_date as string | null,
+        is_estimated: Boolean(m.is_estimated),
+        estimate_source: (m.estimate_source as string | null) || null,
+        estimate_days: m.estimate_days == null ? null : Number(m.estimate_days),
         notes: (m.notes as string | null) || null,
         primary_contract_ref: (m.primary_contract_ref as string | null) || null,
         contract_refs: m.contract_refs,
         raw_xml: (m.raw_xml as string | null) || null,
       });
       if (context.blocked) continue;
+      const timing = applyTimingSignals(tx, {
+        invoice_id: m.invoice_id as string,
+        number: m.invoice_number as string | null,
+        date: m.invoice_date as string | null,
+        counterparty_name: m.counterparty_name as string | null,
+        installment_id: m.installment_id as string | null,
+        amount_due: Number(m.amount_due),
+        paid_amount: Number(m.paid_amount),
+        due_date: m.due_date as string | null,
+        is_estimated: Boolean(m.is_estimated),
+        estimate_source: (m.estimate_source as string | null) || null,
+        estimate_days: m.estimate_days == null ? null : Number(m.estimate_days),
+        notes: (m.notes as string | null) || null,
+        primary_contract_ref: (m.primary_contract_ref as string | null) || null,
+        contract_refs: m.contract_refs,
+        raw_xml: (m.raw_xml as string | null) || null,
+      }, ruleContractRef ? "strong" : "medium");
+      if (timing.blocked) continue;
 
       const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
       if (instRemaining < 0.01) continue;
@@ -1001,8 +1199,8 @@ async function matchByRules(
         bank_transaction_id: tx.id,
         installment_id: m.installment_id,
         invoice_id: m.invoice_id,
-        match_score: Math.max(0, Math.min(98, Math.min(score, 90) + context.scoreDelta)),
-        match_reason: `Regola "${rule.rule_name}" (conf. ${(ruleConf * 100).toFixed(0)}%) → ${m.counterparty_name}${context.reasonParts.length > 0 ? ` — ${context.reasonParts.join(" · ")}` : ""}`,
+        match_score: Math.max(0, Math.min(98, Math.min(score, 90) + context.scoreDelta + timing.scoreDelta)),
+        match_reason: `Regola "${rule.rule_name}" (conf. ${(ruleConf * 100).toFixed(0)}%) → ${m.counterparty_name}${[...context.reasonParts, ...timing.reasonParts].length > 0 ? ` — ${[...context.reasonParts, ...timing.reasonParts].join(" · ")}` : ""}`,
         proposed_by: "rule",
         rule_id: rule.id,
         suggestion_data: {
@@ -1011,6 +1209,7 @@ async function matchByRules(
           amount_diff: amountDiff,
           level: "rule",
           ...context.extra,
+          ...timing.extra,
         },
       });
     }
@@ -1031,7 +1230,7 @@ function dedup(suggestions: Suggestion[], _maxResults: number): Suggestion[] {
       return true;
     })
     .sort((a, b) => b.match_score - a.match_score);
-  return smartRank(unique);
+  return unique.slice(0, _maxResults);
 }
 
 /* ─── smartRank: reduce suggestions to the clearest matches ─── */
@@ -1071,7 +1270,7 @@ async function matchCumulativePayment(
   // Fetch all open installments for this counterparty (invoice date <= payment date)
   const openInst = await sql.unsafe(
     `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
-            ii.amount_due, ii.paid_amount,
+            ii.amount_due, ii.paid_amount, ii.is_estimated, ii.estimate_source, ii.estimate_days,
             inv.number as invoice_number,
             inv.date as invoice_date,
             inv.counterparty->>'denom' as counterparty_name,
@@ -1084,7 +1283,7 @@ async function matchCumulativePayment(
        AND ii.status IN ('pending','overdue','partial')
        AND inv.counterparty->>'denom' ILIKE '%' || $3 || '%'
        AND abs(ii.amount_due - ii.paid_amount) > 0.01
-       AND ($4::date IS NULL OR inv.date <= $4::date)
+       AND ($4::date IS NULL OR inv.date <= ($4::date + (15 * interval '1 day')))
      ORDER BY ii.due_date ASC
      LIMIT 10`,
     [companyId, expectedDirection, cpWord, tx.date || null],
@@ -1115,18 +1314,39 @@ async function matchCumulativePayment(
             amount_due: Number(m.amount_due),
             paid_amount: Number(m.paid_amount),
             due_date: m.due_date as string | null,
+            is_estimated: Boolean(m.is_estimated),
+            estimate_source: (m.estimate_source as string | null) || null,
+            estimate_days: m.estimate_days == null ? null : Number(m.estimate_days),
             notes: (m.notes as string | null) || null,
             primary_contract_ref: (m.primary_contract_ref as string | null) || null,
             contract_refs: m.contract_refs,
             raw_xml: (m.raw_xml as string | null) || null,
           });
           if (context.blocked) return [];
+          const timing = applyTimingSignals(tx, {
+            invoice_id: m.invoice_id as string,
+            number: m.invoice_number as string | null,
+            date: m.invoice_date as string | null,
+            counterparty_name: m.counterparty_name as string | null,
+            installment_id: m.installment_id as string | null,
+            amount_due: Number(m.amount_due),
+            paid_amount: Number(m.paid_amount),
+            due_date: m.due_date as string | null,
+            is_estimated: Boolean(m.is_estimated),
+            estimate_source: (m.estimate_source as string | null) || null,
+            estimate_days: m.estimate_days == null ? null : Number(m.estimate_days),
+            notes: (m.notes as string | null) || null,
+            primary_contract_ref: (m.primary_contract_ref as string | null) || null,
+            contract_refs: m.contract_refs,
+            raw_xml: (m.raw_xml as string | null) || null,
+          }, "weak");
+          if (timing.blocked) return [];
           return [{
             bank_transaction_id: tx.id,
             installment_id: m.installment_id,
             invoice_id: m.invoice_id,
-            match_score: Math.max(0, Math.min(98, score + context.scoreDelta)),
-            match_reason: `Pagamento cumulativo: ${items.map(x => x.invoice_number).join(" + ")} = €${sum.toFixed(2)} (TX €${target.toFixed(2)})${context.reasonParts.length > 0 ? ` — ${context.reasonParts.join(" · ")}` : ""}`,
+            match_score: Math.max(0, Math.min(98, score + context.scoreDelta + timing.scoreDelta)),
+            match_reason: `Pagamento cumulativo: ${items.map(x => x.invoice_number).join(" + ")} = €${sum.toFixed(2)} (TX €${target.toFixed(2)})${[...context.reasonParts, ...timing.reasonParts].length > 0 ? ` — ${[...context.reasonParts, ...timing.reasonParts].join(" · ")}` : ""}`,
             proposed_by: "deterministic" as const,
             rule_id: null,
             suggestion_data: {
@@ -1136,6 +1356,7 @@ async function matchCumulativePayment(
               counterparty: m.counterparty_name,
               amount_diff: Math.abs(sum - target),
               ...context.extra,
+              ...timing.extra,
             },
           }];
         });
@@ -1163,18 +1384,39 @@ async function matchCumulativePayment(
               amount_due: Number(m.amount_due),
               paid_amount: Number(m.paid_amount),
               due_date: m.due_date as string | null,
+              is_estimated: Boolean(m.is_estimated),
+              estimate_source: (m.estimate_source as string | null) || null,
+              estimate_days: m.estimate_days == null ? null : Number(m.estimate_days),
               notes: (m.notes as string | null) || null,
               primary_contract_ref: (m.primary_contract_ref as string | null) || null,
               contract_refs: m.contract_refs,
               raw_xml: (m.raw_xml as string | null) || null,
             });
             if (context.blocked) return [];
+            const timing = applyTimingSignals(tx, {
+              invoice_id: m.invoice_id as string,
+              number: m.invoice_number as string | null,
+              date: m.invoice_date as string | null,
+              counterparty_name: m.counterparty_name as string | null,
+              installment_id: m.installment_id as string | null,
+              amount_due: Number(m.amount_due),
+              paid_amount: Number(m.paid_amount),
+              due_date: m.due_date as string | null,
+              is_estimated: Boolean(m.is_estimated),
+              estimate_source: (m.estimate_source as string | null) || null,
+              estimate_days: m.estimate_days == null ? null : Number(m.estimate_days),
+              notes: (m.notes as string | null) || null,
+              primary_contract_ref: (m.primary_contract_ref as string | null) || null,
+              contract_refs: m.contract_refs,
+              raw_xml: (m.raw_xml as string | null) || null,
+            }, "weak");
+            if (timing.blocked) return [];
             return [{
               bank_transaction_id: tx.id,
               installment_id: m.installment_id,
               invoice_id: m.invoice_id,
-              match_score: Math.max(0, Math.min(98, score + context.scoreDelta)),
-              match_reason: `Pagamento cumulativo: ${items.map(x => x.invoice_number).join(" + ")} = €${sum.toFixed(2)}${context.reasonParts.length > 0 ? ` — ${context.reasonParts.join(" · ")}` : ""}`,
+              match_score: Math.max(0, Math.min(98, score + context.scoreDelta + timing.scoreDelta)),
+              match_reason: `Pagamento cumulativo: ${items.map(x => x.invoice_number).join(" + ")} = €${sum.toFixed(2)}${[...context.reasonParts, ...timing.reasonParts].length > 0 ? ` — ${[...context.reasonParts, ...timing.reasonParts].join(" · ")}` : ""}`,
               proposed_by: "deterministic" as const,
               rule_id: null,
               suggestion_data: {
@@ -1184,6 +1426,7 @@ async function matchCumulativePayment(
                 counterparty: m.counterparty_name,
                 amount_diff: Math.abs(sum - target),
                 ...context.extra,
+                ...timing.extra,
               },
             }];
           });
@@ -1282,6 +1525,199 @@ async function ragBoostSuggestions(
   return suggestions;
 }
 
+function shouldUsePremiumReranker(suggestions: Suggestion[]): boolean {
+  if (suggestions.length < 2) return false;
+  if (suggestions.some((s) => s.suggestion_data?.level === "cumulative")) return false;
+  const sorted = [...suggestions].sort((a, b) => b.match_score - a.match_score);
+  const best = sorted[0]?.match_score || 0;
+  const second = sorted[1]?.match_score || 0;
+  return best < 92 || (best - second) < 8;
+}
+
+async function maybePremiumRerank(
+  tx: TxRow,
+  suggestions: Suggestion[],
+  apiKey: string,
+): Promise<Suggestion[]> {
+  if (!apiKey || !shouldUsePremiumReranker(suggestions)) return suggestions;
+
+  const top = [...suggestions].sort((a, b) => b.match_score - a.match_score).slice(0, 4);
+  const candidateMap = new Map<string, Suggestion>();
+  const candidatePayload = top.map((s, index) => {
+    const key = suggestionEntityKey(s) || `cand:${index}`;
+    candidateMap.set(key, s);
+    return {
+      key,
+      invoice_id: s.invoice_id,
+      installment_id: s.installment_id,
+      score: s.match_score,
+      reason: s.match_reason,
+      level: s.suggestion_data?.level || null,
+      contract_ref_match: s.suggestion_data?.contract_ref_match || false,
+      invoice_after_tx: s.suggestion_data?.invoice_after_tx || false,
+      due_date_is_estimated: s.suggestion_data?.due_date_is_estimated || false,
+      contextual_signals: s.suggestion_data?.contextual_signals || [],
+    };
+  });
+
+  const prompt = [
+    "Sei un revisore senior di riconciliazione bancaria italiana.",
+    "Devi SOLO riordinare una shortlist di candidati gia generati dal motore deterministico.",
+    "Non creare nuovi candidati. Se il caso resta ambiguo, mantieni review_required=true.",
+    "",
+    `MOVIMENTO: ${JSON.stringify({
+      id: tx.id,
+      date: tx.date,
+      amount: tx.amount,
+      counterparty_name: tx.counterparty_name,
+      description: tx.description,
+      notes: tx.notes,
+      extracted_refs: tx.extracted_refs,
+    })}`,
+    "",
+    `CANDIDATI: ${JSON.stringify(candidatePayload)}`,
+    "",
+    "Rispondi SOLO con JSON:",
+    '{"ranked_keys":["key1","key2"],"review_required":true,"top_confidence":0-100,"reasoning":"max 20 parole"}',
+  ].join("\n");
+
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${RERANK_MODEL}:generateContent?key=${apiKey}`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0,
+          responseMimeType: "application/json",
+        },
+      }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload?.error?.message || String(response.status));
+    const text = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (typeof text !== "string" || !text.trim()) return suggestions;
+    const parsed = JSON.parse(text) as {
+      ranked_keys?: string[];
+      review_required?: boolean;
+      top_confidence?: number;
+      reasoning?: string;
+    };
+    if (!Array.isArray(parsed.ranked_keys) || parsed.ranked_keys.length === 0) return suggestions;
+
+    const rankIndex = new Map<string, number>();
+    parsed.ranked_keys.forEach((key, index) => rankIndex.set(key, index));
+
+    return suggestions.map((s) => {
+      const key = suggestionEntityKey(s);
+      const idx = key ? rankIndex.get(key) : undefined;
+      if (idx == null) return s;
+
+      const rankBoost = Math.max(0, 6 - idx * 3);
+      const confidence = Math.max(0, Math.min(100, Number(parsed.top_confidence || 0)));
+      return {
+        ...s,
+        match_score: Math.max(0, Math.min(98, s.match_score + rankBoost)),
+        match_reason: `${s.match_reason} — reranked by ${RERANK_MODEL}${parsed.reasoning ? `: ${parsed.reasoning}` : ""}`,
+        suggestion_data: {
+          ...(s.suggestion_data || {}),
+          reranked_by_model: RERANK_MODEL,
+          rerank_rank: idx + 1,
+          review_required: parsed.review_required !== false,
+          auto_match_eligible: parsed.review_required === false && idx === 0 && confidence >= 97,
+          rerank_confidence: confidence,
+        },
+      };
+    }).sort((a, b) => b.match_score - a.match_score);
+  } catch (err) {
+    console.warn("[reconciliation-generate] premium reranker error:", err);
+    return suggestions;
+  }
+}
+
+function suggestionEntityKey(s: Suggestion): string | null {
+  if (s.installment_id) return `inst:${s.installment_id}`;
+  if (s.invoice_id) return `inv:${s.invoice_id}`;
+  return null;
+}
+
+function applyGlobalCompetition(suggestionsByTx: Map<string, Suggestion[]>): Map<string, Suggestion[]> {
+  const adjusted = new Map<string, Suggestion[]>();
+  const flat = [...suggestionsByTx.values()].flat()
+    .filter((s) => s.suggestion_data?.level !== "cumulative");
+
+  const winners = new Map<string, Suggestion>();
+  const sorted = [...flat].sort((a, b) => b.match_score - a.match_score);
+  const assignedTx = new Set<string>();
+  const assignedEntities = new Set<string>();
+
+  for (const s of sorted) {
+    const entityKey = suggestionEntityKey(s);
+    if (!entityKey) continue;
+    if (assignedTx.has(s.bank_transaction_id) || assignedEntities.has(entityKey)) continue;
+    if (s.match_score < 72) continue;
+    winners.set(s.bank_transaction_id, s);
+    assignedTx.add(s.bank_transaction_id);
+    assignedEntities.add(entityKey);
+  }
+
+  const winnerByEntity = new Map<string, Suggestion>();
+  for (const winner of winners.values()) {
+    const entityKey = suggestionEntityKey(winner);
+    if (entityKey) winnerByEntity.set(entityKey, winner);
+  }
+
+  for (const [txId, list] of suggestionsByTx.entries()) {
+    const txWinner = winners.get(txId);
+    adjusted.set(txId, list.map((s) => {
+      if (s.suggestion_data?.level === "cumulative") return s;
+
+      const entityKey = suggestionEntityKey(s);
+      const entityWinner = entityKey ? winnerByEntity.get(entityKey) : null;
+      const isWinner = txWinner
+        && suggestionEntityKey(txWinner) === entityKey
+        && txWinner.invoice_id === s.invoice_id
+        && txWinner.installment_id === s.installment_id;
+
+      const extra = { ...(s.suggestion_data || {}) } as Record<string, unknown>;
+      const reasonParts: string[] = [];
+      let delta = 0;
+
+      if (isWinner) {
+        delta += 3;
+        extra.global_assignment_rank = 1;
+        extra.global_winner = true;
+      } else {
+        if (entityWinner && entityWinner.bank_transaction_id !== s.bank_transaction_id) {
+          const diff = entityWinner.match_score - s.match_score;
+          const penalty = Math.max(6, Math.min(18, 8 + Math.round(Math.max(0, diff) / 2)));
+          delta -= penalty;
+          reasonParts.push("declassato: rata contesa da altro movimento migliore");
+          extra.global_competition_penalty = Math.abs(Number(extra.global_competition_penalty || 0)) + penalty;
+          extra.contested_by_tx = entityWinner.bank_transaction_id;
+        }
+        if (txWinner && suggestionEntityKey(txWinner) !== entityKey) {
+          const diff = txWinner.match_score - s.match_score;
+          const penalty = Math.max(4, Math.min(12, 4 + Math.round(Math.max(0, diff) / 3)));
+          delta -= penalty;
+          reasonParts.push("declassato: il movimento ha un match migliore");
+          extra.global_tx_penalty = Math.abs(Number(extra.global_tx_penalty || 0)) + penalty;
+        }
+      }
+
+      return {
+        ...s,
+        match_score: Math.max(0, Math.min(98, s.match_score + delta)),
+        match_reason: reasonParts.length > 0 ? `${s.match_reason} — ${reasonParts.join(" · ")}` : s.match_reason,
+        suggestion_data: extra,
+      };
+    }).sort((a, b) => b.match_score - a.match_score));
+  }
+
+  return adjusted;
+}
+
 /* ─── main generator per transaction ──── */
 
 async function generateForTransaction(
@@ -1302,40 +1738,33 @@ async function generateForTransaction(
     invoiceRefs = parseRawTextForRefs(tx.raw_text);
   }
 
+  const collected: Suggestion[] = [];
+
   // ── Level 1: Match by invoice refs (highest priority, score 75-98) ──
   if (invoiceRefs.length > 0) {
-    const refMatches = await matchByInvoiceRefs(
+    collected.push(...await matchByInvoiceRefs(
       sql, companyId, tx, invoiceRefs, remainingAmount,
-    );
-    if (refMatches.length > 0) {
-      return filterRejected(sql, companyId, dedup(refMatches, 20));
-    }
+    ));
   }
 
   // ── Level 1.5: Match by learned rules (Miglioria 3, score 70-90) ──
-  const ruleMatches = await matchByRules(sql, companyId, tx, remainingAmount);
-  if (ruleMatches.length > 0) {
-    return filterRejected(sql, companyId, dedup(ruleMatches, 5));
-  }
+  collected.push(...await matchByRules(sql, companyId, tx, remainingAmount));
 
   // ── Level 2: Match by mandate SDD (score 85) ──
   if (mandateId) {
-    const mandateMatches = await matchByMandate(
+    collected.push(...await matchByMandate(
       sql, companyId, tx, mandateId, remainingAmount,
-    );
-    if (mandateMatches.length > 0) {
-      return filterRejected(sql, companyId, dedup(mandateMatches, 5));
-    }
+    ));
   }
 
   // ── Level 3: Fallback — counterparty + amount (score 50-85) ──
-  const fallback = await matchByCounterpartyAmount(
+  collected.push(...await matchByCounterpartyAmount(
     sql, companyId, tx, remainingAmount,
-  );
-  let results = dedup(fallback, 5);
+  ));
+  let results = dedup(collected, 12);
 
   // ── Level 3.5: Cumulative payments (Miglioria 1) ──
-  if (results.length === 0) {
+  if (results.length === 0 && !invoiceRefs.length && !mandateId) {
     const cumulative = await matchCumulativePayment(sql, companyId, tx, remainingAmount);
     if (cumulative.length > 0) {
       results = cumulative;
@@ -1410,6 +1839,7 @@ Deno.serve(async (req) => {
   const sql = postgres(dbUrl, { max: 1 });
 
   try {
+    const geminiKey = (Deno.env.get("GEMINI_API_KEY") || "").trim();
     const rows: TxRow[] = await sql`
       SELECT id, date, amount, counterparty_name, transaction_type,
              description, extracted_refs, raw_text, notes, direction, reconciled_amount, commission_amount
@@ -1430,10 +1860,21 @@ Deno.serve(async (req) => {
 
     let totalSuggestions = 0;
     let txProcessed = 0;
+    const suggestionsByTx = new Map<string, Suggestion[]>();
 
     for (const tx of rows) {
       const suggestions = await generateForTransaction(sql, companyId, tx);
+      suggestionsByTx.set(tx.id, suggestions);
+    }
 
+    const globallyRanked = applyGlobalCompetition(suggestionsByTx);
+
+    for (const tx of rows) {
+      let suggestions = globallyRanked.get(tx.id) || [];
+      if (geminiKey && suggestions.length > 1) {
+        suggestions = await maybePremiumRerank(tx, suggestions, geminiKey);
+      }
+      suggestions = smartRank(suggestions);
       for (const s of suggestions) {
         if (s.match_score < 50) continue;
 
