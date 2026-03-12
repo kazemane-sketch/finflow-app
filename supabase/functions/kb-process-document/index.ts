@@ -236,7 +236,9 @@ async function extractTextFromPdf(
   apiKey: string,
   fileBytes: Uint8Array,
 ): Promise<string> {
+  console.log(`[process-pdf] File size: ${fileBytes.length} bytes`);
   const base64 = uint8ToBase64(fileBytes);
+  console.log(`[process-pdf] Base64 length: ${base64.length}`);
 
   // Validate: %PDF → JVBERi in base64
   if (!base64.startsWith("JVBERi")) {
@@ -276,10 +278,45 @@ Se ci sono tabelle, convertile in formato testuale leggibile.`,
   }
   const text = payload?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!text) throw new Error("Gemini non ha restituito testo dal PDF");
+  console.log(`[process-pdf] Gemini response length: ${text.length} chars`);
   return text.trim();
 }
 
-/* ─── Text extraction: URL via fetch + strip ────── */
+/* ─── Text extraction: URL via Jina Reader (primary) ── */
+async function fetchWithJina(url: string): Promise<{ text: string; usedJina: boolean }> {
+  try {
+    console.log(`[jina] Fetching clean text from: ${url}`);
+    const jinaUrl = `https://r.jina.ai/${url}`;
+    const resp = await fetch(jinaUrl, {
+      headers: {
+        'Accept': 'text/plain',
+        'X-Return-Format': 'text',
+      },
+      signal: AbortSignal.timeout(30000), // 30s timeout
+    });
+
+    if (!resp.ok) {
+      console.warn(`[jina] Failed (${resp.status}), falling back to direct fetch`);
+      return { text: '', usedJina: false };
+    }
+
+    const text = await resp.text();
+
+    // Sanity check: Jina must return something useful
+    if (text.length < 200) {
+      console.warn(`[jina] Response too short (${text.length} chars), falling back`);
+      return { text: '', usedJina: false };
+    }
+
+    console.log(`[jina] Got ${text.length} chars of clean text`);
+    return { text, usedJina: true };
+  } catch (e: any) {
+    console.warn(`[jina] Error: ${e.message}, falling back to direct fetch`);
+    return { text: '', usedJina: false };
+  }
+}
+
+/* ─── Text extraction: URL via fetch + strip (fallback) ── */
 async function extractTextFromUrl(
   apiKey: string,
   url: string,
@@ -485,14 +522,29 @@ async function handleProcess(
     } else if (inputType === "url") {
       const sourceUrl = doc.source_url as string;
       if (!sourceUrl) throw new Error("URL fonte mancante");
-      console.log(`[process] Fetching URL: ${sourceUrl}`);
-      fullText = sanitizeHtmlEntities(sanitizeText(await extractTextFromUrl(apiKey, sourceUrl)));
+
+      // Step 1: Try Jina Reader (clean text, no nav/footer)
+      console.log(`[process] Step 1a: Jina Reader for URL: ${sourceUrl}`);
+      const jina = await fetchWithJina(sourceUrl);
+
+      if (jina.usedJina && jina.text) {
+        fullText = sanitizeHtmlEntities(sanitizeText(jina.text));
+        console.log(`[process] Jina extraction OK: ${fullText.length} chars`);
+      } else {
+        // Step 2 fallback: direct fetch + stripHtml + Gemini Flash cleanup
+        console.log(`[process] Step 1b: Jina failed, using direct fetch + AI cleanup`);
+        const rawText = await extractTextFromUrl(apiKey, sourceUrl);
+        fullText = sanitizeHtmlEntities(sanitizeText(
+          await cleanExtractedText(apiKey, rawText, doc.title || "Documento")
+        ));
+        console.log(`[process] Fallback extraction: ${fullText.length} chars`);
+      }
+
       // Save extracted text
       await svc
         .from("kb_documents")
         .update({ full_text: fullText } as any)
         .eq("id", documentId);
-      console.log(`[process] URL text extracted: ${fullText.length} chars`);
     } else if (inputType === "pdf") {
       // Read from Supabase Storage
       const storagePath = doc.storage_path as string;
@@ -521,9 +573,9 @@ async function handleProcess(
       throw new Error("Testo estratto vuoto o troppo corto");
     }
 
-    // 5. AI text cleanup (only for URL and PDF sources — text input is already clean)
-    if (inputType === "url" || inputType === "pdf") {
-      console.log(`[process] Step 2: AI text cleanup (${fullText.length} chars)...`);
+    // 5. AI text cleanup (only for PDF — URL is already cleaned by Jina or fallback chain)
+    if (inputType === "pdf") {
+      console.log(`[process] Step 2: AI text cleanup for PDF (${fullText.length} chars)...`);
       fullText = await cleanExtractedText(apiKey, fullText, doc.title || "Documento");
       fullText = sanitizeHtmlEntities(sanitizeText(fullText));
       // Save cleaned text
@@ -627,18 +679,27 @@ async function handleReprocess(
     .eq("id", documentId);
 
   try {
-    // 3. Re-extract from source for URL/PDF, then AI-clean
+    // 3. Re-extract from source for URL, then clean
     const inputType = doc.source_input_type || doc.file_type || "text";
 
     if (inputType === "url" && doc.source_url) {
-      console.log(`[reprocess] Re-extracting from URL: ${doc.source_url}`);
-      fullText = sanitizeHtmlEntities(sanitizeText(await extractTextFromUrl(apiKey, doc.source_url)));
-      console.log(`[reprocess] URL text re-extracted: ${fullText.length} chars`);
+      // Try Jina first, fallback to direct fetch + AI cleanup
+      console.log(`[reprocess] Re-extracting from URL via Jina: ${doc.source_url}`);
+      const jina = await fetchWithJina(doc.source_url);
+      if (jina.usedJina && jina.text) {
+        fullText = jina.text;
+        console.log(`[reprocess] Jina extraction OK: ${fullText.length} chars`);
+      } else {
+        console.log(`[reprocess] Jina failed, using direct fetch + AI cleanup`);
+        const rawText = await extractTextFromUrl(apiKey, doc.source_url);
+        fullText = await cleanExtractedText(apiKey, rawText, doc.title || "Documento");
+        console.log(`[reprocess] Fallback extraction: ${fullText.length} chars`);
+      }
     }
 
-    // AI cleanup for URL/PDF sources
-    if (inputType === "url" || inputType === "pdf") {
-      console.log(`[reprocess] AI cleanup (${fullText!.length} chars)...`);
+    // AI cleanup for PDF sources only (URL already handled above)
+    if (inputType === "pdf") {
+      console.log(`[reprocess] AI cleanup for PDF (${fullText!.length} chars)...`);
       fullText = await cleanExtractedText(apiKey, fullText!, doc.title || "Documento");
     }
 
