@@ -45,6 +45,42 @@ interface DashboardKpis {
   upcomingDue: number
 }
 
+// ─── P&L (Conto Economico) types ───
+type CoaSection =
+  | 'revenue' | 'cost_production' | 'cost_personnel' | 'depreciation'
+  | 'other_costs' | 'financial' | 'extraordinary'
+
+interface PlAccountRow {
+  code: string
+  name: string
+  section: CoaSection
+  total: number
+}
+
+interface PlSectionTotals {
+  revenue: number
+  cost_production: number
+  cost_personnel: number
+  depreciation: number
+  other_costs: number
+  financial: number
+  extraordinary: number
+}
+
+const PL_SECTION_ORDER: { key: keyof PlSectionTotals; label: string; sign: 1 | -1 }[] = [
+  { key: 'revenue',         label: 'Valore della produzione',      sign: 1 },
+  { key: 'cost_production', label: 'Costi della produzione',       sign: -1 },
+  { key: 'cost_personnel',  label: 'Costi del personale',          sign: -1 },
+  { key: 'other_costs',     label: 'Altri costi operativi',        sign: -1 },
+]
+
+// Sections below EBITDA
+const PL_BELOW_EBITDA: { key: keyof PlSectionTotals; label: string; sign: 1 | -1 }[] = [
+  { key: 'depreciation',    label: 'Ammortamenti e svalutazioni',  sign: -1 },
+  { key: 'financial',       label: 'Proventi e oneri finanziari',  sign: -1 },
+  { key: 'extraordinary',   label: 'Componenti straordinarie',     sign: -1 },
+]
+
 // ─── Italian month labels ───
 const MESI = ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu', 'Lug', 'Ago', 'Set', 'Ott', 'Nov', 'Dic']
 
@@ -83,6 +119,52 @@ function EbitdaTooltip({ active, payload, label }: any) {
   )
 }
 
+// ─── P&L Section Block (collapsible section with detail rows) ───
+function PlSectionBlock({ label, rows, total, isRevenue }: {
+  label: string
+  rows: PlAccountRow[]
+  total: number
+  isRevenue: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const totalColor = isRevenue
+    ? 'text-emerald-700'
+    : total > 0 ? 'text-red-700' : 'text-slate-700'
+
+  return (
+    <>
+      {/* Section header row — clickable to expand detail */}
+      <tr
+        className="bg-slate-50/50 cursor-pointer hover:bg-slate-100/60 transition-colors group"
+        onClick={() => setOpen(o => !o)}
+      >
+        <td className="px-4 py-2" />
+        <td className="px-4 py-2 font-semibold text-slate-700 text-[12px]">
+          <span className="inline-flex items-center gap-1.5">
+            <span className={`text-[9px] text-slate-400 transition-transform ${open ? 'rotate-90' : ''}`}>▶</span>
+            {label}
+            <span className="text-[10px] text-slate-400 font-normal">({rows.length})</span>
+          </span>
+        </td>
+        <td className={`text-right px-4 py-2 font-semibold text-[12px] ${totalColor}`}>
+          {isRevenue ? '' : '−'}{fmtEur(Math.abs(total))}
+        </td>
+      </tr>
+
+      {/* Detail rows (visible when expanded) */}
+      {open && rows.map(r => (
+        <tr key={r.code} className="hover:bg-slate-50/50">
+          <td className="px-4 py-1.5 text-[11px] text-slate-400 font-mono">{r.code}</td>
+          <td className="px-4 py-1.5 text-[11px] text-slate-600 pl-10">{r.name}</td>
+          <td className="text-right px-4 py-1.5 text-[11px] text-slate-600 tabular-nums">
+            {fmtEur(r.total)}
+          </td>
+        </tr>
+      ))}
+    </>
+  )
+}
+
 export default function DashboardPage() {
   const { company } = useCompany()
   const navigate = useNavigate()
@@ -91,6 +173,87 @@ export default function DashboardPage() {
   const [monthlyData, setMonthlyData] = useState<MonthlyData[]>([])
   const [kpiData, setKpiData] = useState<DashboardKpis>({ invoiceCount: 0, bankTxCount: 0, unreconciled: 0, upcomingDue: 0 })
   const [chartLoading, setChartLoading] = useState(true)
+  const [plRows, setPlRows] = useState<PlAccountRow[]>([])
+  const [plLoading, setPlLoading] = useState(true)
+
+  // ─── Load P&L (Conto Economico) data ───
+  useEffect(() => {
+    let mounted = true
+    async function loadPL() {
+      if (!company?.id) { if (mounted) { setPlRows([]); setPlLoading(false) }; return }
+      setPlLoading(true)
+      try {
+        // Query classified invoice lines with their account section info
+        // invoice_lines → invoices (for company filter) → chart_of_accounts (for section)
+        const { data, error } = await supabase
+          .from('invoice_lines')
+          .select(`
+            total_price,
+            account_id,
+            chart_of_accounts!inner ( code, name, section, is_header ),
+            invoices!inner ( company_id, direction, date )
+          `)
+          .eq('invoices.company_id', company.id)
+          .not('account_id', 'is', null)
+
+        if (error) throw error
+        if (!data?.length) { if (mounted) { setPlRows([]); setPlLoading(false) }; return }
+
+        // Current year filter
+        const currentYear = String(new Date().getFullYear())
+
+        // Aggregate by account (code + name + section)
+        const accountMap = new Map<string, PlAccountRow>()
+        for (const line of data as any[]) {
+          const coa = line.chart_of_accounts
+          const inv = line.invoices
+          if (!coa || !inv) continue
+          // Skip balance sheet sections
+          if (['assets', 'liabilities', 'equity'].includes(coa.section)) continue
+          // Skip headers
+          if (coa.is_header) continue
+          // Filter current year
+          if (!inv.date?.startsWith(currentYear)) continue
+
+          const amt = Number(line.total_price) || 0
+          if (amt === 0) continue
+
+          const key = coa.code as string
+          const existing = accountMap.get(key)
+          if (existing) {
+            existing.total += amt
+          } else {
+            accountMap.set(key, {
+              code: coa.code,
+              name: coa.name,
+              section: coa.section as CoaSection,
+              total: amt,
+            })
+          }
+        }
+
+        // Sort by section order then code
+        const sectionOrder: Record<string, number> = {
+          revenue: 0, cost_production: 1, cost_personnel: 2,
+          other_costs: 3, depreciation: 4, financial: 5, extraordinary: 6,
+        }
+        const rows = Array.from(accountMap.values())
+          .filter(r => Math.abs(r.total) >= 0.01)
+          .sort((a, b) => {
+            const so = (sectionOrder[a.section] ?? 99) - (sectionOrder[b.section] ?? 99)
+            return so !== 0 ? so : a.code.localeCompare(b.code)
+          })
+
+        if (mounted) setPlRows(rows)
+      } catch (err) {
+        console.error('Dashboard P&L load error:', err)
+      } finally {
+        if (mounted) setPlLoading(false)
+      }
+    }
+    loadPL()
+    return () => { mounted = false }
+  }, [company?.id])
 
   // ─── Load VAT summary ───
   useEffect(() => {
@@ -216,6 +379,33 @@ export default function DashboardPage() {
       marginPct: totalRicavi > 0 ? ((totalRicavi - totalCosti) / totalRicavi) * 100 : 0,
     }
   }, [monthlyData])
+
+  // ─── Computed P&L section totals ───
+  const plTotals = useMemo<PlSectionTotals>(() => {
+    const t: PlSectionTotals = {
+      revenue: 0, cost_production: 0, cost_personnel: 0,
+      depreciation: 0, other_costs: 0, financial: 0, extraordinary: 0,
+    }
+    for (const r of plRows) {
+      if (r.section in t) t[r.section] += r.total
+    }
+    return t
+  }, [plRows])
+
+  const plEbitda = plTotals.revenue - plTotals.cost_production - plTotals.cost_personnel - plTotals.other_costs
+  const plEbit = plEbitda - plTotals.depreciation
+  const plEbt = plEbit - plTotals.financial - plTotals.extraordinary
+
+  // Group plRows by section for expandable detail
+  const plBySection = useMemo(() => {
+    const map = new Map<CoaSection, PlAccountRow[]>()
+    for (const r of plRows) {
+      const arr = map.get(r.section) || []
+      arr.push(r)
+      map.set(r.section, arr)
+    }
+    return map
+  }, [plRows])
 
   // Dynamic KPIs with real data
   const kpis = [
@@ -357,6 +547,113 @@ export default function DashboardPage() {
                 </ComposedChart>
               </ResponsiveContainer>
             </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ═══ Conto Economico Summary Table ═══ */}
+      <Card className="border-slate-200 overflow-hidden">
+        <CardHeader className="bg-slate-50/50 border-b border-slate-100 pb-4">
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base flex items-center gap-2">
+              <TrendingUp className="h-4 w-4 text-emerald-600" />
+              <span className="text-slate-800">Conto Economico — {new Date().getFullYear()}</span>
+            </CardTitle>
+            {plRows.length > 0 && (
+              <span className="text-[10px] text-slate-400">
+                {plRows.length} voci classificate
+              </span>
+            )}
+          </div>
+        </CardHeader>
+        <CardContent className="p-0">
+          {plLoading ? (
+            <div className="flex items-center justify-center h-40 text-slate-400 text-sm">
+              <div className="flex flex-col items-center gap-2">
+                <div className="w-5 h-5 border-2 border-emerald-300 border-t-transparent rounded-full animate-spin" />
+                <span>Caricamento piano dei conti...</span>
+              </div>
+            </div>
+          ) : plRows.length === 0 ? (
+            <div className="flex items-center justify-center h-40 text-slate-400 text-sm">
+              <div className="text-center space-y-1">
+                <TrendingUp className="h-8 w-8 text-slate-300 mx-auto" />
+                <p>Classifica le righe fattura per popolare il conto economico</p>
+              </div>
+            </div>
+          ) : (
+            <table className="w-full text-[12px]">
+              <thead>
+                <tr className="bg-slate-50/80">
+                  <th className="text-left px-4 py-2 font-semibold text-slate-500 w-[60px]">Codice</th>
+                  <th className="text-left px-4 py-2 font-semibold text-slate-500">Voce</th>
+                  <th className="text-right px-4 py-2 font-semibold text-slate-500 w-[140px]">Importo</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {/* ── Above EBITDA sections ── */}
+                {PL_SECTION_ORDER.map(sec => {
+                  const rows = plBySection.get(sec.key) || []
+                  const sectionTotal = plTotals[sec.key]
+                  if (rows.length === 0 && sectionTotal === 0) return null
+                  return (
+                    <PlSectionBlock
+                      key={sec.key}
+                      label={sec.label}
+                      rows={rows}
+                      total={sectionTotal}
+                      isRevenue={sec.key === 'revenue'}
+                    />
+                  )
+                })}
+
+                {/* ── EBITDA subtotal ── */}
+                <tr className="bg-indigo-50/70 border-t-2 border-indigo-200">
+                  <td colSpan={2} className="px-4 py-2.5 font-bold text-indigo-900 text-[13px]">
+                    EBITDA
+                  </td>
+                  <td className={`text-right px-4 py-2.5 font-bold text-[13px] ${plEbitda >= 0 ? 'text-indigo-900' : 'text-red-700'}`}>
+                    {fmtEur(plEbitda)}
+                  </td>
+                </tr>
+
+                {/* ── Below EBITDA sections ── */}
+                {PL_BELOW_EBITDA.map(sec => {
+                  const rows = plBySection.get(sec.key) || []
+                  const sectionTotal = plTotals[sec.key]
+                  if (rows.length === 0 && sectionTotal === 0) return null
+                  return (
+                    <PlSectionBlock
+                      key={sec.key}
+                      label={sec.label}
+                      rows={rows}
+                      total={sectionTotal}
+                      isRevenue={false}
+                    />
+                  )
+                })}
+
+                {/* ── EBIT subtotal ── */}
+                <tr className="bg-slate-100/70 border-t-2 border-slate-300">
+                  <td colSpan={2} className="px-4 py-2 font-bold text-slate-800 text-[12px]">
+                    EBIT (Risultato Operativo)
+                  </td>
+                  <td className={`text-right px-4 py-2 font-bold text-[12px] ${plEbit >= 0 ? 'text-slate-800' : 'text-red-700'}`}>
+                    {fmtEur(plEbit)}
+                  </td>
+                </tr>
+
+                {/* ── EBT subtotal ── */}
+                <tr className="bg-slate-50/70">
+                  <td colSpan={2} className="px-4 py-2 font-semibold text-slate-600 text-[12px]">
+                    EBT (Risultato ante imposte)
+                  </td>
+                  <td className={`text-right px-4 py-2 font-semibold text-[12px] ${plEbt >= 0 ? 'text-slate-600' : 'text-red-600'}`}>
+                    {fmtEur(plEbt)}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
           )}
         </CardContent>
       </Card>
