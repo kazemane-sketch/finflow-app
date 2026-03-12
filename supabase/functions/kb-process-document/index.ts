@@ -25,6 +25,7 @@ const NO_THINKING_CONFIG_MODELS = ["gemini-3.1-pro-preview", "gemini-3.1-pro-pre
 const CHUNK_TARGET_CHARS = 3200; // ~800 tokens
 const CHUNK_OVERLAP_CHARS = 400; // ~100 tokens
 const MAX_CHUNKS = 200;
+const EMBED_BATCH_SIZE = 5;
 
 /* ─── Helpers ───────────────────────────────────── */
 function jsonResponse(body: unknown, status = 200): Response {
@@ -600,28 +601,30 @@ async function handleProcess(
     // 6. Delete old chunks (in case of retry after error)
     await svc.from("kb_chunks").delete().eq("document_id", documentId);
 
-    // 7. Embed and insert each chunk sequentially
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      console.log(`[process] Embedding chunk ${i + 1}/${chunks.length}...`);
-      const embedding = await embedSingle(apiKey, chunk.content);
+    // 7. Embed and insert chunks in parallel batches
+    const totalBatches = Math.ceil(chunks.length / EMBED_BATCH_SIZE);
+    for (let b = 0; b < chunks.length; b += EMBED_BATCH_SIZE) {
+      const batch = chunks.slice(b, b + EMBED_BATCH_SIZE);
+      const batchNum = Math.floor(b / EMBED_BATCH_SIZE) + 1;
 
-      const { error: insertErr } = await svc.from("kb_chunks").insert({
-        document_id: documentId,
-        chunk_index: i,
-        content: sanitizeHtmlEntities(sanitizeText(chunk.content)),
-        section_title: chunk.section_title,
-        embedding: toVectorLiteral(embedding),
-      } as any);
+      await Promise.all(batch.map(async (chunk, j) => {
+        const idx = b + j;
+        const cleanContent = sanitizeHtmlEntities(sanitizeText(chunk.content));
+        const embedding = await embedSingle(apiKey, cleanContent);
+        const { error: insertErr } = await svc.from("kb_chunks").insert({
+          document_id: documentId,
+          chunk_index: idx,
+          content: cleanContent,
+          section_title: chunk.section_title,
+          embedding: toVectorLiteral(embedding),
+        } as any);
+        if (insertErr) {
+          throw new Error(`Insert chunk ${idx} fallito: ${insertErr.message}`);
+        }
+      }));
 
-      if (insertErr) {
-        throw new Error(`Insert chunk ${i} fallito: ${insertErr.message}`);
-      }
-
-      // 500ms pause between embeddings for rate limiting
-      if (i < chunks.length - 1) {
-        await sleep(500);
-      }
+      console.log(`[process] Embed batch ${batchNum}/${totalBatches} done`);
+      if (b + EMBED_BATCH_SIZE < chunks.length) await sleep(300);
     }
 
     // 8. Finalize
@@ -722,25 +725,30 @@ async function handleReprocess(
     // 5. Delete old chunks
     await svc.from("kb_chunks").delete().eq("document_id", documentId);
 
-    // 6. Embed + insert each chunk
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      console.log(`[reprocess] Embedding chunk ${i + 1}/${chunks.length}...`);
-      const embedding = await embedSingle(apiKey, sanitizeHtmlEntities(sanitizeText(chunk.content)));
+    // 6. Embed + insert chunks in parallel batches
+    const totalBatches = Math.ceil(chunks.length / EMBED_BATCH_SIZE);
+    for (let b = 0; b < chunks.length; b += EMBED_BATCH_SIZE) {
+      const batch = chunks.slice(b, b + EMBED_BATCH_SIZE);
+      const batchNum = Math.floor(b / EMBED_BATCH_SIZE) + 1;
 
-      const { error: insertErr } = await svc.from("kb_chunks").insert({
-        document_id: documentId,
-        chunk_index: i,
-        content: sanitizeHtmlEntities(sanitizeText(chunk.content)),
-        section_title: chunk.section_title,
-        embedding: toVectorLiteral(embedding),
-      } as any);
+      await Promise.all(batch.map(async (chunk, j) => {
+        const idx = b + j;
+        const cleanContent = sanitizeHtmlEntities(sanitizeText(chunk.content));
+        const embedding = await embedSingle(apiKey, cleanContent);
+        const { error: insertErr } = await svc.from("kb_chunks").insert({
+          document_id: documentId,
+          chunk_index: idx,
+          content: cleanContent,
+          section_title: chunk.section_title,
+          embedding: toVectorLiteral(embedding),
+        } as any);
+        if (insertErr) {
+          throw new Error(`Insert chunk ${idx} fallito: ${insertErr.message}`);
+        }
+      }));
 
-      if (insertErr) {
-        throw new Error(`Insert chunk ${i} fallito: ${insertErr.message}`);
-      }
-
-      if (i < chunks.length - 1) await sleep(500);
+      console.log(`[reprocess] Embed batch ${batchNum}/${totalBatches} done`);
+      if (b + EMBED_BATCH_SIZE < chunks.length) await sleep(300);
     }
 
     // 7. Finalize
