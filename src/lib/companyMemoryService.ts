@@ -404,18 +404,33 @@ export async function createMemoryFromReconciliation(
   invoiceNumber: string | null,
   txAmount: number,
   matchScore: number | null,
+  context?: {
+    txNotes?: string | null
+    invoiceNotes?: string | null
+    txContractRefs?: string[] | null
+    invoiceContractRefs?: string[] | null
+  },
 ): Promise<string | null> {
   if (!txDescription || txDescription.length < 3) return null
 
   const cpLabel = counterpartyName || 'sconosciuto'
   const invLabel = invoiceNumber || 'N/D'
-  const factText = `Riconciliazione: movimento '${txDescription}' (${txAmount} EUR) di '${cpLabel}' → fattura ${invLabel}`
+  const factParts = [`Riconciliazione: movimento '${txDescription}' (${txAmount} EUR) di '${cpLabel}' → fattura ${invLabel}`]
+  if (context?.txContractRefs?.length) factParts.push(`contratto movimento ${context.txContractRefs.join(', ')}`)
+  if (context?.invoiceContractRefs?.length) factParts.push(`contratto fattura ${context.invoiceContractRefs.join(', ')}`)
+  if (context?.txNotes) factParts.push(`note movimento: ${context.txNotes}`)
+  if (context?.invoiceNotes) factParts.push(`note fattura: ${context.invoiceNotes}`)
+  const factText = factParts.join(' — ')
 
   const metadata: Record<string, unknown> = {
     tx_amount: txAmount,
     match_score: matchScore,
     invoice_number: invoiceNumber,
   }
+  if (context?.txNotes) metadata.tx_notes = context.txNotes
+  if (context?.invoiceNotes) metadata.invoice_notes = context.invoiceNotes
+  if (context?.txContractRefs?.length) metadata.tx_contract_refs = context.txContractRefs
+  if (context?.invoiceContractRefs?.length) metadata.invoice_contract_refs = context.invoiceContractRefs
 
   const memId = await insertMemoryFact({
     company_id: companyId,

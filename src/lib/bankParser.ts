@@ -832,6 +832,7 @@ const BANK_TX_LIST_COLS = `id, company_id, bank_account_id, import_batch_id, dat
   transaction_type, direction, direction_source, direction_confidence,
   direction_needs_review, direction_reason, direction_updated_at, direction_updated_by,
   reference, invoice_ref, cbi_flow_id, branch, commission_amount, posting_side, hash,
+  notes,
   reconciliation_status, extraction_status, extraction_model, extracted_at,
   embedding_status, embedding_model, embedding_updated_at, created_at,
   tx_nature, classification_status, classification_source, classification_confidence,
@@ -1011,7 +1012,7 @@ export async function updateBankTransactionDirection(
 const EDITABLE_FIELDS = new Set([
   'date', 'value_date', 'amount', 'counterparty_name',
   'description', 'transaction_type', 'reference', 'invoice_ref',
-  'commission_amount', 'direction',
+  'commission_amount', 'direction', 'notes',
 ]);
 
 export async function updateBankTransaction(

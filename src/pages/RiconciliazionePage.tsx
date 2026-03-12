@@ -45,6 +45,7 @@ interface SuggestionRow {
     commission_amount: number | null
     reconciled_amount: number | null
     tx_nature: string | null
+    notes: string | null
   } | null
   invoice: {
     id: string
@@ -52,6 +53,9 @@ interface SuggestionRow {
     counterparty: Record<string, unknown> | null
     total_amount: number | null
     date: string | null
+    notes: string | null
+    primary_contract_ref: string | null
+    contract_refs: string[] | null
   } | null
   installment: {
     id: string
@@ -72,6 +76,7 @@ interface UnmatchedTx {
   description: string | null
   transaction_type: string | null
   direction: string | null
+  notes: string | null
   raw_text: string | null
   extraction_status: string | null
   commission_amount: number | null
@@ -91,6 +96,9 @@ interface OpenInstallment {
   direction: string
   invoice_number: string | null
   counterparty_name: string | null
+  invoice_notes?: string | null
+  primary_contract_ref?: string | null
+  contract_refs?: string[] | null
 }
 
 interface ReconciledRow {
@@ -201,6 +209,14 @@ function extractClientInvoiceRefs(refs: Record<string, unknown> | null, rawText:
     for (const m of rawText.matchAll(/SALDO\s+FATTURA\s+N\.?\s*(\S+)/gi)) results.push(m[1].replace(/[,;.]$/, ''))
   }
   return [...new Set(results)].filter(r => r.length >= 2)
+}
+
+function normalizeComparableRef(value: string | null | undefined): string {
+  return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+}
+
+function uniqueStrings(values: Array<string | null | undefined>): string[] {
+  return Array.from(new Set(values.map(v => String(v || '').trim()).filter(Boolean)))
 }
 
 /**
@@ -380,8 +396,8 @@ export default function RiconciliazionePage() {
       .select(`
         id, bank_transaction_id, installment_id, invoice_id,
         match_score, match_reason, proposed_by, rule_id, suggestion_data, status, created_at,
-        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount, reconciled_amount, tx_nature),
-        invoice:invoices(id, number, counterparty, total_amount, date),
+        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount, reconciled_amount, tx_nature, notes),
+        invoice:invoices(id, number, counterparty, total_amount, date, notes, primary_contract_ref, contract_refs),
         installment:invoice_installments(id, installment_no, due_date, amount_due, paid_amount, status, direction)
       `)
       .eq('company_id', companyId)
@@ -401,7 +417,7 @@ export default function RiconciliazionePage() {
     if (!companyId) return
     const { data } = await supabase
       .from('bank_transactions')
-      .select('id, date, amount, counterparty_name, description, transaction_type, direction, raw_text, extraction_status, commission_amount, extracted_refs, reconciled_amount, reconciliation_status')
+      .select('id, date, amount, counterparty_name, description, transaction_type, direction, notes, raw_text, extraction_status, commission_amount, extracted_refs, reconciled_amount, reconciliation_status')
       .eq('company_id', companyId)
       .in('reconciliation_status', ['unmatched', 'partial'])
       .order('date', { ascending: false })
@@ -416,7 +432,7 @@ export default function RiconciliazionePage() {
       .from('invoice_installments')
       .select(`
         id, invoice_id, installment_no, due_date, amount_due, paid_amount, status, direction,
-        invoice:invoices(number, counterparty)
+        invoice:invoices(number, counterparty, notes, primary_contract_ref, contract_refs)
       `)
       .eq('company_id', companyId)
       .in('status', ['pending', 'overdue', 'partial'])
@@ -435,6 +451,9 @@ export default function RiconciliazionePage() {
         direction: d.direction,
         invoice_number: d.invoice?.number || null,
         counterparty_name: d.invoice?.counterparty?.denom || null,
+        invoice_notes: d.invoice?.notes || null,
+        primary_contract_ref: d.invoice?.primary_contract_ref || null,
+        contract_refs: Array.isArray(d.invoice?.contract_refs) ? d.invoice.contract_refs : [],
       })))
     }
   }, [companyId])
@@ -686,12 +705,29 @@ export default function RiconciliazionePage() {
       // 5b. RAG: create learning example + company memory (fire-and-forget)
       if (tx && suggestion.invoice_id) {
         const inv = suggestion.invoice
+        const suggestionData = suggestion.suggestion_data || {}
+        const invoiceContracts = Array.isArray(inv?.contract_refs) ? inv?.contract_refs : []
+        const txContractRefs = uniqueStrings([
+          ...(Array.isArray(suggestionData.tx_contract_refs) ? suggestionData.tx_contract_refs as string[] : []),
+        ])
+        const invoiceContractRefs = uniqueStrings([
+          inv?.primary_contract_ref || null,
+          ...invoiceContracts,
+          ...(Array.isArray(suggestionData.invoice_contract_refs) ? suggestionData.invoice_contract_refs as string[] : []),
+        ])
         createReconciliationExample(
           companyId,
           tx.description || '', tx.date || '', Number(tx.amount),
           inv?.number || '', inv?.date || '', Number(inv?.total_amount || 0),
           tx.id, suggestion.invoice_id, suggestion.installment_id || null,
           suggestion.match_score,
+          {
+            txNotes: tx.notes || null,
+            invoiceNotes: inv?.notes || null,
+            txContractRefs,
+            invoiceContractRefs,
+            counterpartyName: tx.counterparty_name || ((inv?.counterparty as Record<string, unknown> | null)?.denom as string | null) || null,
+          },
         ).catch(err => console.warn('[confirmSuggestion] learning example error:', err))
 
         // Company memory: counterparty payment pattern
@@ -704,17 +740,34 @@ export default function RiconciliazionePage() {
           inv?.number || null,
           Number(tx.amount),
           suggestion.match_score,
+          {
+            txNotes: tx.notes || null,
+            invoiceNotes: inv?.notes || null,
+            txContractRefs,
+            invoiceContractRefs,
+          },
         ).catch(err => console.warn('[confirmSuggestion] memory error:', err))
       }
 
       // 5c. Miglioria 3: Upsert reconciliation rule from confirmed match
       if (tx && suggestion.invoice_id && tx.counterparty_name) {
         const inv = suggestion.invoice
+        const invoiceContracts = Array.isArray(inv?.contract_refs) ? inv?.contract_refs : []
+        const txContractRefs = uniqueStrings([
+          ...(Array.isArray(suggestion.suggestion_data?.tx_contract_refs) ? suggestion.suggestion_data?.tx_contract_refs as string[] : []),
+        ])
+        const invoiceContractRefs = uniqueStrings([
+          inv?.primary_contract_ref || null,
+          ...invoiceContracts,
+        ])
         const ruleName = `${tx.counterparty_name} → ${inv?.number || 'fattura'}`
         const ruleData = {
           counterparty_pattern: tx.counterparty_name,
           transaction_type: tx.transaction_type || null,
           amount_range: [Math.abs(Number(tx.amount)) * 0.85, Math.abs(Number(tx.amount)) * 1.15],
+          contract_ref: txContractRefs[0] || invoiceContractRefs[0] || null,
+          tx_notes: tx.notes || null,
+          invoice_notes: inv?.notes || null,
         }
         supabase.from('reconciliation_rules').upsert({
           company_id: companyId,
@@ -944,7 +997,34 @@ export default function RiconciliazionePage() {
         tx.description || '', tx.date || '', Number(tx.amount),
         installment.invoice_number || '', '', Number(installment.amount_due),
         tx.id, installment.invoice_id, installment.id, 100,
+        {
+          txNotes: tx.notes || null,
+          invoiceNotes: installment.invoice_notes || null,
+          invoiceContractRefs: uniqueStrings([
+            installment.primary_contract_ref || null,
+            ...(Array.isArray(installment.contract_refs) ? installment.contract_refs : []),
+          ]),
+          counterpartyName: tx.counterparty_name || installment.counterparty_name || null,
+        },
       ).catch(err => console.warn('[manualMatch] learning example error:', err))
+
+      createMemoryFromReconciliation(
+        companyId,
+        null,
+        tx.counterparty_name || installment.counterparty_name || null,
+        tx.description || '',
+        installment.invoice_number || null,
+        Number(tx.amount),
+        100,
+        {
+          txNotes: tx.notes || null,
+          invoiceNotes: installment.invoice_notes || null,
+          invoiceContractRefs: uniqueStrings([
+            installment.primary_contract_ref || null,
+            ...(Array.isArray(installment.contract_refs) ? installment.contract_refs : []),
+          ]),
+        },
+      ).catch(err => console.warn('[manualMatch] memory error:', err))
 
       // Expire impossible suggestions for this TX or installment
       if (txFullyMatched) {
@@ -1301,7 +1381,7 @@ export default function RiconciliazionePage() {
           .from('invoice_installments')
           .select(`
             id, invoice_id, installment_no, due_date, amount_due, paid_amount, status, direction,
-            invoice:invoices(number, counterparty)
+            invoice:invoices(number, counterparty, notes, primary_contract_ref, contract_refs)
           `)
           .eq('company_id', companyId)
           .in('invoice_id', ids)
@@ -1319,6 +1399,9 @@ export default function RiconciliazionePage() {
             direction: d.direction,
             invoice_number: d.invoice?.number || null,
             counterparty_name: d.invoice?.counterparty?.denom || null,
+            invoice_notes: d.invoice?.notes || null,
+            primary_contract_ref: d.invoice?.primary_contract_ref || null,
+            contract_refs: Array.isArray(d.invoice?.contract_refs) ? d.invoice.contract_refs : [],
           })))
         }
       }

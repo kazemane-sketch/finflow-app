@@ -1141,6 +1141,7 @@ export default function BancaPage() {
     direction: txDirection(tx),
     counterparty_name: tx.counterparty_name || '',
     description: tx.description || '',
+    notes: tx.notes || '',
     date: tx.date || '',
     value_date: tx.value_date || '',
     transaction_type: tx.transaction_type || '',

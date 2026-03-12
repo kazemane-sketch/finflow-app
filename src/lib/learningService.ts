@@ -173,14 +173,35 @@ export async function createReconciliationExample(
   invoiceId: string,
   installmentId: string | null,
   matchScore: number | null,
+  context?: {
+    txNotes?: string | null
+    invoiceNotes?: string | null
+    txContractRefs?: string[] | null
+    invoiceContractRefs?: string[] | null
+    counterpartyName?: string | null
+  },
 ): Promise<string | null> {
-  const inputText = `TX: ${txDescription} ${txDate} ${txAmount} EUR | INV: Fattura ${invoiceNumber || 'N/D'} del ${invoiceDate} ${invoiceAmount} EUR`
+  const parts = [
+    `TX: ${txDescription} ${txDate} ${txAmount} EUR`,
+    `INV: Fattura ${invoiceNumber || 'N/D'} del ${invoiceDate} ${invoiceAmount} EUR`,
+  ]
+  if (context?.counterpartyName) parts.push(`Controparte: ${context.counterpartyName}`)
+  if (context?.txNotes) parts.push(`Note movimento: ${context.txNotes}`)
+  if (context?.invoiceNotes) parts.push(`Note fattura: ${context.invoiceNotes}`)
+  if (context?.txContractRefs?.length) parts.push(`Contratti movimento: ${context.txContractRefs.join(', ')}`)
+  if (context?.invoiceContractRefs?.length) parts.push(`Contratti fattura: ${context.invoiceContractRefs.join(', ')}`)
+  const inputText = parts.join(' | ')
   const metadata: Record<string, unknown> = {
     transaction_id: transactionId,
     invoice_id: invoiceId,
     match_score: matchScore,
   }
   if (installmentId) metadata.installment_id = installmentId
+  if (context?.counterpartyName) metadata.counterparty_name = context.counterpartyName
+  if (context?.txNotes) metadata.tx_notes = context.txNotes
+  if (context?.invoiceNotes) metadata.invoice_notes = context.invoiceNotes
+  if (context?.txContractRefs?.length) metadata.tx_contract_refs = context.txContractRefs
+  if (context?.invoiceContractRefs?.length) metadata.invoice_contract_refs = context.invoiceContractRefs
 
   const sourceId = `rl:${transactionId}:${invoiceId}`
 

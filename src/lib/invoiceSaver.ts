@@ -42,6 +42,8 @@ export interface DBInvoice {
   reconciliation_status: string;
   sdi_id: string;
   notes: string;
+  primary_contract_ref?: string | null;
+  contract_refs?: string[] | null;
   source_filename: string;
   parse_method: string;
   xml_hash: string | null;
@@ -88,6 +90,18 @@ function minIsoDate(a: string | null, b: string | null): string | null {
   if (!a) return b;
   if (!b) return a;
   return a <= b ? a : b;
+}
+
+function extractContractRefsFromParsed(parsed: any): string[] {
+  const body = parsed?.bodies?.[0];
+  if (!body?.contratti?.length) return [];
+  return Array.from(
+    new Set(
+      body.contratti
+        .map((item: any) => String(item?.id || '').trim())
+        .filter(Boolean),
+    ),
+  );
 }
 
 // ============================================================
@@ -188,6 +202,7 @@ export async function saveInvoicesToDB(
       const totalAmount = !isNaN(totalFromXml) && b.totale !== ''
         ? totalFromXml
         : Math.max(0, taxableAmount + taxAmount - scontoImporto);
+      const contractRefs = extractContractRefsFromParsed(r.data);
 
       // Insert fattura
       const { data: inv, error: invErr } = await supabase
@@ -212,6 +227,8 @@ export async function saveInvoicesToDB(
           payment_terms: b.condPag || '',
           payment_due_date: paymentDue,
           paid_date: null,
+          primary_contract_ref: contractRefs[0] || null,
+          contract_refs: contractRefs,
           raw_xml: r.rawXml,
           xml_version: r.data.ver || '',
           source_filename: r.fn,
@@ -296,7 +313,7 @@ export async function saveInvoicesToDB(
 // ============================================================
 // LOAD — carica lista fatture con filtri e paginazione
 // ============================================================
-const INVOICE_LIST_COLS = 'id, company_id, counterparty_id, counterparty_status_snapshot, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, paid_date, payment_status, reconciliation_status, sdi_id, notes, source_filename, parse_method, xml_hash, extraction_status, classification_status, has_fiscal_alerts, created_at';
+const INVOICE_LIST_COLS = 'id, company_id, counterparty_id, counterparty_status_snapshot, counterparty, direction, doc_type, number, date, currency, total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount, payment_method, payment_terms, payment_due_date, paid_date, payment_status, reconciliation_status, sdi_id, notes, primary_contract_ref, contract_refs, source_filename, parse_method, xml_hash, extraction_status, classification_status, has_fiscal_alerts, created_at';
 
 export interface InvoiceFilters {
   direction?: 'all' | 'in' | 'out';

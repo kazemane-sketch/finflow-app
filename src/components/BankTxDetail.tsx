@@ -242,6 +242,7 @@ export default function BankTxDetail({
         <Row l="IBAN / Conto controparte" v={tx.counterparty_account} />
         <Row l="Saldo dopo" v={tx.balance != null ? fmtEur(tx.balance) : null} />
         <Row l="Descrizione breve" v={tx.description} />
+        <Row l="Note utente" v={tx.notes} />
         <Row l="Origine descrizione" v={tx.description_source} />
         <Row l="Confidenza descrizione" v={tx.description_confidence != null ? `${Math.round(Number(tx.description_confidence) * 100)}%` : null} />
         {tx.raw_text && (
@@ -383,6 +384,16 @@ export default function BankTxDetail({
                   className={inputCls}
                   value={editDraft?.description || ''}
                   onChange={e => onEditDraftChange?.('description', e.target.value)}
+                />
+              </EditField>
+
+              <EditField label="Note utente">
+                <textarea
+                  rows={3}
+                  className={`${inputCls} resize-none`}
+                  value={editDraft?.notes || ''}
+                  onChange={e => onEditDraftChange?.('notes', e.target.value)}
+                  placeholder="Aggiungi una nota utile per ricerca, riconciliazione o storico..."
                 />
               </EditField>
 

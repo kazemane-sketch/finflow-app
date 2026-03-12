@@ -24,6 +24,7 @@ type EmbeddingTx = {
   transaction_type: string | null;
   reference: string | null;
   invoice_ref: string | null;
+  notes: string | null;
   direction: "in" | "out" | null;
   raw_text: string | null;
   extracted_refs: Record<string, unknown> | string | null;
@@ -113,6 +114,9 @@ function buildEmbeddingText(tx: EmbeddingTx): string {
     `Riferimento: ${clip(tx.reference, 120) || "n.d."}`,
     `Rif fattura: ${clip(tx.invoice_ref, 80) || "n.d."}`,
   ];
+  if (tx.notes) {
+    parts.push(`Note utente: ${clip(tx.notes, 600)}`);
+  }
   if (tx.raw_text) {
     parts.push(`Testo operazione completo: ${clip(tx.raw_text, 1500)}`);
   }
@@ -296,7 +300,7 @@ Deno.serve(async (req) => {
   try {
     const { data: rows, error: rowsError } = await serviceClient
       .from("bank_transactions")
-      .select("id,company_id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,direction,raw_text,extracted_refs")
+      .select("id,company_id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,notes,direction,raw_text,extracted_refs")
       .in("id", batchIds);
 
     if (rowsError) {

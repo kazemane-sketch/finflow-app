@@ -25,9 +25,11 @@ interface TxRow {
   date: string;
   amount: number;
   counterparty_name: string | null;
+  description: string | null;
   transaction_type: string | null;
   extracted_refs: Record<string, unknown> | null;
   raw_text: string | null;
+  notes: string | null;
   direction: string;
   reconciled_amount: number;
   commission_amount: number | null;
@@ -47,6 +49,23 @@ interface Suggestion {
   proposed_by: "deterministic" | "rule" | "ai";
   rule_id: string | null;
   suggestion_data: Record<string, unknown> | null;
+}
+
+interface MatchRow {
+  invoice_id: string;
+  number: string | null;
+  total_amount?: number | null;
+  date: string | null;
+  counterparty_name: string | null;
+  installment_id: string | null;
+  amount_due?: number | null;
+  paid_amount?: number | null;
+  due_date?: string | null;
+  status?: string | null;
+  notes?: string | null;
+  primary_contract_ref?: string | null;
+  contract_refs?: unknown;
+  raw_xml?: string | null;
 }
 
 type SqlClient = ReturnType<typeof postgres>;
@@ -220,6 +239,204 @@ function extractMandateId(refs: Record<string, unknown> | null): string | null {
   return null;
 }
 
+function normalizeComparableRef(value: string | null | undefined): string {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/^IT(?=\d)/, "")
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+function extractContractRefs(refs: Record<string, unknown> | null): string[] {
+  if (!refs || typeof refs.error === "string") return [];
+  const values: string[] = [];
+  const arrayFields = [
+    "contract_refs",
+    "contract_numbers",
+    "numeri_contratto",
+    "riferimenti_contratto",
+  ];
+  const scalarFields = [
+    "contract_ref",
+    "contract_number",
+    "numero_contratto",
+    "contratto",
+  ];
+
+  for (const field of arrayFields) {
+    const val = refs[field];
+    if (Array.isArray(val)) {
+      for (const item of val) {
+        const normalized = normalizeComparableRef(typeof item === "string" ? item : null);
+        if (normalized.length >= 3) values.push(normalized);
+      }
+    }
+  }
+  for (const field of scalarFields) {
+    const val = refs[field];
+    const normalized = normalizeComparableRef(typeof val === "string" ? val : null);
+    if (normalized.length >= 3) values.push(normalized);
+  }
+  return [...new Set(values)];
+}
+
+function extractInvoiceContractRefs(row: MatchRow): string[] {
+  const normalized = new Set<string>();
+
+  const add = (value: string | null | undefined) => {
+    const ref = normalizeComparableRef(value);
+    if (ref.length >= 3) normalized.add(ref);
+  };
+
+  add(row.primary_contract_ref);
+
+  if (Array.isArray(row.contract_refs)) {
+    for (const item of row.contract_refs) {
+      add(typeof item === "string" ? item : null);
+    }
+  } else if (typeof row.contract_refs === "string") {
+    try {
+      const parsed = JSON.parse(row.contract_refs);
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) add(typeof item === "string" ? item : null);
+      }
+    } catch {
+      add(row.contract_refs);
+    }
+  }
+
+  if (!normalized.size && row.raw_xml) {
+    for (const m of row.raw_xml.matchAll(/<[^>]*DatiContratto[^>]*>[\s\S]*?<[^>]*IdDocumento[^>]*>([^<]+)<\/[^>]*IdDocumento>/gi)) {
+      add(m[1]);
+    }
+  }
+
+  return [...normalized];
+}
+
+type NoteSignals = {
+  block: boolean;
+  forcedInvoiceRefs: string[];
+  forcedContractRefs: string[];
+  freeText: string;
+};
+
+function parseNoteSignals(note: string | null | undefined): NoteSignals {
+  const source = String(note || "").trim();
+  if (!source) {
+    return { block: false, forcedInvoiceRefs: [], forcedContractRefs: [], freeText: "" };
+  }
+
+  const forcedInvoiceRefs = [...source.matchAll(/#rif_fattura[:=]\s*([^\s,;]+)/gi)]
+    .map((m) => normalizeComparableRef(m[1]))
+    .filter((v) => v.length >= 2);
+  const forcedContractRefs = [...source.matchAll(/#contratto[:=]\s*([^\s,;]+)/gi)]
+    .map((m) => normalizeComparableRef(m[1]))
+    .filter((v) => v.length >= 3);
+  const block = /#non_riconciliare\b/i.test(source);
+  const freeText = source
+    .replace(/#[a-z_]+[:=][^\s,;]+/gi, " ")
+    .replace(/#non_riconciliare\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return {
+    block,
+    forcedInvoiceRefs: [...new Set(forcedInvoiceRefs)],
+    forcedContractRefs: [...new Set(forcedContractRefs)],
+    freeText,
+  };
+}
+
+function freeTextIncludes(haystack: string, needle: string | null | undefined): boolean {
+  const normalizedNeedle = String(needle || "").trim().toLowerCase();
+  if (!haystack || normalizedNeedle.length < 3) return false;
+  return haystack.includes(normalizedNeedle);
+}
+
+function applyContextSignals(
+  tx: TxRow,
+  match: MatchRow,
+): { scoreDelta: number; blocked: boolean; reasonParts: string[]; extra: Record<string, unknown> } {
+  const reasonParts: string[] = [];
+  const extra: Record<string, unknown> = {};
+  let scoreDelta = 0;
+
+  const txContractRefs = extractContractRefs(tx.extracted_refs);
+  const invoiceContractRefs = extractInvoiceContractRefs(match);
+  const txNotes = parseNoteSignals(tx.notes);
+  const invoiceNotes = parseNoteSignals(match.notes);
+  const invoiceNumberNorm = normalizeComparableRef(match.number);
+  const freeTextHay = `${txNotes.freeText} ${invoiceNotes.freeText}`.toLowerCase();
+
+  if (txNotes.block || invoiceNotes.block) {
+    return {
+      scoreDelta: -999,
+      blocked: true,
+      reasonParts: ["nota utente: non riconciliare"],
+      extra: {
+        note_block: true,
+        tx_note_block: txNotes.block,
+        invoice_note_block: invoiceNotes.block,
+      },
+    };
+  }
+
+  if (txContractRefs.length > 0) extra.tx_contract_refs = txContractRefs;
+  if (invoiceContractRefs.length > 0) extra.invoice_contract_refs = invoiceContractRefs;
+
+  const contractMatch = txContractRefs.length > 0 && invoiceContractRefs.some((ref) => txContractRefs.includes(ref));
+  if (contractMatch) {
+    scoreDelta += 16;
+    reasonParts.push("contratto coincidente");
+    extra.contract_ref_match = true;
+  } else if (txContractRefs.length > 0 && invoiceContractRefs.length > 0) {
+    scoreDelta -= 20;
+    reasonParts.push("contratto incompatibile");
+    extra.contract_ref_match = false;
+  }
+
+  const forcedInvoiceMatch = txNotes.forcedInvoiceRefs.includes(invoiceNumberNorm) || invoiceNotes.forcedInvoiceRefs.includes(invoiceNumberNorm);
+  if (forcedInvoiceMatch) {
+    scoreDelta += 18;
+    reasonParts.push("nota: rif. fattura esplicito");
+    extra.note_invoice_match = true;
+  }
+
+  const forcedContractMatch = txNotes.forcedContractRefs.some((ref) => invoiceContractRefs.includes(ref))
+    || invoiceNotes.forcedContractRefs.some((ref) => txContractRefs.includes(ref));
+  if (forcedContractMatch) {
+    scoreDelta += 18;
+    reasonParts.push("nota: contratto esplicito");
+    extra.note_contract_match = true;
+  }
+
+  if (freeTextHay) {
+    if (freeTextIncludes(freeTextHay, match.number)) {
+      scoreDelta += 8;
+      reasonParts.push("nota cita numero fattura");
+    }
+    if (match.counterparty_name && freeTextIncludes(freeTextHay, match.counterparty_name)) {
+      scoreDelta += 4;
+      reasonParts.push("nota cita controparte");
+    }
+    if (invoiceContractRefs.some((ref) => freeTextHay.includes(ref.toLowerCase()))) {
+      scoreDelta += 10;
+      reasonParts.push("nota cita contratto");
+    }
+    if (tx.counterparty_name && freeTextIncludes(String(match.notes || "").toLowerCase(), tx.counterparty_name)) {
+      scoreDelta += 3;
+      reasonParts.push("nota fattura coerente con controparte");
+    }
+  }
+
+  if (tx.notes) extra.tx_notes_used = true;
+  if (match.notes) extra.invoice_notes_used = true;
+  if (reasonParts.length > 0) extra.contextual_signals = reasonParts;
+
+  return { scoreDelta, blocked: false, reasonParts, extra };
+}
+
 /**
  * Parse raw_text for invoice references when AI extraction didn't capture them.
  */
@@ -354,6 +571,7 @@ async function matchByInvoiceRefs(
     const query = `
       SELECT i.id as invoice_id, i.number, i.total_amount, i.date,
              i.counterparty->>'denom' as counterparty_name,
+             i.notes, i.primary_contract_ref, i.contract_refs, i.raw_xml,
              ii.id as installment_id, ii.amount_due, ii.paid_amount, ii.due_date, ii.status
       FROM invoices i
       LEFT JOIN invoice_installments ii
@@ -374,6 +592,9 @@ async function matchByInvoiceRefs(
     );
 
     for (const m of filteredMatches) {
+      const context = applyContextSignals(tx, m as MatchRow);
+      if (context.blocked) continue;
+
       const instRemaining = m.installment_id
         ? Math.abs(Number(m.amount_due) - Number(m.paid_amount || 0))
         : Math.abs(Number(m.total_amount));
@@ -407,12 +628,15 @@ async function matchByInvoiceRefs(
         score = 75;
         reason += ` (⚠ diff €${amountDiff.toFixed(2)} — importo molto diverso)`;
       }
+      if (context.reasonParts.length > 0) {
+        reason += ` — ${context.reasonParts.join(" · ")}`;
+      }
 
       suggestions.push({
         bank_transaction_id: tx.id,
         installment_id: (m.installment_id as string) || null,
         invoice_id: m.invoice_id as string,
-        match_score: score,
+        match_score: Math.max(0, Math.min(98, score + context.scoreDelta)),
         match_reason: reason,
         proposed_by: "deterministic",
         rule_id: null,
@@ -420,6 +644,7 @@ async function matchByInvoiceRefs(
           ref,
           amount_diff: amountDiff,
           level: "invoice_ref",
+          ...context.extra,
         },
       });
     }
@@ -466,7 +691,8 @@ async function matchByMandate(
             ii.amount_due, ii.paid_amount,
             inv.number as invoice_number,
             inv.date as invoice_date,
-            inv.counterparty->>'denom' as counterparty_name
+            inv.counterparty->>'denom' as counterparty_name,
+            inv.notes, inv.primary_contract_ref, inv.contract_refs, inv.raw_xml
      FROM invoice_installments ii
      JOIN invoices inv ON inv.id = ii.invoice_id
      WHERE ii.company_id = $1
@@ -481,6 +707,22 @@ async function matchByMandate(
   );
 
   for (const m of openInst) {
+    const context = applyContextSignals(tx, {
+      invoice_id: m.invoice_id as string,
+      number: m.invoice_number as string | null,
+      date: m.invoice_date as string | null,
+      counterparty_name: m.counterparty_name as string | null,
+      installment_id: m.installment_id as string | null,
+      amount_due: Number(m.amount_due),
+      paid_amount: Number(m.paid_amount),
+      due_date: m.due_date as string | null,
+      notes: (m.notes as string | null) || null,
+      primary_contract_ref: (m.primary_contract_ref as string | null) || null,
+      contract_refs: m.contract_refs,
+      raw_xml: (m.raw_xml as string | null) || null,
+    });
+    if (context.blocked) continue;
+
     const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
     if (instRemaining < 0.01) continue;
     const amountDiff = Math.abs(remainingAmount - instRemaining);
@@ -495,13 +737,14 @@ async function matchByMandate(
     else score = 85;
 
     const temporalNote = tx.date && m.invoice_date ? `, fattura ${Math.round(daysDiff)}gg prima` : "";
+    const contextNote = context.reasonParts.length > 0 ? ` — ${context.reasonParts.join(" · ")}` : "";
 
     suggestions.push({
       bank_transaction_id: tx.id,
       installment_id: m.installment_id,
       invoice_id: m.invoice_id,
-      match_score: score,
-      match_reason: `Mandato SDD "${mandateId}" → ${cpName} + importo simile${temporalNote}`,
+      match_score: Math.max(0, Math.min(98, score + context.scoreDelta)),
+      match_reason: `Mandato SDD "${mandateId}" → ${cpName} + importo simile${temporalNote}${contextNote}`,
       proposed_by: "deterministic",
       rule_id: null,
       suggestion_data: {
@@ -510,6 +753,7 @@ async function matchByMandate(
         amount_diff: amountDiff,
         days_diff: Math.round(daysDiff),
         level: "mandate",
+        ...context.extra,
       },
     });
   }
@@ -539,6 +783,7 @@ async function matchByCounterpartyAmount(
             inv.number as invoice_number,
             inv.date as invoice_date,
             inv.counterparty->>'denom' as counterparty_name,
+            inv.notes, inv.primary_contract_ref, inv.contract_refs, inv.raw_xml,
             cp.payment_terms_days,
             cp.dso_days_override,
             cp.pso_days_override
@@ -557,6 +802,23 @@ async function matchByCounterpartyAmount(
   );
 
   for (const m of cpMatches) {
+    const context = applyContextSignals(tx, {
+      invoice_id: m.invoice_id as string,
+      number: m.invoice_number as string | null,
+      date: m.invoice_date as string | null,
+      counterparty_name: m.counterparty_name as string | null,
+      installment_id: m.installment_id as string | null,
+      amount_due: Number(m.amount_due),
+      paid_amount: Number(m.paid_amount),
+      due_date: m.due_date as string | null,
+      status: m.status as string | null,
+      notes: (m.notes as string | null) || null,
+      primary_contract_ref: (m.primary_contract_ref as string | null) || null,
+      contract_refs: m.contract_refs,
+      raw_xml: (m.raw_xml as string | null) || null,
+    });
+    if (context.blocked) continue;
+
     const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
     if (instRemaining < 0.01) continue;
     const amountDiff = Math.abs(remainingAmount - instRemaining);
@@ -619,13 +881,14 @@ async function matchByCounterpartyAmount(
     // v2: rich match_reason with temporal + DSO info
     const dsoNote = dsoBonus > 0 ? ` (in finestra pagamento ${expectedDays}gg)` : "";
     const temporalNote = daysDiff < 999 ? ` — fattura ${Math.round(daysDiff)}gg prima${dsoNote}` : "";
+    const contextNote = context.reasonParts.length > 0 ? ` — ${context.reasonParts.join(" · ")}` : "";
 
     suggestions.push({
       bank_transaction_id: tx.id,
       installment_id: m.installment_id,
       invoice_id: m.invoice_id,
-      match_score: score,
-      match_reason: `Controparte "${m.counterparty_name}" + importo ${amountRatio < 0.02 ? "esatto" : "simile"} (diff €${amountDiff.toFixed(2)})${temporalNote}${amountNote ? ` — ${amountNote}` : ""}`,
+      match_score: Math.max(0, Math.min(98, score + context.scoreDelta)),
+      match_reason: `Controparte "${m.counterparty_name}" + importo ${amountRatio < 0.02 ? "esatto" : "simile"} (diff €${amountDiff.toFixed(2)})${temporalNote}${amountNote ? ` — ${amountNote}` : ""}${contextNote}`,
       proposed_by: "deterministic",
       rule_id: null,
       suggestion_data: {
@@ -635,6 +898,7 @@ async function matchByCounterpartyAmount(
         level: "counterparty",
         ...(amountNote ? { amount_note: amountNote } : {}),
         ...(dsoBonus > 0 ? { dso_match: true, expected_days: expectedDays } : {}),
+        ...context.extra,
       },
     });
   }
@@ -672,11 +936,17 @@ async function matchByRules(
     // Check if TX matches the rule pattern
     const ruleCounterparty = rd.counterparty_pattern as string | null;
     const ruleType = rd.transaction_type as string | null;
+    const ruleContractRef = rd.contract_ref as string | null;
+    const txContractRefs = extractContractRefs(tx.extracted_refs);
 
     // Counterparty must match
     if (ruleCounterparty && !counterpartyMatches(tx.counterparty_name, ruleCounterparty)) continue;
     // Transaction type must match (if specified)
     if (ruleType && tx.transaction_type && !tx.transaction_type.toUpperCase().includes(ruleType.toUpperCase())) continue;
+    if (
+      ruleContractRef &&
+      !txContractRefs.some((ref) => normalizeComparableRef(ref) === normalizeComparableRef(ruleContractRef))
+    ) continue;
 
     // Find matching invoices
     const cpWord = (ruleCounterparty || tx.counterparty_name || "").split(/\s+/)[0];
@@ -686,7 +956,9 @@ async function matchByRules(
       `SELECT ii.id as installment_id, ii.invoice_id, ii.due_date,
               ii.amount_due, ii.paid_amount,
               inv.number as invoice_number,
-              inv.counterparty->>'denom' as counterparty_name
+              inv.date as invoice_date,
+              inv.counterparty->>'denom' as counterparty_name,
+              inv.notes, inv.primary_contract_ref, inv.contract_refs, inv.raw_xml
        FROM invoice_installments ii
        JOIN invoices inv ON inv.id = ii.invoice_id
        WHERE ii.company_id = $1
@@ -701,6 +973,22 @@ async function matchByRules(
     );
 
     for (const m of ruleMatches) {
+      const context = applyContextSignals(tx, {
+        invoice_id: m.invoice_id as string,
+        number: m.invoice_number as string | null,
+        date: m.invoice_date as string | null,
+        counterparty_name: m.counterparty_name as string | null,
+        installment_id: m.installment_id as string | null,
+        amount_due: Number(m.amount_due),
+        paid_amount: Number(m.paid_amount),
+        due_date: m.due_date as string | null,
+        notes: (m.notes as string | null) || null,
+        primary_contract_ref: (m.primary_contract_ref as string | null) || null,
+        contract_refs: m.contract_refs,
+        raw_xml: (m.raw_xml as string | null) || null,
+      });
+      if (context.blocked) continue;
+
       const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
       if (instRemaining < 0.01) continue;
       const amountDiff = Math.abs(remainingAmount - instRemaining);
@@ -713,8 +1001,8 @@ async function matchByRules(
         bank_transaction_id: tx.id,
         installment_id: m.installment_id,
         invoice_id: m.invoice_id,
-        match_score: Math.min(score, 90),
-        match_reason: `Regola "${rule.rule_name}" (conf. ${(ruleConf * 100).toFixed(0)}%) → ${m.counterparty_name}`,
+        match_score: Math.max(0, Math.min(98, Math.min(score, 90) + context.scoreDelta)),
+        match_reason: `Regola "${rule.rule_name}" (conf. ${(ruleConf * 100).toFixed(0)}%) → ${m.counterparty_name}${context.reasonParts.length > 0 ? ` — ${context.reasonParts.join(" · ")}` : ""}`,
         proposed_by: "rule",
         rule_id: rule.id,
         suggestion_data: {
@@ -722,6 +1010,7 @@ async function matchByRules(
           rule_confidence: ruleConf,
           amount_diff: amountDiff,
           level: "rule",
+          ...context.extra,
         },
       });
     }
@@ -786,6 +1075,7 @@ async function matchCumulativePayment(
             inv.number as invoice_number,
             inv.date as invoice_date,
             inv.counterparty->>'denom' as counterparty_name,
+            inv.notes, inv.primary_contract_ref, inv.contract_refs, inv.raw_xml,
             abs(ii.amount_due - ii.paid_amount) as remaining
      FROM invoice_installments ii
      JOIN invoices inv ON inv.id = ii.invoice_id
@@ -815,22 +1105,40 @@ async function matchCumulativePayment(
         const groupId = crypto.randomUUID();
         const score = ratio < 0.02 ? 75 : 65;
         const items = [openInst[i], openInst[j]];
-        return items.map((m) => ({
-          bank_transaction_id: tx.id,
-          installment_id: m.installment_id,
-          invoice_id: m.invoice_id,
-          match_score: score,
-          match_reason: `Pagamento cumulativo: ${items.map(x => x.invoice_number).join(" + ")} = €${sum.toFixed(2)} (TX €${target.toFixed(2)})`,
-          proposed_by: "deterministic" as const,
-          rule_id: null,
-          suggestion_data: {
-            group_id: groupId,
-            group_total: sum,
-            level: "cumulative",
-            counterparty: m.counterparty_name,
-            amount_diff: Math.abs(sum - target),
-          },
-        }));
+        return items.flatMap((m) => {
+          const context = applyContextSignals(tx, {
+            invoice_id: m.invoice_id as string,
+            number: m.invoice_number as string | null,
+            date: m.invoice_date as string | null,
+            counterparty_name: m.counterparty_name as string | null,
+            installment_id: m.installment_id as string | null,
+            amount_due: Number(m.amount_due),
+            paid_amount: Number(m.paid_amount),
+            due_date: m.due_date as string | null,
+            notes: (m.notes as string | null) || null,
+            primary_contract_ref: (m.primary_contract_ref as string | null) || null,
+            contract_refs: m.contract_refs,
+            raw_xml: (m.raw_xml as string | null) || null,
+          });
+          if (context.blocked) return [];
+          return [{
+            bank_transaction_id: tx.id,
+            installment_id: m.installment_id,
+            invoice_id: m.invoice_id,
+            match_score: Math.max(0, Math.min(98, score + context.scoreDelta)),
+            match_reason: `Pagamento cumulativo: ${items.map(x => x.invoice_number).join(" + ")} = €${sum.toFixed(2)} (TX €${target.toFixed(2)})${context.reasonParts.length > 0 ? ` — ${context.reasonParts.join(" · ")}` : ""}`,
+            proposed_by: "deterministic" as const,
+            rule_id: null,
+            suggestion_data: {
+              group_id: groupId,
+              group_total: sum,
+              level: "cumulative",
+              counterparty: m.counterparty_name,
+              amount_diff: Math.abs(sum - target),
+              ...context.extra,
+            },
+          }];
+        });
       }
     }
   }
@@ -845,22 +1153,40 @@ async function matchCumulativePayment(
           const groupId = crypto.randomUUID();
           const score = ratio < 0.02 ? 70 : 60;
           const items = [openInst[i], openInst[j], openInst[k]];
-          return items.map((m) => ({
-            bank_transaction_id: tx.id,
-            installment_id: m.installment_id,
-            invoice_id: m.invoice_id,
-            match_score: score,
-            match_reason: `Pagamento cumulativo: ${items.map(x => x.invoice_number).join(" + ")} = €${sum.toFixed(2)}`,
-            proposed_by: "deterministic" as const,
-            rule_id: null,
-            suggestion_data: {
-              group_id: groupId,
-              group_total: sum,
-              level: "cumulative",
-              counterparty: m.counterparty_name,
-              amount_diff: Math.abs(sum - target),
-            },
-          }));
+          return items.flatMap((m) => {
+            const context = applyContextSignals(tx, {
+              invoice_id: m.invoice_id as string,
+              number: m.invoice_number as string | null,
+              date: m.invoice_date as string | null,
+              counterparty_name: m.counterparty_name as string | null,
+              installment_id: m.installment_id as string | null,
+              amount_due: Number(m.amount_due),
+              paid_amount: Number(m.paid_amount),
+              due_date: m.due_date as string | null,
+              notes: (m.notes as string | null) || null,
+              primary_contract_ref: (m.primary_contract_ref as string | null) || null,
+              contract_refs: m.contract_refs,
+              raw_xml: (m.raw_xml as string | null) || null,
+            });
+            if (context.blocked) return [];
+            return [{
+              bank_transaction_id: tx.id,
+              installment_id: m.installment_id,
+              invoice_id: m.invoice_id,
+              match_score: Math.max(0, Math.min(98, score + context.scoreDelta)),
+              match_reason: `Pagamento cumulativo: ${items.map(x => x.invoice_number).join(" + ")} = €${sum.toFixed(2)}${context.reasonParts.length > 0 ? ` — ${context.reasonParts.join(" · ")}` : ""}`,
+              proposed_by: "deterministic" as const,
+              rule_id: null,
+              suggestion_data: {
+                group_id: groupId,
+                group_total: sum,
+                level: "cumulative",
+                counterparty: m.counterparty_name,
+                amount_diff: Math.abs(sum - target),
+                ...context.extra,
+              },
+            }];
+          });
         }
       }
     }
@@ -909,7 +1235,16 @@ async function ragBoostSuggestions(
 
   try {
     // Embed the transaction description
-    const txText = `TX: ${tx.counterparty_name || ''} ${tx.date || ''} ${Math.abs(Number(tx.amount))} EUR`;
+    const extractedContractRefs = extractContractRefs(tx.extracted_refs);
+    const txTextParts = [
+      `TX: ${tx.counterparty_name || ""} ${tx.date || ""} ${Math.abs(Number(tx.amount))} EUR`,
+      tx.description || "",
+      tx.notes || "",
+    ];
+    if (extractedContractRefs.length > 0) {
+      txTextParts.push(`Contratti: ${extractedContractRefs.join(" | ")}`);
+    }
+    const txText = txTextParts.filter(Boolean).join(" | ");
     const vec = await callGeminiEmbedding(geminiKey, txText);
     const vecLiteral = toVectorLiteral(vec);
 
@@ -1077,7 +1412,7 @@ Deno.serve(async (req) => {
   try {
     const rows: TxRow[] = await sql`
       SELECT id, date, amount, counterparty_name, transaction_type,
-             extracted_refs, raw_text, direction, reconciled_amount, commission_amount
+             description, extracted_refs, raw_text, notes, direction, reconciled_amount, commission_amount
       FROM bank_transactions
       WHERE company_id = ${companyId}
         AND reconciliation_status IN ('unmatched', 'partial')
