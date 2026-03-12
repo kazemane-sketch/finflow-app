@@ -734,7 +734,7 @@ export default function KBDocumentsPage() {
               }
               if (r.target_type === 'document') payload.target_document_id = r.target_id
               if (r.target_type === 'rule') payload.target_rule_id = r.target_id
-              await supabase.from('kb_document_relations').insert(payload).catch(() => {})
+              try { await supabase.from('kb_document_relations').insert(payload) } catch { /* ignore duplicates */ }
             }
           }
         } catch (e: any) {
@@ -814,10 +814,12 @@ export default function KBDocumentsPage() {
   // ── Stats ──
   const stats = {
     total: docs.length,
+    pending: docs.filter(d => d.status === 'pending').length,
     ready: docs.filter(d => d.status === 'ready').length,
     processing: docs.filter(d => d.status === 'processing' || d.status === 'chunking').length,
     error: docs.filter(d => d.status === 'error').length,
     superseded: docs.filter(d => d.status === 'superseded').length,
+    unclassified: docs.filter(d => d.status === 'ready' && !d.summary).length,
   }
 
   // ════════════════════════════════════════════════
@@ -840,7 +842,7 @@ export default function KBDocumentsPage() {
             onClick={handleBatchProcess}>
             {batchProcessRunning
               ? <><Square className="h-3.5 w-3.5 mr-1" />Stop ({batchProcessProgress.current}/{batchProcessProgress.total})</>
-              : <><Zap className="h-3.5 w-3.5 mr-1" />Processa pending ({stats.total - stats.ready - stats.superseded})</>
+              : <><Zap className="h-3.5 w-3.5 mr-1" />Processa pending ({stats.pending + stats.error})</>
             }
           </Button>
           {/* Batch Classify */}
@@ -848,7 +850,7 @@ export default function KBDocumentsPage() {
             onClick={handleBatchClassify}>
             {batchClassifyRunning
               ? <><Square className="h-3.5 w-3.5 mr-1" />Stop ({batchClassifyProgress.current}/{batchClassifyProgress.total})</>
-              : <><Brain className="h-3.5 w-3.5 mr-1" />Classifica ready</>
+              : <><Brain className="h-3.5 w-3.5 mr-1" />Classifica ready ({stats.unclassified})</>
             }
           </Button>
           <Button onClick={() => openForm()}>
