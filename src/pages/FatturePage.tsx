@@ -2145,6 +2145,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       // 4. Determine and apply classification status
       if (!hasAnyData) {
         // User cleared everything → delete classification and set status 'none'
+        await saveInvoiceProjects(companyId, invoice.id, []);
         await clearAllLineProjects(invoice.id);
         await deleteInvoiceClassification(invoice.id);
         await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
@@ -2438,6 +2439,13 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       await clearAllLineProjects(invoice.id);
     } catch (e) {
       console.warn('[clear] Error clearing line projects from DB:', e);
+    }
+    if (company?.id) {
+      try {
+        await saveInvoiceProjects(company.id, invoice.id, []);
+      } catch (e) {
+        console.warn('[clear] Error clearing invoice-level projects from DB:', e);
+      }
     }
     // Revoke learning artifacts immediately as well, so legacy rules/decisions
     // do not survive while the invoice is visually cleared in the UI.
@@ -2818,7 +2826,19 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
 
 
   // Compute whether classification tab has an unconfirmed indicator
-  const classifNeedsAttention = invoice.classification_status === 'ai_suggested' || (!classification && aiClassifStatus === 'idle');
+  const hasPersistedClassificationData = !!(
+    classification
+    || Object.keys(lineClassifs).length > 0
+    || Object.keys(lineArticleMap).length > 0
+    || hasAnyLineProjects(lineProjects)
+    || cdcRows.length > 0
+    || invProjects.length > 0
+  );
+  const hasReviewableAiSuggestion = invoice.classification_status === 'ai_suggested'
+    && hasPersistedClassificationData
+    && aiClassifStatus !== 'loading'
+    && !singleInvoiceJobRunning;
+  const classifNeedsAttention = hasReviewableAiSuggestion;
   const showDetailSkeleton = referenceDataLoading
     || detailPhase === 'loading'
     || detailPhase === 'refreshing'
@@ -3057,7 +3077,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
               )}
 
               {/* AI suggested banner */}
-              {invoice.classification_status === 'ai_suggested' && !aiClassifResult && (
+              {hasReviewableAiSuggestion && !aiClassifResult && (
                 <div className="flex items-center gap-2 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5">
                   <span className="text-amber-500 text-sm">{'\u26A1'}</span>
                   <span className="text-[10px] text-amber-800">Suggerimento AI {'\u2014'} verifica e Salva</span>
@@ -3079,7 +3099,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
             {/* AI Assistant Box — always visible, 3 states */}
             {(() => {
               const hasAlerts = invoiceNotes.length > 0 || !!(invoice as any).has_fiscal_alerts;
-              const isClassified = invoice.classification_status === 'ai_suggested' || invoice.classification_status === 'confirmed';
+              const isClassified = invoice.classification_status === 'confirmed' || hasPersistedClassificationData || !!aiClassifResult;
               const boxStyle = hasAlerts
                 ? 'border-amber-200 bg-amber-50'
                 : isClassified
