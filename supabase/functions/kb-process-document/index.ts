@@ -73,17 +73,26 @@ function geminiUrl(model: string, method: string, apiKey: string): string {
   return `https://generativelanguage.googleapis.com/v1beta/models/${model}:${method}?key=${apiKey}`;
 }
 
+/** Convert Uint8Array → base64 without stack overflow and with correct padding.
+ *  Builds the full binary string char-by-char (no spread operator), then btoa() once. */
+function uint8ToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
 /* ─── Text extraction: PDF via Gemini Flash ─────── */
 async function extractTextFromPdf(
   apiKey: string,
   fileBytes: Uint8Array,
 ): Promise<string> {
-  // Build base64 in chunks to avoid stack overflow on large PDFs
-  let base64 = "";
-  const chunkSize = 8192;
-  for (let i = 0; i < fileBytes.length; i += chunkSize) {
-    const slice = fileBytes.subarray(i, Math.min(i + chunkSize, fileBytes.length));
-    base64 += btoa(String.fromCharCode(...slice));
+  const base64 = uint8ToBase64(fileBytes);
+
+  // Validate: %PDF → JVBERi in base64
+  if (!base64.startsWith("JVBERi")) {
+    throw new Error("PDF base64 non valido — il file potrebbe non essere un PDF");
   }
 
   const res = await fetch(geminiUrl(FLASH_MODEL, "generateContent", apiKey), {
