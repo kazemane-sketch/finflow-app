@@ -706,8 +706,9 @@ Se nessun alert: []`);
         generationConfig: {
           maxOutputTokens: agentConfig?.max_output_tokens || 32768,
           temperature,
-          ...(budget > 0 ? { thinkingConfig: { thinkingBudget: budget } } : {}),
         },
+        // thinkingConfig MUST be top-level, NOT nested inside generationConfig
+        ...(budget > 0 ? { thinkingConfig: { thinkingBudget: budget } } : {}),
       }),
     });
 

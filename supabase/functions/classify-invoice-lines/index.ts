@@ -869,19 +869,19 @@ async function callGemini(
   console.log(`[gemini] Calling ${model}, prompt=${prompt.length} chars, thinking_budget=${thinkingBudget}`);
 
   try {
-    const genConfig: Record<string, unknown> = { maxOutputTokens };
-    // Add thinkingConfig only for models that support it and budget > 0
+    // thinkingConfig MUST be a top-level sibling of generationConfig, NOT nested inside it
+    const bodyObj: Record<string, unknown> = {
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens },
+    };
     if (thinkingBudget > 0 && !NO_THINKING_CONFIG_MODELS.includes(model)) {
-      genConfig.thinkingConfig = { thinkingBudget };
+      bodyObj.thinkingConfig = { thinkingBudget };
     }
 
     const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: genConfig,
-      }),
+      body: JSON.stringify(bodyObj),
     });
 
     if (!resp.ok) {

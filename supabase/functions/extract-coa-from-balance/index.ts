@@ -134,8 +134,9 @@ async function extractFromChunk(
         temperature: 0,
         maxOutputTokens: 16384,
         responseMimeType: "application/json",
-        thinkingConfig: { thinkingBudget: 0 },
       },
+      // thinkingConfig MUST be top-level, NOT nested inside generationConfig
+      thinkingConfig: { thinkingBudget: 0 },
     }),
   });
 

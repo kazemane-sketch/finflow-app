@@ -340,8 +340,9 @@ async function processChunkWithGemini(apiKey: string, chunkBase64: string): Prom
         temperature: 0,
         maxOutputTokens: MAX_OUTPUT_TOKENS,
         responseMimeType: "application/json",
-        thinkingConfig: { thinkingBudget: 0 },
       },
+      // thinkingConfig MUST be top-level, NOT nested inside generationConfig
+      thinkingConfig: { thinkingBudget: 0 },
     }),
   });
 
