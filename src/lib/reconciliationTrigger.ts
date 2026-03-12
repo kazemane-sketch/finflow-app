@@ -5,14 +5,11 @@
 
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/integrations/supabase/client'
 import { getValidAccessToken } from '@/lib/getValidAccessToken'
-import { getStoredReconciliationEngineMode, type ReconciliationEngineMode } from '@/lib/reconciliationEngineMode'
 import { toast } from 'sonner'
 
 interface ReconciliationResult {
   processed: number
   new_suggestions: number
-  engine_mode?: string
-  shadow_comparison?: Record<string, unknown> | null
 }
 
 /**
@@ -40,7 +37,6 @@ async function runExtractRefs(companyId: string): Promise<number> {
 async function runReconciliationGenerate(
   companyId: string,
   token: string,
-  engineMode: ReconciliationEngineMode,
 ): Promise<ReconciliationResult> {
   const res = await fetch(`${SUPABASE_URL}/functions/v1/reconciliation-generate`, {
     method: 'POST',
@@ -49,7 +45,7 @@ async function runReconciliationGenerate(
       'apikey': SUPABASE_ANON_KEY,
       'Authorization': `Bearer ${token}`,
     },
-    body: JSON.stringify({ company_id: companyId, batch_size: 100, engine_mode: engineMode }),
+    body: JSON.stringify({ company_id: companyId, batch_size: 100, engine_mode: 'contextual' }),
   })
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))
@@ -65,8 +61,6 @@ export interface AutoReconcileOptions {
   onComplete?: (result: ReconciliationResult) => void
   /** Show toast when new suggestions found (default: true) */
   showToast?: boolean
-  /** Override current reconciliation engine mode */
-  engineMode?: ReconciliationEngineMode
 }
 
 /**
@@ -85,7 +79,6 @@ export function triggerAutoReconciliation(
     extractFirst = false,
     onComplete,
     showToast = true,
-    engineMode = getStoredReconciliationEngineMode(companyId),
   } = options
 
   void (async () => {
@@ -100,7 +93,7 @@ export function triggerAutoReconciliation(
 
       // Phase 2: Generate reconciliation suggestions
       const token = await getValidAccessToken()
-      const result = await runReconciliationGenerate(companyId, token, engineMode)
+      const result = await runReconciliationGenerate(companyId, token)
 
       console.log(
         `[AutoReconcile] Done: ${result.new_suggestions} new suggestions from ${result.processed} transactions`,

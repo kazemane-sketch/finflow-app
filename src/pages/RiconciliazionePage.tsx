@@ -18,13 +18,6 @@ import { askInvoiceAiSearch, type InvoiceAiResult } from '@/lib/invoiceAiSearch'
 import { createReconciliationExample } from '@/lib/learningService'
 import { createMemoryFromReconciliation } from '@/lib/companyMemoryService'
 import { useAIJob } from '@/hooks/useAIJob'
-import {
-  getStoredReconciliationEngineMode,
-  reconciliationEngineModeDescription,
-  reconciliationEngineModeLabel,
-  setStoredReconciliationEngineMode,
-  type ReconciliationEngineMode,
-} from '@/lib/reconciliationEngineMode'
 
 /* ─── types ──────────────────────────────────── */
 
@@ -343,7 +336,6 @@ export default function RiconciliazionePage() {
   // UI state
   const [loading, setLoading] = useState(true)
   const { isRunning: generating, startOrStop: reconStartOrStop } = useAIJob('riconciliazione-auto', 'Riconciliazione Automatica')
-  const [engineMode, setEngineMode] = useState<ReconciliationEngineMode>('contextual')
   const [confirmingId, setConfirmingId] = useState<string | null>(null)
   const [rejectingId, setRejectingId] = useState<string | null>(null)
   const [bulkConfirming, setBulkConfirming] = useState(false)
@@ -532,11 +524,6 @@ export default function RiconciliazionePage() {
       .finally(() => setLoading(false))
   }, [companyId, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments, loadReconciled])
 
-  useEffect(() => {
-    if (!companyId) return
-    setEngineMode(getStoredReconciliationEngineMode(companyId))
-  }, [companyId])
-
   // ─── detail popup loader ───────────────────
   useEffect(() => {
     if (!detailPopup) { setDetailPopupData(null); return }
@@ -579,26 +566,16 @@ export default function RiconciliazionePage() {
           'apikey': SUPABASE_ANON_KEY,
           'Authorization': `Bearer ${token}`,
         },
-        body: JSON.stringify({ company_id: companyId, batch_size: 100, engine_mode: engineMode }),
+        body: JSON.stringify({ company_id: companyId, batch_size: 100, engine_mode: 'contextual' }),
         signal,
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
 
-      const engineLabel = reconciliationEngineModeLabel(engineMode)
-      const shadowText = engineMode === 'shadow' && data.shadow_comparison
-        ? ` · shadow diff: ${Number(data.shadow_comparison.top_changed_tx || 0)}`
-        : ''
-      toast.success(`${data.new_suggestions} nuovi suggerimenti generati (${data.processed} movimenti analizzati, ${engineLabel})${shadowText}`)
+      toast.success(`${data.new_suggestions} nuovi suggerimenti generati (${data.processed} movimenti analizzati)`)
       await Promise.all([loadKpis(), loadSuggestions()])
     })
-  }, [companyId, engineMode, reconStartOrStop, loadKpis, loadSuggestions])
-
-  const handleEngineModeChange = useCallback((mode: ReconciliationEngineMode) => {
-    if (!companyId) return
-    setStoredReconciliationEngineMode(companyId, mode)
-    setEngineMode(mode)
-  }, [companyId])
+  }, [companyId, reconStartOrStop, loadKpis, loadSuggestions])
 
   // ─── auto-close remainder (shared helper) ───
   const autoCloseRemainder = useCallback(async (txId: string, amount: number, reason: string) => {
@@ -1671,37 +1648,17 @@ export default function RiconciliazionePage() {
           <h1 className="text-2xl font-bold tracking-tight">Riconciliazione</h1>
           <p className="text-muted-foreground text-sm mt-0.5">Abbina automaticamente movimenti bancari a fatture e rate</p>
         </div>
-        <div className="flex items-end gap-3">
-          <div className="hidden md:block text-right">
-            <div className="flex items-center gap-1.5 justify-end mb-1">
-              {(['legacy', 'contextual', 'shadow'] as ReconciliationEngineMode[]).map((mode) => (
-                <button
-                  key={mode}
-                  onClick={() => handleEngineModeChange(mode)}
-                  className={`px-2.5 py-1 text-[11px] rounded-md border transition-colors ${
-                    engineMode === mode
-                      ? 'bg-slate-900 text-white border-slate-900'
-                      : 'bg-white text-slate-600 border-slate-200 hover:border-slate-300'
-                  }`}
-                >
-                  {reconciliationEngineModeLabel(mode)}
-                </button>
-              ))}
-            </div>
-            <p className="text-[11px] text-gray-500 max-w-[360px]">{reconciliationEngineModeDescription(engineMode)}</p>
-          </div>
-          <button
-            onClick={generateSuggestions}
-            className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
-              generating
-                ? 'bg-red-600 text-white hover:bg-red-700'
-                : 'bg-purple-600 text-white hover:bg-purple-700'
-            }`}
-          >
-            {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-            {generating ? '⏹ Stop' : 'Genera suggerimenti'}
-          </button>
-        </div>
+        <button
+          onClick={generateSuggestions}
+          className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
+            generating
+              ? 'bg-red-600 text-white hover:bg-red-700'
+              : 'bg-purple-600 text-white hover:bg-purple-700'
+          }`}
+        >
+          {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+          {generating ? '⏹ Stop' : 'Genera suggerimenti'}
+        </button>
       </div>
 
       {/* ──── KPI Cards ──── */}
