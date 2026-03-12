@@ -564,8 +564,8 @@ async function handleProcess(
     // Fast path: if full_text already exists, skip extraction entirely
     if (fullText && fullText.length > 100) {
       console.log(`[process] full_text already exists (${fullText.length} chars), skipping extraction`);
-      // Still run AI cleanup for URL/PDF sources
-      if (inputType === "url" || inputType === "pdf") {
+      // AI cleanup only for URL sources (PDF/text are already clean enough)
+      if (inputType === "url") {
         console.log(`[process] AI cleanup on existing text...`);
         fullText = await cleanExtractedText(apiKey, fullText, doc.title || "Documento");
       }
@@ -638,19 +638,7 @@ async function handleProcess(
       throw new Error("Testo estratto vuoto o troppo corto");
     }
 
-    // 5. AI text cleanup (only for PDF — URL is already cleaned by Jina or fallback chain)
-    if (inputType === "pdf") {
-      console.log(`[process] Step 2: AI text cleanup for PDF (${fullText.length} chars)...`);
-      fullText = await cleanExtractedText(apiKey, fullText, doc.title || "Documento");
-      fullText = sanitizeHtmlEntities(sanitizeText(fullText));
-      // Save cleaned text
-      await svc
-        .from("kb_documents")
-        .update({ full_text: fullText } as any)
-        .eq("id", documentId);
-    }
-
-    // 6. Chunking
+    // 5. Chunking
     await svc
       .from("kb_documents")
       .update({ status: "chunking" } as any)
@@ -764,12 +752,6 @@ async function handleReprocess(
       console.log(`[reprocess] AI cleanup (${fullText.length} chars)...`);
       fullText = await cleanExtractedText(apiKey, fullText, doc.title || "Documento");
       console.log(`[reprocess] Cleaned: ${fullText.length} chars`);
-    }
-
-    // AI cleanup for PDF sources only
-    if (inputType === "pdf") {
-      console.log(`[reprocess] AI cleanup for PDF (${fullText!.length} chars)...`);
-      fullText = await cleanExtractedText(apiKey, fullText!, doc.title || "Documento");
     }
 
     fullText = sanitizeHtmlEntities(sanitizeText(fullText!));
