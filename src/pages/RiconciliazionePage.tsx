@@ -99,6 +99,7 @@ interface OpenInstallment {
   direction: string
   invoice_number: string | null
   counterparty_name: string | null
+  invoice_date?: string | null
   invoice_notes?: string | null
   primary_contract_ref?: string | null
   contract_refs?: string[] | null
@@ -108,6 +109,7 @@ interface ReconciledRow {
   id: string
   invoice_id: string
   bank_transaction_id: string
+  installment_id: string | null
   match_type: string
   confidence: number
   match_reason: string | null
@@ -271,6 +273,38 @@ function extractClientMandateId(refs: Record<string, unknown> | null): string | 
     if (typeof first === 'string') return first.trim()
   }
   return null
+}
+
+function paymentDateLabel(date: string | null | undefined): string {
+  return `PAG ${fmtDate(date || null)}`
+}
+
+function invoiceDateSummary(invoiceDate: string | null | undefined, dueDate: string | null | undefined): string {
+  const parts: string[] = []
+  if (invoiceDate) parts.push(`Fatt. ${fmtDate(invoiceDate)}`)
+  if (dueDate) parts.push(`Scad. ${fmtDate(dueDate)}`)
+  return parts.join(' · ') || 'Date n.d.'
+}
+
+function dedupeReconciledRows(rows: ReconciledRow[]): ReconciledRow[] {
+  const byKey = new Map<string, ReconciledRow>()
+  for (const row of rows) {
+    const key = [
+      row.bank_transaction_id,
+      row.invoice_id,
+      row.installment_id || 'no-installment',
+      Number(row.reconciled_amount || 0).toFixed(2),
+    ].join('|')
+    const current = byKey.get(key)
+    const currentStamp = current ? (current.confirmed_at || current.created_at || '') : ''
+    const rowStamp = row.confirmed_at || row.created_at || ''
+    if (!current || rowStamp > currentStamp) {
+      byKey.set(key, row)
+    }
+  }
+  return Array.from(byKey.values()).sort((a, b) =>
+    (b.confirmed_at || b.created_at || '').localeCompare(a.confirmed_at || a.created_at || ''),
+  )
 }
 
 /**
@@ -488,7 +522,7 @@ export default function RiconciliazionePage() {
       .from('invoice_installments')
       .select(`
         id, invoice_id, installment_no, due_date, amount_due, paid_amount, status, direction,
-        invoice:invoices(number, counterparty, notes, primary_contract_ref, contract_refs)
+        invoice:invoices(number, counterparty, notes, primary_contract_ref, contract_refs, date)
       `)
       .eq('company_id', companyId)
       .in('status', ['pending', 'overdue', 'partial'])
@@ -507,6 +541,7 @@ export default function RiconciliazionePage() {
         direction: d.direction,
         invoice_number: d.invoice?.number || null,
         counterparty_name: d.invoice?.counterparty?.denom || null,
+        invoice_date: d.invoice?.date || null,
         invoice_notes: d.invoice?.notes || null,
         primary_contract_ref: d.invoice?.primary_contract_ref || null,
         contract_refs: Array.isArray(d.invoice?.contract_refs) ? d.invoice.contract_refs : [],
@@ -520,7 +555,7 @@ export default function RiconciliazionePage() {
     const { data, error } = await supabase
       .from('reconciliations')
       .select(`
-        id, invoice_id, bank_transaction_id, match_type, confidence,
+        id, invoice_id, bank_transaction_id, installment_id, match_type, confidence,
         match_reason, confirmed_at, created_at, reconciled_amount,
         bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, commission_amount, reconciled_amount),
         invoice:invoices(id, number, counterparty, total_amount, date, direction)
@@ -533,7 +568,7 @@ export default function RiconciliazionePage() {
       console.error('Error loading reconciled:', error)
       return
     }
-    setReconciledRows((data || []) as unknown as ReconciledRow[])
+    setReconciledRows(dedupeReconciledRows((data || []) as unknown as ReconciledRow[]))
   }, [companyId])
 
   // ─── initial load ───────────────────────────
@@ -614,7 +649,7 @@ export default function RiconciliazionePage() {
     } finally {
       setRefreshingResidualTxId(null)
     }
-  }, [companyId, loadKpis, loadSuggestions, loadUnmatched])
+  }, [companyId, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments])
 
   const clearPendingSuggestions = useCallback(async () => {
     if (!companyId || clearingPendingSuggestions || kpi.pendingSuggestions <= 0) return
@@ -646,6 +681,29 @@ export default function RiconciliazionePage() {
       setClearingPendingSuggestions(false)
     }
   }, [companyId, clearingPendingSuggestions, kpi.pendingSuggestions, loadKpis, loadSuggestions])
+
+  const findExistingReconciliation = useCallback(async ({
+    txId,
+    invoiceId,
+    installmentId,
+  }: {
+    txId: string
+    invoiceId: string
+    installmentId: string | null
+  }) => {
+    let query = supabase
+      .from('reconciliations')
+      .select('id')
+      .eq('company_id', companyId)
+      .eq('bank_transaction_id', txId)
+      .eq('invoice_id', invoiceId)
+      .limit(1)
+
+    query = installmentId ? query.eq('installment_id', installmentId) : query.is('installment_id', null)
+    const { data, error } = await query
+    if (error) throw error
+    return data?.[0]?.id || null
+  }, [companyId])
 
   // ─── auto-close remainder (shared helper) ───
   const autoCloseRemainder = useCallback(async (txId: string, amount: number, reason: string) => {
@@ -732,6 +790,22 @@ export default function RiconciliazionePage() {
           .eq('id', suggestion.id)
         toast.error('Movimento o rata già completamente riconciliato')
         setSuggestions(prev => prev.filter(s => s.id !== suggestion.id))
+        setConfirmingId(null)
+        return
+      }
+
+      const existingReconId = await findExistingReconciliation({
+        txId: suggestion.bank_transaction_id,
+        invoiceId: suggestion.invoice_id!,
+        installmentId: suggestion.installment_id,
+      })
+      if (existingReconId) {
+        await supabase
+          .from('reconciliation_suggestions')
+          .update({ status: 'expired', resolved_at: now, resolved_by: userId })
+          .eq('id', suggestion.id)
+        toast.info('Questa riconciliazione era già stata confermata')
+        await Promise.all([loadKpis(), loadSuggestions(), loadUnmatched(), loadOpenInstallments(), loadReconciled()])
         setConfirmingId(null)
         return
       }
@@ -950,13 +1024,13 @@ export default function RiconciliazionePage() {
         }
       }
 
-      await Promise.all([loadKpis(), loadSuggestions(), loadUnmatched()])
+      await Promise.all([loadKpis(), loadSuggestions(), loadUnmatched(), loadOpenInstallments(), loadReconciled()])
     } catch (err: unknown) {
       const msg = errMsg(err)
       toast.error(`Errore conferma: ${msg}`)
     }
     setConfirmingId(null)
-  }, [companyId, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments, autoCloseRemainder])
+  }, [companyId, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments, loadReconciled, autoCloseRemainder, findExistingReconciliation])
 
   // ─── reject suggestion ─────────────────────
   const rejectSuggestion = useCallback(async (suggestion: SuggestionRow) => {
@@ -1088,6 +1162,18 @@ export default function RiconciliazionePage() {
 
       const now = new Date().toISOString()
 
+      const existingReconId = await findExistingReconciliation({
+        txId,
+        invoiceId: installment.invoice_id,
+        installmentId: installment.id,
+      })
+      if (existingReconId) {
+        toast.info('Questa riconciliazione era già presente')
+        await Promise.all([loadKpis(), loadUnmatched(), loadOpenInstallments(), loadReconciled()])
+        setConfirmingId(null)
+        return
+      }
+
       // Create reconciliation (with amount + installment_id)
       const { error: e1 } = await supabase.from('reconciliations').insert({
         company_id: companyId,
@@ -1218,13 +1304,13 @@ export default function RiconciliazionePage() {
         }
       }
 
-      await Promise.all([loadKpis(), loadUnmatched()])
+      await Promise.all([loadKpis(), loadUnmatched(), loadOpenInstallments(), loadReconciled()])
     } catch (err: unknown) {
       const msg = errMsg(err)
       toast.error(`Errore: ${msg}`)
     }
     setConfirmingId(null)
-  }, [companyId, unmatchedTxs, loadKpis, loadUnmatched, autoCloseRemainder])
+  }, [companyId, unmatchedTxs, loadKpis, loadUnmatched, loadOpenInstallments, loadReconciled, autoCloseRemainder, findExistingReconciliation])
 
   // ─── delete reconciliation (undo) ─────────
   const deleteReconciliation = useCallback(async (recon: ReconciledRow) => {
@@ -1327,13 +1413,13 @@ export default function RiconciliazionePage() {
       toast.success('Riconciliazione eliminata')
       setReconciledRows(prev => prev.filter(r => r.id !== recon.id))
       setConfirmDeleteId(null)
-      await Promise.all([loadKpis(), loadUnmatched(), loadOpenInstallments()])
+      await Promise.all([loadKpis(), loadUnmatched(), loadOpenInstallments(), loadReconciled()])
     } catch (err: unknown) {
       const msg = errMsg(err)
       toast.error(`Errore eliminazione: ${msg}`)
     }
     setDeletingReconId(null)
-  }, [companyId, loadKpis, loadUnmatched, loadOpenInstallments])
+  }, [companyId, loadKpis, loadUnmatched, loadOpenInstallments, loadReconciled])
 
   // ─── handle confirm choice (from dialog) ───
   const handleConfirmChoice = useCallback(async (chosenAmount: number) => {
@@ -1435,11 +1521,11 @@ export default function RiconciliazionePage() {
         abbuono_passivo: 'Abbuono',
       }
       toast.success(`Residuo di ${fmtEur(postReconDialog.remainder)} chiuso come ${reasonLabels[reason] || reason}`)
-      await Promise.all([loadKpis(), loadSuggestions(), loadUnmatched()])
+      await Promise.all([loadKpis(), loadSuggestions(), loadUnmatched(), loadOpenInstallments(), loadReconciled()])
     } catch (err: unknown) {
       toast.error(`Errore chiusura residuo: ${errMsg(err)}`)
     }
-  }, [postReconDialog, autoCloseRemainder, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments, regenerateSuggestionsForTransaction])
+  }, [postReconDialog, autoCloseRemainder, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments, loadReconciled, regenerateSuggestionsForTransaction])
 
   // ─── tab change handler ────────────────────
   const handleTabChange = (tab: string) => {
@@ -1499,17 +1585,32 @@ export default function RiconciliazionePage() {
     return list
   }, [unmatchedTxs, assistedSearch, assistedPartialOnly, assistedSortByReconDate, txReconHistory])
 
+  const selectedTxRecord = useMemo(
+    () => (selectedTxId ? unmatchedTxs.find(t => t.id === selectedTxId) || null : null),
+    [selectedTxId, unmatchedTxs],
+  )
+
+  const focusedResidualTx = useMemo(
+    () => (selectedTxRecord?.reconciliation_status === 'partial' ? selectedTxRecord : null),
+    [selectedTxRecord],
+  )
+
+  const assistedTxRows = useMemo(
+    () => (focusedResidualTx ? filteredUnmatched.filter(tx => tx.id !== focusedResidualTx.id) : filteredUnmatched),
+    [filteredUnmatched, focusedResidualTx],
+  )
+
 
 
   // ─── selected TX partial info (for residual banner) ───
   const selectedTxPartialInfo = useMemo(() => {
-    if (!selectedTxId) return null
-    const selTx = unmatchedTxs.find(t => t.id === selectedTxId)
+    if (!selectedTxRecord) return null
+    const selTx = selectedTxRecord
     if (!selTx || selTx.reconciliation_status !== 'partial') return null
     const netAmt = Math.abs(Number(selTx.amount)) - Math.abs(Number(selTx.commission_amount || 0))
     const reconciled = Number(selTx.reconciled_amount || 0)
     return { netAmt, reconciled, residual: netAmt - reconciled }
-  }, [selectedTxId, unmatchedTxs])
+  }, [selectedTxRecord])
 
   // ─── AI search for candidates ────────────
   const handleCandidateAISearch = useCallback(async () => {
@@ -1536,7 +1637,7 @@ export default function RiconciliazionePage() {
           .from('invoice_installments')
           .select(`
             id, invoice_id, installment_no, due_date, amount_due, paid_amount, status, direction,
-            invoice:invoices(number, counterparty, notes, primary_contract_ref, contract_refs)
+            invoice:invoices(number, counterparty, notes, primary_contract_ref, contract_refs, date)
           `)
           .eq('company_id', companyId)
           .in('invoice_id', ids)
@@ -1554,6 +1655,7 @@ export default function RiconciliazionePage() {
             direction: d.direction,
             invoice_number: d.invoice?.number || null,
             counterparty_name: d.invoice?.counterparty?.denom || null,
+            invoice_date: d.invoice?.date || null,
             invoice_notes: d.invoice?.notes || null,
             primary_contract_ref: d.invoice?.primary_contract_ref || null,
             contract_refs: Array.isArray(d.invoice?.contract_refs) ? d.invoice.contract_refs : [],
@@ -1689,6 +1791,11 @@ export default function RiconciliazionePage() {
       )
     })
   }, [reconciledRows, reconciledSearch])
+
+  const reconciledUniqueTxCount = useMemo(
+    () => new Set(reconciledRows.map(r => r.bank_transaction_id)).size,
+    [reconciledRows],
+  )
 
   // Percentage KPI
   const matchPct = kpi.total > 0 ? Math.round((kpi.matched / kpi.total) * 100) : 0
@@ -1945,7 +2052,11 @@ export default function RiconciliazionePage() {
                                     )}
                                   </div>
                                   <div className="flex items-center gap-2 mt-0.5">
-                                    {inst && <span className="text-[10px] text-gray-400">Scad. {fmtDate(inst.due_date)}</span>}
+                                    {inst && (
+                                      <span className="text-[10px] text-gray-400">
+                                        {invoiceDateSummary(inv?.date || null, inst.due_date)}
+                                      </span>
+                                    )}
                                     <span className={`text-[10px] ${scoreBadge(s.match_score)} px-1 py-0.5 rounded`}>
                                       {s.match_score}%
                                     </span>
@@ -2046,8 +2157,12 @@ export default function RiconciliazionePage() {
             <div className="border rounded-lg bg-white flex flex-col">
               <div className="px-3 py-2.5 border-b bg-gray-50/80 flex items-center gap-2">
                 <Landmark className="h-4 w-4 text-gray-500" />
-                <span className="text-sm font-semibold text-gray-700">Movimenti bancari</span>
-                <span className="text-[10px] text-gray-400 ml-auto">{filteredUnmatched.length}</span>
+                <span className="text-sm font-semibold text-gray-700">
+                  {focusedResidualTx ? 'Residuo in lavorazione' : 'Movimenti bancari'}
+                </span>
+                <span className="text-[10px] text-gray-400 ml-auto">
+                  {focusedResidualTx ? assistedTxRows.length : filteredUnmatched.length}
+                </span>
               </div>
               <div className="px-3 py-2 border-b space-y-1.5">
                 <div className="flex items-center gap-1.5">
@@ -2088,10 +2203,89 @@ export default function RiconciliazionePage() {
                   )}
                 </div>
               </div>
+              {focusedResidualTx && selectedTxPartialInfo && (
+                <div className="px-3 py-3 border-b bg-amber-50/60">
+                  <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-3 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-semibold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full">
+                        Parziale da completare
+                      </span>
+                      <span className="text-[10px] text-amber-700 ml-auto">
+                        Residuo {fmtEur(selectedTxPartialInfo.residual)}
+                      </span>
+                    </div>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-gray-800 truncate">
+                          {focusedResidualTx.counterparty_name || 'N.D.'}
+                        </p>
+                        <p className="text-[11px] text-amber-800 mt-0.5">
+                          {paymentDateLabel(focusedResidualTx.date)}
+                        </p>
+                        {focusedResidualTx.description && (
+                          <p className="text-[11px] text-gray-500 mt-1 line-clamp-2">
+                            {focusedResidualTx.description}
+                          </p>
+                        )}
+                      </div>
+                      <div className="text-right shrink-0">
+                        <p className={`text-sm font-bold ${focusedResidualTx.direction === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>
+                          {focusedResidualTx.direction === 'in' ? '+' : '-'}
+                          {fmtEur(getTxNetAmount(focusedResidualTx))}
+                        </p>
+                        {Number(focusedResidualTx.commission_amount || 0) !== 0 && (
+                          <p className="text-[10px] text-gray-400">
+                            lordo {focusedResidualTx.direction === 'in' ? '+' : '-'}
+                            {fmtEur(Math.abs(Number(focusedResidualTx.amount)))}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between gap-3 text-[11px] text-amber-800">
+                      <span>
+                        Riconciliato {fmtEur(selectedTxPartialInfo.reconciled)} di {fmtEur(selectedTxPartialInfo.netAmt)}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setDetailPopup({ type: 'bank_tx', id: focusedResidualTx.id })}
+                          className="px-2 py-1 text-[10px] font-semibold rounded-md border border-amber-300 bg-white text-amber-700 hover:bg-amber-100 transition-colors"
+                        >
+                          Apri dettaglio
+                        </button>
+                        <button
+                          onClick={() => {
+                            setSelectedTxId(null)
+                            setCandidateAiResult(null)
+                            setCandidateAiInstallments([])
+                            setCandidateSearch('')
+                          }}
+                          className="px-2 py-1 text-[10px] font-semibold rounded-md border border-amber-300 bg-white text-gray-600 hover:bg-gray-50 transition-colors"
+                        >
+                          Chiudi focus
+                        </button>
+                      </div>
+                    </div>
+                    {txReconHistory.get(focusedResidualTx.id)?.map((h, hi) => (
+                      <p key={hi} className="text-[10px] text-amber-700/90">
+                        {h.invoiceNumber ? `Gia abbinata Fatt. ${h.invoiceNumber}` : 'Gia abbinato'}: {fmtEur(h.amount)} — {fmtDate(h.date)}
+                      </p>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className="flex-1 overflow-y-auto">
-                {filteredUnmatched.length === 0 ? (
+                {assistedTxRows.length === 0 ? (
                   <div className="text-xs text-gray-400 text-center py-8">Nessun movimento non riconciliato</div>
-                ) : filteredUnmatched.map(tx => {
+                ) : (
+                  <>
+                    {focusedResidualTx && (
+                      <div className="px-3 py-2 border-b bg-gray-50/70">
+                        <span className="text-[11px] font-semibold text-gray-600">
+                          Altri movimenti assistiti
+                        </span>
+                      </div>
+                    )}
+                    {assistedTxRows.map(tx => {
                   const isSelected = selectedTxId === tx.id
                   const txAbs = Math.abs(Number(tx.amount))
                   const hasComm = tx.commission_amount != null && Number(tx.commission_amount) !== 0
@@ -2108,7 +2302,9 @@ export default function RiconciliazionePage() {
                       onDoubleClick={() => setDetailPopup({ type: 'bank_tx', id: tx.id })}
                       title="Doppio click per dettaglio"
                       className={`w-full text-left px-3 py-2 border-b last:border-b-0 transition-colors ${
-                        isSelected ? 'bg-purple-50 border-l-2 border-l-purple-500' : 'hover:bg-gray-50'
+                        isSelected
+                          ? (isPartial ? 'bg-amber-50 border-l-2 border-l-amber-500' : 'bg-purple-50 border-l-2 border-l-purple-500')
+                          : 'hover:bg-gray-50'
                       }`}
                     >
                       <div className="flex items-center justify-between">
@@ -2138,7 +2334,7 @@ export default function RiconciliazionePage() {
                         </div>
                       </div>
                       <div className="flex items-center gap-2 mt-0.5 pl-3.5">
-                        <span className="text-[10px] text-gray-400">{fmtDate(tx.date)}</span>
+                        <span className="text-[10px] text-gray-400">{paymentDateLabel(tx.date)}</span>
                         {tx.description && (
                           <span className="text-[10px] text-gray-400 truncate">{tx.description}</span>
                         )}
@@ -2156,8 +2352,10 @@ export default function RiconciliazionePage() {
                         </div>
                       )}
                     </button>
-                  )
-                })}
+                    )
+                  })}
+                  </>
+                )}
               </div>
             </div>
 
@@ -2166,7 +2364,7 @@ export default function RiconciliazionePage() {
               <div className="px-3 py-2.5 border-b bg-gray-50/80 flex items-center gap-2">
                 <FileText className="h-4 w-4 text-gray-500" />
                 <span className="text-sm font-semibold text-gray-700">
-                  {selectedTxId ? 'Candidati corrispondenti' : 'Seleziona un movimento'}
+                  {selectedTxPartialInfo ? 'Riconciliazione residuo' : selectedTxId ? 'Candidati corrispondenti' : 'Seleziona un movimento'}
                 </span>
                 {selectedTxId && (
                   <span className="text-[10px] text-gray-400 ml-auto">{candidates.length} trovati</span>
@@ -2295,7 +2493,11 @@ export default function RiconciliazionePage() {
                                     )}
                                   </div>
                                   <div className="flex items-center gap-2 mt-0.5">
-                                    {inst && <span className="text-[10px] text-gray-400">Scad. {fmtDate(inst.due_date)}</span>}
+                                    {inst && (
+                                      <span className="text-[10px] text-gray-400">
+                                        {invoiceDateSummary(inv?.date || null, inst.due_date)}
+                                      </span>
+                                    )}
                                     {instRemaining != null && (
                                       <span className="text-[10px] text-gray-500">Residuo: {fmtEur(instRemaining)}</span>
                                     )}
@@ -2369,7 +2571,9 @@ export default function RiconciliazionePage() {
                             )}
                           </div>
                           <div className="flex items-center gap-2 mt-0.5">
-                            <span className="text-[10px] text-gray-400">Scad. {fmtDate(inst.due_date)}</span>
+                            <span className="text-[10px] text-gray-400">
+                              {invoiceDateSummary(inst.invoice_date || null, inst.due_date)}
+                            </span>
                             <span className="text-[10px] text-gray-500">
                               Residuo: {fmtEur(remaining)}
                             </span>
@@ -2427,7 +2631,7 @@ export default function RiconciliazionePage() {
 
               {/* Results count */}
               <p className="text-xs text-gray-400">
-                {filteredReconciled.length} riconciliazion{filteredReconciled.length === 1 ? 'e' : 'i'}
+                {filteredReconciled.length} abbinament{filteredReconciled.length === 1 ? 'o' : 'i'} su {reconciledUniqueTxCount} moviment{reconciledUniqueTxCount === 1 ? 'o' : 'i'} riconciliat{reconciledUniqueTxCount === 1 ? 'o' : 'i'}
                 {reconciledSearch && ` su ${reconciledRows.length} totali`}
               </p>
 
@@ -2491,7 +2695,7 @@ export default function RiconciliazionePage() {
                               </span>
                             </div>
                             <div className="flex items-center gap-2 mt-0.5 pl-3.5">
-                              <span className="text-[10px] text-gray-400">{fmtDate(tx.date)}</span>
+                              <span className="text-[10px] text-gray-400">{paymentDateLabel(tx.date)}</span>
                               {hasComm && (
                                 <span className="text-[10px] text-gray-400">lordo {sign}{fmtEur(absAmount)} | comm. {fmtEur(Math.abs(Number(tx.commission_amount)))}</span>
                               )}
@@ -3115,7 +3319,7 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
               })()}
               <p className="text-xs text-gray-700 mt-0.5">{tx.counterparty_name || 'N.D.'}</p>
               <div className="flex items-center gap-2 mt-0.5">
-                <span className="text-[10px] text-gray-400">{fmtDate(tx.date)}</span>
+                                <span className="text-[10px] text-gray-400">{paymentDateLabel(tx.date)}</span>
                 <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${txTypeBadge(tx.transaction_type ?? undefined)}`}>
                   {txTypeLabel(tx.transaction_type ?? undefined)}
                 </span>
@@ -3157,7 +3361,9 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
                     {inv?.number ? `Fatt. ${inv.number}` : 'N.D.'} &middot; Rata {inst.installment_no}
                   </p>
                   <div className="flex items-center gap-2 mt-0.5">
-                    <span className="text-[10px] text-gray-400">Scad. {fmtDate(inst.due_date)}</span>
+                    <span className="text-[10px] text-gray-400">
+                      {invoiceDateSummary(inv?.date || null, inst.due_date)}
+                    </span>
                     <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${
                       inst.status === 'overdue' ? 'bg-red-100 text-red-700' :
                       inst.status === 'partial' ? 'bg-amber-100 text-amber-700' :
@@ -3461,7 +3667,9 @@ function ResidualManagementDialog({
                           <p className="text-xs font-medium text-gray-800 truncate">{inst.counterparty_name || 'N.D.'}</p>
                           <div className="flex items-center gap-2 mt-0.5">
                             {inst.invoice_number && <span className="text-[10px] text-blue-600 font-medium">#{inst.invoice_number}</span>}
-                            <span className="text-[10px] text-gray-400">Scad. {fmtDate(inst.due_date)}</span>
+                            <span className="text-[10px] text-gray-400">
+                              {invoiceDateSummary(inst.invoice_date || null, inst.due_date)}
+                            </span>
                           </div>
                         </div>
                         <div className="text-right shrink-0">
