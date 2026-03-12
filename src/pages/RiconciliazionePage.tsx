@@ -2470,11 +2470,17 @@ export default function RiconciliazionePage() {
                             const inst = s.installment
                             const inv = s.invoice
                             const instRemaining = inst ? Number(inst.amount_due) - Number(inst.paid_amount || 0) : null
+                            const invoiceTotal = inv ? Number(inv.total_amount || 0) : null
                             const invoiceDenom = inv?.counterparty && typeof inv.counterparty === 'object'
                               ? (inv.counterparty as any).denom || 'N.D.'
                               : 'N.D.'
                             return (
-                              <div key={s.id} className="px-3 py-2.5 flex items-center justify-between gap-3 hover:bg-white/70 transition-colors">
+                              <div
+                                key={s.id}
+                                className="px-3 py-2.5 flex items-center justify-between gap-3 hover:bg-white/70 transition-colors cursor-pointer"
+                                onDoubleClick={() => inv && setDetailPopup({ type: 'invoice', id: inv.id })}
+                                title={inv ? 'Doppio click per dettaglio fattura' : undefined}
+                              >
                                 <div className="min-w-0">
                                   <div className="flex items-center gap-2 flex-wrap">
                                     <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${scoreBadge(s.match_score)}`}>
@@ -2490,6 +2496,11 @@ export default function RiconciliazionePage() {
                                     )}
                                     {inst && (
                                       <span className="text-[10px] text-gray-400">Rata {inst.installment_no}</span>
+                                    )}
+                                    {invoiceTotal != null && (
+                                      <span className="text-[10px] text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded font-medium">
+                                        Totale {fmtEur(invoiceTotal)}
+                                      </span>
                                     )}
                                   </div>
                                   <div className="flex items-center gap-2 mt-0.5">
@@ -2515,6 +2526,18 @@ export default function RiconciliazionePage() {
                                   >
                                     {rejectingId === s.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <XCircle className="h-3.5 w-3.5" />}
                                   </button>
+                                  {inv && (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        setDetailPopup({ type: 'invoice', id: inv.id })
+                                      }}
+                                      className="p-1.5 rounded-md text-gray-400 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+                                      title="Apri dettaglio fattura"
+                                    >
+                                      <ExternalLink className="h-3.5 w-3.5" />
+                                    </button>
+                                  )}
                                   <button
                                     onClick={() => confirmSuggestion(s)}
                                     disabled={confirmingId === s.id || rejectingId === s.id}
@@ -2546,7 +2569,9 @@ export default function RiconciliazionePage() {
                   return (
                     <div
                       key={inst.id}
-                      className={`px-3 py-2.5 border-b last:border-b-0 hover:bg-gray-50 transition-colors ${isRefMatch ? 'bg-emerald-50/50' : isSameCounterparty ? 'bg-blue-50/30' : ''}`}
+                      className={`px-3 py-2.5 border-b last:border-b-0 hover:bg-gray-50 transition-colors cursor-pointer ${isRefMatch ? 'bg-emerald-50/50' : isSameCounterparty ? 'bg-blue-50/30' : ''}`}
+                      onDoubleClick={() => inst.invoice_id && setDetailPopup({ type: 'invoice', id: inst.invoice_id })}
+                      title={inst.invoice_id ? 'Doppio click per dettaglio fattura' : undefined}
                     >
                       <div className="flex items-center justify-between">
                         <div className="min-w-0">
@@ -2569,6 +2594,11 @@ export default function RiconciliazionePage() {
                                 {inst.invoice_number}
                               </span>
                             )}
+                            {inst.invoice_total != null && (
+                              <span className="text-[10px] text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded font-medium">
+                                Totale {fmtEur(Number(inst.invoice_total))}
+                              </span>
+                            )}
                           </div>
                           <div className="flex items-center gap-2 mt-0.5">
                             <span className="text-[10px] text-gray-400">
@@ -2585,17 +2615,31 @@ export default function RiconciliazionePage() {
                             )}
                           </div>
                         </div>
-                        <button
-                          onClick={() => manualMatch(selectedTxId!, inst)}
-                          disabled={confirmingId === selectedTxId}
-                          className="shrink-0 ml-2 flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium rounded-md bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
-                        >
-                          {confirmingId === selectedTxId
-                            ? <Loader2 className="h-3 w-3 animate-spin" />
-                            : <Link2 className="h-3 w-3" />
-                          }
-                          Abbina
-                        </button>
+                        <div className="shrink-0 ml-2 flex items-center gap-1">
+                          {inst.invoice_id && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setDetailPopup({ type: 'invoice', id: inst.invoice_id })
+                              }}
+                              className="p-1.5 rounded-md text-gray-400 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+                              title="Apri dettaglio fattura"
+                            >
+                              <ExternalLink className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                          <button
+                            onClick={() => manualMatch(selectedTxId!, inst)}
+                            disabled={confirmingId === selectedTxId}
+                            className="flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium rounded-md bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
+                          >
+                            {confirmingId === selectedTxId
+                              ? <Loader2 className="h-3 w-3 animate-spin" />
+                              : <Link2 className="h-3 w-3" />
+                            }
+                            Abbina
+                          </button>
+                        </div>
                       </div>
                     </div>
                   )
