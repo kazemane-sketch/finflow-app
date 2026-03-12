@@ -272,6 +272,8 @@ export async function createMemoryFromClassification(
   options?: {
     sourceInvoiceId?: string | null
     origin?: InvoiceMemoryOrigin
+    contractRef?: string | null
+    contractRefs?: string[] | null
   },
 ): Promise<string | null> {
   if (!lineDescription || lineDescription.length < 3) return null
@@ -294,8 +296,11 @@ export async function createMemoryFromClassification(
   if (accountCode) metadata.account_code = accountCode
   if (categoryName) metadata.category_name = categoryName
   if (articleCode) metadata.article_code = articleCode
+  metadata.line_description = lineDescription
   if (options?.sourceInvoiceId) metadata.source_invoice_id = options.sourceInvoiceId
   if (options?.origin) metadata.origin = options.origin
+  if (options?.contractRef) metadata.contract_ref = options.contractRef
+  if (options?.contractRefs?.length) metadata.contract_refs = options.contractRefs
 
   const memId = await insertMemoryFact({
     company_id: companyId,

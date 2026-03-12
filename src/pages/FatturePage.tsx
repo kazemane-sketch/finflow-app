@@ -2306,7 +2306,12 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                 memAcc?.code || null, memAcc?.name || null,
                 invoice.direction as 'in' | 'out',
                 memArt?.code || null, memArt?.name || null,
-                { sourceInvoiceId: invoice.id, origin: 'invoice_classification' },
+                {
+                  sourceInvoiceId: invoice.id,
+                  origin: 'invoice_classification',
+                  contractRef: primaryContractRef,
+                  contractRefs: primaryContractRef ? [primaryContractRef] : [],
+                },
               );
             } catch (error) {
               pushLearningWarning(`salvataggio memoria riga "${line.description.slice(0, 40)}"`, error);

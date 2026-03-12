@@ -12,6 +12,11 @@ import {
   type CompanyContext,
   type MemoryFact,
 } from "../_shared/accounting-system-prompt.ts";
+import {
+  filterCompanyMemoryForInvoiceClassification,
+  getInvoiceContractRefs,
+  type CompanyMemoryQueryRow,
+} from "../_shared/company-memory-filter.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -282,12 +287,13 @@ Deno.serve(async (req) => {
     const lineDescriptions = lines.map((l) => l.description || "");
 
     // ─── Load context + Admin Panel infrastructure in parallel ──────
-    const [articles, categories, accounts, phases, companyRow, agentConfigs, agentRules] = await Promise.all([
+    const [articles, categories, accounts, phases, companyRow, invoiceRow, agentConfigs, agentRules] = await Promise.all([
       sql`SELECT id, code, name, description, keywords FROM articles WHERE company_id = ${companyId} AND active = true ORDER BY code`,
       sql`SELECT id, name, type FROM categories WHERE company_id = ${companyId} AND active = true AND type = ANY(${allowedCatTypes}::text[]) ORDER BY sort_order, name`,
       sql`SELECT id, code, name, section FROM chart_of_accounts WHERE company_id = ${companyId} AND active = true AND is_header = false ORDER BY code`,
       sql`SELECT id, article_id, code, name, phase_type, is_counting_point, invoice_direction FROM article_phases WHERE company_id = ${companyId} AND active = true ORDER BY article_id, sort_order`,
       sql`SELECT name, vat_number, ateco_code FROM companies WHERE id = ${companyId} LIMIT 1`,
+      sql`SELECT primary_contract_ref, contract_refs FROM invoices WHERE id = ${invoiceId} LIMIT 1`,
       // Agent config for commercialista
       sql<AgentConfig[]>`
         SELECT agent_type, system_prompt, model, temperature, thinking_level, max_output_tokens
@@ -305,6 +311,10 @@ Deno.serve(async (req) => {
     const companyAteco = companyRow[0]?.ateco_code || "";
     const atecoPrefix = companyAteco.slice(0, 2);
     const agentConfig = agentConfigs[0] || null;
+    const invoiceContractRefs = getInvoiceContractRefs(
+      invoiceRow[0]?.primary_contract_ref || null,
+      invoiceRow[0]?.contract_refs || null,
+    );
 
     console.log(`[classify-v2] Loaded: ${accounts.length} accounts (ALL sections), ${categories.length} cats, ${articles.length} articles`);
 
@@ -367,14 +377,31 @@ Deno.serve(async (req) => {
       const queryVec = await callGeminiEmbedding(geminiKey, queryText);
       const vecLiteral = toVectorLiteral(queryVec);
       const memRows = await sql.unsafe(
-        `SELECT fact_text, fact_type, (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
-         FROM company_memory
-         WHERE company_id = $2 AND active = true AND embedding IS NOT NULL
-         ORDER BY embedding <=> $1::halfvec(3072) LIMIT 10`,
+        `SELECT
+            cm.fact_text,
+            cm.fact_type,
+            cm.source,
+            cm.metadata,
+            src.primary_contract_ref AS source_primary_contract_ref,
+            src.contract_refs AS source_contract_refs,
+            (1 - (cm.embedding <=> $1::halfvec(3072)))::float as similarity
+         FROM company_memory cm
+         LEFT JOIN invoices src
+           ON src.id = CASE
+             WHEN cm.metadata ? 'source_invoice_id'
+              AND (cm.metadata->>'source_invoice_id') ~* '^[0-9a-f-]{36}$'
+             THEN (cm.metadata->>'source_invoice_id')::uuid
+             ELSE NULL
+           END
+         WHERE cm.company_id = $2 AND cm.active = true AND cm.embedding IS NOT NULL
+         ORDER BY cm.embedding <=> $1::halfvec(3072) LIMIT 15`,
         [vecLiteral, companyId],
       );
-      const memFacts = (memRows as any[]).filter((m) => m.similarity >= 0.40)
-        .map((m) => ({ fact_text: m.fact_text, fact_type: m.fact_type }));
+      const memFacts = filterCompanyMemoryForInvoiceClassification(
+        (memRows as CompanyMemoryQueryRow[]).filter((row) => (row.similarity || 0) >= 0.40),
+        lines.map((line) => line.description || ""),
+        invoiceContractRefs,
+      );
       memoryBlock = getCompanyMemoryBlock(memFacts);
     } catch (e) {
       console.warn("[classify-v2] Memory embedding failed:", e);

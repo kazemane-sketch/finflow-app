@@ -12,6 +12,11 @@ import {
   type CompanyContext,
   type MemoryFact,
 } from "../_shared/accounting-system-prompt.ts";
+import {
+  filterCompanyMemoryForInvoiceClassification,
+  getInvoiceContractRefs,
+  type CompanyMemoryQueryRow,
+} from "../_shared/company-memory-filter.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -255,6 +260,7 @@ async function embeddingPreflight(
   allowedCatTypes: string[],
   counterpartyAteco?: string,
   invoiceNotes?: string,
+  invoiceContractRefs: string[] = [],
 ): Promise<PreflightResult | null> {
   try {
     // Build query text from all line descriptions + counterparty + ATECO + notes
@@ -303,20 +309,50 @@ async function embeddingPreflight(
         ),
         counterpartyId
           ? sql.unsafe(
-              `SELECT id, fact_type, fact_text, metadata, counterparty_id,
-                      (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
-               FROM company_memory
-               WHERE company_id = $2 AND active = true AND embedding IS NOT NULL
-                 AND (counterparty_id IS NULL OR counterparty_id = $3)
-               ORDER BY embedding <=> $1::halfvec(3072) LIMIT 15`,
+              `SELECT
+                  cm.id,
+                  cm.fact_type,
+                  cm.fact_text,
+                  cm.source,
+                  cm.metadata,
+                  cm.counterparty_id,
+                  src.primary_contract_ref AS source_primary_contract_ref,
+                  src.contract_refs AS source_contract_refs,
+                  (1 - (cm.embedding <=> $1::halfvec(3072)))::float as similarity
+               FROM company_memory cm
+               LEFT JOIN invoices src
+                 ON src.id = CASE
+                   WHEN cm.metadata ? 'source_invoice_id'
+                    AND (cm.metadata->>'source_invoice_id') ~* '^[0-9a-f-]{36}$'
+                   THEN (cm.metadata->>'source_invoice_id')::uuid
+                   ELSE NULL
+                 END
+               WHERE cm.company_id = $2 AND cm.active = true AND cm.embedding IS NOT NULL
+                 AND (cm.counterparty_id IS NULL OR cm.counterparty_id = $3)
+               ORDER BY cm.embedding <=> $1::halfvec(3072) LIMIT 15`,
               [vecLiteral, companyId, counterpartyId],
             )
           : sql.unsafe(
-              `SELECT id, fact_type, fact_text, metadata, counterparty_id,
-                      (1 - (embedding <=> $1::halfvec(3072)))::float as similarity
-               FROM company_memory
-               WHERE company_id = $2 AND active = true AND embedding IS NOT NULL
-               ORDER BY embedding <=> $1::halfvec(3072) LIMIT 15`,
+              `SELECT
+                  cm.id,
+                  cm.fact_type,
+                  cm.fact_text,
+                  cm.source,
+                  cm.metadata,
+                  cm.counterparty_id,
+                  src.primary_contract_ref AS source_primary_contract_ref,
+                  src.contract_refs AS source_contract_refs,
+                  (1 - (cm.embedding <=> $1::halfvec(3072)))::float as similarity
+               FROM company_memory cm
+               LEFT JOIN invoices src
+                 ON src.id = CASE
+                   WHEN cm.metadata ? 'source_invoice_id'
+                    AND (cm.metadata->>'source_invoice_id') ~* '^[0-9a-f-]{36}$'
+                   THEN (cm.metadata->>'source_invoice_id')::uuid
+                   ELSE NULL
+                 END
+               WHERE cm.company_id = $2 AND cm.active = true AND cm.embedding IS NOT NULL
+               ORDER BY cm.embedding <=> $1::halfvec(3072) LIMIT 15`,
               [vecLiteral, companyId],
             ),
       ]);
@@ -329,9 +365,11 @@ async function embeddingPreflight(
     const articles = (pfArticles as (ArticleRow & { similarity: number })[])
       .filter((a) => a.similarity >= 0.40);
     const projects = (pfProjects as (ProjectRow & { similarity: number })[]);
-    const memoryFacts = (pfMemory as (MemoryFact & { similarity: number; id: string })[])
-      .filter((m) => m.similarity >= 0.40)
-      .map((m) => ({ fact_text: m.fact_text, fact_type: m.fact_type, similarity: m.similarity }));
+    const memoryFacts = filterCompanyMemoryForInvoiceClassification(
+      (pfMemory as CompanyMemoryQueryRow[]).filter((row) => (row.similarity || 0) >= 0.40),
+      lines.map((line) => line.description || ""),
+      invoiceContractRefs,
+    );
 
     console.log(`[classify-preflight] accounts=${accounts.length}, cats=${categories.length}, arts=${articles.length}, projects=${projects.length}, memory=${memoryFacts.length}`);
 
@@ -1320,8 +1358,17 @@ Deno.serve(async (req) => {
     }
 
     // ─── Step 4: Invoice notes ──────────────────────────────────
-    const [invoiceRow] = await sql`SELECT notes FROM invoices WHERE id = ${invoiceId} LIMIT 1`;
+    const [invoiceRow] = await sql`
+      SELECT notes, primary_contract_ref, contract_refs
+      FROM invoices
+      WHERE id = ${invoiceId}
+      LIMIT 1
+    `;
     const invoiceNotes = (invoiceRow?.notes || "").trim();
+    const invoiceContractRefs = getInvoiceContractRefs(
+      invoiceRow?.primary_contract_ref || null,
+      invoiceRow?.contract_refs || null,
+    );
     if (invoiceNotes) console.log(`[classify] Invoice notes: "${invoiceNotes.slice(0, 80)}…"`);
 
     // ─── Step 5: Counterparty classification history ────────────
@@ -1470,6 +1517,7 @@ Deno.serve(async (req) => {
         direction, geminiKey, dirSections, allowedCatTypes,
         counterpartyAtecoFull || undefined,
         invoiceNotes || undefined,
+        invoiceContractRefs,
       );
 
       if (preflight) {

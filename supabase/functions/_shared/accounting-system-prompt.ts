@@ -194,6 +194,7 @@ export function getCompanyMemoryBlock(memoryFacts: MemoryFact[]): string {
   }
 
   return `\n\nCONOSCENZA AZIENDALE (dalla memoria — regole specifiche di questa azienda):
+Usa questi fatti come memoria aziendale contestuale. Nel reasoning chiamali "memoria aziendale" o "pattern aziendale", NON "storico confermato", salvo quando nel prompt c'è uno storico esplicito separato.
 ${sections.join('\n\n')}`;
 }
 
