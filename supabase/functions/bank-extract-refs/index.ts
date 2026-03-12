@@ -189,7 +189,7 @@ Deno.serve(async (req) => {
   if (!anthropicKey) return json({ error: "ANTHROPIC_API_KEY non configurata" }, 503);
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL non configurato" }, 503);
 
-  let body: { company_id?: string; batch_size?: number };
+  let body: { company_id?: string; batch_size?: number; mode?: string };
   try {
     body = await req.json();
   } catch {
@@ -200,10 +200,22 @@ Deno.serve(async (req) => {
   if (!companyId) return json({ error: "company_id richiesto" }, 400);
 
   const batchSize = Math.min(Math.max(body.batch_size ?? 50, 1), MAX_BATCH);
+  const mode = String(body.mode || "pending_only");
+  const rebuildAll = mode === "rebuild";
 
   const sql = postgres(dbUrl, { max: 1 });
 
   try {
+    if (rebuildAll) {
+      await sql`
+        UPDATE bank_transactions
+        SET extraction_status = 'pending'
+        WHERE company_id = ${companyId}
+          AND raw_text IS NOT NULL
+          AND raw_text != ''
+      `;
+    }
+
     // 1. Select pending rows
     const rows: TxRow[] = await sql`
       SELECT id, raw_text, description, counterparty_name, amount, date, transaction_type
@@ -311,6 +323,7 @@ Deno.serve(async (req) => {
       ready,
       errors,
       total_pending: totalPending,
+      mode,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

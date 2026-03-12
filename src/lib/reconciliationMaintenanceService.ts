@@ -14,6 +14,13 @@ export interface BankEmbeddingBackfillResult {
   remaining: number
 }
 
+export interface BankRefReextractResult {
+  processed: number
+  ready: number
+  errors: number
+  remaining: number
+}
+
 export interface ReconciliationBackfillResult {
   contracts: ContractRefBackfillResult
   bankEmbeddings: BankEmbeddingBackfillResult
@@ -22,6 +29,7 @@ export interface ReconciliationBackfillResult {
 
 const CONTRACT_BATCH_SIZE = 100
 const EMBEDDING_BATCH_SIZE = 50
+const BANK_REF_BATCH_SIZE = 50
 const MAX_ROUNDS = 40
 
 async function callEdge<T>(path: string, payload: Record<string, unknown>): Promise<T> {
@@ -108,5 +116,43 @@ export async function triggerReconciliationHistoricalAlignment(
   }
 
   result.currentStep = undefined
+  return result
+}
+
+export async function triggerBankReferenceReextract(
+  companyId: string,
+  onProgress?: (partial: BankRefReextractResult & { currentStep?: string }) => void,
+): Promise<BankRefReextractResult> {
+  const result: BankRefReextractResult = {
+    processed: 0,
+    ready: 0,
+    errors: 0,
+    remaining: 0,
+  }
+
+  for (let round = 0; round < MAX_ROUNDS; round += 1) {
+    onProgress?.({ ...result, currentStep: 'Riferimenti banca...' })
+
+    const step = await callEdge<{
+      processed?: number
+      ready?: number
+      errors?: number
+      total_pending?: number
+    }>('bank-extract-refs', {
+      company_id: companyId,
+      batch_size: BANK_REF_BATCH_SIZE,
+      mode: round === 0 ? 'rebuild' : 'pending_only',
+    })
+
+    result.processed += Number(step.processed || 0)
+    result.ready += Number(step.ready || 0)
+    result.errors += Number(step.errors || 0)
+    result.remaining = Number(step.total_pending || 0)
+
+    onProgress?.({ ...result, currentStep: 'Riferimenti banca...' })
+
+    if (result.remaining === 0 || Number(step.processed || 0) === 0) break
+  }
+
   return result
 }

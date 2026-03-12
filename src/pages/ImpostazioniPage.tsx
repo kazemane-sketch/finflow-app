@@ -16,6 +16,8 @@ import { triggerFullBrainBackfill, type BrainBackfillResult } from '@/lib/compan
 import {
   triggerReconciliationHistoricalAlignment,
   type ReconciliationBackfillResult,
+  triggerBankReferenceReextract,
+  type BankRefReextractResult,
 } from '@/lib/reconciliationMaintenanceService'
 
 type SettingsTab = 'generale' | 'categorie' | 'progetti' | 'piano-conti' | 'istruzioni-ai'
@@ -467,6 +469,104 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
                 {entityErrors + show.memory.errors} errori totali — riprova per ritentare i falliti
               </p>
             )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function BankReferenceReextractCard({ companyId }: { companyId: string }) {
+  const [running, setRunning] = useState(false)
+  const [result, setResult] = useState<BankRefReextractResult | null>(null)
+  const [error, setError] = useState('')
+
+  const handleRun = async () => {
+    setRunning(true)
+    setError('')
+    setResult(null)
+    try {
+      const res = await triggerBankReferenceReextract(companyId, (partial) => {
+        setResult({
+          processed: partial.processed,
+          ready: partial.ready,
+          errors: partial.errors,
+          remaining: partial.remaining,
+        })
+      })
+      setResult(res)
+    } catch (err: any) {
+      setError(err.message || 'Errore durante la riestrazione')
+    }
+    setRunning(false)
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base flex items-center gap-2">
+          <Landmark className="h-4 w-4 text-emerald-600" />
+          Riestrazione Riferimenti Banca
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-xs text-gray-500">
+          Riestrae da zero i riferimenti strutturati di tutti i movimenti banca già analizzati,
+          così lo storico usa il parser nuovo anche sui record già in stato <code>ready</code>.
+        </p>
+
+        <Button
+          onClick={handleRun}
+          disabled={running}
+          variant="outline"
+          className="border-emerald-200 text-emerald-700 hover:bg-emerald-50"
+        >
+          {running ? (
+            <>
+              <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+              Riferimenti banca...
+            </>
+          ) : (
+            <>
+              <Landmark className="h-3.5 w-3.5 mr-1.5" />
+              {result ? 'Riestrai di nuovo' : 'Riestrai riferimenti banca'}
+            </>
+          )}
+        </Button>
+
+        {error && (
+          <div className="flex items-center gap-2 text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">
+            <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+            {error}
+          </div>
+        )}
+
+        {result && (
+          <div className={`rounded-lg px-3 py-2.5 space-y-2 ${running ? 'bg-emerald-50/70 border border-emerald-200' : 'bg-emerald-50'}`}>
+            <div className="flex items-center gap-2 text-xs font-semibold text-emerald-800">
+              {running ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-500" />
+              ) : (
+                <CheckCircle className="h-3.5 w-3.5 text-emerald-600" />
+              )}
+              {running ? 'Riestrazione in corso...' : 'Riestrazione completata'}
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 text-xs">
+                <span className="text-gray-600">Movimenti esaminati</span>
+                <span className="font-medium text-gray-900">{result.processed}</span>
+              </div>
+              <div className="flex items-center gap-2 text-xs">
+                <span className="text-gray-600">Movimenti pronti</span>
+                <span className="font-medium text-gray-900">{result.ready}</span>
+                {result.remaining > 0 && (
+                  <span className="text-gray-400">({result.remaining} rimanenti)</span>
+                )}
+                {result.errors > 0 && (
+                  <span className="text-amber-600">({result.errors} errori)</span>
+                )}
+              </div>
+            </div>
           </div>
         )}
       </CardContent>
@@ -946,6 +1046,7 @@ export default function ImpostazioniPage() {
         <>
           <BrainActivationCard companyId={companyId} />
           <ReconciliationAlignmentCard companyId={companyId} />
+          <BankReferenceReextractCard companyId={companyId} />
           <InstructionsTab companyId={companyId} />
         </>
       )}
