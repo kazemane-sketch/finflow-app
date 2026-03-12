@@ -17,7 +17,7 @@ import { mpLabel, tpLabel } from '@/lib/invoiceParser'
 import BankTxDetail, { txTypeLabel, txTypeBadge, txDirection } from '@/components/BankTxDetail'
 import { askInvoiceAiSearch, type InvoiceAiResult } from '@/lib/invoiceAiSearch'
 import { createReconciliationExample, deleteReconciliationLearningArtifacts } from '@/lib/learningService'
-import { createMemoryFromReconciliation, deactivateReconciliationMemoryFacts } from '@/lib/companyMemoryService'
+import { deactivateReconciliationMemoryFacts } from '@/lib/companyMemoryService'
 import { useAIJob } from '@/hooks/useAIJob'
 import { resolveSignedCommissionAmount } from '@/lib/bankCommission'
 
@@ -991,7 +991,7 @@ export default function RiconciliazionePage() {
         match_reason: suggestion.match_reason,
       })
 
-      // 5b. RAG: create learning example + company memory (fire-and-forget)
+      // 5b. RAG: create learning example from accepted reconciliation
       if (tx && suggestion.invoice_id) {
         const inv = suggestion.invoice
         const suggestionData = suggestion.suggestion_data || {}
@@ -1019,35 +1019,9 @@ export default function RiconciliazionePage() {
             counterpartyName: tx.counterparty_name || ((inv?.counterparty as Record<string, unknown> | null)?.denom as string | null) || null,
           },
         )
-
-        // Company memory: counterparty payment pattern
-        const invCp = inv?.counterparty as Record<string, unknown> | null
-        const memoryPromise = createMemoryFromReconciliation(
-          companyId,
-          (invCp?.id as string) || null,
-          tx.counterparty_name || (invCp?.denom as string) || null,
-          tx.description || '',
-          inv?.number || null,
-          Number(tx.amount),
-          suggestion.match_score,
-          {
-            reconciliationId,
-            transactionId: tx.id,
-            invoiceId: suggestion.invoice_id,
-            installmentId: suggestion.installment_id || null,
-            txNotes: tx.notes || null,
-            invoiceNotes: inv?.notes || null,
-            txContractRefs,
-            invoiceContractRefs,
-          },
-        )
-
-        const [learningResult, memoryResult] = await Promise.allSettled([learningPromise, memoryPromise])
+        const [learningResult] = await Promise.allSettled([learningPromise])
         if (learningResult.status === 'rejected') {
           console.warn('[confirmSuggestion] learning example error:', learningResult.reason)
-        }
-        if (memoryResult.status === 'rejected') {
-          console.warn('[confirmSuggestion] memory error:', memoryResult.reason)
         }
       }
 
@@ -1293,34 +1267,9 @@ export default function RiconciliazionePage() {
         },
       )
 
-      const memoryPromise = createMemoryFromReconciliation(
-        companyId,
-        null,
-        tx.counterparty_name || installment.counterparty_name || null,
-        tx.description || '',
-        installment.invoice_number || null,
-        Number(tx.amount),
-        100,
-        {
-          reconciliationId,
-          transactionId: tx.id,
-          invoiceId: installment.invoice_id,
-          installmentId: installment.id,
-          txNotes: tx.notes || null,
-          invoiceNotes: installment.invoice_notes || null,
-          invoiceContractRefs: uniqueStrings([
-            installment.primary_contract_ref || null,
-            ...(Array.isArray(installment.contract_refs) ? installment.contract_refs : []),
-          ]),
-        },
-      )
-
-      const [learningResult, memoryResult] = await Promise.allSettled([learningPromise, memoryPromise])
+      const [learningResult] = await Promise.allSettled([learningPromise])
       if (learningResult.status === 'rejected') {
         console.warn('[manualMatch] learning example error:', learningResult.reason)
-      }
-      if (memoryResult.status === 'rejected') {
-        console.warn('[manualMatch] memory error:', memoryResult.reason)
       }
 
       await upsertConfirmedReconciliationRule({
