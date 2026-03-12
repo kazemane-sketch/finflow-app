@@ -174,6 +174,7 @@ export async function createReconciliationExample(
   installmentId: string | null,
   matchScore: number | null,
   context?: {
+    reconciliationId?: string | null
     txNotes?: string | null
     invoiceNotes?: string | null
     txContractRefs?: string[] | null
@@ -196,6 +197,7 @@ export async function createReconciliationExample(
     invoice_id: invoiceId,
     match_score: matchScore,
   }
+  if (context?.reconciliationId) metadata.reconciliation_id = context.reconciliationId
   if (installmentId) metadata.installment_id = installmentId
   if (context?.counterpartyName) metadata.counterparty_name = context.counterpartyName
   if (context?.txNotes) metadata.tx_notes = context.txNotes
@@ -203,9 +205,47 @@ export async function createReconciliationExample(
   if (context?.txContractRefs?.length) metadata.tx_contract_refs = context.txContractRefs
   if (context?.invoiceContractRefs?.length) metadata.invoice_contract_refs = context.invoiceContractRefs
 
-  const sourceId = `rl:${transactionId}:${invoiceId}`
+  const sourceId = context?.reconciliationId
+    ? `rl:${context.reconciliationId}`
+    : `rl:${transactionId}:${invoiceId}${installmentId ? `:${installmentId}` : ''}`
 
   const exId = await createLearningExample(companyId, 'reconciliation', inputText, 'matched', metadata, sourceId)
   if (exId) triggerEmbedding([exId], companyId)
   return exId
+}
+
+export async function deleteReconciliationLearningArtifacts(
+  companyId: string,
+  transactionId: string,
+  invoiceId: string,
+  installmentId?: string | null,
+  reconciliationId?: string | null,
+): Promise<number> {
+  const sourceIds = [
+    reconciliationId ? `rl:${reconciliationId}` : null,
+    `rl:${transactionId}:${invoiceId}`,
+    `rl:${transactionId}:${invoiceId}${installmentId ? `:${installmentId}` : ''}`,
+  ].filter(Boolean) as string[]
+
+  const uniqueSourceIds = Array.from(new Set(sourceIds))
+  let deleted = 0
+
+  for (const sourceId of uniqueSourceIds) {
+    const { data, error } = await supabase
+      .from('learning_examples')
+      .delete()
+      .eq('company_id', companyId)
+      .eq('domain', 'reconciliation')
+      .eq('source_id', sourceId)
+      .select('id')
+
+    if (error) {
+      console.warn('[learningService] deleteReconciliationLearningArtifacts error:', error.message)
+      throw error
+    }
+
+    deleted += data?.length || 0
+  }
+
+  return deleted
 }

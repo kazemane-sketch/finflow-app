@@ -32,6 +32,7 @@ import { useReconciliationBadges } from '@/hooks/useReconciliationBadges'
 import { ReconciliationDot } from '@/components/ReconciliationIndicators'
 import { usePageEntity } from '@/contexts/PageEntityContext'
 import { useAIJob } from '@/hooks/useAIJob'
+import { resolveSignedCommissionAmount } from '@/lib/bankCommission'
 
 import BankTxDetail, {
   txTypeLabel as _txTypeLabel,
@@ -467,10 +468,11 @@ function TxRow({ tx, selected, checked, selectMode, onClick, onCheck, onDoubleCl
   const isIn = direction === 'in'
   const rawAmount = Number(tx.amount || 0)
   const signedAmount = isIn ? Math.abs(rawAmount) : -Math.abs(rawAmount)
-  const hasCommission = tx.commission_amount != null && tx.commission_amount !== 0
+  const commissionAmount = resolveSignedCommissionAmount(tx.commission_amount, tx.raw_text || null)
+  const hasCommission = commissionAmount != null && commissionAmount !== 0
   // Importo netto: rimuovo la commissione (negativa) dall'importo → tx.amount - tx.commission_amount
   // Es: amount=-700.20, commission=-0.20 → netto = -700.20 - (-0.20) = -700.00
-  const netAmount = hasCommission ? signedAmount - Number(tx.commission_amount || 0) : null
+  const netAmount = hasCommission ? signedAmount - Number(commissionAmount || 0) : null
 
   return (
     <div
@@ -497,7 +499,7 @@ function TxRow({ tx, selected, checked, selectMode, onClick, onCheck, onDoubleCl
           )}
           {hasCommission && (
             <span className="text-[9px] bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-medium">
-              comm. {fmtEur(tx.commission_amount)}
+              comm. {fmtEur(commissionAmount)}
             </span>
           )}
         </div>

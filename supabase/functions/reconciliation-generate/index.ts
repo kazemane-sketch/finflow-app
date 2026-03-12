@@ -36,9 +36,45 @@ interface TxRow {
   commission_amount: number | null;
 }
 
+function parseLocalizedAmount(raw: string): number | null {
+  const normalized = String(raw || "")
+    .replace(/\s+/g, "")
+    .replace(/\.(?=\d{3}(?:\D|$))/g, "")
+    .replace(",", ".");
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function extractCommissionAmountFromRawText(rawText: string | null | undefined): number | null {
+  const source = String(rawText || "");
+  if (!source) return null;
+
+  for (const pattern of [
+    /\bCOMM\.?\s*[:=]?\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:,[0-9]{2}))/i,
+    /\bCOMMISSIONI?\s*[:=]?\s*([0-9]{1,3}(?:\.[0-9]{3})*(?:,[0-9]{2})|[0-9]+(?:,[0-9]{2}))/i,
+  ]) {
+    const match = source.match(pattern);
+    if (!match?.[1]) continue;
+    const parsed = parseLocalizedAmount(match[1]);
+    if (parsed != null && parsed > 0) return parsed;
+  }
+
+  return null;
+}
+
+function getTxCommissionAmount(tx: TxRow): number {
+  const explicit = tx.commission_amount != null ? Number(tx.commission_amount) : null;
+  if (explicit != null && Number.isFinite(explicit) && explicit !== 0) {
+    return -Math.abs(explicit);
+  }
+
+  const extracted = extractCommissionAmountFromRawText(tx.raw_text);
+  return extracted != null ? -Math.abs(extracted) : 0;
+}
+
 /** Net amount = gross - commission. All matching uses net. */
 function getTxNetAmount(tx: TxRow): number {
-  return Math.abs(Number(tx.amount)) - Math.abs(Number(tx.commission_amount || 0));
+  return Math.abs(Number(tx.amount)) - Math.abs(getTxCommissionAmount(tx));
 }
 
 interface Suggestion {
@@ -1874,41 +1910,7 @@ async function generateForTransaction(
     results = await ragBoostSuggestions(sql, companyId, tx, results, geminiKey);
   }
 
-  // ── Miglioria 4: filter previously rejected pairs ──
-  return filterRejected(sql, companyId, results);
-}
-
-/* ─── Miglioria 4: Filter previously rejected pairs ─── */
-
-async function filterRejected(
-  sql: SqlClient,
-  companyId: string,
-  suggestions: Suggestion[],
-): Promise<Suggestion[]> {
-  if (suggestions.length === 0) return [];
-
-  const filtered: Suggestion[] = [];
-  for (const s of suggestions) {
-    if (!s.invoice_id) {
-      filtered.push(s);
-      continue;
-    }
-
-    const [{ cnt }] = await sql.unsafe(
-      `SELECT count(*)::int as cnt
-       FROM reconciliation_log
-       WHERE company_id = $1
-         AND bank_transaction_id = $2
-         AND invoice_id = $3
-         AND accepted = false`,
-      [companyId, s.bank_transaction_id, s.invoice_id],
-    );
-
-    if (cnt === 0) {
-      filtered.push(s);
-    }
-  }
-  return filtered;
+  return results;
 }
 
 /* ─── main handler ────────────────────── */

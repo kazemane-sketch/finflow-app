@@ -5,6 +5,7 @@
 import { supabase } from '@/integrations/supabase/client';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client';
 import { getValidAccessToken } from '@/lib/getValidAccessToken';
+import { resolveSignedCommissionAmount } from '@/lib/bankCommission';
 
 // ============================================================
 // TYPES
@@ -230,9 +231,7 @@ function mapRawTx(raw: any): BankTransaction | null {
   const direction = normalizeDirection(raw.direction) || (parsedAmount >= 0 ? 'in' : 'out');
   const amountAbs = Math.abs(parsedAmount);
   const amount = direction === 'in' ? amountAbs : -amountAbs;
-  const commission = raw.commission != null && raw.commission !== 0
-    ? -Math.abs(parseFloat(String(raw.commission)))
-    : undefined;
+  const commission = resolveSignedCommissionAmount(raw.commission, raw.raw_text || raw.description || '');
   const confParsed = parseFloat(String(raw.direction_confidence ?? '0.5'));
   const directionConfidence = Number.isFinite(confParsed)
     ? Math.min(1, Math.max(0, Math.round(confParsed * 100) / 100))
@@ -263,8 +262,8 @@ function mapRawTx(raw: any): BankTransaction | null {
     date: parseItalianDate(raw.date),
     value_date: raw.value_date ? parseItalianDate(raw.value_date) : undefined,
     amount,
-    commission_amount: commission,
-    net_amount: commission ? amount - Math.abs(commission) : amount,
+    commission_amount: commission ?? undefined,
+    net_amount: commission != null ? amount - Math.abs(commission) : amount,
     balance: raw.balance != null ? parseFloat(String(raw.balance)) : undefined,
     description: sanitizeShortDescription(raw.description),
     counterparty_name: counterparty || 'N.D.',

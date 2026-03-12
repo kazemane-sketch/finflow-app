@@ -16,9 +16,10 @@ import { fmtDate, fmtEur } from '@/lib/utils'
 import { mpLabel, tpLabel } from '@/lib/invoiceParser'
 import BankTxDetail, { txTypeLabel, txTypeBadge, txDirection } from '@/components/BankTxDetail'
 import { askInvoiceAiSearch, type InvoiceAiResult } from '@/lib/invoiceAiSearch'
-import { createReconciliationExample } from '@/lib/learningService'
-import { createMemoryFromReconciliation } from '@/lib/companyMemoryService'
+import { createReconciliationExample, deleteReconciliationLearningArtifacts } from '@/lib/learningService'
+import { createMemoryFromReconciliation, deactivateReconciliationMemoryFacts } from '@/lib/companyMemoryService'
 import { useAIJob } from '@/hooks/useAIJob'
+import { resolveSignedCommissionAmount } from '@/lib/bankCommission'
 
 /* ─── types ──────────────────────────────────── */
 
@@ -124,6 +125,7 @@ interface ReconciledRow {
     description: string | null
     transaction_type: string | null
     direction: string | null
+    raw_text: string | null
     commission_amount: number | null
     reconciled_amount: number | null
   } | null
@@ -362,8 +364,13 @@ function invoiceNumberMatchesRef(invoiceNumber: string, ref: string): boolean {
 }
 
 /** Net amount = gross - commission. Used for ALL amount comparisons in reconciliation. */
-function getTxNetAmount(tx: { amount: number; commission_amount?: number | null }): number {
-  return Math.abs(Number(tx.amount)) - Math.abs(Number(tx.commission_amount || 0))
+function getTxCommissionAmount(tx: { commission_amount?: number | null; raw_text?: string | null }): number {
+  return Number(resolveSignedCommissionAmount(tx.commission_amount, tx.raw_text || null) || 0)
+}
+
+/** Net amount = gross - commission. Used for ALL amount comparisons in reconciliation. */
+function getTxNetAmount(tx: { amount: number; commission_amount?: number | null; raw_text?: string | null }): number {
+  return Math.abs(Number(tx.amount)) - Math.abs(getTxCommissionAmount(tx))
 }
 
 /* ─── main component ─────────────────────────── */
@@ -557,7 +564,7 @@ export default function RiconciliazionePage() {
       .select(`
         id, invoice_id, bank_transaction_id, installment_id, match_type, confidence,
         match_reason, confirmed_at, created_at, reconciled_amount,
-        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, commission_amount, reconciled_amount),
+        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, raw_text, commission_amount, reconciled_amount),
         invoice:invoices(id, number, counterparty, total_amount, date, direction)
       `)
       .eq('company_id', companyId)
@@ -705,6 +712,94 @@ export default function RiconciliazionePage() {
     return data?.[0]?.id || null
   }, [companyId])
 
+  const upsertConfirmedReconciliationRule = useCallback(async ({
+    reconciliationId,
+    tx,
+    invoiceId,
+    installmentId,
+    invoiceNumber,
+    invoiceDate,
+    invoiceNotes,
+    invoiceCounterpartyName,
+    invoicePrimaryContractRef,
+    invoiceContractRefs,
+    matchScore,
+    suggestionData,
+  }: {
+    reconciliationId: string
+    tx: UnmatchedTx | SuggestionRow['bank_transaction']
+    invoiceId: string
+    installmentId: string | null
+    invoiceNumber: string | null
+    invoiceDate: string | null
+    invoiceNotes?: string | null
+    invoiceCounterpartyName?: string | null
+    invoicePrimaryContractRef?: string | null
+    invoiceContractRefs?: string[] | null
+    matchScore: number
+    suggestionData?: Record<string, unknown> | null
+  }) => {
+    if (!companyId || !tx || !tx.counterparty_name) return
+
+    const txContractRefs = uniqueStrings([
+      ...extractClientContractRefs(tx.extracted_refs || null, tx.raw_text || null),
+      ...(Array.isArray(suggestionData?.tx_contract_refs) ? suggestionData?.tx_contract_refs as string[] : []),
+    ])
+    const normalizedInvoiceContracts = uniqueStrings([
+      invoicePrimaryContractRef || null,
+      ...(Array.isArray(invoiceContractRefs) ? invoiceContractRefs : []),
+      ...(Array.isArray(suggestionData?.invoice_contract_refs) ? suggestionData?.invoice_contract_refs as string[] : []),
+    ])
+    const txInvoiceRefs = uniqueStrings([
+      ...extractClientInvoiceRefs(tx.extracted_refs || null, tx.raw_text || null).map(normalizeComparableRef),
+      ...(Array.isArray(suggestionData?.ref) ? (suggestionData.ref as string[]).map(normalizeComparableRef) : []),
+      typeof suggestionData?.ref === 'string' ? normalizeComparableRef(String(suggestionData.ref)) : null,
+    ])
+    const mandateId = extractClientMandateId(tx.extracted_refs || null)
+    const ruleName = `${tx.counterparty_name} → ${invoiceNumber || 'fattura'}`
+    const ruleData = {
+      counterparty_pattern: tx.counterparty_name,
+      counterparty_denorm: tx.counterparty_name || invoiceCounterpartyName || null,
+      transaction_type: tx.transaction_type || null,
+      direction: tx.direction || null,
+      amount_range: [Math.abs(Number(tx.amount)) * 0.85, Math.abs(Number(tx.amount)) * 1.15],
+      contract_ref: txContractRefs[0] || normalizedInvoiceContracts[0] || null,
+      contract_refs: uniqueStrings([...txContractRefs, ...normalizedInvoiceContracts]),
+      invoice_ref_patterns: txInvoiceRefs,
+      mandate_id: mandateId,
+      amount_target: Math.abs(Number(tx.amount)),
+      counterparty_similarity: matchScore >= 90 ? 'high' : matchScore >= 75 ? 'medium' : 'low',
+      days_window: typeof suggestionData?.days_diff === 'number' ? Number(suggestionData.days_diff) : null,
+      timing_confidence: typeof suggestionData?.timing_confidence === 'string' ? suggestionData.timing_confidence : null,
+      invoice_after_tx: Boolean(suggestionData?.invoice_after_tx),
+      level: suggestionData?.level || null,
+      tx_description: tx.description || null,
+      tx_notes: tx.notes || null,
+      invoice_notes: invoiceNotes || null,
+      source_reconciliation_id: reconciliationId,
+      source_transaction_id: tx.id,
+      source_invoice_id: invoiceId,
+      source_installment_id: installmentId || null,
+      source_invoice_date: invoiceDate || null,
+    }
+
+    const { error: ruleErr } = await supabase
+      .from('reconciliation_rules')
+      .upsert({
+        company_id: companyId,
+        rule_name: ruleName.slice(0, 200),
+        rule_type: 'counterparty_amount',
+        pattern: ruleData,
+        action: { match_invoice: true },
+        rule_data: ruleData,
+        confidence: Math.min(1, (matchScore / 100) * 0.75 + (suggestionData?.auto_match_eligible ? 0.25 : 0.15)),
+      }, { onConflict: 'company_id,rule_name' })
+
+    if (ruleErr) {
+      console.warn('[reconciliation] rule upsert error:', ruleErr)
+    }
+  }, [companyId])
+
   // ─── auto-close remainder (shared helper) ───
   const autoCloseRemainder = useCallback(async (txId: string, amount: number, reason: string) => {
     if (!companyId) return
@@ -714,13 +809,13 @@ export default function RiconciliazionePage() {
       // Fetch current TX state
       const { data: txData } = await supabase
         .from('bank_transactions')
-        .select('reconciled_amount, amount, commission_amount')
+        .select('reconciled_amount, amount, commission_amount, raw_text')
         .eq('id', txId)
         .single()
       if (!txData) return
 
       const newReconciled = Number(txData.reconciled_amount || 0) + amount
-      const txNet = Math.abs(Number(txData.amount)) - Math.abs(Number(txData.commission_amount || 0))
+      const txNet = getTxNetAmount(txData)
       const newStatus = newReconciled >= txNet - 0.01 ? 'matched' : 'partial'
 
       const { error: e1 } = await supabase.from('bank_transactions')
@@ -818,7 +913,7 @@ export default function RiconciliazionePage() {
       if (e1) throw e1
 
       // 2. Create reconciliation record (with amount + installment_id)
-      const { error: e2 } = await supabase
+      const { data: reconInsert, error: e2 } = await supabase
         .from('reconciliations')
         .insert({
           company_id: companyId,
@@ -832,7 +927,11 @@ export default function RiconciliazionePage() {
           confirmed_by: userId,
           confirmed_at: now,
         })
+        .select('id')
+        .single()
       if (e2) throw e2
+      const reconciliationId = reconInsert?.id
+      if (!reconciliationId) throw new Error('ID riconciliazione non restituito')
 
       // 3. Update bank transaction: increment reconciled_amount, set status
       const newTxReconciled = Number(tx?.reconciled_amount || 0) + reconcileAmount
@@ -895,24 +994,25 @@ export default function RiconciliazionePage() {
           ...invoiceContracts,
           ...(Array.isArray(suggestionData.invoice_contract_refs) ? suggestionData.invoice_contract_refs as string[] : []),
         ])
-        createReconciliationExample(
+        const learningPromise = createReconciliationExample(
           companyId,
           tx.description || '', tx.date || '', Number(tx.amount),
           inv?.number || '', inv?.date || '', Number(inv?.total_amount || 0),
           tx.id, suggestion.invoice_id, suggestion.installment_id || null,
           suggestion.match_score,
           {
+            reconciliationId,
             txNotes: tx.notes || null,
             invoiceNotes: inv?.notes || null,
             txContractRefs,
             invoiceContractRefs,
             counterpartyName: tx.counterparty_name || ((inv?.counterparty as Record<string, unknown> | null)?.denom as string | null) || null,
           },
-        ).catch(err => console.warn('[confirmSuggestion] learning example error:', err))
+        )
 
         // Company memory: counterparty payment pattern
         const invCp = inv?.counterparty as Record<string, unknown> | null
-        createMemoryFromReconciliation(
+        const memoryPromise = createMemoryFromReconciliation(
           companyId,
           (invCp?.id as string) || null,
           tx.counterparty_name || (invCp?.denom as string) || null,
@@ -921,67 +1021,42 @@ export default function RiconciliazionePage() {
           Number(tx.amount),
           suggestion.match_score,
           {
+            reconciliationId,
+            transactionId: tx.id,
+            invoiceId: suggestion.invoice_id,
+            installmentId: suggestion.installment_id || null,
             txNotes: tx.notes || null,
             invoiceNotes: inv?.notes || null,
             txContractRefs,
             invoiceContractRefs,
           },
-        ).catch(err => console.warn('[confirmSuggestion] memory error:', err))
+        )
+
+        const [learningResult, memoryResult] = await Promise.allSettled([learningPromise, memoryPromise])
+        if (learningResult.status === 'rejected') {
+          console.warn('[confirmSuggestion] learning example error:', learningResult.reason)
+        }
+        if (memoryResult.status === 'rejected') {
+          console.warn('[confirmSuggestion] memory error:', memoryResult.reason)
+        }
       }
 
-      // 5c. Miglioria 3: Upsert reconciliation rule from confirmed match
+      // 5c. Upsert reconciliation rule from confirmed match
       if (tx && suggestion.invoice_id && tx.counterparty_name) {
         const inv = suggestion.invoice
-        const suggestionData = suggestion.suggestion_data || {}
-        const invoiceContracts = Array.isArray(inv?.contract_refs) ? inv?.contract_refs : []
-        const txContractRefs = uniqueStrings([
-          ...extractClientContractRefs(tx.extracted_refs || null, tx.raw_text || null),
-          ...(Array.isArray(suggestionData?.tx_contract_refs) ? suggestionData?.tx_contract_refs as string[] : []),
-        ])
-        const invoiceContractRefs = uniqueStrings([
-          inv?.primary_contract_ref || null,
-          ...invoiceContracts,
-          ...(Array.isArray(suggestionData?.invoice_contract_refs) ? suggestionData?.invoice_contract_refs as string[] : []),
-        ])
-        const txInvoiceRefs = uniqueStrings([
-          ...extractClientInvoiceRefs(tx.extracted_refs || null, tx.raw_text || null).map(normalizeComparableRef),
-          ...(Array.isArray(suggestionData?.ref) ? (suggestionData.ref as string[]).map(normalizeComparableRef) : []),
-          typeof suggestionData?.ref === 'string' ? normalizeComparableRef(String(suggestionData.ref)) : null,
-        ])
-        const mandateId = extractClientMandateId(tx.extracted_refs || null)
-        const invoiceAfterTx = Boolean(suggestionData?.invoice_after_tx)
-        const timingConfidence = typeof suggestionData?.timing_confidence === 'string' ? suggestionData.timing_confidence : null
-        const ruleName = `${tx.counterparty_name} → ${inv?.number || 'fattura'}`
-        const ruleData = {
-          counterparty_pattern: tx.counterparty_name,
-          counterparty_denorm: tx.counterparty_name || ((inv?.counterparty as Record<string, unknown> | null)?.denom as string | null) || null,
-          transaction_type: tx.transaction_type || null,
-          direction: tx.direction || null,
-          amount_range: [Math.abs(Number(tx.amount)) * 0.85, Math.abs(Number(tx.amount)) * 1.15],
-          contract_ref: txContractRefs[0] || invoiceContractRefs[0] || null,
-          contract_refs: uniqueStrings([...txContractRefs, ...invoiceContractRefs]),
-          invoice_ref_patterns: txInvoiceRefs,
-          mandate_id: mandateId,
-          amount_target: Math.abs(Number(tx.amount)),
-          counterparty_similarity: suggestion.match_score >= 90 ? 'high' : suggestion.match_score >= 75 ? 'medium' : 'low',
-          days_window: typeof suggestionData?.days_diff === 'number' ? Number(suggestionData.days_diff) : null,
-          timing_confidence: timingConfidence,
-          invoice_after_tx: invoiceAfterTx,
-          level: suggestionData?.level || null,
-          tx_description: tx.description || null,
-          tx_notes: tx.notes || null,
-          invoice_notes: inv?.notes || null,
-        }
-        supabase.from('reconciliation_rules').upsert({
-          company_id: companyId,
-          rule_name: ruleName.slice(0, 200),
-          rule_type: 'counterparty_amount',
-          pattern: ruleData,
-          action: { match_invoice: true },
-          rule_data: ruleData,
-          confidence: Math.min(1, (suggestion.match_score / 100) * 0.75 + (suggestionData?.auto_match_eligible ? 0.25 : 0.15)),
-        }, { onConflict: 'company_id,rule_name' }).then(({ error: ruleErr }) => {
-          if (ruleErr) console.warn('[confirmSuggestion] rule upsert error:', ruleErr)
+        await upsertConfirmedReconciliationRule({
+          reconciliationId,
+          tx,
+          invoiceId: suggestion.invoice_id,
+          installmentId: suggestion.installment_id,
+          invoiceNumber: inv?.number || null,
+          invoiceDate: inv?.date || null,
+          invoiceNotes: inv?.notes || null,
+          invoiceCounterpartyName: ((inv?.counterparty as Record<string, unknown> | null)?.denom as string | null) || null,
+          invoicePrimaryContractRef: inv?.primary_contract_ref || null,
+          invoiceContractRefs: Array.isArray(inv?.contract_refs) ? inv.contract_refs : [],
+          matchScore: suggestion.match_score,
+          suggestionData: suggestion.suggestion_data || null,
         })
       }
 
@@ -1008,7 +1083,7 @@ export default function RiconciliazionePage() {
       // Post-reconciliation remainder dialog
       if (!txFullyMatched && tx) {
         const remainder = txNetAmount - newTxReconciled
-        const commission = Math.abs(Number(tx.commission_amount || 0))
+        const commission = Math.abs(getTxCommissionAmount(tx))
 
         if (remainder > 0.10) {
           setPostReconDialog({
@@ -1030,7 +1105,7 @@ export default function RiconciliazionePage() {
       toast.error(`Errore conferma: ${msg}`)
     }
     setConfirmingId(null)
-  }, [companyId, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments, loadReconciled, autoCloseRemainder, findExistingReconciliation])
+  }, [companyId, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments, loadReconciled, autoCloseRemainder, findExistingReconciliation, upsertConfirmedReconciliationRule])
 
   // ─── reject suggestion ─────────────────────
   const rejectSuggestion = useCallback(async (suggestion: SuggestionRow) => {
@@ -1044,47 +1119,6 @@ export default function RiconciliazionePage() {
         .update({ status: 'rejected', resolved_at: new Date().toISOString(), resolved_by: user?.id })
         .eq('id', suggestion.id)
       if (error) throw error
-
-      await supabase.from('reconciliation_log').insert({
-        company_id: companyId,
-        suggestion_id: suggestion.id,
-        bank_transaction_id: suggestion.bank_transaction_id,
-        installment_id: suggestion.installment_id,
-        invoice_id: suggestion.invoice_id,
-        proposed_by: suggestion.proposed_by,
-        accepted: false,
-        user_id: user?.id,
-        match_score: suggestion.match_score,
-        match_reason: suggestion.match_reason,
-      })
-
-      // Miglioria 4: degrade rule confidence on reject
-      if (suggestion.rule_id) {
-        const { data: ruleRow, error: ruleLoadErr } = await supabase
-          .from('reconciliation_rules')
-          .select('confidence, reject_count')
-          .eq('id', suggestion.rule_id)
-          .single()
-        if (ruleLoadErr) {
-          console.warn('[rejectSuggestion] rule load error:', ruleLoadErr)
-        } else {
-          const currentConfidence = Number(ruleRow?.confidence || 0)
-          const currentRejectCount = Number(ruleRow?.reject_count || 0)
-          const hardReject = suggestion.proposed_by === 'rule' || suggestion.suggestion_data?.level === 'rule'
-          const penalty = hardReject ? 0.2 : 0.12
-          const newRejectCount = currentRejectCount + 1
-          const newConfidence = Math.max(0, currentConfidence - penalty - Math.min(0.1, currentRejectCount * 0.03))
-          const { error: ruleErr } = await supabase
-            .from('reconciliation_rules')
-            .update({
-              confidence: newConfidence,
-              reject_count: newRejectCount,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', suggestion.rule_id)
-          if (ruleErr) console.warn('[rejectSuggestion] rule degrade error:', ruleErr)
-        }
-      }
 
       toast.success('Suggerimento rifiutato')
       setSuggestions(prev => prev.filter(s => s.id !== suggestion.id))
@@ -1175,7 +1209,7 @@ export default function RiconciliazionePage() {
       }
 
       // Create reconciliation (with amount + installment_id)
-      const { error: e1 } = await supabase.from('reconciliations').insert({
+      const { data: reconInsert, error: e1 } = await supabase.from('reconciliations').insert({
         company_id: companyId,
         invoice_id: installment.invoice_id,
         bank_transaction_id: txId,
@@ -1187,7 +1221,11 @@ export default function RiconciliazionePage() {
         confirmed_by: user?.id,
         confirmed_at: now,
       })
+      .select('id')
+      .single()
       if (e1) throw e1
+      const reconciliationId = reconInsert?.id
+      if (!reconciliationId) throw new Error('ID riconciliazione non restituito')
 
       // Update bank tx with reconciled_amount
       const newTxReconciled = txReconciledAlready + reconcileAmount
@@ -1228,12 +1266,13 @@ export default function RiconciliazionePage() {
       })
 
       // RAG: create learning example for manual match (fire-and-forget)
-      createReconciliationExample(
+      const learningPromise = createReconciliationExample(
         companyId,
         tx.description || '', tx.date || '', Number(tx.amount),
         installment.invoice_number || '', '', Number(installment.amount_due),
         tx.id, installment.invoice_id, installment.id, 100,
         {
+          reconciliationId,
           txNotes: tx.notes || null,
           invoiceNotes: installment.invoice_notes || null,
           invoiceContractRefs: uniqueStrings([
@@ -1242,9 +1281,9 @@ export default function RiconciliazionePage() {
           ]),
           counterpartyName: tx.counterparty_name || installment.counterparty_name || null,
         },
-      ).catch(err => console.warn('[manualMatch] learning example error:', err))
+      )
 
-      createMemoryFromReconciliation(
+      const memoryPromise = createMemoryFromReconciliation(
         companyId,
         null,
         tx.counterparty_name || installment.counterparty_name || null,
@@ -1253,6 +1292,10 @@ export default function RiconciliazionePage() {
         Number(tx.amount),
         100,
         {
+          reconciliationId,
+          transactionId: tx.id,
+          invoiceId: installment.invoice_id,
+          installmentId: installment.id,
           txNotes: tx.notes || null,
           invoiceNotes: installment.invoice_notes || null,
           invoiceContractRefs: uniqueStrings([
@@ -1260,7 +1303,30 @@ export default function RiconciliazionePage() {
             ...(Array.isArray(installment.contract_refs) ? installment.contract_refs : []),
           ]),
         },
-      ).catch(err => console.warn('[manualMatch] memory error:', err))
+      )
+
+      const [learningResult, memoryResult] = await Promise.allSettled([learningPromise, memoryPromise])
+      if (learningResult.status === 'rejected') {
+        console.warn('[manualMatch] learning example error:', learningResult.reason)
+      }
+      if (memoryResult.status === 'rejected') {
+        console.warn('[manualMatch] memory error:', memoryResult.reason)
+      }
+
+      await upsertConfirmedReconciliationRule({
+        reconciliationId,
+        tx,
+        invoiceId: installment.invoice_id,
+        installmentId: installment.id,
+        invoiceNumber: installment.invoice_number || null,
+        invoiceDate: installment.invoice_date || null,
+        invoiceNotes: installment.invoice_notes || null,
+        invoiceCounterpartyName: installment.counterparty_name || null,
+        invoicePrimaryContractRef: installment.primary_contract_ref || null,
+        invoiceContractRefs: Array.isArray(installment.contract_refs) ? installment.contract_refs : [],
+        matchScore: 100,
+        suggestionData: { level: 'manual', auto_match_eligible: false },
+      })
 
       // Expire impossible suggestions for this TX or installment
       if (txFullyMatched) {
@@ -1288,7 +1354,7 @@ export default function RiconciliazionePage() {
       // Post-reconciliation remainder dialog
       if (!txFullyMatched) {
         const remainder = txAmount - newTxReconciled  // txAmount is already net
-        const commission = Math.abs(Number(tx.commission_amount || 0))
+        const commission = Math.abs(getTxCommissionAmount(tx))
 
         if (remainder > 0.10) {
           setPostReconDialog({
@@ -1310,7 +1376,7 @@ export default function RiconciliazionePage() {
       toast.error(`Errore: ${msg}`)
     }
     setConfirmingId(null)
-  }, [companyId, unmatchedTxs, loadKpis, loadUnmatched, loadOpenInstallments, loadReconciled, autoCloseRemainder, findExistingReconciliation])
+  }, [companyId, unmatchedTxs, loadKpis, loadUnmatched, loadOpenInstallments, loadReconciled, autoCloseRemainder, findExistingReconciliation, upsertConfirmedReconciliationRule])
 
   // ─── delete reconciliation (undo) ─────────
   const deleteReconciliation = useCallback(async (recon: ReconciledRow) => {
@@ -1346,6 +1412,52 @@ export default function RiconciliazionePage() {
         .eq('id', recon.id)
       if (e1) throw e1
 
+      // 3b. Revoke all learning artifacts tied to this accepted reconciliation
+      let ruleDeleteQuery = supabase
+        .from('reconciliation_rules')
+        .delete()
+        .eq('company_id', companyId)
+        .contains('rule_data', { source_reconciliation_id: recon.id })
+
+      let acceptedLogDeleteQuery = supabase
+        .from('reconciliation_log')
+        .delete()
+        .eq('company_id', companyId)
+        .eq('bank_transaction_id', recon.bank_transaction_id)
+        .eq('invoice_id', recon.invoice_id)
+        .eq('accepted', true)
+
+      if (reconInstallmentId) {
+        acceptedLogDeleteQuery = acceptedLogDeleteQuery.eq('installment_id', reconInstallmentId)
+      }
+
+      await Promise.all([
+        ruleDeleteQuery,
+        deleteReconciliationLearningArtifacts(
+          companyId,
+          recon.bank_transaction_id,
+          recon.invoice_id,
+          reconInstallmentId,
+          recon.id,
+        ),
+        deactivateReconciliationMemoryFacts(
+          recon.id,
+          recon.bank_transaction_id,
+          recon.invoice_id,
+          reconInstallmentId,
+        ),
+        acceptedLogDeleteQuery
+          .is('adjustment_amount', null)
+          .then(async ({ error }) => {
+            if (error?.message?.includes('adjustment_amount')) {
+              const fallback = await acceptedLogDeleteQuery
+              if (fallback.error) throw fallback.error
+            } else if (error) {
+              throw error
+            }
+          }),
+      ])
+
       // 4. Smart reset: recalculate bank TX from remaining reconciliations + adjustments
       const { count: remainingReconCount } = await supabase
         .from('reconciliations')
@@ -1364,12 +1476,12 @@ export default function RiconciliazionePage() {
         const [{ data: remainingRecons }, { data: adjLogs }, { data: txData }] = await Promise.all([
           supabase.from('reconciliations').select('reconciled_amount').eq('bank_transaction_id', recon.bank_transaction_id),
           supabase.from('reconciliation_log').select('adjustment_amount').eq('bank_transaction_id', recon.bank_transaction_id).eq('accepted', true).not('adjustment_amount', 'is', null),
-          supabase.from('bank_transactions').select('amount, commission_amount').eq('id', recon.bank_transaction_id).single(),
+          supabase.from('bank_transactions').select('amount, commission_amount, raw_text').eq('id', recon.bank_transaction_id).single(),
         ])
         const reconSum = (remainingRecons || []).reduce((s, r) => s + Number(r.reconciled_amount || 0), 0)
         const adjSum = (adjLogs || []).reduce((s, a) => s + Number(a.adjustment_amount || 0), 0)
         const newReconciled = Math.max(0, reconSum + adjSum)
-        const txNet = txData ? Math.abs(Number(txData.amount)) - Math.abs(Number(txData.commission_amount || 0)) : 0
+        const txNet = txData ? getTxNetAmount(txData) : 0
         const newStatus = newReconciled >= txNet - 0.01 ? 'matched' : newReconciled > 0.01 ? 'partial' : 'unmatched'
         const { error: e2 } = await supabase
           .from('bank_transactions')
@@ -1396,30 +1508,16 @@ export default function RiconciliazionePage() {
         }
       }
 
-      // 5. Log the undo
-      const { data: { user } } = await supabase.auth.getUser()
-      await supabase.from('reconciliation_log').insert({
-        company_id: companyId,
-        bank_transaction_id: recon.bank_transaction_id,
-        installment_id: installmentId || null,
-        invoice_id: recon.invoice_id,
-        proposed_by: 'manual',
-        accepted: false,
-        user_id: user?.id,
-        match_score: (recon.confidence ?? 0) * 100,
-        match_reason: 'Riconciliazione annullata manualmente',
-      })
-
       toast.success('Riconciliazione eliminata')
       setReconciledRows(prev => prev.filter(r => r.id !== recon.id))
       setConfirmDeleteId(null)
-      await Promise.all([loadKpis(), loadUnmatched(), loadOpenInstallments(), loadReconciled()])
+      await Promise.all([loadKpis(), loadUnmatched(), loadOpenInstallments(), loadReconciled(), regenerateSuggestionsForTransaction(recon.bank_transaction_id)])
     } catch (err: unknown) {
       const msg = errMsg(err)
       toast.error(`Errore eliminazione: ${msg}`)
     }
     setDeletingReconId(null)
-  }, [companyId, loadKpis, loadUnmatched, loadOpenInstallments, loadReconciled])
+  }, [companyId, loadKpis, loadUnmatched, loadOpenInstallments, loadReconciled, regenerateSuggestionsForTransaction])
 
   // ─── handle confirm choice (from dialog) ───
   const handleConfirmChoice = useCallback(async (chosenAmount: number) => {
@@ -1607,7 +1705,7 @@ export default function RiconciliazionePage() {
     if (!selectedTxRecord) return null
     const selTx = selectedTxRecord
     if (!selTx || selTx.reconciliation_status !== 'partial') return null
-    const netAmt = Math.abs(Number(selTx.amount)) - Math.abs(Number(selTx.commission_amount || 0))
+    const netAmt = getTxNetAmount(selTx)
     const reconciled = Number(selTx.reconciled_amount || 0)
     return { netAmt, reconciled, residual: netAmt - reconciled }
   }, [selectedTxRecord])
@@ -1980,9 +2078,10 @@ export default function RiconciliazionePage() {
                   // ── Cumulative invoice-ref card ──
                   const txDir = txDirection(tx0)
                   const absAmount = Math.abs(Number(tx0.amount))
-                  const hasComm = tx0.commission_amount != null && Number(tx0.commission_amount) !== 0
+                  const commissionAmount = getTxCommissionAmount(tx0)
+                  const hasComm = commissionAmount !== 0
                   const sign = txDir === 'in' ? '+' : '-'
-                  const netAmt = hasComm ? absAmount - Math.abs(Number(tx0.commission_amount)) : absAmount
+                  const netAmt = hasComm ? absAmount - Math.abs(commissionAmount) : absAmount
                   const totalInstRemaining = group.items.reduce((sum, s) => {
                     const ir = s.installment ? Number(s.installment.amount_due) - Number(s.installment.paid_amount) : 0
                     return sum + ir
@@ -2233,10 +2332,11 @@ export default function RiconciliazionePage() {
                           {focusedResidualTx.direction === 'in' ? '+' : '-'}
                           {fmtEur(getTxNetAmount(focusedResidualTx))}
                         </p>
-                        {Number(focusedResidualTx.commission_amount || 0) !== 0 && (
+                        {getTxCommissionAmount(focusedResidualTx) !== 0 && (
                           <p className="text-[10px] text-gray-400">
                             lordo {focusedResidualTx.direction === 'in' ? '+' : '-'}
                             {fmtEur(Math.abs(Number(focusedResidualTx.amount)))}
+                            {' '}| comm. {fmtEur(Math.abs(getTxCommissionAmount(focusedResidualTx)))}
                           </p>
                         )}
                       </div>
@@ -2288,9 +2388,10 @@ export default function RiconciliazionePage() {
                     {assistedTxRows.map(tx => {
                   const isSelected = selectedTxId === tx.id
                   const txAbs = Math.abs(Number(tx.amount))
-                  const hasComm = tx.commission_amount != null && Number(tx.commission_amount) !== 0
+                  const commissionAmount = getTxCommissionAmount(tx)
+                  const hasComm = commissionAmount !== 0
                   const sign = tx.direction === 'in' ? '+' : '-'
-                  const netAmt = hasComm ? txAbs - Math.abs(Number(tx.commission_amount)) : txAbs
+                  const netAmt = hasComm ? txAbs - Math.abs(commissionAmount) : txAbs
                   const txRefs = extractClientInvoiceRefs(tx.extracted_refs, tx.raw_text)
                   const isPartial = tx.reconciliation_status === 'partial'
                   const txReconciledAmt = Number(tx.reconciled_amount || 0)
@@ -2705,9 +2806,10 @@ export default function RiconciliazionePage() {
 
                     const txDir = txDirection(tx)
                     const absAmount = Math.abs(Number(tx.amount))
-                    const hasComm = tx.commission_amount != null && Number(tx.commission_amount) !== 0
+                    const commissionAmount = getTxCommissionAmount(tx)
+                    const hasComm = commissionAmount !== 0
                     const sign = txDir === 'in' ? '+' : '-'
-                    const netAmt = hasComm ? absAmount - Math.abs(Number(tx.commission_amount)) : absAmount
+                    const netAmt = hasComm ? absAmount - Math.abs(commissionAmount) : absAmount
                     const invoiceDenom = inv?.counterparty && typeof inv.counterparty === 'object'
                       ? (inv.counterparty as any).denom || 'N.D.' : 'N.D.'
                     const isConfirmingDelete = confirmDeleteId === r.id
@@ -2741,7 +2843,7 @@ export default function RiconciliazionePage() {
                             <div className="flex items-center gap-2 mt-0.5 pl-3.5">
                               <span className="text-[10px] text-gray-400">{paymentDateLabel(tx.date)}</span>
                               {hasComm && (
-                                <span className="text-[10px] text-gray-400">lordo {sign}{fmtEur(absAmount)} | comm. {fmtEur(Math.abs(Number(tx.commission_amount)))}</span>
+                                <span className="text-[10px] text-gray-400">lordo {sign}{fmtEur(absAmount)} | comm. {fmtEur(Math.abs(commissionAmount))}</span>
                               )}
                               {tx.description && (
                                 <span className="text-[10px] text-gray-400 truncate">{tx.description.slice(0, 60)}</span>
@@ -3342,10 +3444,11 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
                 )}
               </div>
               {(() => {
-                const hasComm = tx.commission_amount != null && Number(tx.commission_amount) !== 0
+                const commissionAmount = getTxCommissionAmount(tx)
+                const hasComm = commissionAmount !== 0
                 const sign = txDir === 'in' ? '+' : '-'
                 if (hasComm) {
-                  const netAmt = absAmount - Math.abs(Number(tx.commission_amount))
+                  const netAmt = absAmount - Math.abs(commissionAmount)
                   return (
                     <>
                       <p className={`text-sm font-bold ${txDir === 'in' ? 'text-emerald-700' : 'text-red-700'}`}>

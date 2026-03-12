@@ -405,6 +405,10 @@ export async function createMemoryFromReconciliation(
   txAmount: number,
   matchScore: number | null,
   context?: {
+    reconciliationId?: string | null
+    transactionId?: string | null
+    invoiceId?: string | null
+    installmentId?: string | null
     txNotes?: string | null
     invoiceNotes?: string | null
     txContractRefs?: string[] | null
@@ -427,6 +431,10 @@ export async function createMemoryFromReconciliation(
     match_score: matchScore,
     invoice_number: invoiceNumber,
   }
+  if (context?.reconciliationId) metadata.reconciliation_id = context.reconciliationId
+  if (context?.transactionId) metadata.transaction_id = context.transactionId
+  if (context?.invoiceId) metadata.invoice_id = context.invoiceId
+  if (context?.installmentId) metadata.installment_id = context.installmentId
   if (context?.txNotes) metadata.tx_notes = context.txNotes
   if (context?.invoiceNotes) metadata.invoice_notes = context.invoiceNotes
   if (context?.txContractRefs?.length) metadata.tx_contract_refs = context.txContractRefs
@@ -518,6 +526,42 @@ export async function deactivateInvoiceMemoryFacts(
 
     if (error) {
       console.error('[companyMemory] deactivateInvoiceMemoryFacts error:', error.message)
+      throw error
+    }
+
+    deactivated += data?.length || 0
+  }
+
+  return deactivated
+}
+
+export async function deactivateReconciliationMemoryFacts(
+  reconciliationId: string,
+  transactionId: string,
+  invoiceId: string,
+  installmentId?: string | null,
+): Promise<number> {
+  const filters: Array<Record<string, unknown>> = [
+    { reconciliation_id: reconciliationId },
+    { transaction_id: transactionId, invoice_id: invoiceId },
+  ]
+
+  if (installmentId) {
+    filters.push({ transaction_id: transactionId, invoice_id: invoiceId, installment_id: installmentId })
+  }
+
+  let deactivated = 0
+  for (const filter of filters) {
+    const { data, error } = await supabase
+      .from('company_memory')
+      .update({ active: false, updated_at: new Date().toISOString() })
+      .eq('active', true)
+      .eq('source', 'reconciliation')
+      .contains('metadata', filter)
+      .select('id')
+
+    if (error) {
+      console.error('[companyMemory] deactivateReconciliationMemoryFacts error:', error.message)
       throw error
     }
 

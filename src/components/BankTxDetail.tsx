@@ -4,6 +4,7 @@
 import { X, ChevronDown, Plus } from 'lucide-react'
 import { useState, useRef, useEffect } from 'react'
 import { fmtDate, fmtEur } from '@/lib/utils'
+import { resolveSignedCommissionAmount } from '@/lib/bankCommission'
 
 // ---- helpers ----
 
@@ -176,8 +177,9 @@ export default function BankTxDetail({
   const isIn = currentDirection === 'in'
   const rawAmount = Number(tx.amount || 0)
   const signedAmount = isIn ? Math.abs(rawAmount) : -Math.abs(rawAmount)
-  const hasCommission = tx.commission_amount != null && tx.commission_amount !== 0
-  const netAmount = hasCommission ? signedAmount - Number(tx.commission_amount || 0) : signedAmount
+  const commissionAmount = resolveSignedCommissionAmount(tx.commission_amount, tx.raw_text || null)
+  const hasCommission = commissionAmount != null && commissionAmount !== 0
+  const netAmount = hasCommission ? signedAmount - Number(commissionAmount || 0) : signedAmount
 
   const Row = ({ l, v, mono }: { l: string; v?: any; mono?: boolean }) => {
     if (v == null || v === '' || v === '—') return null
@@ -212,7 +214,7 @@ export default function BankTxDetail({
         </p>
         {hasCommission && (
           <div className="mt-1.5 space-y-0.5">
-            <p className="text-xs text-orange-600">Commissione: {fmtEur(tx.commission_amount)}</p>
+            <p className="text-xs text-orange-600">Commissione: {fmtEur(commissionAmount)}</p>
             <p className="text-xs font-semibold text-gray-700">Importo netto: {fmtEur(netAmount)}</p>
           </div>
         )}
