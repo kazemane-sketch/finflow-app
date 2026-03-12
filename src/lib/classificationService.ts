@@ -564,16 +564,28 @@ export interface LineActionMeta {
 
 /** Load line-level category/account + fiscal_flags + review metadata + line_action for all lines in an invoice.
  *  Reads directly from invoice_lines — works independently of article assignment. */
+export interface LineDetailData {
+  classification_reasoning: string | null;
+  classification_thinking: string | null;
+  fiscal_reasoning: string | null;
+  fiscal_thinking: string | null;
+  fiscal_confidence: number | null;
+  line_note: string | null;
+  line_note_source: string | null;
+  line_note_updated_at: string | null;
+}
+
 export async function loadLineClassifications(invoiceId: string): Promise<{
   classifs: Record<string, LineClassification>;
   fiscalFlags: Record<string, any>;
   confidences: Record<string, number>;
   reviewFlags: Record<string, boolean>;
   lineActions: Record<string, LineActionMeta>;
+  lineDetails: Record<string, LineDetailData>;
 }> {
   const { data, error } = await supabase
     .from('invoice_lines')
-    .select('id, category_id, account_id, fiscal_flags, ai_confidence, needs_review, line_action, grouped_with_line_id, skip_reason')
+    .select('id, category_id, account_id, fiscal_flags, ai_confidence, needs_review, line_action, grouped_with_line_id, skip_reason, classification_reasoning, classification_thinking, fiscal_reasoning, fiscal_thinking, fiscal_confidence, line_note, line_note_source, line_note_updated_at')
     .eq('invoice_id', invoiceId);
   if (error) throw error;
   const classifs: Record<string, LineClassification> = {};
@@ -581,7 +593,8 @@ export async function loadLineClassifications(invoiceId: string): Promise<{
   const confidences: Record<string, number> = {};
   const reviewFlags: Record<string, boolean> = {};
   const lineActions: Record<string, LineActionMeta> = {};
-  for (const row of (data || []) as { id: string; category_id: string | null; account_id: string | null; fiscal_flags: any; ai_confidence: number | null; needs_review: boolean | null; line_action: string | null; grouped_with_line_id: string | null; skip_reason: string | null }[]) {
+  const lineDetails: Record<string, LineDetailData> = {};
+  for (const row of (data || []) as { id: string; category_id: string | null; account_id: string | null; fiscal_flags: any; ai_confidence: number | null; needs_review: boolean | null; line_action: string | null; grouped_with_line_id: string | null; skip_reason: string | null; classification_reasoning: string | null; classification_thinking: string | null; fiscal_reasoning: string | null; fiscal_thinking: string | null; fiscal_confidence: number | null; line_note: string | null; line_note_source: string | null; line_note_updated_at: string | null }[]) {
     if (row.category_id || row.account_id) {
       classifs[row.id] = {
         invoice_line_id: row.id,
@@ -607,8 +620,19 @@ export async function loadLineClassifications(invoiceId: string): Promise<{
         skip_reason: row.skip_reason,
       };
     }
+    // Line detail data (reasoning, notes, thinking)
+    lineDetails[row.id] = {
+      classification_reasoning: row.classification_reasoning,
+      classification_thinking: row.classification_thinking,
+      fiscal_reasoning: row.fiscal_reasoning,
+      fiscal_thinking: row.fiscal_thinking,
+      fiscal_confidence: row.fiscal_confidence,
+      line_note: row.line_note,
+      line_note_source: row.line_note_source,
+      line_note_updated_at: row.line_note_updated_at,
+    };
   }
-  return { classifs, fiscalFlags, confidences, reviewFlags, lineActions };
+  return { classifs, fiscalFlags, confidences, reviewFlags, lineActions, lineDetails };
 }
 
 /** Promote an informational line back to 'classify' (user override). */

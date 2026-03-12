@@ -43,7 +43,7 @@ import {
   createAccountFromSuggestion, createCategoryFromSuggestion,
   type Category, type Project, type ChartAccount, type CoaSection, type CategoryType,
   type InvoiceClassification, type InvoiceProjectAssignment,
-  type LineClassification, type LineProjectAssignment, type LineActionMeta,
+  type LineClassification, type LineProjectAssignment, type LineActionMeta, type LineDetailData,
   type AccountSuggestion, type CategorySuggestion,
   type FiscalAlert, type FiscalAlertOption,
 } from '@/lib/classificationService';
@@ -1012,6 +1012,7 @@ type InvoiceDetailBundle = {
   lineConfidences: Record<string, number>
   lineReviewFlags: Record<string, boolean>
   lineActions: Record<string, import('@/lib/classificationService').LineActionMeta>
+  lineDetails: Record<string, LineDetailData>
   lineProjects: Record<string, LineProjectAssignment[]>
   invoiceNotes: FiscalAlert[]
   lineAssignments: InvoiceLineArticleAssignmentRow[]
@@ -1089,6 +1090,7 @@ async function loadInvoiceDetailBundle(companyId: string, invoiceId: string): Pr
     lineConfidences: lineClfResult.confidences,
     lineReviewFlags: lineClfResult.reviewFlags,
     lineActions: lineClfResult.lineActions,
+    lineDetails: lineClfResult.lineDetails,
     lineProjects,
     invoiceNotes,
     lineAssignments,
@@ -1272,6 +1274,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   const [lineReviewFlags, setLineReviewFlags] = useState<Record<string, boolean>>({});
   // Line action metadata (skip/group informational lines)
   const [lineActions, setLineActions] = useState<Record<string, LineActionMeta>>({});
+  const [lineDetails, setLineDetails] = useState<Record<string, LineDetailData>>({});
   // Fiscal review alerts from Sonnet escalation
   const [invoiceNotes, setInvoiceNotes] = useState<FiscalAlert[]>([]);
   const [pendingFiscalChoices, setPendingFiscalChoices] = useState<PendingFiscalChoice[]>([]);
@@ -1510,6 +1513,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       setLineConfidences(activeDetailBundle.lineConfidences);
       setLineReviewFlags(activeDetailBundle.lineReviewFlags);
       setLineActions(activeDetailBundle.lineActions);
+      setLineDetails(activeDetailBundle.lineDetails || {});
       setPendingFiscalChoices([]);
       setCdcRows(activeDetailBundle.invoiceProjects.map(ip => ({
         project_id: ip.project_id,
@@ -1919,6 +1923,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         setLineConfidences(prev => ({ ...lineClfResult.confidences, ...prev }));
         setLineReviewFlags(prev => ({ ...lineClfResult.reviewFlags, ...prev }));
         setLineActions(prev => ({ ...prev, ...lineClfResult.lineActions }));
+        setLineDetails(prev => ({ ...prev, ...lineClfResult.lineDetails }));
 
         const freshMap: Record<string, LineArticleInfo> = {};
         const freshDbSugg: Record<string, MatchResult> = {};
@@ -2060,6 +2065,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         ]);
         setLineClassifs(lineClfResult.classifs);
         setLineFiscalFlags(prev => ({ ...prev, ...lineClfResult.fiscalFlags }));
+        setLineDetails(prev => ({ ...prev, ...lineClfResult.lineDetails }));
         setAllCategories(freshCats);
         setAllAccounts(freshAccs.filter(a => !a.is_header && a.active));
         // Refresh sidebar badges
@@ -2434,6 +2440,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     setLineConfidences({});
     setLineReviewFlags({});
     setLineActions({});
+    setLineDetails({});
     setInvoiceNotes([]);
     setPendingFiscalChoices([]);
     setAiSuggestions({});
@@ -3682,7 +3689,15 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       <React.Fragment key={i}>
                       <tr className="border-b border-gray-50 hover:bg-gray-50/50">
                         <td className="text-left px-3 py-2">
+                          <button
+                            onClick={() => toggleLineExpand(l.id)}
+                            className="inline-flex items-center justify-center w-4 h-4 mr-1.5 rounded text-gray-400 hover:text-blue-600 hover:bg-blue-50 text-[9px] align-middle"
+                            title={expandedLines[l.id] ? 'Comprimi dettagli' : 'Espandi dettagli'}
+                          >
+                            {expandedLines[l.id] ? '▼' : '▶'}
+                          </button>
                           <span className="text-gray-800">{l.description}</span>
+                          <ConfidenceBadge value={lineConfidences[l.id]} />
                           <ReviewBadge
                             confidence={lineConfidences[l.id]}
                             hasNote={!!(ff2?.note && /verificar|controllare|dubbio/i.test(ff2.note || ''))}
@@ -3778,6 +3793,38 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                           </div>
                         </td>}
                       </tr>
+                      {/* Expandable detail row: Commercialista + Revisore + Note */}
+                      {expandedLines[l.id] && (
+                        <tr>
+                          <td colSpan={colCount2} className="bg-slate-50/80 px-4 py-3 border-b border-slate-200">
+                            <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+                              <ReasoningBox
+                                icon="🏦"
+                                title="Commercialista"
+                                confidence={lineConfidences[l.id] ?? null}
+                                reasoning={lineDetails[l.id]?.classification_reasoning || null}
+                                thinking={lineDetails[l.id]?.classification_thinking || null}
+                                variant="blue"
+                              />
+                              <FiscalBox
+                                icon="⚖️"
+                                title="Revisore Fiscale"
+                                confidence={lineDetails[l.id]?.fiscal_confidence ?? null}
+                                reasoning={lineDetails[l.id]?.fiscal_reasoning || null}
+                                thinking={lineDetails[l.id]?.fiscal_thinking || null}
+                                fiscalFlags={ff2 || null}
+                              />
+                              <NoteBox
+                                lineId={l.id}
+                                note={lineDetails[l.id]?.line_note || null}
+                                noteSource={lineDetails[l.id]?.line_note_source || null}
+                                noteUpdatedAt={lineDetails[l.id]?.line_note_updated_at || null}
+                                onSave={(note) => handleSaveLineNote(l.id, note)}
+                              />
+                            </div>
+                          </td>
+                        </tr>
+                      )}
                       {hasFf2 && (
                         <tr>
                           <td colSpan={colCount2} className="px-3 py-1">
