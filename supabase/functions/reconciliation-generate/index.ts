@@ -1922,7 +1922,13 @@ Deno.serve(async (req) => {
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL non configurato" }, 503);
 
-  let body: { company_id?: string; batch_size?: number; engine_mode?: RequestedEngineMode };
+  let body: {
+    company_id?: string;
+    batch_size?: number;
+    engine_mode?: RequestedEngineMode;
+    tx_id?: string;
+    refresh_existing_for_tx?: boolean;
+  };
   try {
     body = await req.json();
   } catch {
@@ -1931,6 +1937,8 @@ Deno.serve(async (req) => {
 
   const companyId = body.company_id;
   if (!companyId) return json({ error: "company_id richiesto" }, 400);
+  const targetTxId = body.tx_id ?? null;
+  const refreshExistingForTx = body.refresh_existing_for_tx === true;
 
   const batchSize = Math.min(Math.max(body.batch_size ?? 50, 1), MAX_BATCH);
   const requestedEngineMode = normalizeRequestedEngineMode(
@@ -1943,6 +1951,15 @@ Deno.serve(async (req) => {
 
   try {
     const geminiKey = (Deno.env.get("GEMINI_API_KEY") || "").trim();
+    if (targetTxId && refreshExistingForTx) {
+      await sql`
+        UPDATE reconciliation_suggestions
+        SET status = 'expired'
+        WHERE company_id = ${companyId}
+          AND bank_transaction_id = ${targetTxId}
+          AND status = 'pending'
+      `;
+    }
     const rows: TxRow[] = await sql`
       SELECT bt.id, bt.date, bt.amount, bt.counterparty_name, bt.transaction_type,
              bt.description, bt.extracted_refs, bt.raw_text, to_jsonb(bt)->>'notes' as notes,
@@ -1951,10 +1968,14 @@ Deno.serve(async (req) => {
       WHERE company_id = ${companyId}
         AND reconciliation_status IN ('unmatched', 'partial')
         AND abs(amount) - reconciled_amount > 0.01
-        AND id NOT IN (
-          SELECT DISTINCT bank_transaction_id
-          FROM reconciliation_suggestions
-          WHERE company_id = ${companyId} AND status = 'pending'
+        AND (${targetTxId}::uuid IS NULL OR bt.id = ${targetTxId}::uuid)
+        AND (
+          ${targetTxId}::uuid IS NOT NULL
+          OR id NOT IN (
+            SELECT DISTINCT bank_transaction_id
+            FROM reconciliation_suggestions
+            WHERE company_id = ${companyId} AND status = 'pending'
+          )
         )
       ORDER BY
         CASE WHEN extraction_status = 'ready' THEN 0 ELSE 1 END,
@@ -2037,6 +2058,7 @@ Deno.serve(async (req) => {
     return json({
       processed: txProcessed,
       new_suggestions: totalSuggestions,
+      targeted_tx_id: targetTxId,
       engine_mode: requestedEngineMode,
       engine_mode_active: primaryEngineMode,
       shadow_comparison: shadowComparison,

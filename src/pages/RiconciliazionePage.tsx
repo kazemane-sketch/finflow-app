@@ -358,6 +358,7 @@ export default function RiconciliazionePage() {
   const [rejectingId, setRejectingId] = useState<string | null>(null)
   const [bulkConfirming, setBulkConfirming] = useState(false)
   const [clearingPendingSuggestions, setClearingPendingSuggestions] = useState(false)
+  const [refreshingResidualTxId, setRefreshingResidualTxId] = useState<string | null>(null)
 
   // Assisted tab state
   const [selectedTxId, setSelectedTxId] = useState<string | null>(
@@ -452,7 +453,7 @@ export default function RiconciliazionePage() {
         id, bank_transaction_id, installment_id, invoice_id,
         match_score, match_reason, proposed_by, rule_id, suggestion_data, status, created_at,
         bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount, reconciled_amount, tx_nature, extracted_refs, raw_text),
-        invoice:invoices(id, number, counterparty, total_amount, date, notes),
+        invoice:invoices(id, number, counterparty, total_amount, date, notes, primary_contract_ref, contract_refs),
         installment:invoice_installments(id, installment_no, due_date, amount_due, paid_amount, status, direction)
       `)
       .eq('company_id', companyId)
@@ -487,7 +488,7 @@ export default function RiconciliazionePage() {
       .from('invoice_installments')
       .select(`
         id, invoice_id, installment_no, due_date, amount_due, paid_amount, status, direction,
-        invoice:invoices(number, counterparty, notes)
+        invoice:invoices(number, counterparty, notes, primary_contract_ref, contract_refs)
       `)
       .eq('company_id', companyId)
       .in('status', ['pending', 'overdue', 'partial'])
@@ -507,8 +508,8 @@ export default function RiconciliazionePage() {
         invoice_number: d.invoice?.number || null,
         counterparty_name: d.invoice?.counterparty?.denom || null,
         invoice_notes: d.invoice?.notes || null,
-        primary_contract_ref: null,
-        contract_refs: [],
+        primary_contract_ref: d.invoice?.primary_contract_ref || null,
+        contract_refs: Array.isArray(d.invoice?.contract_refs) ? d.invoice.contract_refs : [],
       })))
     }
   }, [companyId])
@@ -592,6 +593,28 @@ export default function RiconciliazionePage() {
       await Promise.all([loadKpis(), loadSuggestions()])
     })
   }, [companyId, reconStartOrStop, loadKpis, loadSuggestions])
+
+  const regenerateSuggestionsForTransaction = useCallback(async (txId: string) => {
+    if (!companyId || !txId) return 0
+    try {
+      setRefreshingResidualTxId(txId)
+      const data = await postEdgeJsonWithAuthRetry<{
+        new_suggestions: number
+        processed: number
+      }>('reconciliation-generate', {
+        company_id: companyId,
+        batch_size: 10,
+        engine_mode: 'contextual',
+        tx_id: txId,
+        refresh_existing_for_tx: true,
+      })
+
+      await Promise.all([loadKpis(), loadSuggestions(), loadUnmatched(), loadOpenInstallments()])
+      return Number(data.new_suggestions || 0)
+    } finally {
+      setRefreshingResidualTxId(null)
+    }
+  }, [companyId, loadKpis, loadSuggestions, loadUnmatched])
 
   const clearPendingSuggestions = useCallback(async () => {
     if (!companyId || clearingPendingSuggestions || kpi.pendingSuggestions <= 0) return
@@ -933,7 +956,7 @@ export default function RiconciliazionePage() {
       toast.error(`Errore conferma: ${msg}`)
     }
     setConfirmingId(null)
-  }, [companyId, loadKpis, loadSuggestions, loadUnmatched, autoCloseRemainder])
+  }, [companyId, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments, autoCloseRemainder])
 
   // ─── reject suggestion ─────────────────────
   const rejectSuggestion = useCallback(async (suggestion: SuggestionRow) => {
@@ -1386,13 +1409,18 @@ export default function RiconciliazionePage() {
     if (action === 'skip') {
       const txId = postReconDialog.txId
       setPostReconDialog(null)
-      // Navigate to assisted tab and pre-select the partial TX for further matching
-      await Promise.all([loadKpis(), loadSuggestions(), loadUnmatched(), loadOpenInstallments()])
+      const generated = await regenerateSuggestionsForTransaction(txId)
+      await loadOpenInstallments()
       setActiveTab('assisted')
       setSelectedTxId(txId)
       setCandidateAiResult(null)
       setCandidateAiInstallments([])
       setCandidateSearch('')
+      toast.success(
+        generated > 0
+          ? `${generated} nuovi suggerimenti AI generati sul residuo`
+          : 'Residuo lasciato parziale. Nessun nuovo suggerimento AI affidabile per questo movimento.',
+      )
       return
     }
 
@@ -1411,7 +1439,7 @@ export default function RiconciliazionePage() {
     } catch (err: unknown) {
       toast.error(`Errore chiusura residuo: ${errMsg(err)}`)
     }
-  }, [postReconDialog, autoCloseRemainder, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments])
+  }, [postReconDialog, autoCloseRemainder, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments, regenerateSuggestionsForTransaction])
 
   // ─── tab change handler ────────────────────
   const handleTabChange = (tab: string) => {
@@ -1508,7 +1536,7 @@ export default function RiconciliazionePage() {
           .from('invoice_installments')
           .select(`
             id, invoice_id, installment_no, due_date, amount_due, paid_amount, status, direction,
-            invoice:invoices(number, counterparty, notes)
+            invoice:invoices(number, counterparty, notes, primary_contract_ref, contract_refs)
           `)
           .eq('company_id', companyId)
           .in('invoice_id', ids)
@@ -1527,8 +1555,8 @@ export default function RiconciliazionePage() {
             invoice_number: d.invoice?.number || null,
             counterparty_name: d.invoice?.counterparty?.denom || null,
             invoice_notes: d.invoice?.notes || null,
-            primary_contract_ref: null,
-            contract_refs: [],
+            primary_contract_ref: d.invoice?.primary_contract_ref || null,
+            contract_refs: Array.isArray(d.invoice?.contract_refs) ? d.invoice.contract_refs : [],
           })))
         }
       }
@@ -1635,6 +1663,13 @@ export default function RiconciliazionePage() {
 
     return enriched.slice(0, 50)
   }, [selectedTxId, unmatchedTxs, openInstallments, candidateSearch, candidateAiResult, candidateAiInstallments])
+
+  const selectedTxSuggestions = useMemo(() => {
+    if (!selectedTxId) return []
+    return suggestions
+      .filter(s => s.bank_transaction_id === selectedTxId)
+      .sort((a, b) => b.match_score - a.match_score)
+  }, [selectedTxId, suggestions])
 
   // Filtered reconciled rows
   const filteredReconciled = useMemo(() => {
@@ -2144,6 +2179,26 @@ export default function RiconciliazionePage() {
                     <span className="text-[10px] font-medium text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded-full">Parziale</span>
                     <span className="text-xs text-amber-800">Residuo da abbinare: <span className="font-bold">{fmtEur(selectedTxPartialInfo.residual)}</span></span>
                     <span className="text-[10px] text-amber-600 ml-auto">Riconciliato: {fmtEur(selectedTxPartialInfo.reconciled)} di {fmtEur(selectedTxPartialInfo.netAmt)}</span>
+                    <button
+                      onClick={async () => {
+                        if (!selectedTxId) return
+                        const generated = await regenerateSuggestionsForTransaction(selectedTxId)
+                        toast.success(
+                          generated > 0
+                            ? `${generated} suggerimenti AI rigenerati sul residuo`
+                            : 'Nessun nuovo suggerimento AI affidabile per il residuo',
+                        )
+                      }}
+                      disabled={!selectedTxId || refreshingResidualTxId === selectedTxId}
+                      className="shrink-0 flex items-center gap-1 px-2 py-1 text-[10px] font-semibold rounded-md border border-amber-300 text-amber-700 bg-white hover:bg-amber-100 disabled:opacity-40 transition-colors"
+                    >
+                      {refreshingResidualTxId === selectedTxId ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <Sparkles className="h-3 w-3" />
+                      )}
+                      Ricalcola AI
+                    </button>
                   </div>
                 </div>
               )}
@@ -2197,11 +2252,90 @@ export default function RiconciliazionePage() {
                     <ArrowRightLeft className="h-10 w-10 text-gray-300 mb-3" />
                     <p className="text-sm text-gray-400">Seleziona un movimento bancario a sinistra per vedere le rate e fatture corrispondenti</p>
                   </div>
-                ) : candidates.length === 0 ? (
+                ) : selectedTxSuggestions.length === 0 && candidates.length === 0 ? (
                   <div className="text-xs text-gray-400 text-center py-8">
                     Nessuna rata aperta corrispondente trovata
                   </div>
-                ) : candidates.map((inst: any) => {
+                ) : (
+                  <>
+                    {selectedTxSuggestions.length > 0 && (
+                      <div className="border-b bg-violet-50/60">
+                        <div className="px-3 py-2 flex items-center gap-2">
+                          <Sparkles className="h-3.5 w-3.5 text-violet-500" />
+                          <span className="text-[11px] font-semibold text-violet-800">
+                            Suggerimenti AI sul residuo
+                          </span>
+                          <span className="text-[10px] text-violet-500 ml-auto">{selectedTxSuggestions.length}</span>
+                        </div>
+                        <div className="divide-y">
+                          {selectedTxSuggestions.map(s => {
+                            const inst = s.installment
+                            const inv = s.invoice
+                            const instRemaining = inst ? Number(inst.amount_due) - Number(inst.paid_amount || 0) : null
+                            const invoiceDenom = inv?.counterparty && typeof inv.counterparty === 'object'
+                              ? (inv.counterparty as any).denom || 'N.D.'
+                              : 'N.D.'
+                            return (
+                              <div key={s.id} className="px-3 py-2.5 flex items-center justify-between gap-3 hover:bg-white/70 transition-colors">
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${scoreBadge(s.match_score)}`}>
+                                      {s.match_score}%
+                                    </span>
+                                    <span className="text-xs font-medium text-gray-800">
+                                      {invoiceDenom}
+                                    </span>
+                                    {inv?.number && (
+                                      <span className="text-[10px] text-violet-700 bg-violet-100 px-1.5 py-0.5 rounded font-semibold">
+                                        {inv.number}
+                                      </span>
+                                    )}
+                                    {inst && (
+                                      <span className="text-[10px] text-gray-400">Rata {inst.installment_no}</span>
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-2 mt-0.5">
+                                    {inst && <span className="text-[10px] text-gray-400">Scad. {fmtDate(inst.due_date)}</span>}
+                                    {instRemaining != null && (
+                                      <span className="text-[10px] text-gray-500">Residuo: {fmtEur(instRemaining)}</span>
+                                    )}
+                                    <span className="text-[10px] text-violet-600 truncate max-w-[320px]">
+                                      {s.match_reason}
+                                    </span>
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <button
+                                    onClick={() => rejectSuggestion(s)}
+                                    disabled={rejectingId === s.id || confirmingId === s.id}
+                                    className="p-1.5 rounded-md text-red-500 hover:bg-red-50 disabled:opacity-40 transition-colors"
+                                    title="Rifiuta"
+                                  >
+                                    {rejectingId === s.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <XCircle className="h-3.5 w-3.5" />}
+                                  </button>
+                                  <button
+                                    onClick={() => confirmSuggestion(s)}
+                                    disabled={confirmingId === s.id || rejectingId === s.id}
+                                    className="flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium rounded-md bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
+                                  >
+                                    {confirmingId === s.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />}
+                                    Abbina
+                                  </button>
+                                </div>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {selectedTxSuggestions.length > 0 && (
+                      <div className="px-3 py-2 border-b bg-gray-50/70">
+                        <span className="text-[11px] font-semibold text-gray-600">Altri candidati manuali</span>
+                      </div>
+                    )}
+
+                    {candidates.map((inst: any) => {
                   const remaining = Number(inst.amount_due) - Number(inst.paid_amount)
                   const isRefMatch = inst._refMatch === true
                   const matchedRef = inst._matchedRef
@@ -2262,6 +2396,8 @@ export default function RiconciliazionePage() {
                     </div>
                   )
                 })}
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -2569,13 +2705,20 @@ export default function RiconciliazionePage() {
             closeDifference(reconRow, amount, reason)
             setResidualDialog(null)
           }}
-          onNavigateToAssisted={(txId) => {
+          onNavigateToAssisted={async (txId) => {
             setResidualDialog(null)
+            const generated = await regenerateSuggestionsForTransaction(txId)
+            await loadOpenInstallments()
             setActiveTab('assisted')
             setSelectedTxId(txId)
             setCandidateAiResult(null)
             setCandidateAiInstallments([])
             setCandidateSearch('')
+            toast.success(
+              generated > 0
+                ? `${generated} suggerimenti AI rigenerati sul residuo`
+                : 'Nessun nuovo suggerimento AI affidabile per il residuo',
+            )
           }}
         />
       )}
