@@ -8,6 +8,7 @@ const corsHeaders = {
 };
 
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
+const PREMIUM_MODEL = "gemini-3.1-pro-preview";
 const CONCURRENCY = 5;
 const MAX_BATCH = 50;
 
@@ -95,6 +96,65 @@ async function extractRefs(
   return JSON.parse(text);
 }
 
+async function extractRefsPremium(
+  apiKey: string,
+  rawText: string,
+): Promise<Record<string, unknown>> {
+  const prompt = EXTRACTION_PROMPT.replace("{RAW_TEXT}", clip(rawText, 3000));
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${PREMIUM_MODEL}:generateContent?key=${apiKey}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0,
+        responseMimeType: "application/json",
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text().catch(() => "unknown");
+    throw new Error(`Gemini API ${response.status}: ${clip(err, 200)}`);
+  }
+
+  const data = await response.json();
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (typeof text !== "string" || !text.trim()) {
+    throw new Error("Gemini premium extraction vuota");
+  }
+  return JSON.parse(text);
+}
+
+function hasMeaningfulRefs(refs: Record<string, unknown> | null | undefined): boolean {
+  if (!refs || typeof refs.error === "string") return false;
+  const arrayKeys = [
+    "invoice_refs", "numeri_fattura", "fatture", "riferimenti_fattura",
+    "contract_refs", "contract_numbers", "numeri_contratto",
+    "codici_mandato_sdd",
+  ];
+  const scalarKeys = [
+    "numero_fattura", "mandate_id", "codice_mandato_sdd", "mandato_sdd",
+    "contract_ref", "contract_number", "numero_contratto",
+    "iban", "bic", "swift", "cro", "trn", "causal_code",
+  ];
+
+  for (const key of arrayKeys) {
+    const value = refs[key];
+    if (Array.isArray(value) && value.some((v) => typeof v === "string" && v.trim().length >= 3)) {
+      return true;
+    }
+  }
+  for (const key of scalarKeys) {
+    const value = refs[key];
+    if (typeof value === "string" && value.trim().length >= 3) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /* ─── concurrency runner ──────────────────── */
 
 async function runWithConcurrency<T>(
@@ -123,6 +183,7 @@ Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
   const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
+  const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
 
   if (!anthropicKey) return json({ error: "ANTHROPIC_API_KEY non configurata" }, 503);
@@ -178,13 +239,19 @@ Deno.serve(async (req) => {
 
     await runWithConcurrency(rows, CONCURRENCY, async (row) => {
       try {
-        const refs = await extractRefs(anthropicKey, row.raw_text);
+        let refs = await extractRefs(anthropicKey, row.raw_text);
+        let extractionModel = HAIKU_MODEL;
+
+        if (!hasMeaningfulRefs(refs) && geminiKey) {
+          refs = await extractRefsPremium(geminiKey, row.raw_text);
+          extractionModel = PREMIUM_MODEL;
+        }
 
         await sql`
           UPDATE bank_transactions
           SET extracted_refs = ${JSON.stringify(refs)}::jsonb,
               extraction_status = 'ready',
-              extraction_model = ${HAIKU_MODEL},
+              extraction_model = ${extractionModel},
               extracted_at = now()
           WHERE id = ${row.id}
         `;
@@ -192,6 +259,25 @@ Deno.serve(async (req) => {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[extract-refs] Error for tx ${row.id}:`, msg);
+
+        if (geminiKey) {
+          try {
+            const premiumRefs = await extractRefsPremium(geminiKey, row.raw_text);
+            await sql`
+              UPDATE bank_transactions
+              SET extracted_refs = ${JSON.stringify(premiumRefs)}::jsonb,
+                  extraction_status = 'ready',
+                  extraction_model = ${PREMIUM_MODEL},
+                  extracted_at = now()
+              WHERE id = ${row.id}
+            `;
+            ready += 1;
+            return;
+          } catch (premiumErr) {
+            const premiumMsg = premiumErr instanceof Error ? premiumErr.message : String(premiumErr);
+            console.error(`[extract-refs] Premium fallback error for tx ${row.id}:`, premiumMsg);
+          }
+        }
 
         await sql`
           UPDATE bank_transactions

@@ -76,6 +76,24 @@ interface MatchRow {
 }
 
 type SqlClient = ReturnType<typeof postgres>;
+type MatchingEngineMode = "legacy" | "contextual";
+type RequestedEngineMode = MatchingEngineMode | "shadow";
+
+const INVOICE_OPTIONAL_SELECT = `
+  to_jsonb(inv)->>'notes' as notes,
+  to_jsonb(inv)->>'primary_contract_ref' as primary_contract_ref,
+  to_jsonb(inv)->'contract_refs' as contract_refs
+`;
+
+const INVOICE_OPTIONAL_SELECT_SHORT = `
+  to_jsonb(i)->>'notes' as notes,
+  to_jsonb(i)->>'primary_contract_ref' as primary_contract_ref,
+  to_jsonb(i)->'contract_refs' as contract_refs
+`;
+
+function normalizeRequestedEngineMode(value: unknown): RequestedEngineMode {
+  return value === "legacy" || value === "shadow" ? value : "contextual";
+}
 
 /* ─── RULE 1: Direction mapping (ABSOLUTE, NO EXCEPTIONS) ─── */
 
@@ -372,7 +390,11 @@ function freeTextIncludes(haystack: string, needle: string | null | undefined): 
 function applyContextSignals(
   tx: TxRow,
   match: MatchRow,
+  mode: MatchingEngineMode,
 ): { scoreDelta: number; blocked: boolean; reasonParts: string[]; extra: Record<string, unknown> } {
+  if (mode === "legacy") {
+    return { scoreDelta: 0, blocked: false, reasonParts: [], extra: {} };
+  }
   const reasonParts: string[] = [];
   const extra: Record<string, unknown> = {};
   let scoreDelta = 0;
@@ -456,7 +478,11 @@ function applyTimingSignals(
   tx: TxRow,
   match: MatchRow,
   strength: "strong" | "medium" | "weak",
+  mode: MatchingEngineMode,
 ): { scoreDelta: number; blocked: boolean; reasonParts: string[]; extra: Record<string, unknown> } {
+  if (mode === "legacy") {
+    return { scoreDelta: 0, blocked: false, reasonParts: [], extra: {} };
+  }
   const reasonParts: string[] = [];
   const extra: Record<string, unknown> = {};
   let scoreDelta = 0;
@@ -598,6 +624,7 @@ async function matchByInvoiceRefs(
   tx: TxRow,
   invoiceRefs: string[],
   remainingAmount: number,
+  mode: MatchingEngineMode,
 ): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
   const expectedDirection = getExpectedInvoiceDirection(Number(tx.amount));
@@ -684,7 +711,8 @@ async function matchByInvoiceRefs(
     const query = `
       SELECT i.id as invoice_id, i.number, i.total_amount, i.date,
              i.counterparty->>'denom' as counterparty_name,
-             i.notes, i.primary_contract_ref, i.contract_refs, i.raw_xml,
+             ${INVOICE_OPTIONAL_SELECT_SHORT},
+             i.raw_xml,
              ii.id as installment_id, ii.amount_due, ii.paid_amount, ii.due_date, ii.status,
              ii.is_estimated, ii.estimate_source, ii.estimate_days
       FROM invoices i
@@ -706,9 +734,9 @@ async function matchByInvoiceRefs(
     );
 
     for (const m of filteredMatches) {
-      const context = applyContextSignals(tx, m as MatchRow);
+      const context = applyContextSignals(tx, m as MatchRow, mode);
       if (context.blocked) continue;
-      const timing = applyTimingSignals(tx, m as MatchRow, "strong");
+      const timing = applyTimingSignals(tx, m as MatchRow, "strong", mode);
       if (timing.blocked) continue;
 
       const instRemaining = m.installment_id
@@ -782,6 +810,7 @@ async function matchByMandate(
   tx: TxRow,
   mandateId: string,
   remainingAmount: number,
+  mode: MatchingEngineMode,
 ): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
   const expectedDirection = getExpectedInvoiceDirection(Number(tx.amount));
@@ -813,7 +842,8 @@ async function matchByMandate(
             inv.number as invoice_number,
             inv.date as invoice_date,
             inv.counterparty->>'denom' as counterparty_name,
-            inv.notes, inv.primary_contract_ref, inv.contract_refs, inv.raw_xml
+            ${INVOICE_OPTIONAL_SELECT},
+            inv.raw_xml
      FROM invoice_installments ii
      JOIN invoices inv ON inv.id = ii.invoice_id
      WHERE ii.company_id = $1
@@ -844,7 +874,7 @@ async function matchByMandate(
       primary_contract_ref: (m.primary_contract_ref as string | null) || null,
       contract_refs: m.contract_refs,
       raw_xml: (m.raw_xml as string | null) || null,
-    });
+    }, mode);
     if (context.blocked) continue;
     const timing = applyTimingSignals(tx, {
       invoice_id: m.invoice_id as string,
@@ -862,7 +892,7 @@ async function matchByMandate(
       primary_contract_ref: (m.primary_contract_ref as string | null) || null,
       contract_refs: m.contract_refs,
       raw_xml: (m.raw_xml as string | null) || null,
-    }, "strong");
+    }, "strong", mode);
     if (timing.blocked) continue;
 
     const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
@@ -915,6 +945,7 @@ async function matchByCounterpartyAmount(
   companyId: string,
   tx: TxRow,
   remainingAmount: number,
+  mode: MatchingEngineMode,
 ): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
   const expectedDirection = getExpectedInvoiceDirection(Number(tx.amount));
@@ -930,7 +961,8 @@ async function matchByCounterpartyAmount(
             inv.number as invoice_number,
             inv.date as invoice_date,
             inv.counterparty->>'denom' as counterparty_name,
-            inv.notes, inv.primary_contract_ref, inv.contract_refs, inv.raw_xml,
+            ${INVOICE_OPTIONAL_SELECT},
+            inv.raw_xml,
             cp.payment_terms_days,
             cp.dso_days_override,
             cp.pso_days_override
@@ -966,7 +998,7 @@ async function matchByCounterpartyAmount(
       primary_contract_ref: (m.primary_contract_ref as string | null) || null,
       contract_refs: m.contract_refs,
       raw_xml: (m.raw_xml as string | null) || null,
-    });
+    }, mode);
     if (context.blocked) continue;
     const timing = applyTimingSignals(tx, {
       invoice_id: m.invoice_id as string,
@@ -988,7 +1020,7 @@ async function matchByCounterpartyAmount(
       primary_contract_ref: (m.primary_contract_ref as string | null) || null,
       contract_refs: m.contract_refs,
       raw_xml: (m.raw_xml as string | null) || null,
-    }, "weak");
+    }, "weak", mode);
     if (timing.blocked) continue;
 
     const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
@@ -1090,6 +1122,7 @@ async function matchByRules(
   companyId: string,
   tx: TxRow,
   remainingAmount: number,
+  mode: MatchingEngineMode,
 ): Promise<Suggestion[]> {
   const suggestions: Suggestion[] = [];
   const expectedDirection = getExpectedInvoiceDirection(Number(tx.amount));
@@ -1121,6 +1154,7 @@ async function matchByRules(
     // Transaction type must match (if specified)
     if (ruleType && tx.transaction_type && !tx.transaction_type.toUpperCase().includes(ruleType.toUpperCase())) continue;
     if (
+      mode !== "legacy" &&
       ruleContractRef &&
       !txContractRefs.some((ref) => normalizeComparableRef(ref) === normalizeComparableRef(ruleContractRef))
     ) continue;
@@ -1135,7 +1169,8 @@ async function matchByRules(
               inv.number as invoice_number,
               inv.date as invoice_date,
               inv.counterparty->>'denom' as counterparty_name,
-              inv.notes, inv.primary_contract_ref, inv.contract_refs, inv.raw_xml
+              ${INVOICE_OPTIONAL_SELECT},
+              inv.raw_xml
        FROM invoice_installments ii
        JOIN invoices inv ON inv.id = ii.invoice_id
        WHERE ii.company_id = $1
@@ -1166,7 +1201,7 @@ async function matchByRules(
         primary_contract_ref: (m.primary_contract_ref as string | null) || null,
         contract_refs: m.contract_refs,
         raw_xml: (m.raw_xml as string | null) || null,
-      });
+      }, mode);
       if (context.blocked) continue;
       const timing = applyTimingSignals(tx, {
         invoice_id: m.invoice_id as string,
@@ -1184,7 +1219,7 @@ async function matchByRules(
         primary_contract_ref: (m.primary_contract_ref as string | null) || null,
         contract_refs: m.contract_refs,
         raw_xml: (m.raw_xml as string | null) || null,
-      }, ruleContractRef ? "strong" : "medium");
+      }, ruleContractRef ? "strong" : "medium", mode);
       if (timing.blocked) continue;
 
       const instRemaining = Math.abs(Number(m.amount_due) - Number(m.paid_amount));
@@ -1260,6 +1295,7 @@ async function matchCumulativePayment(
   companyId: string,
   tx: TxRow,
   remainingAmount: number,
+  mode: MatchingEngineMode,
 ): Promise<Suggestion[]> {
   if (!tx.counterparty_name) return [];
   const cpWord = tx.counterparty_name.split(/\s+/)[0];
@@ -1274,7 +1310,8 @@ async function matchCumulativePayment(
             inv.number as invoice_number,
             inv.date as invoice_date,
             inv.counterparty->>'denom' as counterparty_name,
-            inv.notes, inv.primary_contract_ref, inv.contract_refs, inv.raw_xml,
+            ${INVOICE_OPTIONAL_SELECT},
+            inv.raw_xml,
             abs(ii.amount_due - ii.paid_amount) as remaining
      FROM invoice_installments ii
      JOIN invoices inv ON inv.id = ii.invoice_id
@@ -1321,7 +1358,7 @@ async function matchCumulativePayment(
             primary_contract_ref: (m.primary_contract_ref as string | null) || null,
             contract_refs: m.contract_refs,
             raw_xml: (m.raw_xml as string | null) || null,
-          });
+          }, mode);
           if (context.blocked) return [];
           const timing = applyTimingSignals(tx, {
             invoice_id: m.invoice_id as string,
@@ -1339,7 +1376,7 @@ async function matchCumulativePayment(
             primary_contract_ref: (m.primary_contract_ref as string | null) || null,
             contract_refs: m.contract_refs,
             raw_xml: (m.raw_xml as string | null) || null,
-          }, "weak");
+          }, "weak", mode);
           if (timing.blocked) return [];
           return [{
             bank_transaction_id: tx.id,
@@ -1391,7 +1428,7 @@ async function matchCumulativePayment(
               primary_contract_ref: (m.primary_contract_ref as string | null) || null,
               contract_refs: m.contract_refs,
               raw_xml: (m.raw_xml as string | null) || null,
-            });
+            }, mode);
             if (context.blocked) return [];
             const timing = applyTimingSignals(tx, {
               invoice_id: m.invoice_id as string,
@@ -1409,7 +1446,7 @@ async function matchCumulativePayment(
               primary_contract_ref: (m.primary_contract_ref as string | null) || null,
               contract_refs: m.contract_refs,
               raw_xml: (m.raw_xml as string | null) || null,
-            }, "weak");
+            }, "weak", mode);
             if (timing.blocked) return [];
             return [{
               bank_transaction_id: tx.id,
@@ -1718,12 +1755,52 @@ function applyGlobalCompetition(suggestionsByTx: Map<string, Suggestion[]>): Map
   return adjusted;
 }
 
+function compareSuggestionMaps(
+  primary: Map<string, Suggestion[]>,
+  contextual: Map<string, Suggestion[]>,
+): Record<string, number> {
+  const txIds = new Set<string>([...primary.keys(), ...contextual.keys()]);
+  let txCompared = 0;
+  let topChangedTx = 0;
+  let contextualOnlyTx = 0;
+
+  for (const txId of txIds) {
+    const primaryTop = smartRank(primary.get(txId) || [])[0] || null;
+    const contextualTop = smartRank(contextual.get(txId) || [])[0] || null;
+    if (!primaryTop && !contextualTop) continue;
+    txCompared += 1;
+
+    if (!primaryTop && contextualTop) {
+      contextualOnlyTx += 1;
+      topChangedTx += 1;
+      continue;
+    }
+
+    const primaryKey = primaryTop
+      ? `${primaryTop.installment_id || ""}:${primaryTop.invoice_id || ""}`
+      : "";
+    const contextualKey = contextualTop
+      ? `${contextualTop.installment_id || ""}:${contextualTop.invoice_id || ""}`
+      : "";
+    if (primaryKey !== contextualKey) {
+      topChangedTx += 1;
+    }
+  }
+
+  return {
+    tx_compared: txCompared,
+    top_changed_tx: topChangedTx,
+    contextual_only_tx: contextualOnlyTx,
+  };
+}
+
 /* ─── main generator per transaction ──── */
 
 async function generateForTransaction(
   sql: SqlClient,
   companyId: string,
   tx: TxRow,
+  mode: MatchingEngineMode,
 ): Promise<Suggestion[]> {
   const netAmount = getTxNetAmount(tx);
   const remainingAmount = netAmount - Number(tx.reconciled_amount || 0);
@@ -1743,29 +1820,29 @@ async function generateForTransaction(
   // ── Level 1: Match by invoice refs (highest priority, score 75-98) ──
   if (invoiceRefs.length > 0) {
     collected.push(...await matchByInvoiceRefs(
-      sql, companyId, tx, invoiceRefs, remainingAmount,
+      sql, companyId, tx, invoiceRefs, remainingAmount, mode,
     ));
   }
 
   // ── Level 1.5: Match by learned rules (Miglioria 3, score 70-90) ──
-  collected.push(...await matchByRules(sql, companyId, tx, remainingAmount));
+  collected.push(...await matchByRules(sql, companyId, tx, remainingAmount, mode));
 
   // ── Level 2: Match by mandate SDD (score 85) ──
   if (mandateId) {
     collected.push(...await matchByMandate(
-      sql, companyId, tx, mandateId, remainingAmount,
+      sql, companyId, tx, mandateId, remainingAmount, mode,
     ));
   }
 
   // ── Level 3: Fallback — counterparty + amount (score 50-85) ──
   collected.push(...await matchByCounterpartyAmount(
-    sql, companyId, tx, remainingAmount,
+    sql, companyId, tx, remainingAmount, mode,
   ));
   let results = dedup(collected, 12);
 
   // ── Level 3.5: Cumulative payments (Miglioria 1) ──
   if (results.length === 0 && !invoiceRefs.length && !mandateId) {
-    const cumulative = await matchCumulativePayment(sql, companyId, tx, remainingAmount);
+    const cumulative = await matchCumulativePayment(sql, companyId, tx, remainingAmount, mode);
     if (cumulative.length > 0) {
       results = cumulative;
     }
@@ -1825,7 +1902,7 @@ Deno.serve(async (req) => {
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL non configurato" }, 503);
 
-  let body: { company_id?: string; batch_size?: number };
+  let body: { company_id?: string; batch_size?: number; engine_mode?: RequestedEngineMode };
   try {
     body = await req.json();
   } catch {
@@ -1836,14 +1913,21 @@ Deno.serve(async (req) => {
   if (!companyId) return json({ error: "company_id richiesto" }, 400);
 
   const batchSize = Math.min(Math.max(body.batch_size ?? 50, 1), MAX_BATCH);
+  const requestedEngineMode = normalizeRequestedEngineMode(
+    body.engine_mode ?? Deno.env.get("RECONCILIATION_ENGINE_MODE"),
+  );
+  const primaryEngineMode: MatchingEngineMode = requestedEngineMode === "contextual"
+    ? "contextual"
+    : "legacy";
   const sql = postgres(dbUrl, { max: 1 });
 
   try {
     const geminiKey = (Deno.env.get("GEMINI_API_KEY") || "").trim();
     const rows: TxRow[] = await sql`
-      SELECT id, date, amount, counterparty_name, transaction_type,
-             description, extracted_refs, raw_text, notes, direction, reconciled_amount, commission_amount
-      FROM bank_transactions
+      SELECT bt.id, bt.date, bt.amount, bt.counterparty_name, bt.transaction_type,
+             bt.description, bt.extracted_refs, bt.raw_text, to_jsonb(bt)->>'notes' as notes,
+             bt.direction, bt.reconciled_amount, bt.commission_amount
+      FROM bank_transactions bt
       WHERE company_id = ${companyId}
         AND reconciliation_status IN ('unmatched', 'partial')
         AND abs(amount) - reconciled_amount > 0.01
@@ -1861,22 +1945,41 @@ Deno.serve(async (req) => {
     let totalSuggestions = 0;
     let txProcessed = 0;
     const suggestionsByTx = new Map<string, Suggestion[]>();
+    const shadowContextualByTx = requestedEngineMode === "shadow"
+      ? new Map<string, Suggestion[]>()
+      : null;
 
     for (const tx of rows) {
-      const suggestions = await generateForTransaction(sql, companyId, tx);
+      const suggestions = await generateForTransaction(sql, companyId, tx, primaryEngineMode);
       suggestionsByTx.set(tx.id, suggestions);
+      if (shadowContextualByTx) {
+        shadowContextualByTx.set(tx.id, await generateForTransaction(sql, companyId, tx, "contextual"));
+      }
     }
 
-    const globallyRanked = applyGlobalCompetition(suggestionsByTx);
+    const primaryRanked = primaryEngineMode === "contextual"
+      ? applyGlobalCompetition(suggestionsByTx)
+      : suggestionsByTx;
+    const shadowContextualRanked = shadowContextualByTx
+      ? applyGlobalCompetition(shadowContextualByTx)
+      : null;
+    const shadowComparison = shadowContextualRanked
+      ? compareSuggestionMaps(primaryRanked, shadowContextualRanked)
+      : null;
 
     for (const tx of rows) {
-      let suggestions = globallyRanked.get(tx.id) || [];
-      if (geminiKey && suggestions.length > 1) {
+      let suggestions = primaryRanked.get(tx.id) || [];
+      if (primaryEngineMode === "contextual" && geminiKey && suggestions.length > 1) {
         suggestions = await maybePremiumRerank(tx, suggestions, geminiKey);
       }
       suggestions = smartRank(suggestions);
       for (const s of suggestions) {
         if (s.match_score < 50) continue;
+        const suggestionPayload = {
+          ...(s.suggestion_data ?? {}),
+          engine_mode: primaryEngineMode,
+          ...(requestedEngineMode === "shadow" ? { shadow_mode: true } : {}),
+        };
 
         await sql`
           INSERT INTO reconciliation_suggestions
@@ -1885,7 +1988,7 @@ Deno.serve(async (req) => {
           VALUES
             (${companyId}, ${s.bank_transaction_id}, ${s.installment_id}, ${s.invoice_id},
              ${s.match_score}, ${s.match_reason}, ${s.proposed_by}, ${s.rule_id},
-             ${s.suggestion_data ? JSON.stringify(s.suggestion_data) : null}::jsonb)
+             ${JSON.stringify(suggestionPayload)}::jsonb)
         `;
         totalSuggestions++;
       }
@@ -1914,6 +2017,9 @@ Deno.serve(async (req) => {
     return json({
       processed: txProcessed,
       new_suggestions: totalSuggestions,
+      engine_mode: requestedEngineMode,
+      engine_mode_active: primaryEngineMode,
+      shadow_comparison: shadowComparison,
       totals: {
         pending_suggestions: pending_count,
         unmatched_transactions: unmatched_count,

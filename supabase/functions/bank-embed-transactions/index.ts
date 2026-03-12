@@ -247,6 +247,37 @@ async function runWithConcurrency<T>(
   await Promise.all(runners);
 }
 
+async function fetchBatchRowsWithOptionalNotes(
+  serviceClient: ReturnType<typeof createClient>,
+  batchIds: string[],
+) {
+  let { data, error } = await serviceClient
+    .from("bank_transactions")
+    .select("id,company_id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,notes,direction,raw_text,extracted_refs")
+    .in("id", batchIds);
+
+  if (error && /notes/i.test(error.message)) {
+    const fallback = await serviceClient
+      .from("bank_transactions")
+      .select("id,company_id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,direction,raw_text,extracted_refs")
+      .in("id", batchIds);
+
+    if (!fallback.error) {
+      return {
+        data: (Array.isArray(fallback.data) ? fallback.data : []).map((row) => ({
+          ...row,
+          notes: null,
+        })),
+        error: null,
+      };
+    }
+
+    return { data: fallback.data, error: fallback.error };
+  }
+
+  return { data, error };
+}
+
 Deno.serve(async (req) => {
   const requestId = crypto.randomUUID();
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
@@ -298,10 +329,10 @@ Deno.serve(async (req) => {
   });
 
   try {
-    const { data: rows, error: rowsError } = await serviceClient
-      .from("bank_transactions")
-      .select("id,company_id,date,value_date,amount,description,counterparty_name,transaction_type,reference,invoice_ref,notes,direction,raw_text,extracted_refs")
-      .in("id", batchIds);
+    const { data: rows, error: rowsError } = await fetchBatchRowsWithOptionalNotes(
+      serviceClient,
+      batchIds,
+    );
 
     if (rowsError) {
       return jsonResponse({

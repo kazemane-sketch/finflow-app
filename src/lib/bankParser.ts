@@ -1011,7 +1011,7 @@ export async function updateBankTransactionDirection(
 const EDITABLE_FIELDS = new Set([
   'date', 'value_date', 'amount', 'counterparty_name',
   'description', 'transaction_type', 'reference', 'invoice_ref',
-  'commission_amount', 'direction',
+  'commission_amount', 'direction', 'notes',
 ]);
 
 export async function updateBankTransaction(

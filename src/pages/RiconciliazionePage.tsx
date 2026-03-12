@@ -18,6 +18,13 @@ import { askInvoiceAiSearch, type InvoiceAiResult } from '@/lib/invoiceAiSearch'
 import { createReconciliationExample } from '@/lib/learningService'
 import { createMemoryFromReconciliation } from '@/lib/companyMemoryService'
 import { useAIJob } from '@/hooks/useAIJob'
+import {
+  getStoredReconciliationEngineMode,
+  reconciliationEngineModeDescription,
+  reconciliationEngineModeLabel,
+  setStoredReconciliationEngineMode,
+  type ReconciliationEngineMode,
+} from '@/lib/reconciliationEngineMode'
 
 /* ─── types ──────────────────────────────────── */
 
@@ -46,6 +53,8 @@ interface SuggestionRow {
     reconciled_amount: number | null
     tx_nature: string | null
     notes: string | null
+    extracted_refs?: Record<string, unknown> | null
+    raw_text?: string | null
   } | null
   invoice: {
     id: string
@@ -334,6 +343,7 @@ export default function RiconciliazionePage() {
   // UI state
   const [loading, setLoading] = useState(true)
   const { isRunning: generating, startOrStop: reconStartOrStop } = useAIJob('riconciliazione-auto', 'Riconciliazione Automatica')
+  const [engineMode, setEngineMode] = useState<ReconciliationEngineMode>('contextual')
   const [confirmingId, setConfirmingId] = useState<string | null>(null)
   const [rejectingId, setRejectingId] = useState<string | null>(null)
   const [bulkConfirming, setBulkConfirming] = useState(false)
@@ -430,7 +440,7 @@ export default function RiconciliazionePage() {
       .select(`
         id, bank_transaction_id, installment_id, invoice_id,
         match_score, match_reason, proposed_by, rule_id, suggestion_data, status, created_at,
-        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount, reconciled_amount, tx_nature),
+        bank_transaction:bank_transactions(id, date, amount, counterparty_name, description, transaction_type, direction, reconciliation_status, commission_amount, reconciled_amount, tx_nature, extracted_refs, raw_text),
         invoice:invoices(id, number, counterparty, total_amount, date, notes),
         installment:invoice_installments(id, installment_no, due_date, amount_due, paid_amount, status, direction)
       `)
@@ -522,6 +532,11 @@ export default function RiconciliazionePage() {
       .finally(() => setLoading(false))
   }, [companyId, loadKpis, loadSuggestions, loadUnmatched, loadOpenInstallments, loadReconciled])
 
+  useEffect(() => {
+    if (!companyId) return
+    setEngineMode(getStoredReconciliationEngineMode(companyId))
+  }, [companyId])
+
   // ─── detail popup loader ───────────────────
   useEffect(() => {
     if (!detailPopup) { setDetailPopupData(null); return }
@@ -564,16 +579,26 @@ export default function RiconciliazionePage() {
           'apikey': SUPABASE_ANON_KEY,
           'Authorization': `Bearer ${token}`,
         },
-        body: JSON.stringify({ company_id: companyId, batch_size: 100 }),
+        body: JSON.stringify({ company_id: companyId, batch_size: 100, engine_mode: engineMode }),
         signal,
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
 
-      toast.success(`${data.new_suggestions} nuovi suggerimenti generati (${data.processed} movimenti analizzati)`)
+      const engineLabel = reconciliationEngineModeLabel(engineMode)
+      const shadowText = engineMode === 'shadow' && data.shadow_comparison
+        ? ` · shadow diff: ${Number(data.shadow_comparison.top_changed_tx || 0)}`
+        : ''
+      toast.success(`${data.new_suggestions} nuovi suggerimenti generati (${data.processed} movimenti analizzati, ${engineLabel})${shadowText}`)
       await Promise.all([loadKpis(), loadSuggestions()])
     })
-  }, [companyId, reconStartOrStop, loadKpis, loadSuggestions])
+  }, [companyId, engineMode, reconStartOrStop, loadKpis, loadSuggestions])
+
+  const handleEngineModeChange = useCallback((mode: ReconciliationEngineMode) => {
+    if (!companyId) return
+    setStoredReconciliationEngineMode(companyId, mode)
+    setEngineMode(mode)
+  }, [companyId])
 
   // ─── auto-close remainder (shared helper) ───
   const autoCloseRemainder = useCallback(async (txId: string, amount: number, reason: string) => {
@@ -786,20 +811,43 @@ export default function RiconciliazionePage() {
       // 5c. Miglioria 3: Upsert reconciliation rule from confirmed match
       if (tx && suggestion.invoice_id && tx.counterparty_name) {
         const inv = suggestion.invoice
+        const suggestionData = suggestion.suggestion_data || {}
         const invoiceContracts = Array.isArray(inv?.contract_refs) ? inv?.contract_refs : []
         const txContractRefs = uniqueStrings([
-          ...(Array.isArray(suggestion.suggestion_data?.tx_contract_refs) ? suggestion.suggestion_data?.tx_contract_refs as string[] : []),
+          ...extractClientContractRefs(tx.extracted_refs || null),
+          ...(Array.isArray(suggestionData?.tx_contract_refs) ? suggestionData?.tx_contract_refs as string[] : []),
         ])
         const invoiceContractRefs = uniqueStrings([
           inv?.primary_contract_ref || null,
           ...invoiceContracts,
+          ...(Array.isArray(suggestionData?.invoice_contract_refs) ? suggestionData?.invoice_contract_refs as string[] : []),
         ])
+        const txInvoiceRefs = uniqueStrings([
+          ...extractClientInvoiceRefs(tx.extracted_refs || null, tx.raw_text || null).map(normalizeComparableRef),
+          ...(Array.isArray(suggestionData?.ref) ? (suggestionData.ref as string[]).map(normalizeComparableRef) : []),
+          typeof suggestionData?.ref === 'string' ? normalizeComparableRef(String(suggestionData.ref)) : null,
+        ])
+        const mandateId = extractClientMandateId(tx.extracted_refs || null)
+        const invoiceAfterTx = Boolean(suggestionData?.invoice_after_tx)
+        const timingConfidence = typeof suggestionData?.timing_confidence === 'string' ? suggestionData.timing_confidence : null
         const ruleName = `${tx.counterparty_name} → ${inv?.number || 'fattura'}`
         const ruleData = {
           counterparty_pattern: tx.counterparty_name,
+          counterparty_denorm: tx.counterparty_name || ((inv?.counterparty as Record<string, unknown> | null)?.denom as string | null) || null,
           transaction_type: tx.transaction_type || null,
+          direction: tx.direction || null,
           amount_range: [Math.abs(Number(tx.amount)) * 0.85, Math.abs(Number(tx.amount)) * 1.15],
           contract_ref: txContractRefs[0] || invoiceContractRefs[0] || null,
+          contract_refs: uniqueStrings([...txContractRefs, ...invoiceContractRefs]),
+          invoice_ref_patterns: txInvoiceRefs,
+          mandate_id: mandateId,
+          amount_target: Math.abs(Number(tx.amount)),
+          counterparty_similarity: suggestion.match_score >= 90 ? 'high' : suggestion.match_score >= 75 ? 'medium' : 'low',
+          days_window: typeof suggestionData?.days_diff === 'number' ? Number(suggestionData.days_diff) : null,
+          timing_confidence: timingConfidence,
+          invoice_after_tx: invoiceAfterTx,
+          level: suggestionData?.level || null,
+          tx_description: tx.description || null,
           tx_notes: tx.notes || null,
           invoice_notes: inv?.notes || null,
         }
@@ -810,7 +858,7 @@ export default function RiconciliazionePage() {
           pattern: ruleData,
           action: { match_invoice: true },
           rule_data: ruleData,
-          confidence: Math.min(1, (suggestion.match_score / 100) * 0.8 + 0.2),
+          confidence: Math.min(1, (suggestion.match_score / 100) * 0.75 + (suggestionData?.auto_match_eligible ? 0.25 : 0.15)),
         }, { onConflict: 'company_id,rule_name' }).then(({ error: ruleErr }) => {
           if (ruleErr) console.warn('[confirmSuggestion] rule upsert error:', ruleErr)
         })
@@ -891,12 +939,30 @@ export default function RiconciliazionePage() {
 
       // Miglioria 4: degrade rule confidence on reject
       if (suggestion.rule_id) {
-        supabase.from('reconciliation_rules')
-          .update({ confidence: Math.max(0, (suggestion.match_score / 100) - 0.05), reject_count: 1 })
+        const { data: ruleRow, error: ruleLoadErr } = await supabase
+          .from('reconciliation_rules')
+          .select('confidence, reject_count')
           .eq('id', suggestion.rule_id)
-          .then(({ error: ruleErr }) => {
-            if (ruleErr) console.warn('[rejectSuggestion] rule degrade error:', ruleErr)
-          })
+          .single()
+        if (ruleLoadErr) {
+          console.warn('[rejectSuggestion] rule load error:', ruleLoadErr)
+        } else {
+          const currentConfidence = Number(ruleRow?.confidence || 0)
+          const currentRejectCount = Number(ruleRow?.reject_count || 0)
+          const hardReject = suggestion.proposed_by === 'rule' || suggestion.suggestion_data?.level === 'rule'
+          const penalty = hardReject ? 0.2 : 0.12
+          const newRejectCount = currentRejectCount + 1
+          const newConfidence = Math.max(0, currentConfidence - penalty - Math.min(0.1, currentRejectCount * 0.03))
+          const { error: ruleErr } = await supabase
+            .from('reconciliation_rules')
+            .update({
+              confidence: newConfidence,
+              reject_count: newRejectCount,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', suggestion.rule_id)
+          if (ruleErr) console.warn('[rejectSuggestion] rule degrade error:', ruleErr)
+        }
       }
 
       toast.success('Suggerimento rifiutato')
@@ -912,7 +978,10 @@ export default function RiconciliazionePage() {
   // ─── bulk confirm high-confidence ──────────
   const bulkConfirmHigh = useCallback(async () => {
     // For groups with multiple alternatives, only confirm the best (highest score)
-    const highConf = suggestions.filter(s => s.match_score >= 90)
+    const highConf = suggestions.filter(s =>
+      Boolean(s.suggestion_data?.auto_match_eligible) ||
+      (s.match_score >= 97 && s.suggestion_data?.review_required !== true && s.suggestion_data?.level !== 'cumulative')
+    )
     if (!highConf.length) return
     setBulkConfirming(true)
 
@@ -1602,17 +1671,37 @@ export default function RiconciliazionePage() {
           <h1 className="text-2xl font-bold tracking-tight">Riconciliazione</h1>
           <p className="text-muted-foreground text-sm mt-0.5">Abbina automaticamente movimenti bancari a fatture e rate</p>
         </div>
-        <button
-          onClick={generateSuggestions}
-          className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
-            generating
-              ? 'bg-red-600 text-white hover:bg-red-700'
-              : 'bg-purple-600 text-white hover:bg-purple-700'
-          }`}
-        >
-          {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-          {generating ? '⏹ Stop' : 'Genera suggerimenti'}
-        </button>
+        <div className="flex items-end gap-3">
+          <div className="hidden md:block text-right">
+            <div className="flex items-center gap-1.5 justify-end mb-1">
+              {(['legacy', 'contextual', 'shadow'] as ReconciliationEngineMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => handleEngineModeChange(mode)}
+                  className={`px-2.5 py-1 text-[11px] rounded-md border transition-colors ${
+                    engineMode === mode
+                      ? 'bg-slate-900 text-white border-slate-900'
+                      : 'bg-white text-slate-600 border-slate-200 hover:border-slate-300'
+                  }`}
+                >
+                  {reconciliationEngineModeLabel(mode)}
+                </button>
+              ))}
+            </div>
+            <p className="text-[11px] text-gray-500 max-w-[360px]">{reconciliationEngineModeDescription(engineMode)}</p>
+          </div>
+          <button
+            onClick={generateSuggestions}
+            className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
+              generating
+                ? 'bg-red-600 text-white hover:bg-red-700'
+                : 'bg-purple-600 text-white hover:bg-purple-700'
+            }`}
+          >
+            {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+            {generating ? '⏹ Stop' : 'Genera suggerimenti'}
+          </button>
+        </div>
       </div>
 
       {/* ──── KPI Cards ──── */}
@@ -2935,7 +3024,7 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
           {/* Amount note (Miglioria 5) */}
           {typeof suggestion.suggestion_data?.amount_note === 'string' && (
             <div className="mt-1.5 inline-flex items-center gap-1 text-[10px] bg-amber-50 text-amber-700 border border-amber-200 rounded px-1.5 py-0.5">
-              {suggestion.suggestion_data.amount_note}
+              {String(suggestion.suggestion_data.amount_note)}
             </div>
           )}
 
@@ -2953,6 +3042,37 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
             </div>
           )}
 
+          {suggestion.suggestion_data?.contract_ref_match === true && (
+            <div className="mt-1 ml-1 inline-flex items-center gap-1 text-[10px] bg-violet-50 text-violet-700 border border-violet-200 rounded px-1.5 py-0.5">
+              Contratto coerente
+            </div>
+          )}
+          {suggestion.suggestion_data?.invoice_after_tx === true && (
+            <div className="mt-1 ml-1 inline-flex items-center gap-1 text-[10px] bg-rose-50 text-rose-700 border border-rose-200 rounded px-1.5 py-0.5">
+              Fattura dopo il movimento
+            </div>
+          )}
+          {suggestion.suggestion_data?.due_date_is_estimated === true && (
+            <div className="mt-1 ml-1 inline-flex items-center gap-1 text-[10px] bg-slate-50 text-slate-700 border border-slate-200 rounded px-1.5 py-0.5">
+              Scadenza stimata
+            </div>
+          )}
+          {suggestion.suggestion_data?.reranked_by_model === true && (
+            <div className="mt-1 ml-1 inline-flex items-center gap-1 text-[10px] bg-fuchsia-50 text-fuchsia-700 border border-fuchsia-200 rounded px-1.5 py-0.5">
+              Reranked AI
+            </div>
+          )}
+          {suggestion.suggestion_data?.global_winner === true && (
+            <div className="mt-1 ml-1 inline-flex items-center gap-1 text-[10px] bg-emerald-50 text-emerald-700 border border-emerald-200 rounded px-1.5 py-0.5">
+              Miglior match globale
+            </div>
+          )}
+          {suggestion.suggestion_data?.review_required === true && (
+            <div className="mt-1 ml-1 inline-flex items-center gap-1 text-[10px] bg-amber-50 text-amber-700 border border-amber-200 rounded px-1.5 py-0.5">
+              Review umana
+            </div>
+          )}
+
           {/* Match reason (expandable) */}
           <button
             onClick={() => setExpanded(!expanded)}
@@ -2961,7 +3081,7 @@ function SuggestionCard({ suggestion, onConfirm, onReject, confirming, rejecting
             {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
             {suggestion.match_reason}
           </button>
-          {expanded && suggestion.suggestion_data && (
+          {expanded && suggestion.suggestion_data != null && (
             <div className="mt-1.5 text-[10px] text-gray-400 bg-gray-50 rounded p-2 font-mono">
               {JSON.stringify(suggestion.suggestion_data, null, 2)}
             </div>
