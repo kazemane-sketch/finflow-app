@@ -8,7 +8,7 @@ const corsHeaders = {
 };
 
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
-const PREMIUM_MODEL = "gemini-3.1-pro-preview";
+const PREMIUM_MODEL = "claude-sonnet-4-6";
 const CONCURRENCY = 5;
 const MAX_BATCH = 50;
 
@@ -61,9 +61,10 @@ type TxRow = {
 
 /* ─── Anthropic API call ──────────────────── */
 
-async function extractRefs(
+async function extractRefsWithModel(
   apiKey: string,
   rawText: string,
+  model: string,
 ): Promise<Record<string, unknown>> {
   const prompt = EXTRACTION_PROMPT.replace("{RAW_TEXT}", clip(rawText, 2000));
 
@@ -75,7 +76,7 @@ async function extractRefs(
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: HAIKU_MODEL,
+      model,
       max_tokens: 1024,
       messages: [{ role: "user", content: prompt }],
     }),
@@ -93,37 +94,6 @@ async function extractRefs(
   // Strip markdown code fences if Haiku wraps them
   text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
 
-  return JSON.parse(text);
-}
-
-async function extractRefsPremium(
-  apiKey: string,
-  rawText: string,
-): Promise<Record<string, unknown>> {
-  const prompt = EXTRACTION_PROMPT.replace("{RAW_TEXT}", clip(rawText, 3000));
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${PREMIUM_MODEL}:generateContent?key=${apiKey}`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0,
-        responseMimeType: "application/json",
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    const err = await response.text().catch(() => "unknown");
-    throw new Error(`Gemini API ${response.status}: ${clip(err, 200)}`);
-  }
-
-  const data = await response.json();
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (typeof text !== "string" || !text.trim()) {
-    throw new Error("Gemini premium extraction vuota");
-  }
   return JSON.parse(text);
 }
 
@@ -183,7 +153,6 @@ Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
   const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
-  const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
 
   if (!anthropicKey) return json({ error: "ANTHROPIC_API_KEY non configurata" }, 503);
@@ -212,6 +181,20 @@ Deno.serve(async (req) => {
       SET extraction_status = 'pending'
       WHERE company_id = ${companyId}
         AND extraction_status = 'processing'
+    `;
+
+    // Retry transient/model-format failures from previous runs.
+    await sql`
+      UPDATE bank_transactions
+      SET extraction_status = 'pending'
+      WHERE company_id = ${companyId}
+        AND extraction_status = 'error'
+        AND (
+          coalesce(extracted_refs->>'error', '') ILIKE 'Anthropic API 429:%'
+          OR coalesce(extracted_refs->>'error', '') ILIKE 'Anthropic API 5%:%'
+          OR coalesce(extracted_refs->>'error', '') ILIKE 'Gemini API 429:%'
+          OR coalesce(extracted_refs->>'error', '') ILIKE 'Expected double-quoted property name%'
+        )
     `;
 
     if (rebuildAll) {
@@ -271,12 +254,43 @@ Deno.serve(async (req) => {
 
     await runWithConcurrency(rows, CONCURRENCY, async (row) => {
       try {
-        let refs = await extractRefs(anthropicKey, row.raw_text);
+        let refs: Record<string, unknown> | null = null;
         let extractionModel = HAIKU_MODEL;
+        let haikuError: string | null = null;
+        let sonnetError: string | null = null;
 
-        if (!hasMeaningfulRefs(refs) && geminiKey) {
-          refs = await extractRefsPremium(geminiKey, row.raw_text);
+        try {
+          refs = await extractRefsWithModel(anthropicKey, row.raw_text, HAIKU_MODEL);
+        } catch (err) {
+          haikuError = err instanceof Error ? err.message : String(err);
+        }
+
+        if (!hasMeaningfulRefs(refs)) {
           extractionModel = PREMIUM_MODEL;
+          try {
+            refs = await extractRefsWithModel(anthropicKey, row.raw_text, PREMIUM_MODEL);
+          } catch (err) {
+            sonnetError = err instanceof Error ? err.message : String(err);
+          }
+        }
+
+        if (!hasMeaningfulRefs(refs)) {
+          const errorMessage = sonnetError ||
+            haikuError ||
+            "Nessun riferimento affidabile estratto dai modelli AI";
+          await sql`
+            UPDATE bank_transactions
+            SET extraction_status = 'error',
+                extraction_model = ${extractionModel},
+                extracted_refs = ${JSON.stringify({
+                  error: clip(errorMessage, 300),
+                  ai_only: true,
+                  models_attempted: [HAIKU_MODEL, PREMIUM_MODEL],
+                })}::jsonb
+            WHERE id = ${row.id}
+          `;
+          errors += 1;
+          return;
         }
 
         await sql`
@@ -292,33 +306,17 @@ Deno.serve(async (req) => {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[extract-refs] Error for tx ${row.id}:`, msg);
 
-        if (geminiKey) {
-          try {
-            const premiumRefs = await extractRefsPremium(geminiKey, row.raw_text);
-            await sql`
-              UPDATE bank_transactions
-              SET extracted_refs = ${JSON.stringify(premiumRefs)}::jsonb,
-                  extraction_status = 'ready',
-                  extraction_model = ${PREMIUM_MODEL},
-                  extracted_at = now()
-              WHERE id = ${row.id}
-            `;
-            ready += 1;
-            return;
-          } catch (premiumErr) {
-            const premiumMsg = premiumErr instanceof Error ? premiumErr.message : String(premiumErr);
-            console.error(`[extract-refs] Premium fallback error for tx ${row.id}:`, premiumMsg);
-          }
-        }
-
         await sql`
           UPDATE bank_transactions
           SET extraction_status = 'error',
-              extraction_model = ${HAIKU_MODEL},
-              extracted_refs = ${JSON.stringify({ error: clip(msg, 500) })}::jsonb,
-              extracted_at = now()
+              extraction_model = ${PREMIUM_MODEL},
+              extracted_refs = ${JSON.stringify({
+                error: clip(msg, 300),
+                ai_only: true,
+                models_attempted: [HAIKU_MODEL, PREMIUM_MODEL],
+              })}::jsonb
           WHERE id = ${row.id}
-        `.catch(() => {});
+        `;
         errors += 1;
       }
     });
