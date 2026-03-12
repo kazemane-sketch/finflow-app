@@ -68,6 +68,8 @@ function extractContractRefsFromXml(rawXml: string | null | undefined): string[]
   return [...new Set(refs)];
 }
 
+const OVERFETCH_MULTIPLIER = 10;
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   if (req.method !== "POST") return jsonResponse({ error: "Method not allowed" }, 405);
@@ -108,6 +110,8 @@ Deno.serve(async (req) => {
 
   const sql = postgres(dbUrl, { max: 1 });
   try {
+    const scanLimit = Math.max(batchSize, batchSize * OVERFETCH_MULTIPLIER);
+
     const rows = await sql.unsafe(
       `SELECT id, raw_xml
        FROM invoices i
@@ -127,16 +131,21 @@ Deno.serve(async (req) => {
          )
        ORDER BY i.date DESC, i.created_at DESC
        LIMIT $2`,
-      [companyId, batchSize],
+      [companyId, scanLimit],
     );
 
     let processed = 0;
     let updated = 0;
+    let skipped = 0;
 
     for (const row of rows) {
+      if (updated >= batchSize) break;
       processed += 1;
       const refs = extractContractRefsFromXml(row.raw_xml as string | null);
-      if (refs.length === 0) continue;
+      if (refs.length === 0) {
+        skipped += 1;
+        continue;
+      }
       await sql.unsafe(
         `UPDATE invoices
          SET primary_contract_ref = $2,
@@ -172,6 +181,7 @@ Deno.serve(async (req) => {
       status: "completed",
       processed,
       updated,
+      skipped,
       remaining: Number(remaining || 0),
     });
   } catch (err) {

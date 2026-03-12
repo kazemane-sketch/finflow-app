@@ -3,6 +3,7 @@ import { postEdgeJsonWithAuthRetry } from '@/lib/edgeAuthFetch'
 export interface ContractRefBackfillResult {
   processed: number
   updated: number
+  skipped: number
   remaining: number
 }
 
@@ -32,7 +33,7 @@ export async function triggerReconciliationHistoricalAlignment(
   onProgress?: (partial: ReconciliationBackfillResult) => void,
 ): Promise<ReconciliationBackfillResult> {
   const result: ReconciliationBackfillResult = {
-    contracts: { processed: 0, updated: 0, remaining: 0 },
+    contracts: { processed: 0, updated: 0, skipped: 0, remaining: 0 },
     bankEmbeddings: { processed: 0, ready: 0, errors: 0, remaining: 0 },
   }
 
@@ -47,6 +48,7 @@ export async function triggerReconciliationHistoricalAlignment(
     const step = await callEdge<{
       processed?: number
       updated?: number
+      skipped?: number
       remaining?: number
     }>('backfill-invoice-contract-refs', {
       company_id: companyId,
@@ -55,6 +57,7 @@ export async function triggerReconciliationHistoricalAlignment(
 
     result.contracts.processed += Number(step.processed || 0)
     result.contracts.updated += Number(step.updated || 0)
+    result.contracts.skipped += Number(step.skipped || 0)
     result.contracts.remaining = Number(step.remaining || 0)
 
     onProgress?.({
@@ -63,7 +66,11 @@ export async function triggerReconciliationHistoricalAlignment(
       bankEmbeddings: { ...result.bankEmbeddings },
     })
 
-    if (result.contracts.remaining === 0 || Number(step.processed || 0) === 0) break
+    if (
+      result.contracts.remaining === 0 ||
+      Number(step.processed || 0) === 0 ||
+      (Number(step.updated || 0) === 0 && Number(step.skipped || 0) > 0)
+    ) break
   }
 
   for (let round = 0; round < MAX_ROUNDS; round += 1) {

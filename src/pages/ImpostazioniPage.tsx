@@ -498,6 +498,7 @@ function ReconciliationAlignmentCard({ companyId }: { companyId: string }) {
   const totalTouched = show
     ? show.contracts.updated + show.bankEmbeddings.ready
     : 0
+  const hasContractStall = !!show && show.contracts.remaining > 0 && show.contracts.updated === 0 && show.contracts.skipped > 0
 
   return (
     <Card>
@@ -548,7 +549,11 @@ function ReconciliationAlignmentCard({ companyId }: { companyId: string }) {
               ) : (
                 <CheckCircle className="h-3.5 w-3.5 text-emerald-600" />
               )}
-              {running ? 'Allineamento in corso...' : `Allineamento completato — ${totalTouched} record riallineati`}
+              {running
+                ? 'Allineamento in corso...'
+                : show.contracts.remaining > 0
+                  ? `Batch completato — ${totalTouched} record riallineati`
+                  : `Allineamento completato — ${totalTouched} record riallineati`}
             </div>
 
             <div className="space-y-1">
@@ -561,7 +566,13 @@ function ReconciliationAlignmentCard({ companyId }: { companyId: string }) {
                   <span className="h-3 w-3 flex-shrink-0" />
                 )}
                 <span className="text-gray-600">Contract ref fatture</span>
-                <span className="font-medium text-gray-900">{show.contracts.updated}</span>
+                <span className="font-medium text-gray-900">{show.contracts.updated} aggiornate</span>
+                {show.contracts.processed > 0 && (
+                  <span className="text-gray-400">({show.contracts.processed} esaminate)</span>
+                )}
+                {show.contracts.skipped > 0 && (
+                  <span className="text-amber-600">({show.contracts.skipped} saltate)</span>
+                )}
                 {show.contracts.remaining > 0 && (
                   <span className="text-gray-400">({show.contracts.remaining} rimanenti)</span>
                 )}
@@ -585,6 +596,12 @@ function ReconciliationAlignmentCard({ companyId }: { companyId: string }) {
                 )}
               </div>
             </div>
+
+            {hasContractStall && (
+              <p className="text-[10px] text-amber-600 pt-1 border-t border-sky-100">
+                I documenti rimanenti passano il filtro XML ma non stanno producendo un riferimento contratto estraibile con il parser attuale.
+              </p>
+            )}
           </div>
         )}
       </CardContent>
