@@ -357,6 +357,7 @@ export default function RiconciliazionePage() {
   const [confirmingId, setConfirmingId] = useState<string | null>(null)
   const [rejectingId, setRejectingId] = useState<string | null>(null)
   const [bulkConfirming, setBulkConfirming] = useState(false)
+  const [clearingPendingSuggestions, setClearingPendingSuggestions] = useState(false)
 
   // Assisted tab state
   const [selectedTxId, setSelectedTxId] = useState<string | null>(
@@ -591,6 +592,37 @@ export default function RiconciliazionePage() {
       await Promise.all([loadKpis(), loadSuggestions()])
     })
   }, [companyId, reconStartOrStop, loadKpis, loadSuggestions])
+
+  const clearPendingSuggestions = useCallback(async () => {
+    if (!companyId || clearingPendingSuggestions || kpi.pendingSuggestions <= 0) return
+    const confirmed = window.confirm(
+      `Vuoi rimuovere ${kpi.pendingSuggestions} suggeriment${kpi.pendingSuggestions === 1 ? 'o' : 'i'} pendenti? Le riconciliazioni già confermate non verranno toccate.`,
+    )
+    if (!confirmed) return
+
+    try {
+      setClearingPendingSuggestions(true)
+      const { data, error } = await supabase
+        .from('reconciliation_suggestions')
+        .update({ status: 'expired' })
+        .eq('company_id', companyId)
+        .eq('status', 'pending')
+        .select('id')
+
+      if (error) throw error
+
+      const cleared = data?.length || 0
+      toast.success(
+        `${cleared} suggeriment${cleared === 1 ? 'o pendente rimosso' : 'i pendenti rimossi'}`,
+      )
+      await Promise.all([loadKpis(), loadSuggestions()])
+    } catch (err) {
+      console.error('[clearPendingSuggestions] error:', err)
+      toast.error(`Errore pulizia suggerimenti: ${errMsg(err)}`)
+    } finally {
+      setClearingPendingSuggestions(false)
+    }
+  }, [companyId, clearingPendingSuggestions, kpi.pendingSuggestions, loadKpis, loadSuggestions])
 
   // ─── auto-close remainder (shared helper) ───
   const autoCloseRemainder = useCallback(async (txId: string, amount: number, reason: string) => {
@@ -1663,17 +1695,28 @@ export default function RiconciliazionePage() {
           <h1 className="text-2xl font-bold tracking-tight">Riconciliazione</h1>
           <p className="text-muted-foreground text-sm mt-0.5">Abbina automaticamente movimenti bancari a fatture e rate</p>
         </div>
-        <button
-          onClick={generateSuggestions}
-          className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
-            generating
-              ? 'bg-red-600 text-white hover:bg-red-700'
-              : 'bg-purple-600 text-white hover:bg-purple-700'
-          }`}
-        >
-          {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
-          {generating ? '⏹ Stop' : 'Genera suggerimenti'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={clearPendingSuggestions}
+            disabled={clearingPendingSuggestions || kpi.pendingSuggestions <= 0}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border border-red-200 text-red-700 bg-white hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            title="Rimuovi solo i suggerimenti pendenti, senza toccare le riconciliazioni confermate"
+          >
+            {clearingPendingSuggestions ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+            Azzera suggerimenti
+          </button>
+          <button
+            onClick={generateSuggestions}
+            className={`flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg transition-colors ${
+              generating
+                ? 'bg-red-600 text-white hover:bg-red-700'
+                : 'bg-purple-600 text-white hover:bg-purple-700'
+            }`}
+          >
+            {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+            {generating ? '⏹ Stop' : 'Genera suggerimenti'}
+          </button>
+        </div>
       </div>
 
       {/* ──── KPI Cards ──── */}
