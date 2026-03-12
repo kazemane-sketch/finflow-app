@@ -206,14 +206,34 @@ Deno.serve(async (req) => {
   const sql = postgres(dbUrl, { max: 1 });
 
   try {
+    // Recover rows left in processing by interrupted runs.
+    await sql`
+      UPDATE bank_transactions
+      SET extraction_status = 'pending'
+      WHERE company_id = ${companyId}
+        AND extraction_status = 'processing'
+    `;
+
     if (rebuildAll) {
-      await sql`
-        UPDATE bank_transactions
-        SET extraction_status = 'pending'
+      const [{ active_backlog }] = await sql`
+        SELECT count(*)::int AS active_backlog
+        FROM bank_transactions
         WHERE company_id = ${companyId}
-          AND raw_text IS NOT NULL
-          AND raw_text != ''
+          AND extraction_status = 'pending'
       `;
+
+      // Rebuild from scratch only if there isn't already a pending backlog.
+      // This makes the flow resumable after transient client/network failures.
+      if (Number(active_backlog || 0) === 0) {
+        await sql`
+          UPDATE bank_transactions
+          SET extraction_status = 'pending'
+          WHERE company_id = ${companyId}
+            AND raw_text IS NOT NULL
+            AND raw_text != ''
+            AND extraction_status <> 'pending'
+        `;
+      }
     }
 
     // 1. Select pending rows

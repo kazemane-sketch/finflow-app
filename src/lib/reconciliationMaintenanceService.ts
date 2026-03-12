@@ -36,6 +36,22 @@ async function callEdge<T>(path: string, payload: Record<string, unknown>): Prom
   return await postEdgeJsonWithAuthRetry<T>(path, payload)
 }
 
+async function callEdgeWithRetry<T>(path: string, payload: Record<string, unknown>, attempts = 3): Promise<T> {
+  let lastError: unknown
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await callEdge<T>(path, payload)
+    } catch (error) {
+      lastError = error
+      const message = error instanceof Error ? error.message : String(error)
+      const isTransient = /failed to fetch|networkerror|load failed|fetch/i.test(message)
+      if (!isTransient || attempt === attempts - 1) break
+      await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)))
+    }
+  }
+  throw lastError
+}
+
 export async function triggerReconciliationHistoricalAlignment(
   companyId: string,
   onProgress?: (partial: ReconciliationBackfillResult) => void,
@@ -133,7 +149,7 @@ export async function triggerBankReferenceReextract(
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
     onProgress?.({ ...result, currentStep: 'Riferimenti banca...' })
 
-    const step = await callEdge<{
+    const step = await callEdgeWithRetry<{
       processed?: number
       ready?: number
       errors?: number
