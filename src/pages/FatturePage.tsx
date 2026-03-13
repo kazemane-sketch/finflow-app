@@ -346,7 +346,8 @@ function PipelineStepDetailPanel({ step }: { step: PipelineStepDebug }) {
     commercialista: '\uD83E\uDDE0 Step 2: Commercialista',
     cdc: '\uD83C\uDFE2 Step 3: Centri di Costo',
     reviewer: '\u2696\uFE0F Step 4: Revisore Fiscale',
-    persist: '\uD83D\uDCBE Step 5: Persistenza',
+    consultant: '\uD83D\uDCAC Step 5: Consulente Inline',
+    persist: '\uD83D\uDCBE Step 6: Persistenza',
   };
 
   return (
@@ -1206,6 +1207,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       }) as {
         message?: string
         action?: ConsultantAction
+        debug?: PipelineStepDebug
       };
 
       const assistantMessage: ChatMessage = {
@@ -1214,6 +1216,12 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         action: data.action || undefined,
       };
       setChatMessages([...newMessages, assistantMessage]);
+      if (data.debug?.step === 'consultant') {
+        setPipelineDebug(prev => {
+          const base = Array.isArray(prev) ? prev.filter(step => step.step !== 'consultant') : [];
+          return [...base, data.debug as PipelineStepDebug];
+        });
+      }
       if (data.action?.type === 'apply_consultant_resolution' || data.action?.type === 'apply_fiscal_override') {
         setProposedConsultantAction(data.action as ConsultantAction);
         setAiBannerStatus('proposed');

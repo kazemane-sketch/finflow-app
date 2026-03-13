@@ -258,6 +258,99 @@ function sanitizeEvidenceArray(value: unknown): ConsultantEvidence[] {
     .filter((entry): entry is ConsultantEvidence => Boolean(entry));
 }
 
+function normalizeConsultantEvidenceSource(source: string): string {
+  const normalized = source.trim().toLowerCase();
+  switch (normalized) {
+    case "kb":
+    case "memory":
+    case "deterministic":
+    case "reviewer":
+    case "consultant":
+    case "company_stats":
+    case "invoice":
+    case "history":
+    case "user":
+      return normalized;
+    case "company_memory":
+      return "memory";
+    case "exact_match":
+    case "rule":
+      return "deterministic";
+    default:
+      return normalized || "consultant";
+  }
+}
+
+function hasStrongAccountEvidence(evidence: ConsultantEvidence): boolean {
+  const ref = String(evidence.ref || "");
+  const detail = String(evidence.detail || "");
+  const payload = `${ref} ${detail}`;
+  return /contract_ref=|source_invoice_id=|account_code=|exact_match|deterministic/i.test(payload);
+}
+
+function sanitizeConsultantAction(
+  action: Record<string, unknown> | null,
+  context: {
+    visibleLines: Array<Record<string, unknown>>;
+  },
+): Record<string, unknown> | null {
+  if (!action || typeof action !== "object") return null;
+
+  const sanitizedEvidence = sanitizeEvidenceArray(action.supporting_evidence).map((evidence) => {
+    const source = normalizeConsultantEvidenceSource(evidence.source);
+    const weakMemory = source === "memory" && !hasStrongAccountEvidence(evidence);
+    return {
+      ...evidence,
+      source,
+      label: weakMemory ? "Memory contestuale" : evidence.label,
+      detail: weakMemory && evidence.detail
+        ? `Indizio contestuale: ${evidence.detail}`
+        : evidence.detail,
+    };
+  });
+
+  const visibleLineMap = new Map(
+    context.visibleLines.map((line) => [String(line.id || ""), line]),
+  );
+
+  const lineUpdates = sanitizeLineUpdates(action.line_updates).map((update) => {
+    const current = visibleLineMap.get(update.line_id);
+    const currentAccountId = current ? String(current.account_id || "").trim() || null : null;
+    const wantsSpecificAccount = Boolean(update.account_id && update.account_id !== currentAccountId);
+    const hasStrongEvidence = sanitizedEvidence.some((evidence) => hasStrongAccountEvidence(evidence));
+
+    if (wantsSpecificAccount && !hasStrongEvidence) {
+      return {
+        ...update,
+        account_id: null,
+        decision_status: "needs_review" as const,
+        reasoning_summary_final: clip(
+          [
+            String(update.reasoning_summary_final || "").trim(),
+            "Il conto specifico non e applicato automaticamente: l'evidenza disponibile e contestuale ma non identifica in modo forte il contratto o lo storico esatto.",
+          ].filter(Boolean).join(" "),
+          1200,
+        ) || update.reasoning_summary_final || null,
+        note: clip(
+          [
+            String(update.note || "").trim(),
+            "Conto specifico lasciato da verificare: manca un riferimento contrattuale o storico puntuale a supporto.",
+          ].filter(Boolean).join(" "),
+          800,
+        ) || update.note || null,
+      };
+    }
+
+    return update;
+  });
+
+  return {
+    ...action,
+    supporting_evidence: sanitizedEvidence,
+    line_updates: lineUpdates,
+  };
+}
+
 function sanitizeStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return Array.from(new Set(
@@ -2695,7 +2788,10 @@ ${visibleLines.map((line) => [
             },
           );
 
-      const action = parseResolutionAction(result.content);
+      const action = sanitizeConsultantAction(
+        parseResolutionAction(result.content),
+        { visibleLines },
+      );
       const message = stripJsonBlock(result.content);
 
       return json({
@@ -2704,6 +2800,18 @@ ${visibleLines.map((line) => [
         thinking: result.thinking || null,
         consultant_mode: "thinking",
         model_used: runtime.model,
+        debug: {
+          step: "consultant",
+          prompt_sent: geminiPrompt,
+          raw_response: result.content,
+          model_used: runtime.model,
+          extra: {
+            line_ids: requestedLineIds,
+            kb_hits: kbContext ? kbContext.split("\n").filter(Boolean).length : 0,
+            memory_hits: memoryContext ? memoryContext.split("\n").filter(Boolean).length : 0,
+            alert_context: alertContext || null,
+          },
+        },
         tool_calls: result.toolCalls.map((tc) => ({
           name: tc.name,
           args: tc.args,
