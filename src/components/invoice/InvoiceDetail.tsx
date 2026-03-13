@@ -2579,14 +2579,14 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
                   )}
                 </span>
               </div>
-              <div className="overflow-x-auto">
+              <div className="overflow-hidden">
                 <table className="w-full text-[11px]">
                   <thead className="bg-slate-50/50 text-left text-slate-500">
                   <tr>
-                    <th className="text-left px-3 py-2 font-semibold min-w-[240px]">Descrizione</th>
-                    <th className="text-right px-2 py-2 font-semibold w-14">Qt{'\u00E0'}</th>
+                    <th className="text-left px-3 py-2 font-semibold w-[25%]">Descrizione</th>
+                    <th className="text-right px-2 py-2 font-semibold w-12">Qt{'\u00E0'}</th>
                     <th className="text-right px-2 py-2 font-semibold w-16">P. Unit.</th>
-                    <th className="text-right px-2 py-2 font-semibold w-14">IVA</th>
+                    <th className="text-right px-2 py-2 font-semibold w-12">IVA</th>
                     <th className="text-right px-2 py-2 font-semibold w-16">Totale</th>
                     {allCategories.length > 0 && (
                       <th className="text-center px-1 py-2 text-gray-600 font-semibold w-32">
@@ -2617,8 +2617,8 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
                     )}
                     {(allCategories.length > 0 || allAccounts.length > 0) && <th className="text-center px-0.5 py-2 font-normal w-10"></th>}
                     <th className="text-center px-2 py-2 font-semibold w-14">Conf.</th>
-                    <th className="text-left px-2 py-2 font-semibold min-w-[180px]">Motivazione finale</th>
-                    <th className="text-left px-2 py-2 font-semibold min-w-[100px]">Note</th>
+                    <th className="text-left px-2 py-2 font-semibold w-[25%]">Motivazione finale</th>
+                    <th className="text-left px-2 py-2 font-semibold w-[15%]">Note</th>
                   </tr></thead>
                   <tbody className="divide-y divide-slate-100">
                     {/* Sort lines: classify lines first (with grouped children after parent), then skip lines */}
@@ -2730,7 +2730,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
                       return (
                       <React.Fragment key={i}>
                       <tr className="hover:bg-slate-50/50">
-                        <td className="text-left px-3 py-2.5 min-w-[240px]">
+                        <td className="text-left px-3 py-2.5 w-[25%]">
                           <div className="flex flex-col gap-1">
                             <span className="text-slate-800 leading-snug">{l.descrizione}</span>
                             {/* Badges row: fiscal flags + review badge + article */}
@@ -2791,6 +2791,8 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
                               onChange={v => handleLineClassifChange(lineId, 'category_id', v)}
                               placeholder={selCategoryId ? '\u2190 Fatt.' : '\u2014'}
                               emptyLabel={selCategoryId ? '\u2190 Fatt.' : undefined}
+                              selectedClassName="max-w-[120px]"
+                              emptyClassName="max-w-[120px]"
                               truncate={18}
                             />
                           ) : <span className="text-[9px] text-gray-300">{'\u2014'}</span>}
@@ -2816,7 +2818,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
                                 }`}
                               >
                                 {lineProjects[lineId]?.length
-                                  ? lineProjects[lineId].map(lp => { const p = allProjects.find(pp => pp.id === lp.project_id); return p ? `${p.code} ${p.name?.substring(0, 8) || ''}` : ''; }).filter(Boolean).join(', ').substring(0, 18)
+                                  ? lineProjects[lineId].map(lp => { const p = allProjects.find(pp => pp.id === lp.project_id); return p ? p.code : ''; }).filter(Boolean).join(', ').substring(0, 18)
                                   : (cdcRows.length > 0 ? '\u2190 Fatt.' : '\u2014')
                                 }
                               </button>
@@ -2830,8 +2832,8 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
                               onChange={v => handleLineClassifChange(lineId, 'account_id', v)}
                               placeholder={selAccountId ? '\u2190 Fatt.' : '\u2014'}
                               emptyLabel={selAccountId ? '\u2190 Fatt.' : undefined}
-                              selectedClassName="bg-emerald-50 border-emerald-200 text-emerald-700 font-semibold"
-                              emptyClassName="border-gray-200 bg-white text-gray-500"
+                              selectedClassName="bg-emerald-50 border-emerald-200 text-emerald-700 font-semibold max-w-[120px]"
+                              emptyClassName="border-gray-200 bg-white text-gray-500 max-w-[120px]"
                               truncate={20}
                             />
                           ) : <span className="text-[9px] text-gray-300">{'\u2014'}</span>}
@@ -2860,7 +2862,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
                           {lineId && <ConfidenceBadge value={lineConfidences[lineId]} />}
                         </td>
                         {/* Motivazione finale column */}
-                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 min-w-[180px]">
+                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 w-[25%] break-words">
                           {lineId && (() => {
                             const finalReasoning = getFinalReasoningSummary(lineDetails[lineId]);
                             const pendingReason = getPendingDecisionReason(lineDetails[lineId]);
@@ -2874,7 +2876,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
                           })()}
                         </td>
                         {/* Note column — clickable inline edit */}
-                        <td className="text-left px-3 py-2.5 text-[11px] min-w-[100px]">
+                        <td className="text-left px-3 py-2.5 text-[11px] w-[15%]">
                           {lineId && editingNoteLineId === lineId ? (
                             <div className="flex flex-col gap-1">
                               <textarea
