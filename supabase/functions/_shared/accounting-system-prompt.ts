@@ -193,8 +193,8 @@ export function getCompanyMemoryBlock(memoryFacts: MemoryFact[]): string {
     sections.push(`[${label}]\n${facts.map(f => `- ${f}`).join('\n')}`);
   }
 
-  return `\n\nCONOSCENZA AZIENDALE (dalla memoria — regole specifiche di questa azienda):
-Usa questi fatti come memoria aziendale contestuale. Nel reasoning chiamali "memoria aziendale" o "pattern aziendale", NON "storico confermato", salvo quando nel prompt c'è uno storico esplicito separato.
+  return `\n\nCONOSCENZA AZIENDALE (memoria contestuale, non verdetto automatico):
+Usa questi fatti come evidenze contestuali e pattern aziendali. Nel reasoning chiamali "memoria aziendale" o "pattern aziendale", NON "storico confermato". Se i fatti sono parziali o non equivalenti, trattali come indizi da pesare e non come prova conclusiva.
 ${sections.join('\n\n')}`;
 }
 

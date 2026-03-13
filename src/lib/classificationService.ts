@@ -574,6 +574,10 @@ export interface LineDetailData {
   fiscal_reasoning: string | null;
   fiscal_thinking: string | null;
   fiscal_confidence: number | null;
+  reasoning_summary_final: string | null;
+  decision_status: 'pending' | 'finalized' | 'needs_review' | 'unassigned' | null;
+  final_confidence: number | null;
+  final_decision_source: 'commercialista' | 'revisore' | 'consulente' | 'user' | 'exact_match' | 'none' | null;
   line_note: string | null;
   line_note_source: string | null;
   line_note_updated_at: string | null;
@@ -589,7 +593,7 @@ export async function loadLineClassifications(invoiceId: string): Promise<{
 }> {
   const { data, error } = await supabase
     .from('invoice_lines')
-    .select('id, category_id, account_id, fiscal_flags, ai_confidence, needs_review, line_action, grouped_with_line_id, skip_reason, classification_reasoning, classification_thinking, fiscal_reasoning, fiscal_thinking, fiscal_confidence, line_note, line_note_source, line_note_updated_at')
+    .select('id, category_id, account_id, fiscal_flags, ai_confidence, needs_review, line_action, grouped_with_line_id, skip_reason, classification_reasoning, classification_thinking, fiscal_reasoning, fiscal_thinking, fiscal_confidence, reasoning_summary_final, decision_status, final_confidence, final_decision_source, line_note, line_note_source, line_note_updated_at')
     .eq('invoice_id', invoiceId);
   if (error) throw error;
   const classifs: Record<string, LineClassification> = {};
@@ -598,7 +602,7 @@ export async function loadLineClassifications(invoiceId: string): Promise<{
   const reviewFlags: Record<string, boolean> = {};
   const lineActions: Record<string, LineActionMeta> = {};
   const lineDetails: Record<string, LineDetailData> = {};
-  for (const row of (data || []) as { id: string; category_id: string | null; account_id: string | null; fiscal_flags: any; ai_confidence: number | null; needs_review: boolean | null; line_action: string | null; grouped_with_line_id: string | null; skip_reason: string | null; classification_reasoning: string | null; classification_thinking: string | null; fiscal_reasoning: string | null; fiscal_thinking: string | null; fiscal_confidence: number | null; line_note: string | null; line_note_source: string | null; line_note_updated_at: string | null }[]) {
+  for (const row of (data || []) as { id: string; category_id: string | null; account_id: string | null; fiscal_flags: any; ai_confidence: number | null; needs_review: boolean | null; line_action: string | null; grouped_with_line_id: string | null; skip_reason: string | null; classification_reasoning: string | null; classification_thinking: string | null; fiscal_reasoning: string | null; fiscal_thinking: string | null; fiscal_confidence: number | null; reasoning_summary_final: string | null; decision_status: 'pending' | 'finalized' | 'needs_review' | 'unassigned' | null; final_confidence: number | null; final_decision_source: 'commercialista' | 'revisore' | 'consulente' | 'user' | 'exact_match' | 'none' | null; line_note: string | null; line_note_source: string | null; line_note_updated_at: string | null }[]) {
     if (row.category_id || row.account_id) {
       classifs[row.id] = {
         invoice_line_id: row.id,
@@ -631,6 +635,10 @@ export async function loadLineClassifications(invoiceId: string): Promise<{
       fiscal_reasoning: row.fiscal_reasoning,
       fiscal_thinking: row.fiscal_thinking,
       fiscal_confidence: row.fiscal_confidence,
+      reasoning_summary_final: row.reasoning_summary_final || row.fiscal_reasoning || row.classification_reasoning,
+      decision_status: row.decision_status,
+      final_confidence: row.final_confidence,
+      final_decision_source: row.final_decision_source,
       line_note: row.line_note,
       line_note_source: row.line_note_source,
       line_note_updated_at: row.line_note_updated_at,
@@ -661,6 +669,9 @@ export async function clearAllLineClassifications(invoiceId: string): Promise<vo
     .update({
       category_id: null, account_id: null, fiscal_flags: null,
       ai_confidence: null, needs_review: false,
+      classification_reasoning: null, classification_thinking: null,
+      fiscal_reasoning: null, fiscal_thinking: null, fiscal_confidence: null,
+      decision_status: null, reasoning_summary_final: null, final_confidence: null, final_decision_source: null,
       line_action: 'classify', grouped_with_line_id: null, skip_reason: null,
     } as any)
     .eq('invoice_id', invoiceId);

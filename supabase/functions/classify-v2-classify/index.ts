@@ -45,6 +45,17 @@ interface InputLine {
   matched_groups: string[];
 }
 
+interface ExactMatchEvidence {
+  line_id: string;
+  source: "rule" | "history";
+  confidence: number;
+  reasoning: string;
+  category_id: string | null;
+  account_id: string | null;
+  article_id?: string | null;
+  phase_id?: string | null;
+}
+
 interface Understanding {
   line_id: string;
   operation_type: string;
@@ -63,6 +74,18 @@ interface FiscalFlags {
   note: string | null;
 }
 
+interface WeakField<T = string | null> {
+  value: T | null;
+  state: "assigned" | "unassigned" | "needs_review";
+}
+
+interface SupportingEvidence {
+  source: string;
+  label: string;
+  detail?: string | null;
+  ref?: string | null;
+}
+
 interface ClassifyResult {
   line_id: string;
   article_code: string | null;
@@ -74,6 +97,18 @@ interface ClassifyResult {
   confidence: number;
   reasoning: string;
   fiscal_flags: FiscalFlags;
+  rationale_summary?: string | null;
+  decision_basis?: string[];
+  supporting_factors?: string[];
+  supporting_evidence?: SupportingEvidence[];
+  weak_fields?: {
+    category?: WeakField;
+    account?: WeakField;
+    article?: WeakField;
+    phase?: WeakField;
+    cost_center?: WeakField;
+  };
+  exact_match_evidence_used?: boolean;
   suggest_new_account?: {
     code: string; name: string; section: string; parent_code: string; reason: string;
   } | null;
@@ -82,14 +117,23 @@ interface ClassifyResult {
   } | null;
 }
 
+interface CommercialistaResponse {
+  invoice_summary?: string | null;
+  evidence_refs?: string[];
+  needs_consultant_hint?: boolean;
+  line_proposals: ClassifyResult[];
+}
+
 /* ─── Admin Panel types ─────────────────── */
 
 interface AgentConfig {
   agent_type: string;
   system_prompt: string;
   model: string;
+  model_escalation?: string | null;
   temperature: number;
   thinking_level: string;
+  thinking_budget?: number | null;
   max_output_tokens: number;
 }
 
@@ -106,6 +150,9 @@ interface KBRule {
   audience: string;
   title: string;
   content: string;
+  summary_structured?: Record<string, unknown> | null;
+  applicability?: Record<string, unknown> | null;
+  source_chunk_ids?: string[] | null;
   normativa_ref: string[];
   fiscal_values: Record<string, unknown>;
   trigger_keywords: string[];
@@ -164,7 +211,13 @@ function formatKBRules(kbRules: KBRule[]): string {
   const lines: string[] = ["=== NORMATIVA E KNOWLEDGE BASE ==="];
   for (const r of kbRules) {
     const ref = r.normativa_ref?.length ? ` (Rif: ${r.normativa_ref.join(", ")})` : "";
-    lines.push(`[${domainLabels[r.domain] || r.domain}] ${r.title}: ${r.content}${ref}`);
+    const summary = r.summary_structured && Object.keys(r.summary_structured).length > 0
+      ? JSON.stringify(r.summary_structured)
+      : r.content;
+    const applicability = r.applicability && Object.keys(r.applicability).length > 0
+      ? ` | Applicabilita: ${JSON.stringify(r.applicability)}`
+      : "";
+    lines.push(`[${domainLabels[r.domain] || r.domain}] ${r.title}: ${summary}${ref}${applicability}`);
   }
   return lines.join("\n");
 }
@@ -257,6 +310,7 @@ Deno.serve(async (req) => {
     invoice_id?: string;
     lines?: InputLine[];
     understandings?: Understanding[];
+    deterministic_matches?: ExactMatchEvidence[];
     direction?: string;
     counterparty_name?: string;
     counterparty_vat_key?: string;
@@ -267,6 +321,7 @@ Deno.serve(async (req) => {
   const invoiceId = body.invoice_id;
   const lines = body.lines || [];
   const understandings = body.understandings || [];
+  const deterministicMatches = body.deterministic_matches || [];
   const direction = body.direction || "in";
   const counterpartyName = body.counterparty_name || "N.D.";
   const counterpartyVatKey = body.counterparty_vat_key || null;
@@ -282,6 +337,7 @@ Deno.serve(async (req) => {
   try {
     // Build understanding map
     const underMap = new Map(understandings.map((u) => [u.line_id, u]));
+    const exactMatchMap = new Map(deterministicMatches.map((match) => [match.line_id, match]));
 
     const allowedCatTypes = CAT_TYPES_FOR_DIRECTION[direction] || CAT_TYPES_FOR_DIRECTION["in"];
     const lineDescriptions = lines.map((l) => l.description || "");
@@ -296,7 +352,7 @@ Deno.serve(async (req) => {
       sql`SELECT primary_contract_ref, contract_refs FROM invoices WHERE id = ${invoiceId} LIMIT 1`,
       // Agent config for commercialista
       sql<AgentConfig[]>`
-        SELECT agent_type, system_prompt, model, temperature, thinking_level, max_output_tokens
+        SELECT agent_type, system_prompt, model, model_escalation, temperature, thinking_level, thinking_budget, max_output_tokens
         FROM agent_config WHERE active = true AND agent_type = 'commercialista'
         LIMIT 1`,
       // Agent rules for commercialista
@@ -320,7 +376,7 @@ Deno.serve(async (req) => {
 
     // Load knowledge_base (needs atecoPrefix)
     const allKBRules = await sql<KBRule[]>`
-      SELECT id, domain, audience, title, content, normativa_ref,
+      SELECT id, domain, audience, title, content, summary_structured, applicability, source_chunk_ids, normativa_ref,
              fiscal_values, trigger_keywords, trigger_ateco_prefixes,
              trigger_vat_natures, trigger_doc_types, ateco_scope, priority
       FROM knowledge_base
@@ -519,8 +575,12 @@ Deno.serve(async (req) => {
     // Lines with understanding context
     const lineEntries = lines.map((l, i) => {
       const u = underMap.get(l.line_id);
+      const exactMatch = exactMatchMap.get(l.line_id);
       const uCtx = u ? ` → COMPRENSIONE: "${u.operation_type}" sections=${u.account_sections.join(",")}${u.is_NOT.length ? ` NOT=[${u.is_NOT.join("; ")}]` : ""}` : "";
-      return `${i + 1}. [${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} tot=${l.total_price ?? "N/D"}${uCtx}`;
+      const exactCtx = exactMatch
+        ? ` → EXACT_MATCH_EVIDENCE: source=${exactMatch.source} conf=${exactMatch.confidence} note="${exactMatch.reasoning}"`
+        : "";
+      return `${i + 1}. [${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} tot=${l.total_price ?? "N/D"}${uCtx}${exactCtx}`;
     }).join("\n");
 
     // ─── Build prompt with Admin Panel data ──────────────────
@@ -577,12 +637,12 @@ Deno.serve(async (req) => {
     if (memoryBlock) promptParts.push(memoryBlock);
     promptParts.push("");
 
-    // 6. Comprehension context (sections = guidance, NOT hard filter)
-    promptParts.push(`IMPORTANTE — COMPRENSIONE (Stage A):
-Ogni riga ha una "COMPRENSIONE" allegata che ti dice cos'è l'operazione e in quali sezioni PROBABILMENTE cercare il conto.
-Le sezioni suggerite sono una GUIDA, non un vincolo assoluto: se trovi un conto più appropriato in un'altra sezione, USALO.
-Se la comprensione dice NOT=["vendita di pozzolana"], allora NON classificare come vendita.
-Priorità: memoria aziendale e storico > comprensione Stage A > ragionamento autonomo.`);
+    // 6. Evidence policy
+    promptParts.push(`IMPORTANTE — POLITICA DELLE EVIDENZE:
+Le evidenze di exact match, la memoria aziendale e la KB sono supporti al giudizio, non verdetti automatici.
+Se un exact match e il contesto attuale coincidono davvero, puoi seguirlo.
+Se le evidenze sono parziali, rumorose o non equivalenti, abbassa la confidence e lascia i campi deboli come needs_review o unassigned.
+Le comprensioni eventualmente presenti sono una guida, non un vincolo assoluto.`);
     promptParts.push("");
 
     // 7. Charts of accounts, categories, articles
@@ -605,9 +665,42 @@ Priorità: memoria aziendale e storico > comprensione Stage A > ragionamento aut
 - confidence 0-100 (dubbio → bassa, mai confidence alta su scelte incerte)
 - fiscal_flags per OGNI riga: ritenuta_acconto (solo professionisti), reverse_charge, split_payment, bene_strumentale (solo beni FISICI > 516€), deducibilita_pct, iva_detraibilita_pct, note
 - Righe con tot=0: informative, confidence 30-50
+- Se l'evidenza non basta, puoi lasciare category_id/account_id null e marcare i campi deboli come needs_review o unassigned
 
-Rispondi con JSON array (no markdown):
-[{"line_id":"uuid","article_code":"CODE"|null,"phase_code":"code"|null,"category_id":"uuid","category_name":"nome","account_id":"uuid","account_code":"codice","confidence":0-100,"reasoning":"max 30 parole","fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"suggest_new_account":null,"suggest_new_category":null}]`);
+Rispondi con un JSON object (no markdown):
+{
+  "invoice_summary":"breve sintesi dell'impostazione della fattura",
+  "evidence_refs":["kb:Titolo","memory:Pattern aziendale"],
+  "needs_consultant_hint":false,
+  "line_proposals":[
+    {
+      "line_id":"uuid",
+      "article_code":"CODE"|null,
+      "phase_code":"code"|null,
+      "category_id":"uuid"|null,
+      "category_name":"nome"|null,
+      "account_id":"uuid"|null,
+      "account_code":"codice"|null,
+      "confidence":0-100,
+      "reasoning":"max 30 parole",
+      "rationale_summary":"sintesi professionale della scelta o del non deciso",
+      "decision_basis":["fattura intera","kb","memoria aziendale"],
+      "supporting_factors":["fattore 1","fattore 2"],
+      "supporting_evidence":[{"source":"kb","label":"Titolo KB","detail":"breve dettaglio"}],
+      "weak_fields":{
+        "category":{"value":"uuid"|null,"state":"assigned"|"unassigned"|"needs_review"},
+        "account":{"value":"uuid"|null,"state":"assigned"|"unassigned"|"needs_review"},
+        "article":{"value":"CODE"|null,"state":"assigned"|"unassigned"|"needs_review"},
+        "phase":{"value":"code"|null,"state":"assigned"|"unassigned"|"needs_review"},
+        "cost_center":{"value":null,"state":"unassigned"}
+      },
+      "exact_match_evidence_used":false,
+      "fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},
+      "suggest_new_account":null,
+      "suggest_new_category":null
+    }
+  ]
+}`);
 
     const prompt = promptParts.join("\n");
 
@@ -618,7 +711,7 @@ Rispondi con JSON array (no markdown):
     const thinkingBudget: Record<string, number> = {
       none: 0, low: 1024, medium: 8192, high: 24576,
     };
-    const budget = thinkingBudget[thinkingLevel] ?? 8192;
+    const budget = agentConfig?.thinking_budget ?? thinkingBudget[thinkingLevel] ?? 8192;
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
     const resp = await fetch(url, {
@@ -649,21 +742,32 @@ Rispondi con JSON array (no markdown):
       else if (part.text) responseText += part.text;
     }
 
-    let results: ClassifyResult[] = [];
-    const jsonStr = extractFirstJsonArray(responseText);
-    if (jsonStr) {
-      try {
-        results = JSON.parse(jsonStr);
-      } catch (e) {
-        console.error("[classify-v2] JSON parse error:", e);
+    let structuredResponse: CommercialistaResponse = { line_proposals: [] };
+    try {
+      const parsed = extractJson(responseText);
+      if (Array.isArray(parsed)) {
+        structuredResponse = { line_proposals: parsed as ClassifyResult[] };
+      } else if (parsed && typeof parsed === "object") {
+        structuredResponse = {
+          invoice_summary: typeof parsed.invoice_summary === "string" ? parsed.invoice_summary : null,
+          evidence_refs: Array.isArray(parsed.evidence_refs) ? parsed.evidence_refs as string[] : [],
+          needs_consultant_hint: Boolean(parsed.needs_consultant_hint),
+          line_proposals: Array.isArray(parsed.line_proposals) ? parsed.line_proposals as ClassifyResult[] : [],
+        };
       }
+    } catch (e) {
+      console.error("[classify-v2] JSON parse error:", e);
     }
+
+    let results: ClassifyResult[] = structuredResponse.line_proposals || [];
     if (results.length === 0) {
-      try {
-        const fallback = extractJson(responseText);
-        results = Array.isArray(fallback) ? fallback : [fallback];
-        console.warn(`[classify-v2] extractFirstJsonArray failed, extractJson fallback OK: ${results.length} items`);
-      } catch { /* both failed */ }
+      const jsonStr = extractFirstJsonArray(responseText);
+      if (jsonStr) {
+        try {
+          results = JSON.parse(jsonStr);
+          structuredResponse.line_proposals = results;
+        } catch { /* ignore */ }
+      }
     }
 
     // Validate UUIDs — ensure account_id and category_id exist in our loaded data
@@ -689,12 +793,29 @@ Rispondi con JSON array (no markdown):
           r.category_id = null;
         }
       }
+      if (!r.rationale_summary) r.rationale_summary = r.reasoning || null;
+      if (!Array.isArray(r.decision_basis)) r.decision_basis = [];
+      if (!Array.isArray(r.supporting_factors)) r.supporting_factors = [];
+      if (!Array.isArray(r.supporting_evidence)) r.supporting_evidence = [];
+      r.weak_fields = {
+        category: r.weak_fields?.category || { value: r.category_id || null, state: r.category_id ? "assigned" : "needs_review" },
+        account: r.weak_fields?.account || { value: r.account_id || null, state: r.account_id ? "assigned" : "needs_review" },
+        article: r.weak_fields?.article || { value: r.article_code || null, state: r.article_code ? "assigned" : "unassigned" },
+        phase: r.weak_fields?.phase || { value: r.phase_code || null, state: r.phase_code ? "assigned" : "unassigned" },
+        cost_center: r.weak_fields?.cost_center || { value: null, state: "unassigned" },
+      };
     }
 
     await sql.end();
 
     return json({
       classifications: results,
+      commercialista: {
+        invoice_summary: structuredResponse.invoice_summary || null,
+        evidence_refs: structuredResponse.evidence_refs || [],
+        needs_consultant_hint: structuredResponse.needs_consultant_hint || false,
+        line_proposals: results,
+      },
       thinking: thinkingText || null,
       prompt_length: prompt.length,
       accounts_shown: accounts.length,
@@ -722,6 +843,7 @@ Rispondi con JSON array (no markdown):
           account_sections: u.account_sections,
           is_NOT: u.is_NOT,
         })),
+        deterministic_matches_received: deterministicMatches.length,
         history_count: historySection ? historySection.split("\n").length : 0,
         memory_facts_count: memoryBlock ? memoryBlock.split("\n").length : 0,
         invoice_notes: invoiceNotes ? invoiceNotes.slice(0, 200) : null,

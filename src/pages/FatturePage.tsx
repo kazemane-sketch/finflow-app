@@ -53,6 +53,7 @@ import { runClassificationPipeline, type PipelineStepDebug } from '@/lib/classif
 import { createMemoryFromClassification, createMemoryFromFiscalChoice, deleteInvoiceMemoryFacts } from '@/lib/companyMemoryService';
 import { extractProvinceSiglaFromAddress, loadCounterpartyHeaderInfo } from '@/lib/counterpartyService';
 import { deleteFiscalDecisionsForInvoice, saveFiscalDecision } from '@/lib/fiscalDecisionService';
+import { applyConsultantResolution, clearInvoiceDecisionTrail, type SupportingEvidence } from '@/lib/invoiceDecisionService';
 import ExportDialog from '@/components/ExportDialog';
 import SearchableSelect from '@/components/SearchableSelect';
 import { ConfidenceBadge, FiscalFlagsBadges, AIAssistantBanner } from '@/components/invoice';
@@ -208,6 +209,19 @@ function Row({ l, v, accent, bold }: { l: string; v?: string | null; accent?: bo
     <span className="text-gray-500 text-xs min-w-[120px]">{l}</span>
     <span className={`text-xs text-right max-w-[64%] break-words ${accent ? 'text-sky-700 font-bold' : bold ? 'font-bold' : ''}`}>{v}</span>
   </div>);
+}
+
+function getFinalReasoningSummary(detail?: LineDetailData | null): string | null {
+  if (!detail) return null;
+  return detail.reasoning_summary_final || detail.fiscal_reasoning || detail.classification_reasoning || null;
+}
+
+function getPendingDecisionReason(detail?: LineDetailData | null): string | null {
+  if (!detail?.decision_status) return null;
+  if (detail.decision_status === 'needs_review') return 'Non deciso: serve revisione manuale';
+  if (detail.decision_status === 'unassigned') return 'Non deciso: evidenza insufficiente';
+  if (detail.decision_status === 'pending') return 'Decisione in consolidamento';
+  return null;
 }
 
 // ============================================================
@@ -1146,6 +1160,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   const [chatAlertContext, setChatAlertContext] = useState('');
   const [chatLineIds, setChatLineIds] = useState<string[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
+  const [proposedConsultantAction, setProposedConsultantAction] = useState<ConsultantAction | null>(null);
   // Inline note editing in flat table
   const [editingNoteLineId, setEditingNoteLineId] = useState<string | null>(null);
   const [editingNoteText, setEditingNoteText] = useState('');
@@ -1167,7 +1182,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     setChatAlertContext(`${alert.title}: ${alert.description}`);
     setChatLineIds(alert.affected_lines || []);
     setChatMessages([]);
-    setAiBannerStatus('chat');
+    setProposedConsultantAction(null);
+    setAiBannerStatus('consulting');
   }, []);
 
   const handleSendChatMessage = useCallback(async (text: string) => {
@@ -1182,14 +1198,22 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
           alert_context: chatAlertContext,
           messages: newMessages,
           company_id: company?.id,
+          consulting_mode: 'deep',
         },
       });
       if (error) throw error;
-      setChatMessages([...newMessages, {
+      const assistantMessage: ChatMessage = {
         role: 'assistant',
         content: data.message,
         action: data.action || undefined,
-      }]);
+      };
+      setChatMessages([...newMessages, assistantMessage]);
+      if (data.action?.type === 'apply_consultant_resolution' || data.action?.type === 'apply_fiscal_override') {
+        setProposedConsultantAction(data.action as ConsultantAction);
+        setAiBannerStatus('proposed');
+      } else {
+        setAiBannerStatus('consulting');
+      }
     } catch (e: any) {
       toast.error('Errore consulente AI: ' + (e.message || 'sconosciuto'));
       setChatMessages([...newMessages, { role: 'assistant', content: 'Mi dispiace, si è verificato un errore. Riprova.' }]);
@@ -1198,25 +1222,135 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     }
   }, [chatMessages, chatLineIds, chatAlertContext, invoice.id, company?.id]);
 
-  const handleApplyConsultantAction = useCallback((action: ConsultantAction) => {
+  const handleApplyConsultantAction = useCallback(async (action: ConsultantAction) => {
     if (action.type === 'apply_fiscal_override' && action.affected_line_ids?.length) {
+      const affectedLineIds = action.affected_line_ids || [];
       setLineFiscalFlags(prev => {
         const updated = { ...prev };
-        for (const lid of action.affected_line_ids) {
+        for (const lid of affectedLineIds) {
           updated[lid] = { ...(updated[lid] || {}), ...action.fiscal_override };
         }
         return updated;
       });
       // Save note on affected lines
-      for (const lid of action.affected_line_ids) {
+      for (const lid of affectedLineIds) {
         if (action.note) {
           handleSaveLineNote(lid, action.note);
         }
       }
       setClassifDirty(true);
+      setProposedConsultantAction(action);
+      setAiBannerStatus('applied');
       toast.success('Decisione fiscale applicata');
+      return;
     }
-  }, [handleSaveLineNote]);
+    if (action.type === 'apply_consultant_resolution' && company?.id && action.line_updates?.length) {
+      try {
+        await applyConsultantResolution(company.id, invoice.id, {
+          invoice_line_ids: action.line_updates.map(update => update.line_id),
+          message_excerpt: chatMessages[chatMessages.length - 1]?.content || null,
+          recommended_conclusion: action.recommended_conclusion || null,
+          rationale_summary: action.rationale_summary || action.reasoning || action.note || null,
+          risk_level: action.risk_level || 'medium',
+          supporting_evidence: (action.supporting_evidence || []).map((evidence): SupportingEvidence => ({
+            source: ['kb', 'memory', 'deterministic', 'reviewer', 'consultant', 'company_stats', 'invoice', 'history', 'user'].includes(evidence.source)
+              ? evidence.source as SupportingEvidence['source']
+              : 'consultant',
+            label: evidence.label,
+            detail: evidence.detail ?? null,
+            ref: evidence.ref ?? null,
+          })),
+          expected_impact: action.expected_impact || null,
+          decision_basis: ['consultant_resolution'],
+          supporting_factors: action.reasoning ? [action.reasoning] : [],
+          decision_patch: {
+            line_updates: action.line_updates,
+          },
+          source_payload: action as unknown as Record<string, unknown>,
+          line_updates: action.line_updates,
+        });
+
+        setLineClassifs(prev => {
+          const updated = { ...prev };
+          for (const lineUpdate of action.line_updates || []) {
+            updated[lineUpdate.line_id] = {
+              invoice_line_id: lineUpdate.line_id,
+              category_id: lineUpdate.category_id ?? prev[lineUpdate.line_id]?.category_id ?? null,
+              account_id: lineUpdate.account_id ?? prev[lineUpdate.line_id]?.account_id ?? null,
+            };
+          }
+          return updated;
+        });
+        setLineFiscalFlags(prev => {
+          const updated = { ...prev };
+          for (const lineUpdate of action.line_updates || []) {
+            if (lineUpdate.fiscal_flags !== undefined) updated[lineUpdate.line_id] = lineUpdate.fiscal_flags || {};
+          }
+          return updated;
+        });
+        setLineConfidences(prev => {
+          const updated = { ...prev };
+          for (const lineUpdate of action.line_updates || []) {
+            if (lineUpdate.final_confidence != null) updated[lineUpdate.line_id] = lineUpdate.final_confidence;
+          }
+          return updated;
+        });
+        setLineReviewFlags(prev => {
+          const updated = { ...prev };
+          for (const lineUpdate of action.line_updates || []) {
+            updated[lineUpdate.line_id] = (lineUpdate.decision_status || 'finalized') !== 'finalized';
+          }
+          return updated;
+        });
+        setLineDetails(prev => {
+          const updated = { ...prev };
+          for (const lineUpdate of action.line_updates || []) {
+            updated[lineUpdate.line_id] = {
+              ...(updated[lineUpdate.line_id] || {
+                classification_reasoning: null,
+                classification_thinking: null,
+                fiscal_reasoning: null,
+                fiscal_thinking: null,
+                fiscal_confidence: null,
+                reasoning_summary_final: null,
+                decision_status: null,
+                final_confidence: null,
+                final_decision_source: null,
+                line_note: null,
+                line_note_source: null,
+                line_note_updated_at: null,
+              }),
+              reasoning_summary_final: lineUpdate.reasoning_summary_final || action.rationale_summary || updated[lineUpdate.line_id]?.reasoning_summary_final || null,
+              decision_status: lineUpdate.decision_status || 'finalized',
+              final_confidence: lineUpdate.final_confidence ?? updated[lineUpdate.line_id]?.final_confidence ?? null,
+              final_decision_source: 'consulente',
+              line_note: lineUpdate.note ?? updated[lineUpdate.line_id]?.line_note ?? null,
+              line_note_source: lineUpdate.note ? 'ai_consultant' : updated[lineUpdate.line_id]?.line_note_source ?? null,
+              line_note_updated_at: lineUpdate.note ? new Date().toISOString() : updated[lineUpdate.line_id]?.line_note_updated_at ?? null,
+            };
+          }
+          return updated;
+        });
+
+        setClassifDirty(true);
+        setProposedConsultantAction(action);
+        setAiBannerStatus('applied');
+        onInvalidateBundle(invoice.id);
+        toast.success('Risoluzione del consulente applicata');
+      } catch (e: any) {
+        toast.error(`Errore applicazione consulente: ${e.message || 'sconosciuto'}`);
+      }
+    }
+  }, [chatMessages, company?.id, handleSaveLineNote, invoice.id, onInvalidateBundle]);
+
+  const handleKeepCurrentDecision = useCallback(() => {
+    setAiBannerStatus('done');
+    toast.success('Decisione corrente mantenuta');
+  }, []);
+
+  const handleAskConsultantFollowUp = useCallback(() => {
+    setAiBannerStatus('consulting');
+  }, []);
 
   // Required note dialog for non-conservative fiscal choices
   const [requiredNoteDialog, setRequiredNoteDialog] = useState<{
@@ -1828,6 +1962,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     setAiClassifResult(null);
     setPipelineDebug(null);
     setShowRulesDialog(false);
+    setAiBannerStatus('idle');
+    setProposedConsultantAction(null);
 
     startSingleInvoiceJob(async (signal, updateProgress, appendLog) => {
       appendLog?.(`Avvio classificazione su ${lines.length} righe${skipRules ? ' (forzando AI)' : ''}`);
@@ -1884,15 +2020,35 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         match_type: lr.source as any,
         confidence: lr.confidence,
         reasoning: lr.reasoning,
+        reasoning_summary_final: lr.reasoning_summary_final,
+        decision_status: lr.decision_status,
+        final_decision_source: lr.final_decision_source,
+        final_confidence: lr.confidence,
+        decision_basis: lr.decision_basis,
+        supporting_factors: lr.supporting_factors,
+        supporting_evidence: lr.supporting_evidence,
         fiscal_flags: lr.fiscal_flags,
         suggest_new_account: lr.suggest_new_account,
         suggest_new_category: lr.suggest_new_category,
+        classification_reasoning: lr.classification_reasoning || null,
+        classification_thinking: lr.classification_thinking || null,
+        fiscal_reasoning: lr.fiscal_reasoning || null,
+        fiscal_thinking: lr.fiscal_thinking || null,
+        fiscal_confidence: lr.fiscal_confidence ?? null,
       }));
 
-      const classified = pipelineResult.lines.filter(l => l.confidence >= 60 && (l.category_id || l.account_id));
+      const classified = pipelineResult.lines.filter(l =>
+        l.decision_status === 'finalized' && l.confidence >= 60 && (l.category_id || l.account_id),
+      );
       const best = classified.length > 0
         ? classified.reduce((a, b) => b.confidence > a.confidence ? b : a)
         : null;
+      const invoiceReasoning = pipelineResult.reviewer?.invoice_summary_final
+        || pipelineResult.commercialista?.invoice_summary
+        || `Pipeline vNext: ${pipelineResult.stats.deterministic} evidenze deterministiche, ${pipelineResult.stats.ai_classified} proposte AI`;
+      const invoiceConfidence = classified.length > 0
+        ? Math.round(classified.reduce((sum, line) => sum + line.confidence, 0) / classified.length)
+        : 0;
 
       const result = {
         invoice_id: runInvoiceId,
@@ -1901,12 +2057,15 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
           category_id: best.category_id,
           account_id: best.account_id,
           project_allocations: best.cost_center_allocations || [],
-          confidence: best.confidence,
-          reasoning: `Pipeline v2: ${pipelineResult.stats.deterministic} deterministiche, ${pipelineResult.stats.ai_classified} AI`,
+          confidence: invoiceConfidence,
+          reasoning: invoiceReasoning,
         } : {
           category_id: null, account_id: null, project_allocations: [],
-          confidence: 0, reasoning: 'Nessuna classificazione riuscita',
+          confidence: 0, reasoning: invoiceReasoning || 'Nessuna classificazione riuscita',
         },
+        stats: pipelineResult.stats,
+        commercialista: pipelineResult.commercialista,
+        reviewer: pipelineResult.reviewer,
       };
 
       setAiClassifResult(result);
@@ -1929,7 +2088,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         const lid = lr.line_id || lr.invoice_line_id;
         if (lid) {
           if (lr.confidence != null) confs[lid] = lr.confidence;
-          reviews[lid] = lr.confidence < 65
+          reviews[lid] = lr.decision_status !== 'finalized'
+            || lr.confidence < 65
             || !!(lr.fiscal_flags?.note && /verificar|controllare|dubbio/i.test(String(lr.fiscal_flags?.note || '')))
             || lr.suggest_new_account != null;
         }
@@ -1985,6 +2145,10 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
             fiscal_reasoning: (lr as any).fiscal_reasoning || null,
             fiscal_thinking: (lr as any).fiscal_thinking || null,
             fiscal_confidence: (lr as any).fiscal_confidence ?? null,
+            reasoning_summary_final: (lr as any).reasoning_summary_final || null,
+            decision_status: (lr as any).decision_status || null,
+            final_confidence: (lr as any).final_confidence ?? lr.confidence ?? null,
+            final_decision_source: (lr as any).final_decision_source || null,
             line_note: null,
             line_note_source: null,
             line_note_updated_at: null,
@@ -2261,6 +2425,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         await clearInvoiceNotes(invoice.id);
         await saveInvoiceProjects(companyId, invoice.id, []);
         await clearAllLineProjects(invoice.id);
+        await clearAllLineClassifications(invoice.id);
+        await clearInvoiceDecisionTrail(invoice.id);
         await deleteInvoiceClassification(invoice.id);
         await supabase.from('invoices').update({ classification_status: 'none' } as any).eq('id', invoice.id);
         onPatchInvoice(invoice.id, { classification_status: 'none', has_fiscal_alerts: false } as Partial<DBInvoice>);
@@ -2542,7 +2708,9 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     setDismissedSuggestions(new Set());
     setDismissedArticleLineIds(new Set());
     setAiClassifResult(null);
+    setProposedConsultantAction(null);
     setAiClassifStatus('idle');
+    setAiBannerStatus('idle');
     setPipelineDebug(null);
     setShowZeroLines(false);
     setClearPending(true);
@@ -2560,6 +2728,11 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       await clearAllLineProjects(invoice.id);
     } catch (e) {
       console.warn('[clear] Error clearing line projects from DB:', e);
+    }
+    try {
+      await clearInvoiceDecisionTrail(invoice.id);
+    } catch (e) {
+      console.warn('[clear] Error clearing invoice decision trail:', e);
     }
     try {
       await clearInvoiceNotes(invoice.id);
@@ -2592,7 +2765,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       console.warn('[clear] Error deactivating invoice memory facts:', e);
     }
     onInvalidateBundle(invoice.id);
-  }, [invoice?.id, onInvalidateBundle]);
+  }, [company?.id, invoice?.id, onInvalidateBundle, onPatchInvoice]);
 
   // ─── Fiscal Review: handle user choice on an alert ─────
   const applyFiscalChoice = useCallback((alertIdx: number, option: FiscalAlertOption) => {
@@ -3194,10 +3367,12 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         {/* ═══ TAB: CLASSIFICAZIONE ═══ */}
         {activeTab === 'classificazione' && (
           <div className="p-4 space-y-4">
-            {/* AI Assistant Banner — unified 5-state component */}
+            {/* AI Assistant Banner */}
             <AIAssistantBanner
               status={
-                aiBannerStatus === 'chat' ? 'chat' :
+                aiBannerStatus === 'consulting' ? 'consulting' :
+                aiBannerStatus === 'proposed' ? 'proposed' :
+                aiBannerStatus === 'applied' ? 'applied' :
                 (aiClassifStatus === 'loading' || singleInvoiceJobRunning) ? 'processing' :
                 invoiceNotes.length > 0 ? 'alerts' :
                 (aiClassifResult || hasPersistedClassificationData || invoice.classification_status === 'confirmed') ? 'done' :
@@ -3223,9 +3398,12 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
               chatMessages={chatMessages}
               onSendMessage={handleSendChatMessage}
               onApplyAction={handleApplyConsultantAction}
+              onKeepCurrentDecision={handleKeepCurrentDecision}
+              onAskFollowUp={handleAskConsultantFollowUp}
               chatLoading={chatLoading}
               chatAlertTitle={chatAlertContext}
-              summary={aiClassifResult ? `Classificate ${aiClassifResult.lines?.length || 0} righe` : invoice.classification_status === 'confirmed' ? 'Classificazione confermata' : undefined}
+              proposedAction={proposedConsultantAction}
+              summary={aiClassifResult ? (aiClassifResult.invoice_level?.reasoning || `Classificate ${aiClassifResult.lines?.length || 0} righe`) : invoice.classification_status === 'confirmed' ? 'Classificazione confermata' : undefined}
               onRestart={handleRequestAiClassification}
             />
 
@@ -3247,9 +3425,14 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                   <span className="text-[10px] text-purple-500">
                     {aiClassifResult.invoice_level?.confidence ?? 0}%
                   </span>
-                  {aiClassifResult.stats?.sonnet_escalated > 0 && (
+                  {aiClassifResult.stats?.deterministic > 0 && (
+                    <span className="text-[9px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full font-medium">
+                      {aiClassifResult.stats.deterministic} exact
+                    </span>
+                  )}
+                  {aiClassifResult.stats?.fiscal_issues > 0 && (
                     <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">
-                      {aiClassifResult.stats.sonnet_escalated} Sonnet
+                      {aiClassifResult.stats.fiscal_issues} alert
                     </span>
                   )}
                 </div>
@@ -3353,8 +3536,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                     )}
                     {(allCategories.length > 0 || allAccounts.length > 0) && <th className="text-center px-0.5 py-2 font-normal w-10"></th>}
                     <th className="text-center px-2 py-2 font-semibold w-14">Conf.</th>
-                    <th className="text-left px-2 py-2 font-semibold min-w-[140px]">R. Commercialista</th>
-                    <th className="text-left px-2 py-2 font-semibold min-w-[140px]">R. Revisore</th>
+                    <th className="text-left px-2 py-2 font-semibold min-w-[180px]">Motivazione finale</th>
                     <th className="text-left px-2 py-2 font-semibold min-w-[100px]">Note</th>
                   </tr></thead>
                   <tbody className="divide-y divide-slate-100">
@@ -3413,7 +3595,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       const lineCat = lineId ? lineClassifs[lineId]?.category_id : null;
                       const lineAcc = lineId ? lineClassifs[lineId]?.account_id : null;
                       const ff = lineId ? lineFiscalFlags[lineId] : null;
-                      const colCount = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0) + 4;
+                      const colCount = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0) + 3;
 
                       // ─── Skip/Group informational lines: special rendering ───
                       if (isInformational) {
@@ -3456,8 +3638,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                               {allProjects.length > 0 && <td></td>}
                               {allAccounts.length > 0 && <td></td>}
                               {(allCategories.length > 0 || allAccounts.length > 0) && <td></td>}
-                              {/* Empty cells for Conf/Reasoning/Note columns */}
-                              <td></td><td></td><td></td><td></td>
+                              {/* Empty cells for Conf/Motivazione/Note columns */}
+                              <td></td><td></td><td></td>
                             </tr>
                           </React.Fragment>
                         );
@@ -3596,17 +3778,19 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                         <td className="text-center px-2 py-2.5">
                           {lineId && <ConfidenceBadge value={lineConfidences[lineId]} />}
                         </td>
-                        {/* R. Commercialista column */}
-                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 min-w-[140px]">
-                          {lineId && lineDetails[lineId]?.classification_reasoning && (
-                            <span className="line-clamp-3 leading-relaxed">{lineDetails[lineId].classification_reasoning}</span>
-                          )}
-                        </td>
-                        {/* R. Revisore column */}
-                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 min-w-[140px]">
-                          {lineId && lineDetails[lineId]?.fiscal_reasoning && (
-                            <span className="line-clamp-3 leading-relaxed">{lineDetails[lineId].fiscal_reasoning}</span>
-                          )}
+                        {/* Motivazione finale column */}
+                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 min-w-[180px]">
+                          {lineId && (() => {
+                            const finalReasoning = getFinalReasoningSummary(lineDetails[lineId]);
+                            const pendingReason = getPendingDecisionReason(lineDetails[lineId]);
+                            if (finalReasoning) {
+                              return <span className="line-clamp-3 leading-relaxed">{finalReasoning}</span>;
+                            }
+                            if (pendingReason) {
+                              return <span className="line-clamp-3 leading-relaxed italic text-amber-700">{pendingReason}</span>;
+                            }
+                            return null;
+                          })()}
                         </td>
                         {/* Note column — clickable inline edit */}
                         <td className="text-left px-3 py-2.5 text-[11px] min-w-[100px]">
@@ -3727,7 +3911,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                       const lineCat = lineClassifs[l.id]?.category_id;
                       const lineAcc = lineClassifs[l.id]?.account_id;
                       const ff2 = lineFiscalFlags[l.id];
-                      const colCount2 = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0) + 4;
+                      const colCount2 = 5 + (allCategories.length > 0 ? 1 : 0) + (allProjects.length > 0 ? 1 : 0) + (allAccounts.length > 0 ? 1 : 0) + ((allCategories.length > 0 || allAccounts.length > 0) ? 1 : 0) + 3;
 
                       // ─── Skip/Group informational lines: special rendering ───
                       if (isInformational) {
@@ -3766,8 +3950,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                               {allProjects.length > 0 && <td></td>}
                               {allAccounts.length > 0 && <td></td>}
                               {(allCategories.length > 0 || allAccounts.length > 0) && <td></td>}
-                              {/* Empty cells for Conf/Reasoning/Note columns */}
-                              <td></td><td></td><td></td><td></td>
+                              {/* Empty cells for Conf/Motivazione/Note columns */}
+                              <td></td><td></td><td></td>
                             </tr>
                           </React.Fragment>
                         );
@@ -3883,17 +4067,19 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                         <td className="text-center px-2 py-2.5">
                           <ConfidenceBadge value={lineConfidences[l.id]} />
                         </td>
-                        {/* R. Commercialista column */}
-                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 min-w-[140px]">
-                          {lineDetails[l.id]?.classification_reasoning && (
-                            <span className="line-clamp-3 leading-relaxed">{lineDetails[l.id].classification_reasoning}</span>
-                          )}
-                        </td>
-                        {/* R. Revisore column */}
-                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 min-w-[140px]">
-                          {lineDetails[l.id]?.fiscal_reasoning && (
-                            <span className="line-clamp-3 leading-relaxed">{lineDetails[l.id].fiscal_reasoning}</span>
-                          )}
+                        {/* Motivazione finale column */}
+                        <td className="text-left px-3 py-2.5 text-[11px] text-slate-500 min-w-[180px]">
+                          {(() => {
+                            const finalReasoning = getFinalReasoningSummary(lineDetails[l.id]);
+                            const pendingReason = getPendingDecisionReason(lineDetails[l.id]);
+                            if (finalReasoning) {
+                              return <span className="line-clamp-3 leading-relaxed">{finalReasoning}</span>;
+                            }
+                            if (pendingReason) {
+                              return <span className="line-clamp-3 leading-relaxed italic text-amber-700">{pendingReason}</span>;
+                            }
+                            return null;
+                          })()}
                         </td>
                         {/* Note column — clickable inline edit */}
                         <td className="text-left px-3 py-2.5 text-[11px] min-w-[100px]">

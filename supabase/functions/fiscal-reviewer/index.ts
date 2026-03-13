@@ -56,6 +56,7 @@ interface ClassifiedLine {
   line_id: string;
   description: string;
   total_price: number | null;
+  category_id?: string | null;
   category_name: string | null;
   account_id?: string | null;
   account_code: string | null;
@@ -92,6 +93,33 @@ interface ReviewResult {
   confidence_adjustment: number;
 }
 
+interface SupportingEvidence {
+  source: string;
+  label: string;
+  detail?: string | null;
+  ref?: string | null;
+}
+
+interface ReviewerLineVerdict {
+  line_id: string;
+  decision_status: "finalized" | "needs_review" | "unassigned" | "pending";
+  rationale_summary: string;
+  decision_basis: string[];
+  supporting_factors: string[];
+  supporting_evidence: SupportingEvidence[];
+  clear_fields?: string[];
+  consultant_recommended?: boolean;
+}
+
+interface ReviewerResponse {
+  invoice_summary_final?: string | null;
+  line_verdicts?: ReviewerLineVerdict[];
+  escalation_candidates?: string[];
+  red_flags?: string[];
+  reviews?: ReviewResult[];
+  alerts?: FiscalAlert[];
+}
+
 /* ─── Admin Panel types ─────────────────── */
 
 interface AgentConfig {
@@ -100,6 +128,7 @@ interface AgentConfig {
   model: string;
   temperature: number;
   thinking_level: string;
+  thinking_budget?: number | null;
   max_output_tokens: number;
 }
 
@@ -116,6 +145,8 @@ interface KBRule {
   audience: string;
   title: string;
   content: string;
+  summary_structured?: Record<string, unknown> | null;
+  applicability?: Record<string, unknown> | null;
   normativa_ref: string[];
   fiscal_values: Record<string, unknown>;
   trigger_keywords: string[];
@@ -174,7 +205,13 @@ function formatKBRules(kbRules: KBRule[]): string {
   const lines: string[] = ["=== NORMATIVA E KNOWLEDGE BASE ==="];
   for (const r of kbRules) {
     const ref = r.normativa_ref?.length ? ` (Rif: ${r.normativa_ref.join(", ")})` : "";
-    let entry = `[${domainLabels[r.domain] || r.domain}] ${r.title}: ${r.content}${ref}`;
+    const summary = r.summary_structured && Object.keys(r.summary_structured).length > 0
+      ? JSON.stringify(r.summary_structured)
+      : r.content;
+    const applicability = r.applicability && Object.keys(r.applicability).length > 0
+      ? ` | Applicabilita: ${JSON.stringify(r.applicability)}`
+      : "";
+    let entry = `[${domainLabels[r.domain] || r.domain}] ${r.title}: ${summary}${ref}${applicability}`;
     // Include fiscal_values if available (important for the reviewer)
     if (r.fiscal_values && Object.keys(r.fiscal_values).length > 0) {
       entry += ` | Valori: ${JSON.stringify(r.fiscal_values)}`;
@@ -281,10 +318,6 @@ function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
   return union > 0 ? intersection / union : 0;
 }
 
-function requiresExactContractRef(description: string): boolean {
-  return /\b(leasing|locazione finanziaria)\b/i.test(description);
-}
-
 /* ─── Main ───────────────────────────────── */
 
 Deno.serve(async (req) => {
@@ -341,7 +374,7 @@ Deno.serve(async (req) => {
       sql`SELECT name, ateco_code FROM companies WHERE id = ${companyId} LIMIT 1`,
       // Agent config for revisore
       sql<AgentConfig[]>`
-        SELECT agent_type, system_prompt, model, temperature, thinking_level, max_output_tokens
+        SELECT agent_type, system_prompt, model, temperature, thinking_level, thinking_budget, max_output_tokens
         FROM agent_config WHERE active = true AND agent_type = 'revisore'
         LIMIT 1`,
       // Agent rules for revisore
@@ -378,7 +411,7 @@ Deno.serve(async (req) => {
 
     // ─── Load knowledge_base (NEW: replaces old fiscal_knowledge RAG) ──
     const allKBRules = await sql<KBRule[]>`
-      SELECT id, domain, audience, title, content, normativa_ref,
+      SELECT id, domain, audience, title, content, summary_structured, applicability, normativa_ref,
              fiscal_values, trigger_keywords, trigger_ateco_prefixes,
              trigger_vat_natures, trigger_doc_types, ateco_scope, priority
       FROM knowledge_base
@@ -490,8 +523,6 @@ Deno.serve(async (req) => {
 
           const lineSubjectKw = extractSubjectKeywords(line.description);
           const lineSubjectSet = new Set(lineSubjectKw);
-          const requireContractRef = requiresExactContractRef(line.description);
-
           const lineDecisions: typeof preResolvedFiscal extends Map<string, infer V> ? V : never = [];
 
           for (const dec of fiscalDecisions) {
@@ -509,12 +540,9 @@ Deno.serve(async (req) => {
 
             if (dec.operation_group_code !== lineGroupCode) continue;
 
-            // Contract ref compatibility: if the decision has a contract_ref,
-            // the invoice MUST have the same ref
-            if (requireContractRef) {
-              if (!dec.contract_ref) continue;
-              if (!contractRefs.includes(dec.contract_ref)) continue;
-            } else if (dec.contract_ref) {
+            // Strong-reference compatibility: specific learned decisions
+            // can only flow to invoices carrying the same normalized reference.
+            if (dec.contract_ref) {
               if (!contractRefs.includes(dec.contract_ref)) continue;
             }
 
@@ -662,8 +690,9 @@ Verificale solo se noti un'incongruenza EVIDENTE. Non generare alert su queste.
     // 8. Task instructions + output format
     promptParts.push(`IL TUO COMPITO:
 1. Per ogni riga, VERIFICA i fiscal_flags. Correggi se necessario.
-2. Genera ALERT per l'utente quando serve una decisione umana.
-3. Per le righe con decisioni già prese dall'utente o confermate da regole, RISPETTA le scelte (salvo incongruenze evidenti).
+2. Produci il VERDETTO FINALE operativo per la riga: finalized, needs_review oppure unassigned.
+3. Genera ALERT per l'utente quando serve una decisione umana.
+4. Per le righe con decisioni già prese dall'utente o confermate da regole, RISPETTA le scelte (salvo incongruenze evidenti).
 
 REGOLE DI VERIFICA:
 - Ritenuta d'acconto: SOLO su compensi a professionisti individuali (persone fisiche). MAI su SRL, SPA, cooperative. Controlla il tipo legale della controparte.
@@ -673,16 +702,34 @@ REGOLE DI VERIFICA:
 - Split payment: solo verso PA (controlla ragione sociale).
 - Deducibilità: auto non da trasporto 20%, telefonia 80%, ristorazione 75%.
 - Coerenza: tutte le righe per lo stesso tipo di operazione devono avere le STESSE percentuali.
+- Se il commercialista non ha abbastanza evidenza, NON completare la riga a forza: usa needs_review o unassigned.
 
-FORMATO OUTPUT (2 sezioni):
-
-Sezione 1 — JSON array revisioni:
-[{"line_id":"uuid","fiscal_flags_corrected":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"issues":["descrizione problema"],"confidence_adjustment":0}]
-
----ALERTS---
-JSON array di alert fiscali per l'utente (solo se servono decisioni umane):
-[{"type":"deducibilita"|"ritenuta"|"reverse_charge"|"split_payment"|"bene_strumentale"|"iva_indetraibile"|"general","severity":"warning"|"info","title":"titolo breve","description":"spiegazione per l'utente","current_choice":"scelta conservativa applicata","options":[{"label":"Opzione A","fiscal_override":{},"is_default":false},{"label":"Opzione B","fiscal_override":{},"is_default":true}],"affected_lines":["line_id1"]}]
-Se nessun alert: []`);
+FORMATO OUTPUT:
+Rispondi con un SOLO JSON object:
+{
+  "invoice_summary_final":"sintesi finale della fattura",
+  "red_flags":["rischio 1","rischio 2"],
+  "escalation_candidates":["line_id1"],
+  "line_verdicts":[
+    {
+      "line_id":"uuid",
+      "decision_status":"finalized"|"needs_review"|"unassigned",
+      "rationale_summary":"spiega la scelta finale o il perche non decidi",
+      "decision_basis":["fattura intera","revisione fiscale","memoria aziendale"],
+      "supporting_factors":["fattore 1","fattore 2"],
+      "supporting_evidence":[{"source":"kb","label":"Titolo","detail":"breve dettaglio"}],
+      "clear_fields":["category","account"],
+      "consultant_recommended":false
+    }
+  ],
+  "reviews":[
+    {"line_id":"uuid","fiscal_flags_corrected":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},"issues":["descrizione problema"],"confidence_adjustment":0}
+  ],
+  "alerts":[
+    {"type":"deducibilita"|"ritenuta"|"reverse_charge"|"split_payment"|"bene_strumentale"|"iva_indetraibile"|"general","severity":"warning"|"info","title":"titolo breve","description":"spiegazione per l'utente","current_choice":"scelta conservativa applicata","options":[{"label":"Opzione A","fiscal_override":{},"is_default":false},{"label":"Opzione B","fiscal_override":{},"is_default":true}],"affected_lines":["line_id1"]}
+  ]
+}
+Se non servono alert: "alerts": []`);
 
     const prompt = promptParts.join("\n");
 
@@ -693,7 +740,7 @@ Se nessun alert: []`);
     const thinkingBudget: Record<string, number> = {
       none: 0, low: 1024, medium: 8192, high: 24576,
     };
-    const budget = thinkingBudget[thinkingLevel] ?? 24576;
+    const budget = agentConfig?.thinking_budget ?? thinkingBudget[thinkingLevel] ?? 24576;
 
     console.log(`[fiscal-reviewer] Using model=${model} temp=${temperature} thinking=${thinkingLevel}(${budget})`);
 
@@ -726,11 +773,25 @@ Se nessun alert: []`);
       else if (part.text) responseText += part.text;
     }
 
-    // Parse reviews — balanced extractor first, extractJson fallback
-    let reviews: ReviewResult[] = [];
-    const reviewStr = extractFirstJsonArray(responseText);
-    if (reviewStr) {
-      try { reviews = JSON.parse(reviewStr); } catch { /* ignore */ }
+    let structuredResponse: ReviewerResponse = {};
+    try {
+      const parsed = extractJson(responseText);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        structuredResponse = parsed as ReviewerResponse;
+      }
+    } catch {
+      // keep legacy fallback below
+    }
+
+    // Parse reviews — prefer structured object, keep legacy fallback
+    let reviews: ReviewResult[] = Array.isArray(structuredResponse.reviews)
+      ? structuredResponse.reviews
+      : [];
+    if (reviews.length === 0) {
+      const reviewStr = extractFirstJsonArray(responseText);
+      if (reviewStr) {
+        try { reviews = JSON.parse(reviewStr); } catch { /* ignore */ }
+      }
     }
     if (reviews.length === 0) {
       try {
@@ -769,28 +830,70 @@ Se nessun alert: []`);
       }
     }
 
-    // Parse alerts — filter out alerts for pre-resolved lines/types
-    const alertStr = extractJsonSection(responseText, "---ALERTS---");
+    let lineVerdicts: ReviewerLineVerdict[] = Array.isArray(structuredResponse.line_verdicts)
+      ? structuredResponse.line_verdicts
+      : [];
+
+    // Parse alerts — prefer structured object, filter out pre-resolved lines/types
     let alerts: FiscalAlert[] = [];
-    if (alertStr) {
-      try {
-        const rawAlerts: FiscalAlert[] = JSON.parse(alertStr);
-        alerts = rawAlerts.filter((a) => {
-          const remainingLines = a.affected_lines.filter((lid) => {
-            const preTypes = preResolvedAlertTypes.get(lid);
-            if (preTypes && preTypes.has(a.type)) return false;
-            return true;
-          });
-          a.affected_lines = remainingLines;
-          return remainingLines.length > 0;
-        });
-      } catch { /* ignore */ }
+    if (Array.isArray(structuredResponse.alerts)) {
+      alerts = structuredResponse.alerts;
+    } else {
+      const alertStr = extractJsonSection(responseText, "---ALERTS---");
+      if (alertStr) {
+        try {
+          alerts = JSON.parse(alertStr);
+        } catch { /* ignore */ }
+      }
+    }
+
+    alerts = alerts.filter((a) => {
+      const remainingLines = a.affected_lines.filter((lid) => {
+        const preTypes = preResolvedAlertTypes.get(lid);
+        if (preTypes && preTypes.has(a.type)) return false;
+        return true;
+      });
+      a.affected_lines = remainingLines;
+      return remainingLines.length > 0;
+    });
+
+    if (lineVerdicts.length === 0) {
+      lineVerdicts = lines.map((line) => {
+        const review = reviews.find((item) => item.line_id === line.line_id);
+        const issues = review?.issues || [];
+        const issueText = issues.join("; ");
+        const adjustedConfidence = Math.max(0, Math.min(100, Number(line.confidence || 0) + Number(review?.confidence_adjustment || 0)));
+        const hasMaterialDoubt = /dubbio|verific|incert|chiar/i.test(issueText);
+        const decisionStatus = !line.account_id && !line.category_name
+          ? "unassigned"
+          : hasMaterialDoubt || adjustedConfidence < 60
+            ? "needs_review"
+            : "finalized";
+        return {
+          line_id: line.line_id,
+          decision_status: decisionStatus,
+          rationale_summary: issues.length > 0
+            ? issueText
+            : "Verdetto finale confermato dal revisore",
+          decision_basis: ["reviewer_verdict"],
+          supporting_factors: issues.length > 0 ? issues : ["Nessuna anomalia fiscale materiale rilevata"],
+          supporting_evidence: [],
+          clear_fields: decisionStatus === "finalized" ? [] : ["category", "account", "article", "phase", "cost_center"],
+          consultant_recommended: decisionStatus === "needs_review" && adjustedConfidence < 55,
+        };
+      });
     }
 
     await sql.end();
 
     return json({
       reviews,
+      reviewer_verdict: {
+        invoice_summary_final: structuredResponse.invoice_summary_final || null,
+        line_verdicts: lineVerdicts,
+        escalation_candidates: Array.isArray(structuredResponse.escalation_candidates) ? structuredResponse.escalation_candidates : [],
+        red_flags: Array.isArray(structuredResponse.red_flags) ? structuredResponse.red_flags : [],
+      },
       alerts,
       thinking: thinkingText || null,
       pre_resolved_count: preResolvedFiscal.size,

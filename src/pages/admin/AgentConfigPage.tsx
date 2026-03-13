@@ -11,7 +11,7 @@ import { Bot, Loader2, Save, Brain, Cpu, Zap } from 'lucide-react'
 interface AgentConfig {
   id: string; agent_type: string; display_name: string; description: string | null;
   system_prompt: string; model: string; model_escalation: string | null;
-  temperature: number; thinking_level: string; thinking_budget: number | null;
+  temperature: number; thinking_level: string; thinking_budget: number | null; thinking_budget_escalation: number | null;
   max_output_tokens: number; version: number; updated_at: string;
 }
 
@@ -20,6 +20,8 @@ const MODEL_OPTIONS = [
   { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', desc: 'Economico, veloce' },
   { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro Preview', desc: 'Top qualita, RPD basso (250)' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview', desc: 'Veloce, economico' },
+  { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', desc: 'Molto forte su ragionamento e consulenza' },
+  { value: 'claude-haiku-4-5', label: 'Claude Haiku 4.5', desc: 'Rapido per chat leggere' },
 ]
 
 const THINKING_BUDGET_OPTIONS = [
@@ -37,12 +39,14 @@ const NO_THINKING_CONFIG_MODELS = ['gemini-3.1-pro-preview', 'gemini-3.1-pro-pre
 const AGENT_COLORS: Record<string, string> = {
   commercialista: 'sky',
   revisore: 'violet',
+  consulente: 'amber',
   kb_classifier: 'emerald',
 }
 
 const AGENT_ICONS: Record<string, typeof Bot> = {
   commercialista: Cpu,
   revisore: Brain,
+  consulente: Bot,
   kb_classifier: Zap,
 }
 
@@ -87,6 +91,7 @@ export default function AgentConfigPage() {
         temperature: Number(edit.temperature ?? agent.temperature),
         thinking_level: edit.thinking_level || agent.thinking_level,
         thinking_budget: edit.thinking_budget != null ? Number(edit.thinking_budget) : null,
+        thinking_budget_escalation: edit.thinking_budget_escalation != null ? Number(edit.thinking_budget_escalation) : null,
         max_output_tokens: Number(edit.max_output_tokens ?? agent.max_output_tokens),
         version: agent.version + 1,
         updated_at: new Date().toISOString(),
@@ -120,7 +125,9 @@ export default function AgentConfigPage() {
           const color = AGENT_COLORS[agent.agent_type] || 'slate'
           const IconComponent = AGENT_ICONS[agent.agent_type] || Bot
           const thinkingBudget = edit.thinking_budget ?? 0
+          const escalationThinkingBudget = edit.thinking_budget_escalation ?? 0
           const modelSupportsThinking = !NO_THINKING_CONFIG_MODELS.includes(edit.model || agent.model)
+          const escalationModelSupportsThinking = !NO_THINKING_CONFIG_MODELS.includes(edit.model_escalation || agent.model_escalation || '')
           const costPerCall = thinkingBudget > 0 && modelSupportsThinking
             ? (thinkingBudget / 1_000_000 * 10).toFixed(3)
             : '0.000'
@@ -200,6 +207,26 @@ export default function AgentConfigPage() {
                       )}
                     </div>
                     <div className="space-y-2">
+                      {agent.agent_type === 'consulente' && (
+                        <div>
+                          <Label className="text-xs">Thinking Deep Mode</Label>
+                          <select
+                            value={escalationThinkingBudget}
+                            onChange={e => updateField(agent.id, 'thinking_budget_escalation', Number(e.target.value))}
+                            className="mt-1 w-full h-9 border rounded-md px-2 text-xs bg-white"
+                            disabled={!escalationModelSupportsThinking}
+                          >
+                            {THINKING_BUDGET_OPTIONS.map(o => (
+                              <option key={o.value} value={o.value}>{o.label} — {o.desc}</option>
+                            ))}
+                          </select>
+                          {!escalationModelSupportsThinking && (
+                            <p className="text-[10px] text-amber-600 mt-1">
+                              {(edit.model_escalation || agent.model_escalation || 'Nessuno')} non supporta thinkingConfig esplicito
+                            </p>
+                          )}
+                        </div>
+                      )}
                       <div>
                         <Label className="text-xs">Temperature</Label>
                         <div className="flex items-center gap-2 mt-1">

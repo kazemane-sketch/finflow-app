@@ -1,19 +1,25 @@
 /**
- * classificationPipelineService — Frontend orchestrator for the v2 cascade pipeline.
+ * classificationPipelineService — Frontend orchestrator for invoice vNext.
  *
- * Pipeline steps (sequential, per invoice):
- *   1. classify-v2-deterministic → instant rules + history matches
- *   2. classify-v2-understand    → comprehension (what is this operation?)
- *   3. classify-v2-classify      → account/category/article assignment
- *   4. classify-v2-cdc           → cost center assignment for ALL lines
- *   5. fiscal-reviewer           → fiscal flags validation + alerts
- *   6. Persist results to DB (same pattern as classify-invoice-lines)
- *
- * Designed to be called from FatturePage via useAIJob pattern.
+ * Pipeline steps:
+ *   1. classify-v2-deterministic → exact/history evidence gate
+ *   2. classify-v2-classify      → commercialista invoice-wide proposal
+ *   3. classify-v2-cdc           → cost center assignment
+ *   4. fiscal-reviewer           → reviewer final verdict + alerts
+ *   5. Persist results + audit trail
  */
 
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
 import { getValidAccessToken } from '@/lib/getValidAccessToken'
+import {
+  saveCommercialistaProposals,
+  saveFinalDecisions,
+  saveReviewerVerdicts,
+  type FinalDecisionSource,
+  type LineDecisionStatus,
+  type SupportingEvidence,
+  type WeakFieldState,
+} from '@/lib/invoiceDecisionService'
 
 /* ─── Types ──────────────────────────────────── */
 
@@ -40,16 +46,9 @@ interface DeterministicResult {
   matched_groups: string[]
 }
 
-interface UnresolvedLine extends InputLine {
-  matched_groups: string[]
-}
-
-interface Understanding {
-  line_id: string
-  operation_type: string
-  account_sections: string[]
-  is_NOT: string[]
-  reasoning: string
+interface WeakField<T = string | null> {
+  value: T | null
+  state: WeakFieldState
 }
 
 interface ClassifyResult {
@@ -62,9 +61,28 @@ interface ClassifyResult {
   account_code: string | null
   confidence: number
   reasoning: string
+  rationale_summary?: string | null
+  decision_basis?: string[]
+  supporting_factors?: string[]
+  supporting_evidence?: SupportingEvidence[]
+  weak_fields?: {
+    category?: WeakField
+    account?: WeakField
+    article?: WeakField
+    phase?: WeakField
+    cost_center?: WeakField
+  }
+  exact_match_evidence_used?: boolean
   fiscal_flags: Record<string, unknown>
   suggest_new_account?: Record<string, string> | null
   suggest_new_category?: Record<string, string> | null
+}
+
+interface CommercialistaPayload {
+  invoice_summary: string | null
+  evidence_refs: string[]
+  needs_consultant_hint: boolean
+  line_proposals: ClassifyResult[]
 }
 
 interface CdcAllocation {
@@ -79,20 +97,38 @@ interface ReviewResult {
   confidence_adjustment: number
 }
 
+interface ReviewerLineVerdict {
+  line_id: string
+  decision_status: LineDecisionStatus
+  rationale_summary: string
+  decision_basis: string[]
+  supporting_factors: string[]
+  supporting_evidence: SupportingEvidence[]
+  clear_fields?: string[]
+  consultant_recommended?: boolean
+}
+
+interface ReviewerPayload {
+  invoice_summary_final: string | null
+  line_verdicts: ReviewerLineVerdict[]
+  escalation_candidates: string[]
+  red_flags: string[]
+}
+
 interface FiscalAlert {
   type: string
   severity: 'warning' | 'info'
   title: string
   description: string
   current_choice: string
-  options: { label: string; fiscal_override: Record<string, unknown>; is_default: boolean }[]
+  options: { label: string; fiscal_override: Record<string, unknown>; is_default?: boolean; isConservative?: boolean; suggestedNote?: string }[]
   affected_lines: string[]
 }
 
 export interface PipelineStepDebug {
-  step: string              // 'deterministic' | 'understand' | 'classify' | 'cdc' | 'reviewer'
-  prompt_sent?: string      // Full prompt sent to Gemini
-  raw_response?: string     // Raw AI response
+  step: string
+  prompt_sent?: string
+  raw_response?: string
   model_used?: string
   agent_config_loaded?: boolean
   agent_rules_count?: number
@@ -107,7 +143,7 @@ export interface PipelineStepDebug {
     account_sections: string[]
     is_NOT: string[]
   }>
-  extra?: Record<string, unknown>  // catch-all for extra data
+  extra?: Record<string, unknown>
 }
 
 export interface PipelineResult {
@@ -121,12 +157,17 @@ export interface PipelineResult {
     cost_center_allocations: { project_id: string; percentage: number }[]
     confidence: number
     reasoning: string
+    reasoning_summary_final: string | null
+    decision_status: LineDecisionStatus
+    final_decision_source: FinalDecisionSource
+    decision_basis: string[]
+    supporting_factors: string[]
+    supporting_evidence: SupportingEvidence[]
     fiscal_flags: Record<string, unknown>
     source: string
     rule_id?: string | null
     suggest_new_account?: Record<string, string> | null
     suggest_new_category?: Record<string, string> | null
-    // Separated reasoning fields (populated after steps 3 + 5)
     classification_reasoning?: string | null
     classification_thinking?: string | null
     fiscal_reasoning?: string | null
@@ -134,6 +175,8 @@ export interface PipelineResult {
     fiscal_confidence?: number | null
   }[]
   alerts: FiscalAlert[]
+  commercialista?: CommercialistaPayload
+  reviewer?: ReviewerPayload
   stats: {
     total: number
     deterministic: number
@@ -150,7 +193,9 @@ export interface PipelineEvents {
   onLog?: (text: string) => void
 }
 
-const PIPELINE_TOTAL_STEPS = 6
+const PIPELINE_TOTAL_STEPS = 5
+
+type FinalLineResult = PipelineResult['lines'][number]
 
 function abortError(): DOMException {
   return new DOMException('Aborted', 'AbortError')
@@ -174,10 +219,8 @@ function createPipelineReporter(events?: PipelineEvents) {
     if (message) events?.onLog?.(message)
   }
 
-  return { beginStage, finishStage, total: PIPELINE_TOTAL_STEPS }
+  return { beginStage, finishStage }
 }
-
-/* ─── API call helper ────────────────────────── */
 
 async function callEdge(
   functionName: string,
@@ -196,7 +239,6 @@ async function callEdge(
     signal,
   })
 
-  // 401 = JWT expired → force refresh and retry once
   if (res.status === 401) {
     const newToken = await getValidAccessToken({ forceRefresh: true })
     res = await fetch(`${SUPABASE_URL}/functions/v1/${functionName}`, {
@@ -213,13 +255,74 @@ async function callEdge(
 
   if (!res.ok) {
     const text = await res.text().catch(() => '')
-    throw new Error(`${functionName} HTTP ${res.status}: ${text.slice(0, 200)}`)
+    throw new Error(`${functionName} HTTP ${res.status}: ${text.slice(0, 300)}`)
   }
 
   return res.json()
 }
 
-/* ─── Persistence (via supabase client, mirrors classify-invoice-lines) ── */
+function defaultFiscalFlags(flags?: Record<string, unknown> | null) {
+  return {
+    ritenuta_acconto: null,
+    reverse_charge: false,
+    split_payment: false,
+    bene_strumentale: false,
+    deducibilita_pct: 100,
+    iva_detraibilita_pct: 100,
+    note: null,
+    ...(flags || {}),
+  }
+}
+
+function normalizeStringArray(input: unknown): string[] {
+  if (!Array.isArray(input)) return []
+  return Array.from(new Set(input.map((value) => String(value || '').trim()).filter(Boolean)))
+}
+
+function normalizeEvidenceSource(input: unknown): SupportingEvidence['source'] {
+  const raw = String(input || '').trim().toLowerCase()
+  switch (raw) {
+    case 'kb':
+    case 'memory':
+    case 'deterministic':
+    case 'reviewer':
+    case 'consultant':
+    case 'company_stats':
+    case 'invoice':
+    case 'history':
+    case 'user':
+      return raw
+    case 'rule':
+    case 'exact_match':
+      return 'deterministic'
+    case 'commercialista':
+      return 'invoice'
+    default:
+      return 'invoice'
+  }
+}
+
+function normalizeEvidence(input: unknown): SupportingEvidence[] {
+  if (!Array.isArray(input)) return []
+  return input
+    .filter((item) => item && typeof item === 'object')
+    .map((item) => {
+      const row = item as Record<string, unknown>
+      return {
+        source: normalizeEvidenceSource(row.source),
+        label: String(row.label || row.ref || 'Evidenza'),
+        detail: row.detail != null ? String(row.detail) : null,
+        ref: row.ref != null ? String(row.ref) : null,
+      }
+    })
+}
+
+function shouldNeedsReview(line: Pick<FinalLineResult, 'decision_status' | 'confidence' | 'fiscal_flags' | 'suggest_new_account'>) {
+  return line.decision_status !== 'finalized'
+    || line.confidence < 65
+    || !!(line.fiscal_flags?.note && /verificar|controllare|dubbio|incert/i.test(String(line.fiscal_flags.note || '')))
+    || line.suggest_new_account != null
+}
 
 async function persistPipelineResults(
   companyId: string,
@@ -227,69 +330,99 @@ async function persistPipelineResults(
   result: PipelineResult,
   signal?: AbortSignal,
 ): Promise<void> {
-  const MIN_CONFIDENCE = 60
+  const commercialistaRows = result.commercialista?.line_proposals || []
+  const reviewerRows = result.reviewer?.line_verdicts || []
+
+  if (commercialistaRows.length > 0) {
+    await saveCommercialistaProposals(companyId, invoiceId, commercialistaRows.map((row) => ({
+      line_id: row.line_id,
+      confidence: row.confidence,
+      proposal: row as unknown as Record<string, unknown>,
+      rationale_summary: row.rationale_summary || row.reasoning || null,
+      decision_basis: normalizeStringArray(row.decision_basis),
+      supporting_factors: normalizeStringArray(row.supporting_factors),
+      supporting_evidence: normalizeEvidence(row.supporting_evidence),
+    })))
+  }
+
+  if (reviewerRows.length > 0) {
+    await saveReviewerVerdicts(companyId, invoiceId, reviewerRows.map((row) => ({
+      line_id: row.line_id,
+      decision_status: row.decision_status,
+      final_confidence: result.lines.find((line) => line.line_id === row.line_id)?.confidence ?? null,
+      verdict: row as unknown as Record<string, unknown>,
+      rationale_summary: row.rationale_summary,
+      decision_basis: normalizeStringArray(row.decision_basis),
+      supporting_factors: normalizeStringArray(row.supporting_factors),
+      supporting_evidence: normalizeEvidence(row.supporting_evidence),
+      red_flags: row.consultant_recommended ? ['consultant_recommended'] : [],
+    })))
+  }
+
+  await saveFinalDecisions(companyId, invoiceId, result.lines.map((line) => ({
+    line_id: line.line_id,
+    decision_source: line.final_decision_source,
+    decision_status: line.decision_status,
+    confidence: line.confidence,
+    applied_payload: {
+      category_id: line.category_id,
+      account_id: line.account_id,
+      article_id: line.article_id,
+      phase_id: line.phase_id,
+      cost_center_allocations: line.cost_center_allocations,
+      fiscal_flags: line.fiscal_flags,
+    },
+    rationale_summary: line.reasoning_summary_final,
+    decision_basis: line.decision_basis,
+    supporting_factors: line.supporting_factors,
+    supporting_evidence: line.supporting_evidence,
+  })))
 
   for (const lr of result.lines) {
     throwIfAborted(signal)
-    if (lr.confidence < MIN_CONFIDENCE) {
-      await supabase.from('invoice_lines').update({
-        ai_confidence: Math.round(lr.confidence),
-        needs_review: true,
-        classification_reasoning: lr.classification_reasoning || null,
-        classification_thinking: lr.classification_thinking || null,
-        fiscal_reasoning: lr.fiscal_reasoning || null,
-        fiscal_thinking: lr.fiscal_thinking || null,
-        fiscal_confidence: lr.fiscal_confidence != null ? Math.round(lr.fiscal_confidence) : null,
-      } as any).eq('id', lr.line_id)
-      continue
-    }
+    await supabase.from('invoice_lines').update({
+      category_id: lr.category_id,
+      account_id: lr.account_id,
+      fiscal_flags: lr.fiscal_flags,
+      classification_status: 'ai_suggested',
+      ai_confidence: Math.round(lr.confidence),
+      needs_review: shouldNeedsReview(lr),
+      classification_reasoning: lr.classification_reasoning || null,
+      classification_thinking: lr.classification_thinking || null,
+      fiscal_reasoning: lr.fiscal_reasoning || null,
+      fiscal_thinking: lr.fiscal_thinking || null,
+      fiscal_confidence: lr.fiscal_confidence != null ? Math.round(lr.fiscal_confidence) : null,
+      decision_status: lr.decision_status,
+      reasoning_summary_final: lr.reasoning_summary_final,
+      final_confidence: Math.round(lr.confidence),
+      final_decision_source: lr.final_decision_source,
+    } as any).eq('id', lr.line_id)
 
-    // Update line classification
-    if (lr.category_id || lr.account_id) {
-      const needsReview = lr.confidence < 65
-        || !!(lr.fiscal_flags?.note && /verificar|controllare|dubbio/i.test(String(lr.fiscal_flags.note || '')))
-        || lr.suggest_new_account != null
+    const { error: deleteProjectsError } = await supabase
+      .from('invoice_line_projects')
+      .delete()
+      .eq('invoice_line_id', lr.line_id)
+    if (deleteProjectsError) throw deleteProjectsError
 
-      await supabase.from('invoice_lines').update({
-        category_id: lr.category_id,
-        account_id: lr.account_id,
-        fiscal_flags: lr.fiscal_flags,
-        classification_status: 'ai_suggested',
-        ai_confidence: Math.round(lr.confidence),
-        needs_review: needsReview,
-        classification_reasoning: lr.classification_reasoning || null,
-        classification_thinking: lr.classification_thinking || null,
-        fiscal_reasoning: lr.fiscal_reasoning || null,
-        fiscal_thinking: lr.fiscal_thinking || null,
-        fiscal_confidence: lr.fiscal_confidence != null ? Math.round(lr.fiscal_confidence) : null,
-      } as any).eq('id', lr.line_id).is('category_id', null)
-    }
-
-    // CdC allocations
-    for (const pa of lr.cost_center_allocations || []) {
-      throwIfAborted(signal)
-      try {
-        await supabase.from('invoice_line_projects').upsert({
-          company_id: companyId,
-          invoice_id: invoiceId,
-          invoice_line_id: lr.line_id,
-          project_id: pa.project_id,
-          percentage: pa.percentage,
-          assigned_by: 'ai_auto',
-        } as any, { onConflict: 'invoice_line_id,project_id' })
-      } catch { /* ignore duplicate */ }
+    for (const allocation of lr.cost_center_allocations || []) {
+      const { error } = await supabase.from('invoice_line_projects').insert({
+        company_id: companyId,
+        invoice_id: invoiceId,
+        invoice_line_id: lr.line_id,
+        project_id: allocation.project_id,
+        percentage: allocation.percentage,
+        assigned_by: 'ai_auto',
+      } as any)
+      if (error) throw error
     }
   }
 
-  // Invoice-level classification (weighted best)
-  const classified = result.lines.filter(l => l.confidence >= MIN_CONFIDENCE && (l.category_id || l.account_id))
+  const classified = result.lines.filter((line) => line.decision_status === 'finalized' && (line.category_id || line.account_id))
   if (classified.length > 0) {
-    // Best category/account by weighted confidence
-    const best = classified.reduce((a, b) =>
-      (Math.abs(b.confidence) > Math.abs(a.confidence)) ? b : a
+    const best = classified.reduce((current, candidate) =>
+      candidate.confidence > current.confidence ? candidate : current,
     )
-    const avgConf = Math.round(classified.reduce((s, l) => s + l.confidence, 0) / classified.length)
-
+    const avgConf = Math.round(classified.reduce((sum, line) => sum + line.confidence, 0) / classified.length)
     await supabase.from('invoice_classifications').upsert({
       company_id: companyId,
       invoice_id: invoiceId,
@@ -298,16 +431,51 @@ async function persistPipelineResults(
       assigned_by: 'ai_auto',
       verified: false,
       ai_confidence: avgConf,
-      ai_reasoning: `Pipeline v2: ${result.stats.deterministic} deterministiche, ${result.stats.ai_classified} AI. Conf. media: ${avgConf}%`,
+      ai_reasoning: result.reviewer?.invoice_summary_final
+        || result.commercialista?.invoice_summary
+        || `Verdetto AI consolidato su ${classified.length} righe`,
       invoice_notes: result.alerts.length > 0 ? JSON.stringify(result.alerts) : null,
     } as any, { onConflict: 'invoice_id' })
   }
 
-  throwIfAborted(signal)
   await supabase.from('invoices').update({
     has_fiscal_alerts: result.alerts.length > 0,
     classification_status: 'ai_suggested',
   } as any).eq('id', invoiceId)
+}
+
+function buildInitialResult(line: InputLine, deterministic?: DeterministicResult): FinalLineResult {
+  const fiscalFlags = defaultFiscalFlags(deterministic?.fiscal_flags || null)
+  return {
+    line_id: line.line_id,
+    category_id: deterministic?.category_id || null,
+    account_id: deterministic?.account_id || null,
+    account_code: null,
+    article_id: deterministic?.article_id || null,
+    phase_id: deterministic?.phase_id || null,
+    cost_center_allocations: deterministic?.cost_center_allocations || [],
+    confidence: deterministic?.confidence || 0,
+    reasoning: deterministic?.reasoning || 'Non classificata',
+    reasoning_summary_final: deterministic?.reasoning || null,
+    decision_status: deterministic ? 'pending' : 'unassigned',
+    final_decision_source: deterministic?.source === 'rule' ? 'exact_match' : 'none',
+    decision_basis: deterministic ? ['deterministic_evidence'] : [],
+    supporting_factors: deterministic ? [deterministic.reasoning] : [],
+    supporting_evidence: deterministic ? [{
+      source: deterministic.source === 'rule' ? 'deterministic' : 'history',
+      label: deterministic.source === 'rule' ? 'Exact match da regola' : 'Pattern storico controparte',
+      detail: deterministic.reasoning,
+      ref: deterministic.rule_id || null,
+    }] : [],
+    fiscal_flags: fiscalFlags,
+    source: deterministic?.source || 'none',
+    rule_id: deterministic?.rule_id || null,
+    classification_reasoning: deterministic?.reasoning || null,
+    classification_thinking: null,
+    fiscal_reasoning: null,
+    fiscal_thinking: null,
+    fiscal_confidence: deterministic?.confidence ?? null,
+  }
 }
 
 /* ─── Main pipeline executor ─────────────────── */
@@ -327,7 +495,6 @@ export async function runClassificationPipeline(
   const token = await getValidAccessToken()
   const debugSteps: PipelineStepDebug[] = []
 
-  // ─── Load invoice notes + causale ──────────────────
   let invoiceNotes = ''
   let invoiceCausale = ''
   try {
@@ -336,21 +503,20 @@ export async function runClassificationPipeline(
       .select('notes, raw_xml')
       .eq('id', invoiceId)
       .single()
-
     if (inv?.notes) invoiceNotes = inv.notes
-
-    // Extract causale from raw_xml
     if (inv?.raw_xml) {
       try {
         const { reparseXml } = await import('@/lib/invoiceParser')
         const parsed = reparseXml(inv.raw_xml)
         const body = parsed.bodies?.[0]
-        if (body?.causali?.length) {
-          invoiceCausale = body.causali.filter(Boolean).join(' | ')
-        }
-      } catch { /* ignore parse errors */ }
+        if (body?.causali?.length) invoiceCausale = body.causali.filter(Boolean).join(' | ')
+      } catch {
+        // ignore parse errors
+      }
     }
-  } catch { /* ignore */ }
+  } catch {
+    // ignore
+  }
 
   const commonBody = {
     company_id: companyId,
@@ -365,342 +531,317 @@ export async function runClassificationPipeline(
   reporter.beginStage('Ricerca regole e storico', `Analizzo ${lines.length} righe della fattura`)
   const step1 = await callEdge('classify-v2-deterministic', {
     ...commonBody,
-    lines: lines.map(l => ({
-      line_id: l.line_id,
-      description: l.description,
-      quantity: l.quantity,
-      unit_price: l.unit_price,
-      total_price: l.total_price,
-    })),
+    lines,
     ...(contractRefs?.length ? { contract_refs: contractRefs } : {}),
   }, token, signal)
-
   throwIfAborted(signal)
 
   const resolved: DeterministicResult[] = step1.resolved || []
-  const unresolved: UnresolvedLine[] = step1.unresolved || []
+  const unresolved: Array<InputLine & { matched_groups: string[] }> = step1.unresolved || []
+  const deterministicMap = new Map(resolved.map((row) => [row.line_id, row]))
+  const matchedGroupsMap = new Map<string, string[]>()
+  for (const row of resolved) matchedGroupsMap.set(row.line_id, row.matched_groups || [])
+  for (const row of unresolved) matchedGroupsMap.set(row.line_id, row.matched_groups || [])
+
   if (step1._debug) {
     debugSteps.push({ step: 'deterministic', extra: step1._debug })
   }
   reporter.finishStage(
     'Ricerca regole e storico',
-    `Ricerca regole e storico: ${resolved.length} righe risolte, ${unresolved.length} da approfondire`,
+    `Gate completato: ${resolved.length} evidenze determinate, ${unresolved.length} righe senza exact match pieno`,
   )
 
-  const lineResults = new Map<string, PipelineResult['lines'][0]>()
-  for (const r of resolved) {
-    const defaultFlags = {
-      ritenuta_acconto: null,
-      reverse_charge: false,
-      split_payment: false,
-      bene_strumentale: false,
-      deducibilita_pct: 100,
-      iva_detraibilita_pct: 100,
-      note: null,
-    }
-    const fiscalFlags = r.fiscal_flags && Object.keys(r.fiscal_flags).length > 0
-      ? { ...defaultFlags, ...r.fiscal_flags }
-      : defaultFlags
+  reporter.beginStage('Commercialista', 'Propongo classificazione e fiscalita su fattura intera')
+  const step2 = await callEdge('classify-v2-classify', {
+    ...commonBody,
+    lines: lines.map((line) => ({
+      ...line,
+      matched_groups: matchedGroupsMap.get(line.line_id) || [],
+    })),
+    deterministic_matches: resolved.map((row) => ({
+      line_id: row.line_id,
+      source: row.source,
+      confidence: row.confidence,
+      reasoning: row.reasoning,
+      category_id: row.category_id,
+      account_id: row.account_id,
+      article_id: row.article_id,
+      phase_id: row.phase_id,
+    })),
+  }, token, signal)
+  throwIfAborted(signal)
 
-    lineResults.set(r.line_id, {
-      line_id: r.line_id,
-      category_id: r.category_id,
-      account_id: r.account_id,
-      account_code: null,
-      article_id: r.article_id,
-      phase_id: r.phase_id,
-      cost_center_allocations: r.cost_center_allocations || [],
-      confidence: r.confidence,
-      reasoning: r.reasoning,
-      fiscal_flags: fiscalFlags,
-      source: r.source,
-      rule_id: r.rule_id || null,
-      classification_reasoning: r.reasoning,
-      classification_thinking: null, // deterministic has no AI thinking
+  const commercialista: CommercialistaPayload = {
+    invoice_summary: step2.commercialista?.invoice_summary || null,
+    evidence_refs: Array.isArray(step2.commercialista?.evidence_refs) ? step2.commercialista.evidence_refs : [],
+    needs_consultant_hint: Boolean(step2.commercialista?.needs_consultant_hint),
+    line_proposals: Array.isArray(step2.commercialista?.line_proposals)
+      ? step2.commercialista.line_proposals
+      : (step2.classifications || []),
+  }
+  const classifyThinking: string | null = step2.thinking || null
+
+  if (step2._debug) {
+    debugSteps.push({
+      step: 'commercialista',
+      prompt_sent: step2._debug.prompt_sent,
+      raw_response: step2._debug.raw_response,
+      model_used: step2._debug.model_used,
+      agent_config_loaded: step2._debug.agent_config_loaded,
+      agent_rules_count: step2._debug.agent_rules_count,
+      kb_rules_count: step2._debug.kb_rules_count,
+      kb_rules_titles: step2._debug.kb_rules_titles,
+      company_ateco: step2._debug.company_ateco,
+      accounts_shown: step2.accounts_shown,
+      accounts_by_section: step2._debug.accounts_by_section,
+      understandings: step2._debug.understandings_received,
+      extra: {
+        evidence_refs: commercialista.evidence_refs,
+        needs_consultant_hint: commercialista.needs_consultant_hint,
+        history_count: step2._debug.history_count,
+        memory_facts_count: step2._debug.memory_facts_count,
+      },
     })
   }
+  reporter.finishStage(
+    'Commercialista',
+    `Commercialista: ${commercialista.line_proposals.length} proposte elaborate sull'intera fattura`,
+  )
 
-  let aiClassifiedCount = 0
+  const lineResults = new Map<string, FinalLineResult>()
+  for (const line of lines) {
+    lineResults.set(line.line_id, buildInitialResult(line, deterministicMap.get(line.line_id)))
+  }
 
-  if (unresolved.length > 0) {
-    reporter.beginStage('Comprensione righe', `Comprendo ${unresolved.length} righe non risolte`)
-    const step2 = await callEdge('classify-v2-understand', {
-      ...commonBody,
-      lines: unresolved,
-    }, token, signal)
-
-    throwIfAborted(signal)
-
-    const understandings: Understanding[] = step2.understandings || []
-    if (step2._debug) {
-      debugSteps.push({
-        step: 'understand',
-        prompt_sent: step2._debug.prompt_sent,
-        raw_response: step2._debug.raw_response,
-        model_used: step2._debug.model_used,
-        agent_config_loaded: step2._debug.agent_config_loaded,
-        agent_rules_count: step2._debug.agent_rules_count,
-        kb_rules_count: step2._debug.kb_rules_count,
-        kb_rules_titles: step2._debug.kb_rules_titles,
-        company_ateco: step2._debug.company_ateco,
-        extra: {
-          counterparty_info: step2._debug.counterparty_info,
-        },
-      })
-    }
-    reporter.finishStage(
-      'Comprensione righe',
-      `Comprensione righe: completata su ${understandings.length} righe`,
-    )
-
-    reporter.beginStage('Classificazione righe', `Classifico ${unresolved.length} righe con AI`)
-    const step3 = await callEdge('classify-v2-classify', {
-      ...commonBody,
-      lines: unresolved,
-      understandings,
-    }, token, signal)
-
-    throwIfAborted(signal)
-
-    const classifications: ClassifyResult[] = step3.classifications || []
-    const classifyThinking: string | null = step3.thinking || null
-    if (step3._debug) {
-      debugSteps.push({
-        step: 'classify',
-        prompt_sent: step3._debug.prompt_sent,
-        raw_response: step3._debug.raw_response,
-        model_used: step3._debug.model_used,
-        agent_config_loaded: step3._debug.agent_config_loaded,
-        agent_rules_count: step3._debug.agent_rules_count,
-        kb_rules_count: step3._debug.kb_rules_count,
-        kb_rules_titles: step3._debug.kb_rules_titles,
-        company_ateco: step3._debug.company_ateco,
-        accounts_shown: step3.accounts_shown,
-        accounts_by_section: step3._debug.accounts_by_section,
-        understandings: step3._debug.understandings_received,
-        extra: {
-          history_count: step3._debug.history_count,
-          memory_facts_count: step3._debug.memory_facts_count,
-        },
-      })
-    }
-
-    for (const c of classifications) {
-      lineResults.set(c.line_id, {
-        line_id: c.line_id,
-        category_id: c.category_id,
-        account_id: c.account_id,
-        account_code: c.account_code,
-        article_id: null, // article_code needs resolution — done at persist time
-        phase_id: null,
-        cost_center_allocations: [],
-        confidence: c.confidence,
-        reasoning: c.reasoning,
-        fiscal_flags: c.fiscal_flags || {},
-        source: 'ai',
-        suggest_new_account: c.suggest_new_account,
-        suggest_new_category: c.suggest_new_category,
-        classification_reasoning: c.reasoning,
-        classification_thinking: classifyThinking,
-      })
-      aiClassifiedCount++
-    }
-    reporter.finishStage(
-      'Classificazione righe',
-      `Classificazione righe: ${classifications.length} suggerimenti AI prodotti`,
-    )
-  } else {
-    reporter.beginStage('Comprensione righe', 'Nessuna riga da approfondire')
-    reporter.finishStage('Comprensione righe', 'Comprensione righe: saltata, tutte le righe erano già risolte')
-    reporter.beginStage('Classificazione righe', 'Nessuna riga da classificare con AI')
-    reporter.finishStage('Classificazione righe', 'Classificazione righe: saltata, nessuna riga rimasta da classificare')
+  for (const proposal of commercialista.line_proposals) {
+    const current = lineResults.get(proposal.line_id)
+    if (!current) continue
+    const deterministic = deterministicMap.get(proposal.line_id)
+    const confidence = Math.max(proposal.confidence || 0, deterministic?.confidence || 0)
+    lineResults.set(proposal.line_id, {
+      ...current,
+      category_id: proposal.category_id ?? current.category_id,
+      account_id: proposal.account_id ?? current.account_id,
+      account_code: proposal.account_code ?? current.account_code,
+      confidence,
+      reasoning: proposal.reasoning,
+      reasoning_summary_final: proposal.rationale_summary || proposal.reasoning || current.reasoning_summary_final,
+      decision_status: 'pending',
+      final_decision_source: current.final_decision_source === 'exact_match' && !proposal.exact_match_evidence_used ? 'commercialista' : current.final_decision_source,
+      decision_basis: normalizeStringArray(proposal.decision_basis),
+      supporting_factors: normalizeStringArray(proposal.supporting_factors),
+      supporting_evidence: normalizeEvidence(proposal.supporting_evidence).concat(current.supporting_evidence),
+      fiscal_flags: defaultFiscalFlags(proposal.fiscal_flags),
+      source: deterministic ? `${proposal.exact_match_evidence_used ? 'deterministic+' : ''}commercialista` : 'commercialista',
+      suggest_new_account: proposal.suggest_new_account,
+      suggest_new_category: proposal.suggest_new_category,
+      classification_reasoning: proposal.rationale_summary || proposal.reasoning || null,
+      classification_thinking: classifyThinking,
+      fiscal_confidence: confidence,
+    })
   }
 
   let cdcAssigned = 0
-  reporter.beginStage('Attribuzione CdC', 'Assegno i centri di costo alle righe classificate')
+  reporter.beginStage('Attribuzione CdC', 'Assegno i centri di costo alle righe proposte')
   try {
-    const allLineData = lines.map(l => {
-      const lr = lineResults.get(l.line_id)
-      return {
-        line_id: l.line_id,
-        description: l.description,
-        total_price: l.total_price,
-        category_name: lr?.category_id ? undefined : undefined, // keep it lightweight
-        account_code: lr?.account_code || undefined,
-      }
-    })
-
-    const step4 = await callEdge('classify-v2-cdc', {
+    const step3 = await callEdge('classify-v2-cdc', {
       ...commonBody,
-      lines: allLineData,
+      lines: lines.map((line) => {
+        const result = lineResults.get(line.line_id)
+        return {
+          line_id: line.line_id,
+          description: line.description,
+          total_price: line.total_price,
+          account_code: result?.account_code || undefined,
+          category_name: undefined,
+        }
+      }),
     }, token, signal)
-
     throwIfAborted(signal)
 
-    if (step4._debug) {
-      debugSteps.push({ step: 'cdc', extra: step4._debug })
-    }
-    if (!step4.skipped) {
-      const allocations: CdcAllocation[] = step4.allocations || []
-      for (const a of allocations) {
-        const existing = lineResults.get(a.line_id)
-        if (existing && a.cost_center_allocations?.length > 0) {
-          existing.cost_center_allocations = a.cost_center_allocations
-          cdcAssigned++
+    if (step3._debug) debugSteps.push({ step: 'cdc', extra: step3._debug })
+
+    if (!step3.skipped) {
+      const allocations: CdcAllocation[] = step3.allocations || []
+      for (const allocation of allocations) {
+        const current = lineResults.get(allocation.line_id)
+        if (current && allocation.cost_center_allocations?.length > 0) {
+          current.cost_center_allocations = allocation.cost_center_allocations
+          cdcAssigned += 1
         }
       }
-      reporter.finishStage(
-        'Attribuzione CdC',
-        `Attribuzione CdC: assegnazioni trovate per ${cdcAssigned} righe`,
-      )
+      reporter.finishStage('Attribuzione CdC', `CdC trovati per ${cdcAssigned} righe`)
     } else {
-      reporter.finishStage(
-        'Attribuzione CdC',
-        'Attribuzione CdC: saltata, nessun centro di costo applicabile',
-      )
+      reporter.finishStage('Attribuzione CdC', 'CdC saltati: nessun centro applicabile')
     }
-  } catch (e) {
-    console.warn('[pipeline] CdC step failed (non-blocking):', e)
-    reporter.finishStage(
-      'Attribuzione CdC',
-      `Attribuzione CdC: warning non bloccante (${e instanceof Error ? e.message : 'errore sconosciuto'})`,
-    )
+  } catch (error) {
+    console.warn('[pipeline] CdC step failed (non-blocking):', error)
+    reporter.finishStage('Attribuzione CdC', `CdC: warning non bloccante (${error instanceof Error ? error.message : 'errore sconosciuto'})`)
   }
 
   let alerts: FiscalAlert[] = []
   let fiscalIssues = 0
-  reporter.beginStage('Revisore fiscale', 'Verifico fiscalità, detraibilità e possibili alert')
-  try {
-    const reviewLines = lines.map(l => {
-      const lr = lineResults.get(l.line_id)
-      const ruleResolved = resolved.find(r => r.line_id === l.line_id)
-      const hasFiscalFromRule = ruleResolved?.fiscal_flags && Object.keys(ruleResolved.fiscal_flags).length > 0
+  const reviewerPayload: ReviewerPayload = {
+    invoice_summary_final: null,
+    line_verdicts: [],
+    escalation_candidates: [],
+    red_flags: [],
+  }
 
+  reporter.beginStage('Revisore', 'Consolido il verdetto finale riga per riga')
+  try {
+    const reviewLines = lines.map((line) => {
+      const current = lineResults.get(line.line_id)
+      const ruleResolved = deterministicMap.get(line.line_id)
+      const hasFiscalFromRule = !!(ruleResolved?.fiscal_flags && Object.keys(ruleResolved.fiscal_flags).length > 0)
       return {
-        line_id: l.line_id,
-        description: l.description,
-        total_price: l.total_price,
-        category_name: null, // would need lookup
-        account_id: lr?.account_id || null,
-        account_code: lr?.account_code || null,
+        line_id: line.line_id,
+        description: line.description,
+        total_price: line.total_price,
+        category_id: current?.category_id || null,
+        category_name: null,
+        account_id: current?.account_id || null,
+        account_code: current?.account_code || null,
         account_name: null,
-        confidence: lr?.confidence || 0,
-        fiscal_flags: lr?.fiscal_flags || {
-          ritenuta_acconto: null, reverse_charge: false, split_payment: false,
-          bene_strumentale: false, deducibilita_pct: 100, iva_detraibilita_pct: 100, note: null,
-        },
-        source: lr?.source || 'unknown',
+        confidence: current?.confidence || 0,
+        fiscal_flags: defaultFiscalFlags(current?.fiscal_flags),
+        source: current?.source || 'unknown',
         fiscal_flags_source: hasFiscalFromRule ? 'rule_confirmed' : 'to_review',
-        fiscal_flags_preset: hasFiscalFromRule ? ruleResolved!.fiscal_flags : null,
+        fiscal_flags_preset: hasFiscalFromRule ? ruleResolved?.fiscal_flags : null,
       }
-    }).filter(l => {
-      const lr = lineResults.get(l.line_id)
-      return lr && lr.confidence >= 50 // only review lines with some classification
+    }).filter((line) => {
+      const current = lineResults.get(line.line_id)
+      return current && (current.account_id || current.category_id || current.confidence > 0)
     })
 
     if (reviewLines.length > 0) {
-      const step5 = await callEdge('fiscal-reviewer', {
+      const step4 = await callEdge('fiscal-reviewer', {
         ...commonBody,
         lines: reviewLines,
         ...(contractRefs?.length ? { contract_refs: contractRefs } : {}),
       }, token, signal)
-
       throwIfAborted(signal)
 
-      const reviews: ReviewResult[] = step5.reviews || []
-      alerts = step5.alerts || []
-      const fiscalThinking: string | null = step5.thinking || null
-      if (step5._debug) {
+      const reviews: ReviewResult[] = step4.reviews || []
+      alerts = step4.alerts || []
+      reviewerPayload.invoice_summary_final = step4.reviewer_verdict?.invoice_summary_final || null
+      reviewerPayload.line_verdicts = Array.isArray(step4.reviewer_verdict?.line_verdicts)
+        ? step4.reviewer_verdict.line_verdicts
+        : []
+      reviewerPayload.escalation_candidates = Array.isArray(step4.reviewer_verdict?.escalation_candidates)
+        ? step4.reviewer_verdict.escalation_candidates
+        : []
+      reviewerPayload.red_flags = Array.isArray(step4.reviewer_verdict?.red_flags)
+        ? step4.reviewer_verdict.red_flags
+        : []
+      const fiscalThinking: string | null = step4.thinking || null
+
+      if (step4._debug) {
         debugSteps.push({
           step: 'reviewer',
-          prompt_sent: step5._debug.prompt_sent,
-          raw_response: step5._debug.raw_response,
-          model_used: step5._debug.model_used,
-          agent_config_loaded: step5._debug.agent_config_loaded,
-          agent_rules_count: step5._debug.agent_rules_count,
-          kb_rules_count: step5._debug.kb_rules_count,
-          company_ateco: step5._debug.company_ateco,
+          prompt_sent: step4._debug.prompt_sent,
+          raw_response: step4._debug.raw_response,
+          model_used: step4._debug.model_used,
+          agent_config_loaded: step4._debug.agent_config_loaded,
+          agent_rules_count: step4._debug.agent_rules_count,
+          kb_rules_count: step4._debug.kb_rules_count,
+          company_ateco: step4._debug.company_ateco,
           extra: {
-            counterparty_ateco: step5._debug.counterparty_ateco,
-            counterparty_legal_type: step5._debug.counterparty_legal_type,
-            kb_source_table: step5._debug.kb_source_table,
-            pre_resolved_decisions: step5._debug.pre_resolved_decisions,
-            rule_confirmed_lines: step5._debug.rule_confirmed_lines,
+            counterparty_ateco: step4._debug.counterparty_ateco,
+            counterparty_legal_type: step4._debug.counterparty_legal_type,
+            pre_resolved_decisions: step4._debug.pre_resolved_decisions,
+            rule_confirmed_lines: step4._debug.rule_confirmed_lines,
+            escalation_candidates: reviewerPayload.escalation_candidates,
           },
         })
       }
 
-      // Apply fiscal corrections + reasoning
-      for (const rev of reviews) {
-        const lr = lineResults.get(rev.line_id)
-        if (lr && rev.fiscal_flags_corrected) {
-          lr.fiscal_flags = rev.fiscal_flags_corrected
-          lr.confidence = Math.max(0, Math.min(100, lr.confidence + (rev.confidence_adjustment || 0)))
-        }
-        if (lr) {
-          lr.fiscal_reasoning = rev.issues?.length ? rev.issues.join('; ') : 'Nessun problema fiscale rilevato'
-          lr.fiscal_thinking = fiscalThinking
-          lr.fiscal_confidence = lr.confidence
-        }
-        if (rev.issues?.length) fiscalIssues += rev.issues.length
+      for (const review of reviews) {
+        const current = lineResults.get(review.line_id)
+        if (!current) continue
+        current.fiscal_flags = defaultFiscalFlags(review.fiscal_flags_corrected)
+        current.confidence = Math.max(0, Math.min(100, current.confidence + (review.confidence_adjustment || 0)))
+        current.fiscal_reasoning = review.issues?.length ? review.issues.join('; ') : 'Nessun problema fiscale rilevato'
+        current.fiscal_thinking = fiscalThinking
+        current.fiscal_confidence = current.confidence
+        if (review.issues?.length) fiscalIssues += review.issues.length
       }
-      reporter.finishStage(
-        'Revisore fiscale',
-        `Revisore fiscale: ${reviews.length} righe verificate, ${alerts.length} alert generati`,
-      )
+
+      const verdictMap = new Map(reviewerPayload.line_verdicts.map((row) => [row.line_id, row]))
+      for (const line of lines) {
+        const current = lineResults.get(line.line_id)
+        if (!current) continue
+        const verdict = verdictMap.get(line.line_id)
+        if (verdict) {
+          const clearFields = new Set(verdict.clear_fields || [])
+          if (clearFields.has('category')) current.category_id = null
+          if (clearFields.has('account')) {
+            current.account_id = null
+            current.account_code = null
+          }
+          if (clearFields.has('article')) current.article_id = null
+          if (clearFields.has('phase')) current.phase_id = null
+          if (clearFields.has('cost_center')) current.cost_center_allocations = []
+          current.decision_status = verdict.decision_status
+          current.reasoning_summary_final = verdict.rationale_summary || current.reasoning_summary_final
+          current.decision_basis = normalizeStringArray(verdict.decision_basis)
+          current.supporting_factors = normalizeStringArray(verdict.supporting_factors)
+          current.supporting_evidence = normalizeEvidence(verdict.supporting_evidence).concat(current.supporting_evidence)
+          current.final_decision_source = 'revisore'
+          current.fiscal_reasoning = verdict.rationale_summary || current.fiscal_reasoning
+        } else {
+          current.decision_status = current.account_id || current.category_id ? 'finalized' : 'unassigned'
+          current.final_decision_source = current.final_decision_source === 'none' ? 'commercialista' : current.final_decision_source
+        }
+
+        if (current.decision_status !== 'finalized') {
+          current.final_decision_source = 'revisore'
+        }
+      }
+
+      reporter.finishStage('Revisore', `Revisore: ${reviews.length} revisioni, ${alerts.length} alert, ${reviewerPayload.escalation_candidates.length} escalation`)
     } else {
-      reporter.finishStage(
-        'Revisore fiscale',
-        'Revisore fiscale: saltato, nessuna riga con confidenza sufficiente da revisionare',
-      )
+      reporter.finishStage('Revisore', 'Revisore saltato: nessuna proposta sostanziale da consolidare')
     }
-  } catch (e) {
-    console.warn('[pipeline] Fiscal review failed (non-blocking):', e)
-    reporter.finishStage(
-      'Revisore fiscale',
-      `Revisore fiscale: warning non bloccante (${e instanceof Error ? e.message : 'errore sconosciuto'})`,
-    )
+  } catch (error) {
+    console.warn('[pipeline] Reviewer failed (non-blocking):', error)
+    reporter.finishStage('Revisore', `Revisore: warning non bloccante (${error instanceof Error ? error.message : 'errore sconosciuto'})`)
   }
 
-  // ─── Build final result ─────────────────────────────────
-  const finalLines = lines.map(l => {
-    const lr = lineResults.get(l.line_id)
-    if (lr) return lr
-    return {
-      line_id: l.line_id,
-      category_id: null,
-      account_id: null,
-      account_code: null,
-      article_id: null,
-      phase_id: null,
-      cost_center_allocations: [],
-      confidence: 0,
-      reasoning: 'Non classificata',
-      fiscal_flags: {},
-      source: 'none',
+  const finalLines = lines.map((line) => lineResults.get(line.line_id) || buildInitialResult(line))
+  for (const finalLine of finalLines) {
+    if (!finalLine.reasoning_summary_final) {
+      finalLine.reasoning_summary_final = finalLine.decision_status === 'unassigned'
+        ? 'Decisione non applicata: evidenza insufficiente sulla riga'
+        : finalLine.classification_reasoning || finalLine.fiscal_reasoning || finalLine.reasoning
     }
-  })
+    if (finalLine.decision_status === 'pending') {
+      finalLine.decision_status = finalLine.account_id || finalLine.category_id ? 'finalized' : 'unassigned'
+      if (finalLine.final_decision_source === 'none') {
+        finalLine.final_decision_source = finalLine.account_id || finalLine.category_id ? 'commercialista' : 'none'
+      }
+    }
+  }
 
   const pipelineResult: PipelineResult = {
     lines: finalLines,
     alerts,
+    commercialista,
+    reviewer: reviewerPayload,
     stats: {
       total: lines.length,
       deterministic: resolved.length,
-      ai_classified: aiClassifiedCount,
+      ai_classified: commercialista.line_proposals.length,
       cdc_assigned: cdcAssigned,
       fiscal_issues: fiscalIssues,
     },
     debug: debugSteps.length > 0 ? debugSteps : undefined,
   }
 
-  reporter.beginStage('Salvataggio risultati', 'Persisto suggerimenti, alert e metadati in piattaforma')
+  reporter.beginStage('Salvataggio risultati', 'Persisto verdetti, trail strutturato e snapshot finale')
   throwIfAborted(signal)
   await persistPipelineResults(companyId, invoiceId, pipelineResult, signal)
-  reporter.finishStage(
-    'Salvataggio risultati',
-    `Salvataggio risultati: completato su ${pipelineResult.lines.length} righe`,
-  )
+  reporter.finishStage('Salvataggio risultati', `Salvataggio completato su ${pipelineResult.lines.length} righe`)
 
   return pipelineResult
 }

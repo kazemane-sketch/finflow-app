@@ -59,6 +59,10 @@ function normalizeContractRef(value: string | null | undefined): string {
   return (value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
+function hasStrongReferenceLanguage(value: string | null | undefined): boolean {
+  return /\b(contratto|polizza|mutuo|finanziamento|canone|ratea?|rata|lease|leasing|abbonamento)\b/i.test(value || "");
+}
+
 function extractFactLineDescription(row: CompanyMemoryQueryRow): string | null {
   const metadata = parseMetadata(row.metadata);
   const fromMetadata = metadata.line_description;
@@ -66,10 +70,6 @@ function extractFactLineDescription(row: CompanyMemoryQueryRow): string | null {
 
   const match = row.fact_text.match(/riga ['"]([^'"]+)['"]/i);
   return match?.[1]?.trim() || null;
-}
-
-function isLeasingText(value: string | null | undefined): boolean {
-  return /(leasing|locazione finanziaria|canone leasing|canone locazione finanziaria)/i.test(value || "");
 }
 
 function extractFactContractRefs(row: CompanyMemoryQueryRow): string[] {
@@ -125,13 +125,17 @@ export function filterCompanyMemoryForInvoiceClassification(
       if (!isTraceableInvoiceClassificationMemory(row)) return false;
 
       const factLineDescription = extractFactLineDescription(row);
-      const leasingLike = isLeasingText(row.fact_text) || isLeasingText(factLineDescription);
-      if (!leasingLike) return true;
+      const factContractRefs = extractFactContractRefs(row);
+      const strongReferenceContext =
+        currentContractRefs.size > 0 ||
+        factContractRefs.length > 0 ||
+        hasStrongReferenceLanguage(row.fact_text) ||
+        hasStrongReferenceLanguage(factLineDescription);
+
+      if (!strongReferenceContext) return true;
 
       if (!factLineDescription) return false;
       if (!currentLineDescriptions.has(normalizeText(factLineDescription))) return false;
-
-      const factContractRefs = extractFactContractRefs(row);
       if (currentContractRefs.size === 0 || factContractRefs.length === 0) return false;
 
       return factContractRefs.some((ref) => currentContractRefs.has(ref));

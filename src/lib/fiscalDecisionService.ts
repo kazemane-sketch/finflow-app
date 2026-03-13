@@ -36,10 +36,6 @@ export interface FiscalDecision {
   operation_group_code: string
 }
 
-function requiresExactContractRef(description: string): boolean {
-  return /\b(leasing|locazione finanziaria)\b/i.test(description)
-}
-
 /* ─── Save a fiscal decision ─────────────────── */
 
 /**
@@ -151,7 +147,6 @@ export async function findMatchingFiscalDecisions(
 
     const lineSubjectKw = extractSubjectKeywords(line.description)
     const lineSubjectSet = new Set(lineSubjectKw)
-    const requireContractRef = requiresExactContractRef(line.description)
 
     const matching: FiscalDecision[] = []
 
@@ -159,12 +154,9 @@ export async function findMatchingFiscalDecisions(
       // Check 1: stesso operation group
       if (dec.operation_group_code !== lineOpGroup.group_code) continue
 
-      // Check 1.5: contract_ref compatibility
-      // If the decision has a contract_ref, the invoice MUST have the same ref
-      if (requireContractRef) {
-        if (!(dec as any).contract_ref) continue
-        if (!contractRefs?.includes((dec as any).contract_ref)) continue
-      } else if ((dec as any).contract_ref) {
+      // Strong-reference compatibility: if the learned decision is tied to
+      // a specific contract/reference, the current invoice must carry it too.
+      if ((dec as any).contract_ref) {
         if (!contractRefs?.includes((dec as any).contract_ref)) continue
       }
 

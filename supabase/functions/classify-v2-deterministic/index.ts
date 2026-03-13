@@ -308,7 +308,7 @@ Deno.serve(async (req) => {
             cost_center_allocations: null,
             fiscal_flags: null, // History doesn't carry fiscal_flags — reviewer must check
             confidence: 75, // History-based: decent but not as strong as rules
-            reasoning: `Storico controparte (pattern confermato in precedenza)`,
+            reasoning: `Pattern storico controparte usato come evidenza contestuale`,
             source: "history",
             rule_id: null,
             matched_groups: lineGroupCodes,
