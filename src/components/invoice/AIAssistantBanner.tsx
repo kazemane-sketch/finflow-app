@@ -343,7 +343,17 @@ function ProposedState({
             <div className="mt-2 space-y-2">
               {action.supporting_evidence.map((evidence, index) => (
                 <div key={index} className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-[12px] text-slate-600">
-                  <span className="font-medium text-slate-800">{evidence.label}</span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium text-slate-800">{evidence.label}</span>
+                    <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                      {evidence.source}
+                    </span>
+                    {evidence.ref ? (
+                      <span className="rounded-full bg-white px-2 py-0.5 font-mono text-[10px] text-slate-500">
+                        {evidence.ref}
+                      </span>
+                    ) : null}
+                  </div>
                   {evidence.detail && <span> — {evidence.detail}</span>}
                 </div>
               ))}

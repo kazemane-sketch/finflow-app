@@ -133,6 +133,72 @@ interface AgentConfig {
   max_output_tokens: number;
 }
 
+const CONTABILE_LEAK_PATTERNS = [
+  /\bconto\b/i,
+  /\bcategoria\b/i,
+  /\barticolo\b/i,
+  /\bfase\b/i,
+  /\bcdc\b/i,
+  /\bcentro di costo\b/i,
+  /\bnormalizz/i,
+  /\briclassific/i,
+  /\bnuovo conto\b/i,
+  /\bnuova categoria\b/i,
+  /\b[A-Z]\d{3,}\b/,
+  /\b\d{4,}\b\s*[-–—]\s*[A-Za-zÀ-ÿ]/,
+];
+
+function looksLikeContabileLeak(text: string): boolean {
+  return CONTABILE_LEAK_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function sanitizeReviewerText(text: unknown, fallback: string): string {
+  const raw = String(text || "").trim();
+  if (!raw) return fallback;
+
+  const kept = raw
+    .split(/(?<=[.;!?])\s+/)
+    .map((chunk) => chunk.trim())
+    .filter(Boolean)
+    .filter((chunk) => !looksLikeContabileLeak(chunk));
+
+  const cleaned = kept.join(" ").trim();
+  return cleaned || fallback;
+}
+
+function sanitizeReviewerList(values: unknown, fallback: string[] = []): string[] {
+  if (!Array.isArray(values)) return fallback;
+  const cleaned = values
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .filter((value) => !looksLikeContabileLeak(value));
+
+  return cleaned.length > 0 ? cleaned : fallback;
+}
+
+function sanitizeReviewerEvidence(values: unknown): SupportingEvidence[] {
+  if (!Array.isArray(values)) return [];
+  return values
+    .filter((value) => value && typeof value === "object")
+    .map((value) => {
+      const row = value as Record<string, unknown>;
+      const label = sanitizeReviewerText(row.label, "Evidenza fiscale");
+      const detail = row.detail == null
+        ? null
+        : sanitizeReviewerText(row.detail, "");
+      const ref = String(row.ref || "").trim() || null;
+      const signature = [label, detail || "", ref || ""].join(" ");
+      if (looksLikeContabileLeak(signature)) return null;
+      return {
+        source: String(row.source || "kb").trim() || "kb",
+        label,
+        detail: detail || null,
+        ref,
+      };
+    })
+    .filter((value): value is SupportingEvidence => Boolean(value));
+}
+
 interface AgentRule {
   title: string;
   rule_text: string;
@@ -697,6 +763,7 @@ Verificale solo se noti un'incongruenza EVIDENTE. Non generare alert su queste.
 4. Per le righe con decisioni già prese dall'utente o confermate da regole, RISPETTA le scelte (salvo incongruenze evidenti).
 
 REGOLE DI VERIFICA:
+- Ambito del revisore: il revisore fiscale NON propone nuovi conti, categorie, articoli, fasi o CdC. Se la classificazione contabile appare debole, segnala il dubbio ma non inventare codici o descrizioni alternative e non usare clear_fields per cancellare campi contabili.
 - Ritenuta d'acconto: SOLO su compensi a professionisti individuali (persone fisiche). MAI su SRL, SPA, cooperative. Controlla il tipo legale della controparte.
 - Bene strumentale: SOLO beni FISICI DUREVOLI > 516,46€. MAI su: canoni leasing, servizi, materiali di consumo, manodopera, utenze, affitti, noleggi.
 - IVA indetraibile: auto non da trasporto 40%, telefonia 50%, rappresentanza 0% se > 50€.
@@ -720,7 +787,7 @@ Rispondi con un SOLO JSON object:
       "decision_basis":["fattura intera","revisione fiscale","memoria aziendale"],
       "supporting_factors":["fattore 1","fattore 2"],
       "supporting_evidence":[{"source":"kb","label":"Titolo","detail":"breve dettaglio"}],
-      "clear_fields":["category","account"],
+      "clear_fields":[],
       "consultant_recommended":false
     }
   ],
@@ -832,6 +899,18 @@ Se non servono alert: "alerts": []`);
       }
     }
 
+    reviews = reviews
+      .filter((review) => review && typeof review === "object" && String(review.line_id || "").trim())
+      .map((review) => ({
+        line_id: String(review.line_id || "").trim(),
+        fiscal_flags_corrected: review.fiscal_flags_corrected,
+        issues: sanitizeReviewerList(review.issues, []),
+        confidence_adjustment: Math.max(
+          -20,
+          Math.min(20, Number.isFinite(Number(review.confidence_adjustment)) ? Number(review.confidence_adjustment) : 0),
+        ),
+      }));
+
     let lineVerdicts: ReviewerLineVerdict[] = Array.isArray(structuredResponse.line_verdicts)
       ? structuredResponse.line_verdicts
       : [];
@@ -859,6 +938,38 @@ Se non servono alert: "alerts": []`);
       return remainingLines.length > 0;
     });
 
+    const invoiceSummaryFinal = sanitizeReviewerText(
+      structuredResponse.invoice_summary_final,
+      "Revisione fiscale completata sulla fattura.",
+    );
+    const redFlags = sanitizeReviewerList(structuredResponse.red_flags, []);
+    const escalationCandidates = Array.isArray(structuredResponse.escalation_candidates)
+      ? Array.from(new Set(structuredResponse.escalation_candidates.map((lineId) => String(lineId || "").trim()).filter(Boolean)))
+      : [];
+
+    if (lineVerdicts.length > 0) {
+      lineVerdicts = lineVerdicts
+        .filter((verdict) => verdict && typeof verdict === "object" && String(verdict.line_id || "").trim())
+        .map((verdict) => ({
+          line_id: String(verdict.line_id || "").trim(),
+          decision_status: verdict.decision_status === "finalized" || verdict.decision_status === "unassigned"
+            ? verdict.decision_status
+            : "needs_review",
+          rationale_summary: sanitizeReviewerText(
+            verdict.rationale_summary,
+            "Il revisore fiscale mantiene un dubbio operativo da verificare.",
+          ),
+          decision_basis: sanitizeReviewerList(verdict.decision_basis, ["revisione fiscale"]),
+          supporting_factors: sanitizeReviewerList(
+            verdict.supporting_factors,
+            ["Valutazione fiscale condotta sul contesto disponibile"],
+          ),
+          supporting_evidence: sanitizeReviewerEvidence(verdict.supporting_evidence),
+          clear_fields: [],
+          consultant_recommended: Boolean(verdict.consultant_recommended),
+        }));
+    }
+
     if (lineVerdicts.length === 0) {
       lineVerdicts = lines.map((line) => {
         const review = reviews.find((item) => item.line_id === line.line_id);
@@ -874,13 +985,14 @@ Se non servono alert: "alerts": []`);
         return {
           line_id: line.line_id,
           decision_status: decisionStatus,
-          rationale_summary: issues.length > 0
-            ? issueText
-            : "Verdetto finale confermato dal revisore",
-          decision_basis: ["reviewer_verdict"],
+          rationale_summary: sanitizeReviewerText(
+            issues.length > 0 ? issueText : "",
+            "Verdetto fiscale finale confermato dal revisore",
+          ),
+          decision_basis: ["revisione fiscale"],
           supporting_factors: issues.length > 0 ? issues : ["Nessuna anomalia fiscale materiale rilevata"],
           supporting_evidence: [],
-          clear_fields: decisionStatus === "finalized" ? [] : ["category", "account", "article", "phase", "cost_center"],
+          clear_fields: [],
           consultant_recommended: decisionStatus === "needs_review" && adjustedConfidence < 55,
         };
       });
@@ -891,10 +1003,10 @@ Se non servono alert: "alerts": []`);
     return json({
       reviews,
       reviewer_verdict: {
-        invoice_summary_final: structuredResponse.invoice_summary_final || null,
+        invoice_summary_final: invoiceSummaryFinal || null,
         line_verdicts: lineVerdicts,
-        escalation_candidates: Array.isArray(structuredResponse.escalation_candidates) ? structuredResponse.escalation_candidates : [],
-        red_flags: Array.isArray(structuredResponse.red_flags) ? structuredResponse.red_flags : [],
+        escalation_candidates: escalationCandidates,
+        red_flags: redFlags,
       },
       alerts,
       thinking: thinkingText || null,

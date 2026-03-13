@@ -765,15 +765,6 @@ export async function runClassificationPipeline(
         if (!current) continue
         const verdict = verdictMap.get(line.line_id)
         if (verdict) {
-          const clearFields = new Set(verdict.clear_fields || [])
-          if (clearFields.has('category')) current.category_id = null
-          if (clearFields.has('account')) {
-            current.account_id = null
-            current.account_code = null
-          }
-          if (clearFields.has('article')) current.article_id = null
-          if (clearFields.has('phase')) current.phase_id = null
-          if (clearFields.has('cost_center')) current.cost_center_allocations = []
           current.decision_status = verdict.decision_status
           current.reasoning_summary_final = verdict.rationale_summary || current.reasoning_summary_final
           current.decision_basis = normalizeStringArray(verdict.decision_basis)

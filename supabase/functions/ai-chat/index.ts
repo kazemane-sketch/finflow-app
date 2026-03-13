@@ -76,6 +76,66 @@ function clip(s: string | null | undefined, max: number): string {
   return s.length > max ? s.slice(0, max) : s;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringOrNull(value: unknown, max = 240): string | null {
+  const raw = String(value || "").trim();
+  return raw ? clip(raw, max) : null;
+}
+
+function formatConsultantKbContext(rows: Record<string, unknown>[]): string {
+  return rows
+    .map((row, index) => {
+      const parts = [
+        `KB-${index + 1}`,
+        `file=${stringOrNull(row.file_name, 120) || "Documento"}`,
+        `chunk=${row.chunk_index ?? "?"}`,
+        `sim=${stringOrNull(row.similarity, 16) || "0"}`,
+        `excerpt="${clip(String(row.content || ""), 700)}"`,
+      ];
+      return `- ${parts.join(" | ")}`;
+    })
+    .join("\n");
+}
+
+function formatConsultantMemoryContext(rows: Record<string, unknown>[]): string {
+  return rows
+    .map((row, index) => {
+      const metadata = asRecord(row.metadata);
+      const contractRefs = Array.isArray(metadata?.contract_refs)
+        ? metadata?.contract_refs.map((value) => String(value || "").trim()).filter(Boolean).slice(0, 5).join(", ")
+        : "";
+
+      const parts = [
+        `MEM-${index + 1}`,
+        `memory_id=${stringOrNull(row.id, 80) || "n/a"}`,
+        `type=${stringOrNull(row.fact_type, 40) || "general"}`,
+        `sim=${stringOrNull(row.similarity, 16) || "0"}`,
+        `fact="${clip(String(row.fact_text || ""), 500)}"`,
+      ];
+
+      const sourceInvoiceId = stringOrNull(metadata?.source_invoice_id, 80);
+      const origin = stringOrNull(metadata?.origin, 80);
+      const contractRef = stringOrNull(metadata?.contract_ref, 120);
+      const accountCode = stringOrNull(metadata?.account_code, 40);
+      const accountName = stringOrNull(metadata?.account_name, 120);
+
+      if (sourceInvoiceId) parts.push(`source_invoice_id=${sourceInvoiceId}`);
+      if (origin) parts.push(`origin=${origin}`);
+      if (contractRef) parts.push(`contract_ref=${contractRef}`);
+      if (contractRefs) parts.push(`contract_refs=${clip(contractRefs, 180)}`);
+      if (accountCode) parts.push(`account_code=${accountCode}`);
+      if (accountName) parts.push(`account_name=${accountName}`);
+
+      return `- ${parts.join(" | ")}`;
+    })
+    .join("\n");
+}
+
 function parseJwt(token: string): Record<string, unknown> | null {
   try {
     const parts = token.split(".");
@@ -1435,6 +1495,7 @@ async function handleSearchCompanyMemory(sql: SqlClient, companyId: string, args
   return {
     query,
     results: results.map((r: Record<string, unknown>) => ({
+      id: r.id,
       fact_type: r.fact_type,
       fact_text: String(r.fact_text || "").slice(0, 1000),
       metadata: r.metadata,
@@ -2524,9 +2585,7 @@ Deno.serve(async (req) => {
       try {
         const kbSearch = await handleSearchKnowledgeBase(sql, companyId, { query: ragQuery, limit: 5 }) as Record<string, unknown>;
         const kbResults = Array.isArray(kbSearch.results) ? kbSearch.results as Record<string, unknown>[] : [];
-        kbContext = kbResults
-          .map((row) => `- ${row.file_name || "Documento"} [chunk ${row.chunk_index ?? "?"}] sim=${row.similarity || "0"}: ${clip(String(row.content || ""), 700)}`)
-          .join("\n");
+        kbContext = formatConsultantKbContext(kbResults);
       } catch {
         kbContext = "";
       }
@@ -2539,9 +2598,7 @@ Deno.serve(async (req) => {
           limit: 8,
         }) as Record<string, unknown>;
         const memoryResults = Array.isArray(memorySearch.results) ? memorySearch.results as Record<string, unknown>[] : [];
-        memoryContext = memoryResults
-          .map((row) => `- [${row.fact_type || "general"}] sim=${row.similarity || "0"}: ${clip(String(row.fact_text || ""), 500)}`)
-          .join("\n");
+        memoryContext = formatConsultantMemoryContext(memoryResults);
       } catch {
         memoryContext = "";
       }
@@ -2557,6 +2614,10 @@ Deno.serve(async (req) => {
 - Qui lavori sempre in modalita thinking esteso.
 - Devi ragionare sulla decisione corrente di commercialista/revisore, non riclassificare tutto da zero senza motivo.
 - Se suggerisci una modifica applicabile, NON chiamare tool mutativi in autonomia in questa modalita: restituisci invece un blocco JSON opzionale con la proposta, che l'utente potra applicare dalla UI.
+- Distingui sempre tra evidenza reale, inferenza e proposta. Non trasformare un indizio in una certezza.
+- Se citi KB o memory, usa SOLO riferimenti realmente presenti nel contesto qui sotto. Nel campo supporting_evidence usa label/ref come KB-1, MEM-2, source_invoice_id o contract_ref quando esistono davvero.
+- Non usare espressioni come "storico confermato" o "pattern certo" se la memoria non mostra un match davvero specifico.
+- Se esistono piu conti leasing simili e manca un riferimento contrattuale esatto, non scegliere in modo assertivo un conto specifico solo per controparte o descrizione generica: parla di conto candidato oppure mantieni needs_review.
 - Il JSON opzionale deve avere forma:
 \`\`\`json
 {"action":{"type":"apply_consultant_resolution","recommended_conclusion":"...","rationale_summary":"...","risk_level":"low|medium|high","supporting_evidence":[{"source":"kb","label":"...","detail":"...","ref":"..."}],"expected_impact":"...","line_updates":[{"line_id":"uuid","category_id":"uuid|null","account_id":"uuid|null","fiscal_flags":{},"decision_status":"finalized|needs_review|unassigned","reasoning_summary_final":"...","final_confidence":72,"note":"..."}]}}
@@ -2595,8 +2656,8 @@ ${visibleLines.map((line) => [
         chartRows.length > 0
           ? `PIANO DEI CONTI DISPONIBILE:\n${clip(chartRows.map((row) => `${row.code} ${row.name} (${row.section})`).join("\n"), 3200)}`
           : "",
-        kbContext ? `EVIDENZE KB:\n${kbContext}` : "",
-        memoryContext ? `MEMORIA AZIENDALE (contestuale, non confermata):\n${memoryContext}` : "",
+        kbContext ? `EVIDENZE KB CITABILI:\n${kbContext}` : "",
+        memoryContext ? `MEMORIA AZIENDALE (contestuale, non confermata ma con ref auditabili):\n${memoryContext}` : "",
         `STATO AZIENDALE AGGREGATO:\n${clip(JSON.stringify(companyStats), 2500)}`,
       ].filter(Boolean).join("\n\n");
 
