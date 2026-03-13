@@ -100,7 +100,7 @@ export async function startExtraction(companyId: string, invoiceCount: number) {
         // Load invoice lines
         const { data: lines } = await supabase
           .from('invoice_lines')
-          .select('id, description, quantity, unit_price, total_price')
+          .select('id, description, quantity, unit_price, total_price, vat_rate')
           .eq('invoice_id', inv.id);
 
         if (!lines || lines.length === 0) {
@@ -119,6 +119,7 @@ export async function startExtraction(companyId: string, invoiceCount: number) {
               quantity: l.quantity,
               unit_price: l.unit_price,
               total_price: l.total_price,
+              vat_rate: l.vat_rate,
             })),
             (inv.direction || 'in') as 'in' | 'out',
             cp?.piva || null,

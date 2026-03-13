@@ -28,6 +28,7 @@ interface InputLine {
   quantity: number | null
   unit_price: number | null
   total_price: number | null
+  vat_rate: number | null
 }
 
 interface DeterministicResult {
@@ -250,7 +251,7 @@ async function callEdge(
 }
 
 function defaultFiscalFlags(flags?: Record<string, unknown> | null) {
-  return {
+  const normalized = {
     ritenuta_acconto: null,
     reverse_charge: false,
     split_payment: false,
@@ -260,6 +261,9 @@ function defaultFiscalFlags(flags?: Record<string, unknown> | null) {
     note: null,
     ...(flags || {}),
   }
+  if (normalized.deducibilita_pct == null) normalized.deducibilita_pct = 0
+  if (normalized.iva_detraibilita_pct == null) normalized.iva_detraibilita_pct = 0
+  return normalized
 }
 
 function normalizeStringArray(input: unknown): string[] {
@@ -685,6 +689,7 @@ export async function runClassificationPipeline(
         line_id: line.line_id,
         description: line.description,
         total_price: line.total_price,
+        vat_rate: line.vat_rate,
         category_id: current?.category_id || null,
         category_name: null,
         account_id: current?.account_id || null,

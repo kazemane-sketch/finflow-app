@@ -341,10 +341,12 @@ function ReviewBadge({ confidence, hasNote, needsReview }: {
 function PipelineStepDetailPanel({ step }: { step: PipelineStepDebug }) {
   const stepLabels: Record<string, string> = {
     deterministic: '\uD83D\uDD0D Step 1: Regole + Storico',
-    understand: '\uD83E\uDDE0 Step 2: Comprensione',
-    classify: '\uD83D\uDCCB Step 3: Classificazione',
-    cdc: '\uD83C\uDFE2 Step 4: Centri di Costo',
-    reviewer: '\u2696\uFE0F Step 5: Revisore Fiscale',
+    understand: '\uD83E\uDDE0 Step 2: Comprensione (legacy)',
+    classify: '\uD83E\uDDE0 Step 2: Commercialista',
+    commercialista: '\uD83E\uDDE0 Step 2: Commercialista',
+    cdc: '\uD83C\uDFE2 Step 3: Centri di Costo',
+    reviewer: '\u2696\uFE0F Step 4: Revisore Fiscale',
+    persist: '\uD83D\uDCBE Step 5: Persistenza',
   };
 
   return (
@@ -1485,6 +1487,18 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   const [invoiceNotes, setInvoiceNotes] = useState<FiscalAlert[]>([]);
   const [pendingFiscalChoices, setPendingFiscalChoices] = useState<PendingFiscalChoice[]>([]);
   const [pipelineDebug, setPipelineDebug] = useState<PipelineStepDebug[] | null>(null);
+  const resolveInvoiceAlertIndex = useCallback((alertId: string) => {
+    const indexedPrefix = 'alert-';
+    if (alertId.startsWith(indexedPrefix)) {
+      const parsedIdx = Number.parseInt(alertId.slice(indexedPrefix.length), 10);
+      if (Number.isFinite(parsedIdx) && parsedIdx >= 0 && parsedIdx < invoiceNotes.length) return parsedIdx;
+    }
+
+    return invoiceNotes.findIndex((alert, index) => {
+      const runtimeId = (alert as FiscalAlert & { id?: string }).id;
+      return runtimeId === alertId || `${indexedPrefix}${index}` === alertId;
+    });
+  }, [invoiceNotes]);
   // AI suggestion state for new accounts/categories
   const [lineSuggestions, setLineSuggestions] = useState<Record<string, {
     suggest_new_account?: AccountSuggestion | null;
@@ -1991,6 +2005,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
           quantity: l.quantity,
           unit_price: l.unit_price,
           total_price: l.total_price,
+          vat_rate: l.vat_rate,
         })),
         invoice.direction as 'in' | 'out',
         cp?.piva || null,
@@ -3388,13 +3403,12 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
               elapsedSeconds={singleInvoiceJobRunning ? Math.round((singleInvoiceJobProgress.pct || 0) / 10) : undefined}
               alerts={invoiceNotes}
               onAlertAction={(action) => {
+                const alertIdx = resolveInvoiceAlertIndex(action.alertId);
+                const alert = alertIdx >= 0 ? invoiceNotes[alertIdx] : null;
                 if (action.option && 'type' in action.option && action.option.type === 'consult') {
-                  const alertIdx = parseInt(action.alertId.replace('alert-', ''), 10);
-                  const alert = invoiceNotes[alertIdx];
                   if (alert) handleStartChat(alert);
                 } else {
-                  const alertIdx = parseInt(action.alertId.replace('alert-', ''), 10);
-                  handleFiscalChoice(alertIdx, action.option as FiscalAlertOption);
+                  if (alertIdx >= 0) handleFiscalChoice(alertIdx, action.option as FiscalAlertOption);
                 }
               }}
               chatMessages={chatMessages}
@@ -3463,7 +3477,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
               <details className="mb-3 border border-slate-200 rounded-xl overflow-hidden">
                 <summary className="px-4 py-2.5 bg-slate-50 cursor-pointer text-sm font-semibold text-slate-700 hover:bg-slate-100 flex items-center gap-2">
                   <span className="text-base">{'\uD83D\uDD0D'}</span>
-                  Dettagli Pipeline AI ({pipelineDebug.length} step)
+                  Dettagli Pipeline AI ({pipelineDebug.length} step visibili)
                 </summary>
                 <div className="p-4 space-y-3 bg-white">
                   {pipelineDebug.map((step, i) => (
@@ -5015,14 +5029,14 @@ export default function FatturePage() {
               // Load invoice lines
               const { data: lines } = await supabase
                 .from('invoice_lines')
-                .select('id, description, quantity, unit_price, total_price')
+                .select('id, description, quantity, unit_price, total_price, vat_rate')
                 .eq('invoice_id', inv.id)
                 .order('line_number');
               if (!lines || lines.length === 0) return { ok: false };
 
               const cp = (inv.counterparty || {}) as any;
 
-              // Run the v2 cascade pipeline (deterministic → understand → classify → CdC → fiscal review)
+              // Run the v2 cascade pipeline (deterministic → commercialista → CdC → fiscal review)
               await runClassificationPipeline(
                 companyId,
                 inv.id,
@@ -5032,6 +5046,7 @@ export default function FatturePage() {
                   quantity: l.quantity,
                   unit_price: l.unit_price,
                   total_price: l.total_price,
+                  vat_rate: l.vat_rate,
                 })),
                 inv.direction as 'in' | 'out',
                 cp?.piva || null,
@@ -5093,7 +5108,7 @@ export default function FatturePage() {
           if (signal.aborted) break;
           const { data: lines } = await supabase
             .from('invoice_lines')
-            .select('id, description, quantity, unit_price, total_price')
+            .select('id, description, quantity, unit_price, total_price, vat_rate')
             .eq('invoice_id', inv.id);
           if (!lines || lines.length === 0) { totalProcessed++; continue; }
           const cp = inv.counterparty as Record<string, string> | null;
@@ -5107,6 +5122,7 @@ export default function FatturePage() {
               quantity: l.quantity,
               unit_price: l.unit_price,
               total_price: l.total_price,
+              vat_rate: l.vat_rate,
             })),
             (inv.direction || 'in') as 'in' | 'out',
             cp?.piva || null,

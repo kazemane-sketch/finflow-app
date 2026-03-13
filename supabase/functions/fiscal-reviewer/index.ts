@@ -56,6 +56,7 @@ interface ClassifiedLine {
   line_id: string;
   description: string;
   total_price: number | null;
+  vat_rate?: number | null;
   category_id?: string | null;
   category_name: string | null;
   account_id?: string | null;
@@ -624,6 +625,7 @@ Verificale solo se noti un'incongruenza EVIDENTE. Non generare alert su queste.
       const ff = l.fiscal_flags;
       return `${i + 1}. [${l.line_id}] "${l.description}" tot=${l.total_price ?? "N/D"}
    → conto: ${l.account_code || "N/D"} (${l.account_name || "N/D"}) | cat: ${l.category_name || "N/D"} | conf: ${l.confidence} | source: ${l.source}
+   → IVA fattura: ${l.vat_rate != null ? `${l.vat_rate}%` : "N/D"}
    → fiscale: deducib=${ff.deducibilita_pct}% IVA_detr=${ff.iva_detraibilita_pct}% ritenuta=${ff.ritenuta_acconto ? ff.ritenuta_acconto.aliquota + "%" : "no"} RC=${ff.reverse_charge} SP=${ff.split_payment} BS=${ff.bene_strumentale}${ff.note ? ` nota:"${ff.note}"` : ""}`;
     }).join("\n\n");
 
