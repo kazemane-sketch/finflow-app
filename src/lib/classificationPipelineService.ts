@@ -10,7 +10,6 @@
  */
 
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
-import { getValidAccessToken } from '@/lib/getValidAccessToken'
 import {
   saveCommercialistaProposals,
   saveFinalDecisions,
@@ -201,10 +200,6 @@ function abortError(): DOMException {
   return new DOMException('Aborted', 'AbortError')
 }
 
-function hasJwtAuthSignal(bodyText: string): boolean {
-  return /invalid jwt|jwt|sessione scaduta|session expired|auth session|token/i.test(bodyText)
-}
-
 function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw abortError()
 }
@@ -229,54 +224,28 @@ function createPipelineReporter(events?: PipelineEvents) {
 async function callEdge(
   functionName: string,
   body: Record<string, unknown>,
-  token: string,
   signal?: AbortSignal,
 ): Promise<any> {
-  const runFetch = async (bearerToken: string) => {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/${functionName}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${bearerToken}`,
-        'apikey': SUPABASE_ANON_KEY,
-      },
-      body: JSON.stringify(body),
-      signal,
-    })
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/${functionName}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': SUPABASE_ANON_KEY,
+    },
+    body: JSON.stringify(body),
+    signal,
+  })
 
-    const text = await res.text().catch(() => '')
-    let payload: unknown = {}
-    if (text) {
-      try {
-        payload = JSON.parse(text)
-      } catch {
-        payload = {}
-      }
-    }
-
-    return { res, text, payload }
+  const text = await res.text().catch(() => '')
+  if (!res.ok) {
+    throw new Error(`${functionName} HTTP ${res.status}: ${text.slice(0, 300)}`)
   }
 
-  let result = await runFetch(token)
-
-  if (result.res.status === 401 || result.res.status === 403) {
-    try {
-      const newToken = await getValidAccessToken({ forceRefresh: true })
-      result = await runFetch(newToken)
-    } catch (refreshError: any) {
-      const message = refreshError?.message || 'Sessione non valida o scaduta. Effettua nuovamente il login.'
-      throw new Error(message)
-    }
+  try {
+    return text ? JSON.parse(text) : {}
+  } catch {
+    return {}
   }
-
-  if (!result.res.ok) {
-    if ((result.res.status === 401 || result.res.status === 403) && hasJwtAuthSignal(result.text)) {
-      throw new Error('Sessione non valida o scaduta. Effettua nuovamente il login e riprova.')
-    }
-    throw new Error(`${functionName} HTTP ${result.res.status}: ${result.text.slice(0, 300)}`)
-  }
-
-  return result.payload
 }
 
 function defaultFiscalFlags(flags?: Record<string, unknown> | null) {
@@ -510,7 +479,6 @@ export async function runClassificationPipeline(
   contractRefs?: string[],
 ): Promise<PipelineResult> {
   const reporter = createPipelineReporter(events)
-  const token = await getValidAccessToken()
   const debugSteps: PipelineStepDebug[] = []
 
   let invoiceNotes = ''
@@ -551,7 +519,7 @@ export async function runClassificationPipeline(
     ...commonBody,
     lines,
     ...(contractRefs?.length ? { contract_refs: contractRefs } : {}),
-  }, token, signal)
+  }, signal)
   throwIfAborted(signal)
 
   const resolved: DeterministicResult[] = step1.resolved || []
@@ -586,7 +554,7 @@ export async function runClassificationPipeline(
       article_id: row.article_id,
       phase_id: row.phase_id,
     })),
-  }, token, signal)
+  }, signal)
   throwIfAborted(signal)
 
   const commercialista: CommercialistaPayload = {
@@ -674,7 +642,7 @@ export async function runClassificationPipeline(
           category_name: undefined,
         }
       }),
-    }, token, signal)
+    }, signal)
     throwIfAborted(signal)
 
     if (step3._debug) debugSteps.push({ step: 'cdc', extra: step3._debug })
@@ -737,7 +705,7 @@ export async function runClassificationPipeline(
         ...commonBody,
         lines: reviewLines,
         ...(contractRefs?.length ? { contract_refs: contractRefs } : {}),
-      }, token, signal)
+      }, signal)
       throwIfAborted(signal)
 
       const reviews: ReviewResult[] = step4.reviews || []
