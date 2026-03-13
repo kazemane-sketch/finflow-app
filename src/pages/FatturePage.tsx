@@ -3273,7 +3273,6 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
               </div>
               <div>
                 <span className="text-[10px] text-slate-400 uppercase tracking-wide">Controparte</span>
-                <p className="font-medium text-slate-700 mt-0.5">{invoice.number || '\u2014'} {'\u2014'} {fmtDate(invoice.date)}</p>
                 {(counterpartyHeaderInfo.atecoDescription || counterpartyHeaderInfo.provinceSigla) && (
                   <div className="flex items-center gap-1 mt-0.5 flex-wrap">
                     {counterpartyHeaderInfo.atecoDescription && (
@@ -3288,6 +3287,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                     )}
                   </div>
                 )}
+                <p className="font-medium text-slate-700 mt-0.5">{invoice.number || '\u2014'} {'\u2014'} {fmtDate(invoice.date)}</p>
               </div>
               <div>
                 <span className="text-[10px] text-slate-400 uppercase tracking-wide">Scadenza</span>
@@ -4295,7 +4295,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                   </span>
                   {(persistedHasData || draftHasData || clearPending) && (
                     <button onClick={() => setShowClearDialog(true)}
-                      className="px-2 py-1 text-[10px] font-medium rounded border border-slate-200 text-slate-500 hover:bg-slate-50 hover:text-red-500 transition-colors">
+                      className="px-4 py-1.5 text-xs font-medium rounded-full border border-slate-200 text-slate-600 bg-white hover:bg-slate-50 transition-colors">
                       Cancella tutto
                     </button>
                   )}
@@ -4303,7 +4303,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                 <div className="flex items-center gap-2">
                   {isPostConfirmDirty && (
                     <button onClick={handleConfirmChanges} disabled={confirmChangesSaving || !cdcValidation.valid}
-                      className="px-5 py-2 text-sm font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 transition-colors"
+                      className="px-5 py-1.5 text-xs font-semibold rounded-full bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors"
                       title={!cdcValidation.valid ? cdcValidation.message : 'Salva tutte le modifiche'}>
                       {confirmChangesSaving ? 'Salvataggio...' : 'Salva'}
                     </button>
@@ -5657,7 +5657,7 @@ export default function FatturePage() {
         <button onClick={() => setExportOpen(true)} className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50">
           {'\u2193'} Export
         </button>
-        <button onClick={() => fileRef.current?.click()} className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-indigo-600 text-white border border-indigo-600 rounded-lg hover:bg-indigo-700">+ Importa</button>
+        <button onClick={() => fileRef.current?.click()} className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-violet-500 text-white border border-violet-500 rounded-lg hover:bg-violet-600">+ Importa</button>
         <input ref={fileRef} type="file" multiple accept=".xml,.p7m,.zip" onChange={e => e.target.files && handleImport(e.target.files)} className="hidden" />
       </div>
 

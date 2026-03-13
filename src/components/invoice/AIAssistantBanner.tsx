@@ -143,11 +143,11 @@ function ProcessingState({ steps, elapsed }: { steps?: ProgressStep[]; elapsed?:
       eyebrow="In lavorazione"
       title="Sto costruendo il verdetto finale della fattura"
       subtitle="La pipeline usa il commercialista per la proposta e il revisore per il consolidamento finale."
-      accent="blue"
+      accent="violet"
     >
-      <div className="rounded-2xl border border-blue-100 bg-white/80 p-4">
+      <div className="rounded-2xl border border-violet-100 bg-white/80 p-4">
         <div className="mb-3 flex items-center gap-2 text-sm font-medium text-slate-800">
-          <span className="inline-flex h-5 w-5 animate-spin rounded-full border-2 border-slate-300 border-t-blue-500" />
+          <span className="inline-flex h-5 w-5 animate-spin rounded-full border-2 border-slate-300 border-t-indigo-500" />
           Elaborazione in corso
           {elapsed != null && <span className="ml-auto text-xs text-slate-400">{elapsed}s</span>}
         </div>
@@ -156,7 +156,7 @@ function ProcessingState({ steps, elapsed }: { steps?: ProgressStep[]; elapsed?:
             <div key={index} className="flex items-center gap-2 text-[12px]">
               <span className={
                 step.status === 'done' ? 'text-emerald-600' :
-                step.status === 'running' ? 'text-blue-600' :
+                step.status === 'running' ? 'text-indigo-600' :
                 step.status === 'error' ? 'text-red-600' :
                 'text-slate-300'
               }>
@@ -186,17 +186,17 @@ function AlertsState({
       eyebrow="Dubbi da sciogliere"
       title="Il revisore ha trovato punti che meritano una scelta esplicita"
       subtitle="Puoi applicare una scelta, oppure aprire il consulente per una second opinion contestuale."
-      accent="amber"
+      accent="violet"
     >
       <div className="space-y-3">
         {alerts.map((alert, index) => (
-          <div key={index} className="rounded-2xl border border-amber-200 bg-white/90 p-4">
+          <div key={index} className="rounded-2xl border border-violet-200 bg-white/90 p-4">
             <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
               <div>
                 <p className="text-sm font-semibold text-slate-900">{alert.title}</p>
                 <p className="mt-1 text-[12px] leading-relaxed text-slate-600">{alert.description}</p>
               </div>
-              <span className="rounded-full bg-amber-100 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-amber-700">
+              <span className="rounded-full bg-violet-100 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-violet-700">
                 {alert.severity}
               </span>
             </div>
@@ -216,7 +216,7 @@ function AlertsState({
               ))}
               <button
                 onClick={() => onAction?.({ alertId: `alert-${index}`, option: { type: 'consult' } })}
-                className="rounded-xl border border-blue-200 bg-blue-50 px-3 py-1.5 text-[11px] font-medium text-blue-700 transition hover:bg-blue-100"
+                className="rounded-xl border border-violet-200 bg-violet-50 px-3 py-1.5 text-[11px] font-medium text-violet-700 transition hover:bg-violet-100"
               >
                 Approfondisci con consulente
               </button>
@@ -333,9 +333,9 @@ function ProposedState({
       eyebrow="Proposta consulente"
       title={action.recommended_conclusion || 'Risoluzione proposta pronta da applicare'}
       subtitle={action.rationale_summary || 'Il consulente ha costruito una proposta applicabile con nota esplicativa.'}
-      accent="amber"
+      accent="violet"
     >
-      <div className="rounded-2xl border border-amber-200 bg-white/90 p-4">
+      <div className="rounded-2xl border border-violet-200 bg-white/90 p-4">
         <div className="grid gap-3 sm:grid-cols-2">
           <Metric label="Rischio" value={action.risk_level || 'N/D'} />
           <Metric label="Impatto atteso" value={action.expected_impact || 'Non specificato'} />
