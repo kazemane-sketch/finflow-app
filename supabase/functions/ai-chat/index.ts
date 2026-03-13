@@ -285,7 +285,7 @@ function hasStrongAccountEvidence(evidence: ConsultantEvidence): boolean {
   const ref = String(evidence.ref || "");
   const detail = String(evidence.detail || "");
   const payload = `${ref} ${detail}`;
-  return /contract_ref=|source_invoice_id=|account_code=|exact_match|deterministic/i.test(payload);
+  return /contract_ref=|contract_refs=|exact_match|deterministic/i.test(payload);
 }
 
 function sanitizeConsultantAction(
@@ -313,6 +313,8 @@ function sanitizeConsultantAction(
     context.visibleLines.map((line) => [String(line.id || ""), line]),
   );
 
+  let weakenedSpecificAccountRecommendation = false;
+
   const lineUpdates = sanitizeLineUpdates(action.line_updates).map((update) => {
     const current = visibleLineMap.get(update.line_id);
     const currentAccountId = current ? String(current.account_id || "").trim() || null : null;
@@ -320,10 +322,14 @@ function sanitizeConsultantAction(
     const hasStrongEvidence = sanitizedEvidence.some((evidence) => hasStrongAccountEvidence(evidence));
 
     if (wantsSpecificAccount && !hasStrongEvidence) {
+      weakenedSpecificAccountRecommendation = true;
       return {
         ...update,
         account_id: null,
         decision_status: "needs_review" as const,
+        final_confidence: update.final_confidence == null
+          ? 68
+          : Math.min(update.final_confidence, 68),
         reasoning_summary_final: clip(
           [
             String(update.reasoning_summary_final || "").trim(),
@@ -344,8 +350,26 @@ function sanitizeConsultantAction(
     return update;
   });
 
-  return {
+  const sanitizedAction = {
     ...action,
+    supporting_evidence: sanitizedEvidence,
+    line_updates: lineUpdates,
+  };
+
+  if (!weakenedSpecificAccountRecommendation) return sanitizedAction;
+
+  return {
+    ...sanitizedAction,
+    recommended_conclusion: "needs_review_contract_account",
+    rationale_summary: clip(
+      [
+        "La memoria disponibile e utile come indizio contestuale, ma non basta per assegnare in modo definitivo un conto leasing specifico.",
+        "Senza un riferimento contrattuale esplicito, il conto resta da verificare.",
+      ].join(" "),
+      1600,
+    ),
+    risk_level: "medium",
+    expected_impact: "Mantiene prudenza contabile: evita di forzare un conto leasing specifico senza un aggancio contrattuale puntuale.",
     supporting_evidence: sanitizedEvidence,
     line_updates: lineUpdates,
   };
