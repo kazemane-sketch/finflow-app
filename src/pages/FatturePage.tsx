@@ -586,13 +586,13 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, on
           onSelect();
         }
       }}
-      className={`flex items-start gap-2 px-3 py-2.5 cursor-pointer border-b border-gray-100 transition-all ${checked ? 'bg-blue-50 border-l-4 border-l-blue-500' : selected ? 'bg-sky-50 border-l-4 border-l-sky-500' : 'border-l-4 border-l-transparent hover:bg-gray-50'}`}
+      className={`flex items-start gap-2 px-3 py-2 cursor-pointer border-b border-slate-100 transition-all ${checked ? 'bg-blue-50 border-l-2 border-l-blue-500' : selected ? 'bg-slate-50 border-l-2 border-l-slate-800' : 'border-l-2 border-l-transparent hover:bg-slate-50/60'}`}
     >
       {selectMode && <input type="checkbox" checked={checked} onChange={onCheck} className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />}
       <div className="flex-1 min-w-0" onClick={onSelect}>
         <div className="flex justify-between items-center">
           <span className="text-xs font-semibold text-gray-800 truncate max-w-[55%]">{displayName}</span>
-          <span className={`text-xs font-bold ${inv.direction === 'in' ? 'text-red-600' : 'text-emerald-700'}`}>{fmtEur(inv.total_amount)}</span>
+          <span className="text-xs font-bold text-slate-900">{fmtEur(inv.total_amount)}</span>
         </div>
         <div className="flex justify-between items-center mt-0.5">
           <span className="text-[10px] text-gray-500">n.{inv.number} — {fmtDate(inv.date)}</span>
@@ -816,12 +816,12 @@ function PhaseDropdown({ phases, currentPhaseId, onSelect }: {
 // ============================================================
 // FULL INVOICE DETAIL — matches artifact output
 // ============================================================
-type DetailTab = 'classificazione' | 'documento' | 'pagamenti' | 'note';
-const DETAIL_TABS: { key: DetailTab; label: string; icon: string }[] = [
-  { key: 'classificazione', label: 'Classificazione', icon: '\uD83C\uDFF7\uFE0F' },
-  { key: 'documento', label: 'Documento', icon: '\uD83D\uDCC4' },
-  { key: 'pagamenti', label: 'Pagamenti', icon: '\uD83D\uDCB3' },
-  { key: 'note', label: 'Note', icon: '\uD83D\uDCDD' },
+type DetailTab = 'dettaglio' | 'documento' | 'pagamenti' | 'note';
+const DETAIL_TABS: { key: DetailTab; label: string }[] = [
+  { key: 'dettaglio', label: 'Dettaglio' },
+  { key: 'documento', label: 'Documento' },
+  { key: 'pagamenti', label: 'Pagamenti' },
+  { key: 'note', label: 'Note' },
 ];
 
 type FattureReturnFilters = {
@@ -1151,7 +1151,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   const activeDetailBundle = detailBundle?.invoiceId === invoice.id ? detailBundle : null;
   const detail = activeDetailBundle?.detail ?? null;
   const installments = activeDetailBundle?.installments ?? [];
-  const [activeTab, setActiveTab] = useState<DetailTab>('classificazione');
+  const [activeTab, setActiveTab] = useState<DetailTab>('dettaglio');
   const [editing, setEditing] = useState(false);
   const [showXml, setShowXml] = useState(false);
   const [parsed, setParsed] = useState<any>(null);
@@ -3233,100 +3233,149 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   const informationalTotal = skippedLineCount + groupedLineCount;
 
   return (
-    <div className="flex flex-col h-full" id="invoice-detail-print">
-	      {/* HEADER — Clean card inspired by TestLab */}
-	      <div className="bg-white border-b flex-shrink-0">
-	        {/* Top bar: badges + actions */}
-	        <div className="flex items-center justify-between px-5 pt-4 pb-2">
-	          <div className="flex items-center gap-3 min-w-0">
-	            <button
-	              onClick={onNavigateCounterparty}
-	              className="text-base font-bold text-slate-900 hover:text-blue-700 hover:underline cursor-pointer bg-transparent border-none p-0 text-left truncate max-w-[420px]"
-	              title="Vai alla controparte"
-	            >
-	              {cp?.denom || invoice.source_filename || 'Sconosciuto'}
-	            </button>
-	            {cp?.piva && <span className="text-[10px] text-slate-400 flex-shrink-0">P.IVA {cp.piva}</span>}
-	          </div>
-	          <div className="flex items-center gap-1.5 flex-shrink-0">
-            {detail?.raw_xml && (
-              <button onClick={() => setShowXml(!showXml)} className={`w-7 h-7 flex items-center justify-center rounded-lg text-[10px] transition-colors ${showXml ? 'bg-sky-600 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-500'}`} title="Vedi XML">&lt;/&gt;</button>
-            )}
-            {detail?.raw_xml && (
-              <button onClick={downloadXml} className="w-7 h-7 flex items-center justify-center rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs" title="Scarica XML">{'\u2B07'}</button>
-            )}
-            <button onClick={() => window.print()} className="w-7 h-7 flex items-center justify-center rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs" title="Stampa PDF">{'\uD83D\uDDA8'}</button>
-            <button onClick={() => setEditing(!editing)} className={`w-7 h-7 flex items-center justify-center rounded-lg text-xs transition-colors ${editing ? 'bg-blue-600 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-500'}`} title="Modifica">{'\u270F'}</button>
-            <button onClick={onOpenScadenzario} className="w-7 h-7 flex items-center justify-center rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs" title="Scadenzario">{'\uD83D\uDCC5'}</button>
-            <button onClick={onDelete} className="w-7 h-7 flex items-center justify-center rounded-lg bg-red-50 hover:bg-red-100 text-red-400 text-xs" title="Elimina">{'\uD83D\uDDD1'}</button>
-          </div>
-        </div>
-        {/* Metadata grid — clean 4-col like TestLab */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-2 px-5 pb-4 text-xs">
-          <div>
-            <span className="text-slate-400 text-[10px]">Tipo doc</span>
-            <p className="font-medium text-slate-700">{tpLabel(invoice.doc_type) || invoice.doc_type}</p>
-          </div>
-          <div>
-            <span className="text-slate-400 text-[10px]">Direzione</span>
-            <div className="flex items-center gap-1.5 mt-0.5">
-              <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${
-                invoice.direction === 'in' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'
-              }`}>
-                {invoice.direction === 'in' ? 'Passiva' : 'Attiva'}
-              </span>
-              <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${STATUS_COLORS[invoice.payment_status] || 'bg-slate-100 text-slate-600'}`}>
+    <div className="flex flex-col h-full bg-slate-50/50" id="invoice-detail-print">
+        {/* CARD 1 — Counterparty header */}
+        <div className="mx-4 mt-3 bg-white border border-slate-200 rounded-xl flex-shrink-0 shadow-sm">
+          {/* Row 1: Counterparty name + amount hero */}
+          <div className="flex items-start justify-between px-5 pt-4 pb-2">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={onNavigateCounterparty}
+                  className="text-lg font-bold text-slate-900 hover:text-slate-600 cursor-pointer bg-transparent border-none p-0 text-left truncate max-w-[420px]"
+                  title="Vai alla controparte"
+                >
+                  {cp?.denom || invoice.source_filename || 'Sconosciuto'}
+                </button>
+              </div>
+              {cp?.piva && <span className="text-[10px] text-slate-400 block mt-0.5">#IVA {cp.piva}</span>}
+            </div>
+            <div className="flex items-center gap-3 flex-shrink-0">
+              <span className={`px-2.5 py-1 rounded-md text-[11px] font-semibold ${STATUS_COLORS[invoice.payment_status] || 'bg-slate-100 text-slate-600'}`}>
                 {getStatusLabel(invoice.payment_status, invoice.direction)}
               </span>
+              <span className="text-xl font-bold text-slate-900">{fmtEur(invoice.total_amount)}</span>
             </div>
           </div>
-          <div>
-            <span className="text-slate-400 text-[10px]">Controparte</span>
-            <p className="font-medium text-slate-700">{invoice.number || '\u2014'} {'\u2014'} {fmtDate(invoice.date)}</p>
-            <div className="flex items-center gap-1 mt-0.5 flex-wrap">
-              {counterpartyHeaderInfo.atecoDescription && (
-                <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-blue-50 text-blue-600">
-                  {counterpartyHeaderInfo.atecoDescription}
-                </span>
-              )}
-              {counterpartyHeaderInfo.provinceSigla && (
-                <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">
-                  {counterpartyHeaderInfo.provinceSigla}
-                </span>
-              )}
+          {/* Row 2: Metadata 3-col + action buttons */}
+          <div className="flex items-end justify-between px-5 pb-3">
+            <div className="grid grid-cols-3 gap-x-8 text-xs flex-1">
+              <div>
+                <span className="text-[10px] text-slate-400 uppercase tracking-wide">Tipo doc</span>
+                <div className="flex items-center gap-1.5 mt-0.5">
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                    invoice.direction === 'in' ? 'bg-slate-100 text-slate-600' : 'bg-slate-100 text-slate-600'
+                  }`}>
+                    {invoice.direction === 'in' ? 'Passivo' : 'Attivo'}
+                  </span>
+                  <span className="text-[10px] text-slate-500">{tpLabel(invoice.doc_type) || invoice.doc_type}</span>
+                </div>
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-400 uppercase tracking-wide">Controparte</span>
+                <p className="font-medium text-slate-700 mt-0.5">{invoice.number || '\u2014'} {'\u2014'} {fmtDate(invoice.date)}</p>
+                {(counterpartyHeaderInfo.atecoDescription || counterpartyHeaderInfo.provinceSigla) && (
+                  <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                    {counterpartyHeaderInfo.atecoDescription && (
+                      <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-slate-50 text-slate-500">
+                        {counterpartyHeaderInfo.atecoDescription}
+                      </span>
+                    )}
+                    {counterpartyHeaderInfo.provinceSigla && (
+                      <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-slate-50 text-slate-500">
+                        {counterpartyHeaderInfo.provinceSigla}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+              <div>
+                <span className="text-[10px] text-slate-400 uppercase tracking-wide">Scadenza</span>
+                <p className={`font-semibold mt-0.5 ${invoice.payment_status === 'overdue' ? 'text-red-600' : 'text-slate-700'}`}>
+                  {invoice.payment_due_date ? fmtDate(invoice.payment_due_date) : '\u2014'}
+                </p>
+              </div>
             </div>
-          </div>
-          <div>
-            <span className="text-slate-400 text-[10px]">Totale</span>
-            <p className="font-bold text-slate-900 text-sm">{fmtEur(invoice.total_amount)}</p>
-            <p className="text-[10px] text-slate-400">{invoice.payment_due_date ? `Scad. ${fmtDate(invoice.payment_due_date)}` : ''}</p>
+            <div className="flex items-center gap-1 flex-shrink-0">
+              {detail?.raw_xml && (
+                <button onClick={() => setShowXml(!showXml)} className={`w-6 h-6 flex items-center justify-center rounded text-[9px] transition-colors ${showXml ? 'bg-slate-700 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-400'}`} title="Vedi XML">&lt;/&gt;</button>
+              )}
+              {detail?.raw_xml && (
+                <button onClick={downloadXml} className="w-6 h-6 flex items-center justify-center rounded bg-slate-100 hover:bg-slate-200 text-slate-400 text-[9px]" title="Scarica XML">{'\u2B07'}</button>
+              )}
+              <button onClick={() => window.print()} className="w-6 h-6 flex items-center justify-center rounded bg-slate-100 hover:bg-slate-200 text-slate-400 text-[9px]" title="Stampa">{'\uD83D\uDDA8'}</button>
+              <button onClick={() => setEditing(!editing)} className={`w-6 h-6 flex items-center justify-center rounded text-[9px] transition-colors ${editing ? 'bg-slate-700 text-white' : 'bg-slate-100 hover:bg-slate-200 text-slate-400'}`} title="Modifica">{'\u270F'}</button>
+              <button onClick={onOpenScadenzario} className="w-6 h-6 flex items-center justify-center rounded bg-slate-100 hover:bg-slate-200 text-slate-400 text-[9px]" title="Scadenzario">{'\uD83D\uDCC5'}</button>
+              <button onClick={onDelete} className="w-6 h-6 flex items-center justify-center rounded bg-slate-100 hover:bg-red-100 text-slate-400 hover:text-red-500 text-[9px]" title="Elimina">{'\uD83D\uDDD1'}</button>
+            </div>
           </div>
         </div>
+
+      {/* CARD 2 — AI Assistant */}
+      <div className="mx-4 mt-3 bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden flex-shrink-0">
+        <AIAssistantBanner
+          status={
+            aiBannerStatus === 'consulting' ? 'consulting' :
+            aiBannerStatus === 'proposed' ? 'proposed' :
+            aiBannerStatus === 'applied' ? 'applied' :
+            (aiClassifStatus === 'loading' || singleInvoiceJobRunning) ? 'processing' :
+            invoiceNotes.length > 0 ? 'alerts' :
+            (aiClassifResult || hasPersistedClassificationData || invoice.classification_status === 'confirmed') ? 'done' :
+            'idle'
+          }
+          onStartClassification={handleRequestAiClassification}
+          lineCount={detail?.invoice_lines?.length}
+          progressSteps={singleInvoiceJob ? [
+            { label: singleInvoiceJob.stage || 'Classificazione AI...', status: 'running' as const },
+          ] : undefined}
+          elapsedSeconds={singleInvoiceJobRunning ? Math.round((singleInvoiceJobProgress.pct || 0) / 10) : undefined}
+          alerts={invoiceNotes}
+          onAlertAction={(action) => {
+            const alertIdx = resolveInvoiceAlertIndex(action.alertId);
+            const alert = alertIdx >= 0 ? invoiceNotes[alertIdx] : null;
+            if (action.option && 'type' in action.option && action.option.type === 'consult') {
+              if (alert) handleStartChat(alert);
+            } else {
+              if (alertIdx >= 0) handleFiscalChoice(alertIdx, action.option as FiscalAlertOption);
+            }
+          }}
+          chatMessages={chatMessages}
+          onSendMessage={handleSendChatMessage}
+          onApplyAction={handleApplyConsultantAction}
+          onKeepCurrentDecision={handleKeepCurrentDecision}
+          onAskFollowUp={handleAskConsultantFollowUp}
+          chatLoading={chatLoading}
+          chatAlertTitle={chatAlertContext}
+          proposedAction={proposedConsultantAction}
+          summary={aiClassifResult ? (aiClassifResult.invoice_level?.reasoning || `Classificate ${aiClassifResult.lines?.length || 0} righe`) : invoice.classification_status === 'confirmed' ? 'Classificazione confermata' : undefined}
+          onRestart={handleRequestAiClassification}
+        />
       </div>
 
-      {/* TAB BAR — clean underline style */}
-      <div className="flex border-b bg-white flex-shrink-0 px-5">
-        {DETAIL_TABS.map(tab => (
-          <button
-            key={tab.key}
-            onClick={() => setActiveTab(tab.key)}
-            className={`flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold border-b-2 transition-colors ${
-              activeTab === tab.key
-                ? 'text-purple-700 border-purple-600'
-                : 'text-slate-400 border-transparent hover:text-slate-600'
-            }`}
-          >
-            <span>{tab.icon}</span>
-            <span>{tab.label}</span>
-            {tab.key === 'classificazione' && classifNeedsAttention && (
-              <span className="w-2 h-2 rounded-full bg-orange-400 flex-shrink-0" />
-            )}
-          </button>
-        ))}
-      </div>
+      {/* CARD 3 — Tabs + content */}
+      <div className="mx-4 mt-3 flex-1 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        {/* Tab bar */}
+        <div className="flex border-b border-slate-200 flex-shrink-0 px-5 gap-1">
+          {DETAIL_TABS.map(tab => (
+            <button
+              key={tab.key}
+              onClick={() => setActiveTab(tab.key)}
+              className={`px-4 py-2.5 text-xs font-medium border-b-2 transition-all ${
+                activeTab === tab.key
+                  ? 'text-slate-900 border-slate-900'
+                  : 'text-slate-400 border-transparent hover:text-slate-600 hover:border-slate-300'
+              }`}
+            >
+              {tab.label}
+              {tab.key === 'dettaglio' && classifNeedsAttention && (
+                <span className="ml-1.5 w-1.5 h-1.5 rounded-full bg-orange-400 inline-block" />
+              )}
+            </button>
+          ))}
+        </div>
 
-      {/* TAB CONTENT (scrollable) */}
-      <div className="flex-1 overflow-y-auto">
+        {/* TAB CONTENT (scrollable) */}
+        <div className="flex-1 overflow-y-auto">
         {/* XML viewer (always visible when toggled) */}
         {showXml && detail?.raw_xml && (
           <div className="mx-4 mt-3 bg-gray-900 rounded-lg overflow-hidden border print:hidden">
@@ -3391,48 +3440,9 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
           </div>
         ) : (
           <>
-        {/* ═══ TAB: CLASSIFICAZIONE ═══ */}
-        {activeTab === 'classificazione' && (
-          <div className="p-4 space-y-4">
-            {/* AI Assistant Banner */}
-            <AIAssistantBanner
-              status={
-                aiBannerStatus === 'consulting' ? 'consulting' :
-                aiBannerStatus === 'proposed' ? 'proposed' :
-                aiBannerStatus === 'applied' ? 'applied' :
-                (aiClassifStatus === 'loading' || singleInvoiceJobRunning) ? 'processing' :
-                invoiceNotes.length > 0 ? 'alerts' :
-                (aiClassifResult || hasPersistedClassificationData || invoice.classification_status === 'confirmed') ? 'done' :
-                'idle'
-              }
-              onStartClassification={handleRequestAiClassification}
-              lineCount={detail?.invoice_lines?.length}
-              progressSteps={singleInvoiceJob ? [
-                { label: singleInvoiceJob.stage || 'Classificazione AI...', status: 'running' as const },
-              ] : undefined}
-              elapsedSeconds={singleInvoiceJobRunning ? Math.round((singleInvoiceJobProgress.pct || 0) / 10) : undefined}
-              alerts={invoiceNotes}
-              onAlertAction={(action) => {
-                const alertIdx = resolveInvoiceAlertIndex(action.alertId);
-                const alert = alertIdx >= 0 ? invoiceNotes[alertIdx] : null;
-                if (action.option && 'type' in action.option && action.option.type === 'consult') {
-                  if (alert) handleStartChat(alert);
-                } else {
-                  if (alertIdx >= 0) handleFiscalChoice(alertIdx, action.option as FiscalAlertOption);
-                }
-              }}
-              chatMessages={chatMessages}
-              onSendMessage={handleSendChatMessage}
-              onApplyAction={handleApplyConsultantAction}
-              onKeepCurrentDecision={handleKeepCurrentDecision}
-              onAskFollowUp={handleAskConsultantFollowUp}
-              chatLoading={chatLoading}
-              chatAlertTitle={chatAlertContext}
-              proposedAction={proposedConsultantAction}
-              summary={aiClassifResult ? (aiClassifResult.invoice_level?.reasoning || `Classificate ${aiClassifResult.lines?.length || 0} righe`) : invoice.classification_status === 'confirmed' ? 'Classificazione confermata' : undefined}
-              onRestart={handleRequestAiClassification}
-            />
-
+        {/* ═══ TAB: DETTAGLIO ═══ */}
+        {activeTab === 'dettaglio' && (
+          <div className="px-5 pt-3 pb-2 space-y-3">
             <div className="flex items-center gap-3 flex-wrap">
               {aiClassifStatus === 'error' && (
                 <div className="flex items-center gap-2">
@@ -3498,31 +3508,25 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
             )}
 
             {/* Invoice lines table with classification */}
-            <div className="border rounded-lg bg-white overflow-hidden">
-              <div className="flex items-center justify-between px-4 py-2.5 border-b bg-slate-50">
-                <div className="flex items-center gap-2">
-                  <span className="text-purple-500 text-sm">{'\u2699\uFE0F'}</span>
-                  <h3 className="text-sm font-bold text-slate-800">Classificazione</h3>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] text-slate-400">
-                    {visibleLineCount} righe
-                    {(hiddenLineCount > 0 || showZeroLines) && (
-                      <button onClick={() => setShowZeroLines(!showZeroLines)}
-                        className="ml-1 text-gray-400 hover:text-gray-600 underline">
-                        {showZeroLines ? 'nascondi righe a zero' : `+${hiddenLineCount} a zero`}
-                      </button>
-                    )}
-                  </span>
-                  <span className="text-[10px] text-slate-400">
-                    {classifiedLineCount}/{visibleLineCount - informationalTotal} classificate
-                    {informationalTotal > 0 && (
-                      <span className="ml-1 text-gray-300">
-                        ({groupedLineCount > 0 ? `${groupedLineCount} rif.` : ''}{groupedLineCount > 0 && skippedLineCount > 0 ? ', ' : ''}{skippedLineCount > 0 ? `${skippedLineCount} info` : ''})
-                      </span>
-                    )}
-                  </span>
-                </div>
+            <div className="border border-slate-200 rounded-lg bg-white overflow-hidden">
+              <div className="flex items-center justify-between px-4 py-2 border-b border-slate-100">
+                <span className="text-[11px] font-medium text-slate-500">
+                  {classifiedLineCount}/{visibleLineCount - informationalTotal} classificate
+                  {(hiddenLineCount > 0 || showZeroLines) && (
+                    <button onClick={() => setShowZeroLines(!showZeroLines)}
+                      className="ml-1.5 text-slate-400 hover:text-slate-600 underline">
+                      {showZeroLines ? 'nascondi a zero' : `+${hiddenLineCount} a zero`}
+                    </button>
+                  )}
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  {visibleLineCount} righe
+                  {informationalTotal > 0 && (
+                    <span className="ml-1 text-slate-300">
+                      ({groupedLineCount > 0 ? `${groupedLineCount} rif.` : ''}{groupedLineCount > 0 && skippedLineCount > 0 ? ', ' : ''}{skippedLineCount > 0 ? `${skippedLineCount} info` : ''})
+                    </span>
+                  )}
+                </span>
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-[11px]">
@@ -4277,36 +4281,33 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
                 </div>,
                 document.body
               )}
-              {/* Footer */}
-              <div className="flex items-center justify-between px-4 py-2.5 border-t bg-slate-50">
+              {/* Footer — sticky save bar */}
+              <div className="sticky bottom-0 z-10 flex items-center justify-between px-4 py-2.5 border-t border-slate-200 bg-white/95 backdrop-blur-sm">
                 <div className="flex items-center gap-2">
-                  <span className="text-[11px] text-gray-400">
+                  <span className="text-[11px] text-slate-400">
                     {isPostConfirmDirty
-                      ? '⚠ Modifiche non salvate'
+                      ? '\u26A0 Modifiche non salvate'
                       : isConfirmed
                         ? '\u2713 Classificazione confermata'
                         : classification
                           ? '\u2713 Classificazione salvata'
                           : 'Nessuna classificazione'}
                   </span>
-                  {/* "Cancella tutto" — clears entire classification (always visible when there's data) */}
                   {(persistedHasData || draftHasData || clearPending) && (
                     <button onClick={() => setShowClearDialog(true)}
-                      className="px-2 py-1 text-[10px] font-semibold rounded-md border border-red-200 text-red-500 hover:bg-red-50 transition-colors">
-                      {'\uD83D\uDDD1'} Cancella tutto
+                      className="px-2 py-1 text-[10px] font-medium rounded border border-slate-200 text-slate-500 hover:bg-slate-50 hover:text-red-500 transition-colors">
+                      Cancella tutto
                     </button>
                   )}
                 </div>
                 <div className="flex items-center gap-2">
-                  {/* Universal "Salva" — visible whenever there are unsaved changes */}
                   {isPostConfirmDirty && (
                     <button onClick={handleConfirmChanges} disabled={confirmChangesSaving || !cdcValidation.valid}
-                      className="px-5 py-2 text-sm font-bold rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 transition-colors shadow-md animate-pulse"
+                      className="px-5 py-2 text-sm font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-50 transition-colors"
                       title={!cdcValidation.valid ? cdcValidation.message : 'Salva tutte le modifiche'}>
-                      {confirmChangesSaving ? 'Salvataggio...' : '\uD83D\uDCBE Salva'}
+                      {confirmChangesSaving ? 'Salvataggio...' : 'Salva'}
                     </button>
                   )}
-                  {/* No Conferma/Ignora — user uses universal Save button above */}
                 </div>
               </div>
             </div>
@@ -4487,32 +4488,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
               </div>
             )}
 
-            {/* Dettaglio Beni e Servizi (read-only) */}
-            <div className="bg-white border rounded-xl overflow-hidden">
-              <h4 className="text-xs font-bold text-gray-700 px-4 py-2.5 border-b bg-gray-50">Dettaglio Beni e Servizi</h4>
-              <div className="overflow-x-auto">
-                <table className="w-full border-collapse text-[11px]">
-                  <thead><tr className="bg-slate-50/50 border-b">
-                    <th className="text-left px-3 py-2 text-gray-600 font-semibold">Descrizione</th>
-                    <th className="text-right px-2 py-2 text-gray-600 font-semibold">Qt{'\u00E0'}</th>
-                    <th className="text-right px-2 py-2 text-gray-600 font-semibold">P. Unit.</th>
-                    <th className="text-right px-2 py-2 text-gray-600 font-semibold">IVA %</th>
-                    <th className="text-right px-2 py-2 text-gray-600 font-semibold">Totale</th>
-                  </tr></thead>
-                  <tbody>
-                    {(b?.linee || detail?.invoice_lines || []).map((l: any, i: number) => (
-                      <tr key={i} className="border-b border-gray-50">
-                        <td className="text-left px-3 py-1.5">{l.descrizione || l.description}</td>
-                        <td className="text-right px-2 py-1.5">{fmtNum(safeFloat(l.quantita ?? l.quantity) || 1)}</td>
-                        <td className="text-right px-2 py-1.5">{fmtNum(safeFloat(l.prezzoUnitario ?? l.unit_price))}</td>
-                        <td className="text-right px-2 py-1.5">{fmtNum(safeFloat(l.aliquotaIVA ?? l.vat_rate))}%</td>
-                        <td className="text-right px-2 py-1.5 font-bold">{fmtNum(safeFloat(l.prezzoTotale ?? l.total_price))}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+            {/* Dettaglio Beni e Servizi — removed: lines are shown in Dettaglio tab */}
 
             {/* Riepilogo IVA + Totale */}
             {b?.riepilogo?.length > 0 && (
@@ -4727,6 +4703,9 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
           </>
         )}
       </div>
+      {/* end scrollable */}
+      </div>
+      {/* end CARD 3 — Tabs + content */}
 
       {/* Required note dialog for non-conservative fiscal choices (section 3.9) */}
       {requiredNoteDialog && createPortal(
@@ -5629,35 +5608,36 @@ export default function FatturePage() {
   }, [selectedInvoice, setPageEntity]);
 
   return (
-    <div className="h-full flex flex-col bg-gray-50">
+    <div className="h-full flex flex-col bg-slate-50">
       <ConfirmDeleteModal open={deleteModal.open} count={deleteModal.ids.length} onConfirm={handleDeleteConfirm} onCancel={() => setDeleteModal({ open: false, ids: [] })} />
       {companyId && <ExportDialog open={exportOpen} onClose={() => setExportOpen(false)} companyId={companyId} companyName={company?.name || 'Azienda'} />}
       {/* Top bar */}
-      <div className="flex items-center gap-3 px-4 py-2 bg-white border-b shadow-sm flex-shrink-0 print:hidden">
-        <h1 className="text-lg font-bold text-gray-800">Fatture</h1>
+      <div className="flex items-center gap-3 px-4 py-2 bg-white border-b border-slate-200 flex-shrink-0 print:hidden">
+        <h1 className="text-lg font-bold text-slate-800">Fatture</h1>
         {/* Segmented control Passive/Attive */}
-        <div className="flex bg-gray-100 rounded-lg p-0.5">
+        <div className="flex border border-slate-200 rounded-full p-0.5">
           {([['in', 'Passive'], ['out', 'Attive']] as const).map(([k, label]) => (
             <button key={k} onClick={() => setDirectionFilter(k)}
-              className={`px-3 py-1 text-xs font-semibold rounded-md transition-all ${
+              className={`flex flex-col items-center px-5 py-1 text-xs rounded-full transition-all ${
                 directionFilter === k
-                  ? (k === 'in' ? 'bg-white text-orange-700 shadow-sm' : 'bg-white text-emerald-700 shadow-sm')
-                  : 'text-gray-500 hover:text-gray-700'
+                  ? 'bg-slate-100 text-slate-900 font-semibold'
+                  : 'text-slate-400 hover:text-slate-600'
               }`}>
-              {label} <span className="font-normal">{tabCounts[k]}</span>
+              <span>{label}</span>
+              <span className="text-[10px] font-normal">{tabCounts[k]}</span>
             </button>
           ))}
         </div>
         <div className="flex-1" />
         {/* Inline stats */}
-        <div className="flex items-center gap-1 text-xs text-gray-600">
-          <span className="w-2 h-2 rounded-full bg-yellow-400 inline-block" /><span>{stats.daPagare} {directionFilter === 'out' ? 'da incassare' : 'da pagare'}</span>
-          <span className="text-gray-300 mx-1">|</span>
-          <span className="w-2 h-2 rounded-full bg-red-400 inline-block" /><span>{stats.scadute} scadute</span>
-          <span className="text-gray-300 mx-1">|</span>
-          <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block" /><span>{stats.pagate} {directionFilter === 'out' ? 'incassate' : 'pagate'}</span>
-          <span className="text-gray-300 mx-1">|</span>
-          <span className="font-bold text-gray-800">{fmtEur(stats.totalAmount)}</span>
+        <div className="flex items-center gap-1 text-xs text-slate-500">
+          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" /><span>{stats.daPagare} {directionFilter === 'out' ? 'da incassare' : 'da pagare'}</span>
+          <span className="text-slate-300 mx-1">|</span>
+          <span className="w-1.5 h-1.5 rounded-full bg-red-400 inline-block" /><span>{stats.scadute} scadute</span>
+          <span className="text-slate-300 mx-1">|</span>
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" /><span>{stats.pagate} {directionFilter === 'out' ? 'incassate' : 'pagate'}</span>
+          <span className="text-slate-300 mx-1">|</span>
+          <span className="font-semibold text-slate-700">{fmtEur(stats.totalAmount)}</span>
         </div>
         {/* Action buttons */}
         <button
@@ -5666,7 +5646,7 @@ export default function FatturePage() {
           className={`inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors ${
             batchClassifRunning
               ? 'text-red-700 bg-red-50 border-red-200 hover:bg-red-100'
-              : 'text-purple-700 bg-white border-purple-300 hover:bg-purple-50'
+              : 'text-slate-700 bg-white border-slate-300 hover:bg-slate-50'
           }`}
         >
           {batchClassifRunning
@@ -5674,10 +5654,10 @@ export default function FatturePage() {
             : <>{'\u2728'} Classifica AI</>
           }
         </button>
-        <button onClick={() => setExportOpen(true)} className="px-3 py-1.5 text-xs font-semibold text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">
+        <button onClick={() => setExportOpen(true)} className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50">
           Export
         </button>
-        <button onClick={() => fileRef.current?.click()} className="px-3 py-1.5 text-xs font-semibold bg-blue-600 text-white rounded-lg hover:bg-blue-700">+ Importa</button>
+        <button onClick={() => fileRef.current?.click()} className="px-3 py-1.5 text-xs font-semibold bg-slate-900 text-white rounded-lg hover:bg-slate-800">+ Importa</button>
         <input ref={fileRef} type="file" multiple accept=".xml,.p7m,.zip" onChange={e => e.target.files && handleImport(e.target.files)} className="hidden" />
       </div>
 
@@ -5695,7 +5675,7 @@ export default function FatturePage() {
                 onChange={e => handleQueryChange(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter' && query.trim()) handleAISearch(); }}
                 placeholder="Cerca fattura o controparte..."
-                className="w-full pl-7 pr-12 py-2 text-xs border rounded-lg bg-gray-50 outline-none focus:ring-1 focus:ring-blue-400"
+                className="w-full pl-7 pr-12 py-2 text-xs border border-slate-200 rounded-lg bg-white outline-none focus:ring-1 focus:ring-slate-300"
               />
               <button
                 onClick={handleAISearch}

@@ -136,6 +136,111 @@ function formatConsultantMemoryContext(rows: Record<string, unknown>[]): string 
     .join("\n");
 }
 
+function toStringArray(input: unknown): string[] {
+  if (!input) return [];
+  if (Array.isArray(input)) {
+    return input
+      .map((value) => String(value || "").trim())
+      .filter(Boolean);
+  }
+  if (typeof input === "string") {
+    const trimmed = input.trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+      try {
+        return toStringArray(JSON.parse(trimmed));
+      } catch {
+        return [trimmed];
+      }
+    }
+    return [trimmed];
+  }
+  return [];
+}
+
+function normalizeMemoryText(value: string | null | undefined): string {
+  return (value || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function normalizeContractRef(value: string | null | undefined): string {
+  return (value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function extractConsultantFactLineDescription(row: Record<string, unknown>): string | null {
+  const metadata = asRecord(row.metadata);
+  const fromMetadata = stringOrNull(metadata?.line_description, 240);
+  if (fromMetadata) return fromMetadata;
+  const match = String(row.fact_text || "").match(/riga ['"]([^'"]+)['"]/i);
+  return match?.[1]?.trim() || null;
+}
+
+function extractConsultantFactContractRefs(row: Record<string, unknown>): string[] {
+  const metadata = asRecord(row.metadata);
+  const refs = new Set<string>();
+  const pushRefs = (value: unknown) => {
+    for (const ref of toStringArray(value)) {
+      const normalized = normalizeContractRef(ref);
+      if (normalized) refs.add(normalized);
+    }
+  };
+
+  pushRefs(metadata?.contract_ref);
+  pushRefs(metadata?.contract_refs);
+  pushRefs(row.source_primary_contract_ref);
+  pushRefs(row.source_contract_refs);
+
+  return [...refs];
+}
+
+function isSpecificAccountPattern(row: Record<string, unknown>): boolean {
+  const metadata = asRecord(row.metadata);
+  const factText = String(row.fact_text || "");
+  return /→ conto\s+[A-Z0-9.]+/i.test(factText) || Boolean(stringOrNull(metadata?.account_code, 64));
+}
+
+function isTraceableInvoiceClassificationMemoryRow(row: Record<string, unknown>): boolean {
+  const metadata = asRecord(row.metadata);
+  const origin = stringOrNull(metadata?.origin, 80);
+  const sourceInvoiceId = stringOrNull(metadata?.source_invoice_id, 80);
+  const sourceStatus = stringOrNull(row.source_classification_status, 40)?.toLowerCase() || "";
+
+  return origin === "invoice_classification"
+    && Boolean(sourceInvoiceId)
+    && Boolean(sourceStatus)
+    && sourceStatus !== "none";
+}
+
+function filterConsultantMemoryRows(
+  rows: Record<string, unknown>[],
+  lineDescriptions: string[],
+  invoiceContractRefs: string[],
+): Record<string, unknown>[] {
+  const currentLineDescriptions = new Set(
+    lineDescriptions.map((line) => normalizeMemoryText(line)).filter(Boolean),
+  );
+  const currentContractRefs = new Set(
+    invoiceContractRefs.map((ref) => normalizeContractRef(ref)).filter(Boolean),
+  );
+
+  return rows.filter((row) => {
+    if (String(row.source || "").toLowerCase() === "reconciliation") return false;
+
+    const factType = String(row.fact_type || "").trim().toLowerCase();
+    if (factType !== "counterparty_pattern") return true;
+    if (!isSpecificAccountPattern(row)) return true;
+    if (!isTraceableInvoiceClassificationMemoryRow(row)) return false;
+
+    const factLineDescription = extractConsultantFactLineDescription(row);
+    if (!factLineDescription) return false;
+    if (!currentLineDescriptions.has(normalizeMemoryText(factLineDescription))) return false;
+
+    const factContractRefs = extractConsultantFactContractRefs(row);
+    if (currentContractRefs.size === 0 || factContractRefs.length === 0) return false;
+
+    return factContractRefs.some((ref) => currentContractRefs.has(ref));
+  });
+}
+
 function parseJwt(token: string): Record<string, unknown> | null {
   try {
     const parts = token.split(".");
