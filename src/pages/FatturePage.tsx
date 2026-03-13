@@ -586,7 +586,7 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, on
           onSelect();
         }
       }}
-      className={`flex items-start gap-2 px-3 py-2 cursor-pointer border-b border-slate-100 transition-all ${checked ? 'bg-blue-50 border-l-2 border-l-blue-500' : selected ? 'bg-slate-50 border-l-2 border-l-slate-800' : 'border-l-2 border-l-transparent hover:bg-slate-50/60'}`}
+      className={`flex items-start gap-2 px-3 py-2 cursor-pointer border-b border-slate-100 transition-all ${checked ? 'bg-blue-50 border-l-2 border-l-blue-500' : selected ? 'bg-indigo-50/40 border-l-2 border-l-indigo-500' : 'border-l-2 border-l-transparent hover:bg-slate-50/60'}`}
     >
       {selectMode && <input type="checkbox" checked={checked} onChange={onCheck} className="mt-1 accent-blue-600 cursor-pointer flex-shrink-0" onClick={e => e.stopPropagation()} />}
       <div className="flex-1 min-w-0" onClick={onSelect}>
@@ -611,25 +611,25 @@ function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCheck, on
             <>
               {/* Category: no badge when 0, full when all, warning when partial */}
               {meta.lines_with_category > 0 && (meta.has_category
-                ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">Cat</span>
-                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Cat</span>)}
+                ? <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 border border-slate-200">Cat</span>
+                : <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 border border-amber-200">!Cat</span>)}
               {/* CdC */}
               {meta.lines_with_cdc > 0 && (meta.has_cost_center
-                ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700">CdC</span>
-                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!CdC</span>)}
+                ? <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 border border-slate-200">CdC</span>
+                : <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 border border-amber-200">!CdC</span>)}
               {/* Account */}
               {meta.lines_with_account > 0 && (meta.has_account
-                ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">Conto</span>
-                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Conto</span>)}
+                ? <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 border border-slate-200">Conto</span>
+                : <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 border border-amber-200">!Conto</span>)}
               {/* Article: uses lines_with_complete_article for phase-aware check */}
               {meta.lines_with_article > 0 && (meta.has_article
-                ? <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">Art</span>
-                : <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 border border-amber-300">!Art</span>)}
+                ? <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 border border-slate-200">Art</span>
+                : <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 border border-amber-200">!Art</span>)}
             </>
           ) : inv.classification_status === 'ai_suggested' ? (
             <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 flex items-center gap-0.5">&#9889; Da confermare</span>
           ) : needsClassification ? (
-            <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 flex items-center gap-0.5">&#9889; Da classificare</span>
+            <span className="text-[9px] font-medium text-amber-600 flex items-center gap-0.5">↳ Da classificare</span>
           ) : null}
         </div>
       </div>

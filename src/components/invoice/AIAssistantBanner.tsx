@@ -62,7 +62,7 @@ interface Props {
 
 export default function AIAssistantBanner(props: Props) {
   return (
-    <div className="overflow-hidden rounded-[22px] border border-slate-200 bg-[linear-gradient(135deg,rgba(255,248,233,0.8),rgba(255,255,255,0.96)_42%,rgba(242,247,255,0.92))] shadow-[0_14px_40px_rgba(15,23,42,0.06)]">
+    <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
       {props.status === 'idle' && <IdleState onStart={props.onStartClassification} lineCount={props.lineCount} />}
       {props.status === 'processing' && <ProcessingState steps={props.progressSteps} elapsed={props.elapsedSeconds} />}
       {props.status === 'alerts' && <AlertsState alerts={props.alerts} onAction={props.onAlertAction} />}
@@ -128,7 +128,7 @@ function IdleState({ onStart, lineCount }: { onStart: () => void; lineCount?: nu
         </div>
         <button
           onClick={onStart}
-          className="rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-slate-800"
+          className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-indigo-700"
         >
           Avvia classificazione AI
         </button>
@@ -367,7 +367,7 @@ function ProposedState({
           {onApply && (
             <button
               onClick={() => onApply(action)}
-              className="rounded-xl bg-slate-900 px-4 py-2 text-[12px] font-medium text-white transition hover:bg-slate-800"
+              className="rounded-xl bg-indigo-600 px-4 py-2 text-[12px] font-medium text-white transition hover:bg-indigo-700"
             >
               Apply recommendation
             </button>
