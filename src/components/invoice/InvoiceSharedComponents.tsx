@@ -389,7 +389,7 @@ export function InvoiceCard({ inv, selected, checked, selectMode, onSelect, onCh
         checked 
           ? 'bg-blue-50/80 border-blue-400 shadow-sm ring-2 ring-blue-500/20' 
           : selected 
-            ? 'bg-indigo-50/60 border-indigo-300 shadow-md ring-4 ring-indigo-500/10 scale-[1.02] z-10' 
+            ? 'bg-indigo-50/60 border-indigo-400 shadow-sm ring-1 ring-indigo-400' 
             : 'bg-white border-transparent shadow-sm hover:shadow hover:scale-[1.01] hover:border-slate-200 relative'
       }`}
     >

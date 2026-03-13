@@ -2425,7 +2425,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
       </div>
 
       {/* CARD 3 — Tabs + content */}
-      <div className="mx-4 mt-3 mb-3 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+      <div className="mx-4 mt-3 mb-12 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden flex-shrink-0">
         {/* Tab bar */}
         <div className="flex border-b border-slate-200 flex-shrink-0 px-5 gap-1">
           {DETAIL_TABS.map(tab => (
