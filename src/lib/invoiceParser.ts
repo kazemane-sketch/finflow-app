@@ -313,6 +313,17 @@ export function reparseXml(rawXml: string): ParsedInvoice {
   return parseFattura(rawXml);
 }
 
+export function extractPrimaryContractRef(rawXml?: string | null): string | null {
+  if (!rawXml) return null;
+  try {
+    const parsed = reparseXml(rawXml);
+    const body = parsed?.bodies?.[0];
+    return body?.contratti?.[0]?.id || null;
+  } catch {
+    return null;
+  }
+}
+
 // Lookup tables
 export const TIPO: Record<string, string> = { TD01: "Fattura", TD02: "Acconto/Anticipo", TD03: "Acconto Parcella", TD04: "Nota di Credito", TD05: "Nota di Debito", TD06: "Parcella", TD07: "Fatt. semplificata", TD08: "NC semplificata", TD16: "Integr. RC interno", TD17: "Integr. servizi UE", TD18: "Integr. beni UE", TD19: "Integr. art.17", TD20: "Autofattura", TD24: "Fatt. differita", TD25: "Fatt. differita (b)", TD26: "Cess. ammortizzabili", TD27: "Autoconsumo", TD28: "Acq. San Marino" };
 export const MP: Record<string, string> = { MP01: "Contanti", MP02: "Assegno", MP03: "Assegno circ.", MP04: "Contanti presso Tesoreria", MP05: "Bonifico", MP06: "Vaglia cambiario", MP07: "Bollettino bancario", MP08: "Carta di pagamento", MP09: "RID", MP10: "RID utenze", MP11: "RID veloce", MP12: "RIBA", MP13: "MAV", MP14: "Quietanza erario", MP15: "Giroconto su conti di contabilità speciale", MP16: "Domic. bancaria", MP17: "Domic. postale", MP18: "Boll. postale", MP19: "SEPA DD", MP20: "SEPA CORE", MP21: "SEPA B2B", MP22: "Trattenuta", MP23: "PagoPA" };
