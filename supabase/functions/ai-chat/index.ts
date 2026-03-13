@@ -2401,8 +2401,6 @@ Deno.serve(async (req) => {
     const agentConfig = await loadConsultantAgentConfig(sql);
 
     if (mode === "invoice_consultant") {
-      if (!userId) return json({ error: "Autenticazione richiesta" }, 401);
-
       const invoiceId = String(body.invoice_id || "").trim();
       if (!invoiceId) return json({ error: "invoice_id richiesto" }, 400);
 

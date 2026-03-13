@@ -1201,6 +1201,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         alert_context: chatAlertContext,
         messages: newMessages,
         company_id: company?.id,
+      }, {
+        requireUserAuth: false,
       }) as {
         message?: string
         action?: ConsultantAction

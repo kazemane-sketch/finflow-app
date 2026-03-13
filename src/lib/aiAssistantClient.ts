@@ -22,10 +22,16 @@ export interface AiAssistantResponse {
   [key: string]: unknown
 }
 
+interface InvokeAiAssistantOptions {
+  requireUserAuth?: boolean
+}
+
 export async function invokeAiAssistant<T extends AiAssistantResponse = AiAssistantResponse>(
   body: Record<string, unknown>,
+  options: InvokeAiAssistantOptions = {},
 ): Promise<T> {
-  const token = await getValidAccessToken()
+  const requireUserAuth = options.requireUserAuth ?? true
+  const token = requireUserAuth ? await getValidAccessToken() : SUPABASE_ANON_KEY
   const response = await fetch(`${SUPABASE_URL}/functions/v1/ai-chat`, {
     method: 'POST',
     headers: {
