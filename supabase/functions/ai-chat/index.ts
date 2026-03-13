@@ -121,6 +121,66 @@ function sanitizeRiskLevel(value: unknown): RiskLevel | null {
     : null;
 }
 
+async function callGeminiPrompt(args: {
+  apiKey: string;
+  model: string;
+  prompt: string;
+  temperature: number;
+  maxOutputTokens: number;
+  thinkingBudget?: number;
+}): Promise<{ content: string; thinking?: string; toolCalls: ToolCallInfo[]; tokensUsed: number }> {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${args.model}:generateContent?key=${args.apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: args.prompt }] }],
+        generationConfig: {
+          temperature: args.temperature,
+          maxOutputTokens: args.maxOutputTokens,
+          ...(args.thinkingBudget && args.thinkingBudget > 0
+            ? { thinkingConfig: { thinkingBudget: args.thinkingBudget, includeThoughts: true } }
+            : {}),
+        },
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    const err = await response.text().catch(() => "");
+    throw new Error(`Gemini API ${response.status}: ${clip(err, 300)}`);
+  }
+
+  const data = await response.json().catch(() => ({}));
+  const candidate = Array.isArray((data as Record<string, unknown>)?.candidates)
+    ? ((data as Record<string, unknown>).candidates as Array<Record<string, unknown>>)[0]
+    : null;
+  const parts = Array.isArray(candidate?.content && (candidate.content as Record<string, unknown>).parts)
+    ? ((candidate?.content as Record<string, unknown>).parts as Array<Record<string, unknown>>)
+    : [];
+
+  let content = "";
+  let thinking = "";
+  for (const part of parts) {
+    const text = String(part?.text || "");
+    if (!text) continue;
+    if (part?.thought) thinking += (thinking ? "\n\n" : "") + text;
+    else content += text;
+  }
+
+  const usage = (data as Record<string, unknown>)?.usageMetadata as Record<string, unknown> | undefined;
+  const inputTokens = Number(usage?.promptTokenCount || 0);
+  const outputTokens = Number(usage?.candidatesTokenCount || 0);
+
+  return {
+    content: content || "Non ho trovato una risposta.",
+    thinking: thinking || undefined,
+    toolCalls: [],
+    tokensUsed: inputTokens + outputTokens,
+  };
+}
+
 function sanitizeEvidenceArray(value: unknown): ConsultantEvidence[] {
   if (!Array.isArray(value)) return [];
   return value
@@ -2345,9 +2405,9 @@ Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
   const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
+  const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
 
-  if (!anthropicKey) return json({ error: "ANTHROPIC_API_KEY non configurata" }, 503);
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL non configurato" }, 503);
 
   // Parse JWT to get user_id
@@ -2540,18 +2600,39 @@ ${visibleLines.map((line) => [
         `STATO AZIENDALE AGGREGATO:\n${clip(JSON.stringify(companyStats), 2500)}`,
       ].filter(Boolean).join("\n\n");
 
-      const result = await runAiChat(
-        messages,
-        sql,
-        companyId,
-        runtime.model,
-        {
-          thinkingEnabled: true,
-          extraSystemContext,
-          maxOutputTokens: runtime.maxOutputTokens,
-          thinkingBudget: runtime.thinkingBudget,
-        },
-      );
+      const prefersGemini = runtime.model.toLowerCase().startsWith("gemini");
+      const geminiPrompt = [
+        SYSTEM_PROMPT,
+        extraSystemContext,
+        "STORICO CHAT:",
+        messages.map((message) =>
+          `${message.role === "assistant" ? "Consulente" : "Utente"}: ${message.content}`).join("\n") || "(vuoto)",
+      ].filter(Boolean).join("\n\n");
+
+      const result = prefersGemini
+        ? await (async () => {
+            if (!geminiKey) throw new Error("GEMINI_API_KEY non configurata");
+            return await callGeminiPrompt({
+              apiKey: geminiKey,
+              model: runtime.model,
+              prompt: geminiPrompt,
+              temperature: runtime.temperature,
+              maxOutputTokens: runtime.maxOutputTokens,
+              thinkingBudget: runtime.thinkingBudget,
+            });
+          })()
+        : await runAiChat(
+            messages,
+            sql,
+            companyId,
+            runtime.model,
+            {
+              thinkingEnabled: true,
+              extraSystemContext,
+              maxOutputTokens: runtime.maxOutputTokens,
+              thinkingBudget: runtime.thinkingBudget,
+            },
+          );
 
       const action = parseResolutionAction(result.content);
       const message = stripJsonBlock(result.content);
@@ -2575,6 +2656,7 @@ ${visibleLines.map((line) => [
 
     const userMessage = String(body.message || "").trim();
     if (!userMessage) return json({ error: "Messaggio vuoto" }, 400);
+    if (!anthropicKey) return json({ error: "ANTHROPIC_API_KEY non configurata" }, 503);
 
     const modelPreference = String(body.model_preference || "fast");
     const runtime = resolveAgentRuntime(agentConfig, {
