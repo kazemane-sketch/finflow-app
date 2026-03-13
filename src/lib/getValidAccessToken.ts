@@ -32,6 +32,15 @@ function isTokenExpiringSoon(token: string, bufferSeconds = 60): boolean {
   }
 }
 
+async function isTokenAcceptedByAuth(token: string): Promise<boolean> {
+  try {
+    const { data, error } = await supabase.auth.getUser(token)
+    return !error && !!data?.user
+  } catch {
+    return false
+  }
+}
+
 /**
  * Get a valid (non-expired) access token for edge function calls.
  *
@@ -45,39 +54,57 @@ function isTokenExpiringSoon(token: string, bufferSeconds = 60): boolean {
  */
 export async function getValidAccessToken(opts?: { forceRefresh?: boolean }): Promise<string> {
   const forceRefresh = opts?.forceRefresh === true
+  const { data: sessionData } = await supabase.auth.getSession()
+  const currentSession = sessionData?.session ?? null
+  const currentToken = currentSession?.access_token ?? null
 
   // Step 1: check cached session (skip if forceRefresh)
-  if (!forceRefresh) {
-    const { data: sessionData } = await supabase.auth.getSession()
-    const token = sessionData?.session?.access_token
-    if (token && !isTokenExpiringSoon(token)) return token
+  if (!forceRefresh && currentToken && !isTokenExpiringSoon(currentToken)) {
+    return currentToken
   }
 
-  // Step 2: call getUser() — this hits /auth/v1/user and the Supabase
-  // client will auto-refresh the access token if it's expired.
-  // This is the SAME auto-refresh mechanism that makes regular
-  // supabase.from(...).select() work even with expired tokens.
+  // Step 2: explicit refresh using the stored refresh token.
+  // This is more reliable than relying on getUser() side effects when the
+  // access token is still unexpired but has become invalid server-side.
   try {
-    const { error: userError } = await supabase.auth.getUser()
+    if (currentSession?.refresh_token) {
+      const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession({
+        refresh_token: currentSession.refresh_token,
+      })
+      const refreshedToken = refreshed?.session?.access_token
+      if (!refreshError && refreshedToken && !isTokenExpiringSoon(refreshedToken, 5)) {
+        const verified = await isTokenAcceptedByAuth(refreshedToken)
+        if (verified) return refreshedToken
+      }
+    }
+  } catch {
+    // fall through to getUser() verification
+  }
+
+  // Step 3: verify current session via Auth API, which may also auto-refresh
+  // sessions managed internally by the Supabase client.
+  try {
+    const { error: userError } = currentToken
+      ? await supabase.auth.getUser(currentToken)
+      : await supabase.auth.getUser()
     if (!userError) {
-      // Auto-refresh succeeded — read the updated session
       const { data: freshSession } = await supabase.auth.getSession()
       const freshToken = freshSession?.session?.access_token
-      if (freshToken && !isTokenExpiringSoon(freshToken, 5)) return freshToken
+      if (freshToken && !isTokenExpiringSoon(freshToken, 5)) {
+        const verified = await isTokenAcceptedByAuth(freshToken)
+        if (verified) return freshToken
+      }
     }
   } catch {
-    // getUser failed — fall through to refreshSession
+    // getUser verification failed
   }
 
-  // Step 3: explicit refreshSession as last resort
+  // Step 4: clear the local stale session to avoid repeating the same invalid
+  // JWT forever after project/key rotation.
   try {
-    const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession()
-    if (!refreshError) {
-      const refreshedToken = refreshed?.session?.access_token
-      if (refreshedToken && !isTokenExpiringSoon(refreshedToken, 5)) return refreshedToken
-    }
+    await supabase.auth.signOut({ scope: 'local' })
   } catch {
-    // refresh failed
+    // sign-out cleanup is best-effort
   }
 
   // All strategies exhausted — session is truly dead

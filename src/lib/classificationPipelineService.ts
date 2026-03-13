@@ -201,6 +201,10 @@ function abortError(): DOMException {
   return new DOMException('Aborted', 'AbortError')
 }
 
+function hasJwtAuthSignal(bodyText: string): boolean {
+  return /invalid jwt|jwt|sessione scaduta|session expired|auth session|token/i.test(bodyText)
+}
+
 function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw abortError()
 }
@@ -228,37 +232,51 @@ async function callEdge(
   token: string,
   signal?: AbortSignal,
 ): Promise<any> {
-  let res = await fetch(`${SUPABASE_URL}/functions/v1/${functionName}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`,
-      'apikey': SUPABASE_ANON_KEY,
-    },
-    body: JSON.stringify(body),
-    signal,
-  })
-
-  if (res.status === 401) {
-    const newToken = await getValidAccessToken({ forceRefresh: true })
-    res = await fetch(`${SUPABASE_URL}/functions/v1/${functionName}`, {
+  const runFetch = async (bearerToken: string) => {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/${functionName}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${newToken}`,
+        'Authorization': `Bearer ${bearerToken}`,
         'apikey': SUPABASE_ANON_KEY,
       },
       body: JSON.stringify(body),
       signal,
     })
-  }
 
-  if (!res.ok) {
     const text = await res.text().catch(() => '')
-    throw new Error(`${functionName} HTTP ${res.status}: ${text.slice(0, 300)}`)
+    let payload: unknown = {}
+    if (text) {
+      try {
+        payload = JSON.parse(text)
+      } catch {
+        payload = {}
+      }
+    }
+
+    return { res, text, payload }
   }
 
-  return res.json()
+  let result = await runFetch(token)
+
+  if (result.res.status === 401 || result.res.status === 403) {
+    try {
+      const newToken = await getValidAccessToken({ forceRefresh: true })
+      result = await runFetch(newToken)
+    } catch (refreshError: any) {
+      const message = refreshError?.message || 'Sessione non valida o scaduta. Effettua nuovamente il login.'
+      throw new Error(message)
+    }
+  }
+
+  if (!result.res.ok) {
+    if ((result.res.status === 401 || result.res.status === 403) && hasJwtAuthSignal(result.text)) {
+      throw new Error('Sessione non valida o scaduta. Effettua nuovamente il login e riprova.')
+    }
+    throw new Error(`${functionName} HTTP ${result.res.status}: ${result.text.slice(0, 300)}`)
+  }
+
+  return result.payload
 }
 
 function defaultFiscalFlags(flags?: Record<string, unknown> | null) {
