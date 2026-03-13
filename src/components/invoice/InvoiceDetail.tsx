@@ -2422,6 +2422,21 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
           summary={aiClassifResult ? (aiClassifResult.invoice_level?.reasoning || `Classificate ${aiClassifResult.lines?.length || 0} righe`) : invoice.classification_status === 'confirmed' ? 'Classificazione confermata' : undefined}
           onRestart={handleRequestAiClassification}
         />
+
+        {/* Pipeline Debug Panel — visible only after fresh classification */}
+        {pipelineDebug && pipelineDebug.length > 0 && (
+          <details className="mt-3 border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+            <summary className="px-5 py-3 bg-slate-50/80 backdrop-blur-sm cursor-pointer text-sm font-semibold text-slate-700 hover:bg-slate-100 flex items-center gap-2 transition-colors">
+              <span className="text-base grayscale opacity-70">🔍</span>
+              Dettagli Pipeline AI ({pipelineDebug.length} step visibili)
+            </summary>
+            <div className="p-5 space-y-4 bg-white">
+              {pipelineDebug.map((step, i) => (
+                <PipelineStepDetailPanel key={i} step={step} />
+              ))}
+            </div>
+          </details>
+        )}
       </div>
 
       {/* CARD 3 — Tabs + content */}
@@ -2523,28 +2538,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
                 </div>
               )}
 
-              {/* AI result info */}
-              {aiClassifResult && (
-                <div className="flex items-center gap-2 bg-purple-50 border border-purple-200 rounded-lg px-2.5 py-1.5">
-                  <span className="text-purple-600 text-sm">{'\u2728'}</span>
-                  <span className="text-[10px] text-purple-700">
-                    {aiClassifResult.invoice_level?.reasoning || 'AI applicata'}
-                  </span>
-                  <span className="text-[10px] text-purple-500">
-                    {aiClassifResult.invoice_level?.confidence ?? 0}%
-                  </span>
-                  {aiClassifResult.stats?.deterministic > 0 && (
-                    <span className="text-[9px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full font-medium">
-                      {aiClassifResult.stats.deterministic} exact
-                    </span>
-                  )}
-                  {aiClassifResult.stats?.fiscal_issues > 0 && (
-                    <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">
-                      {aiClassifResult.stats.fiscal_issues} alert
-                    </span>
-                  )}
-                </div>
-              )}
+
 
               {/* AI suggested banner */}
               {hasReviewableAiSuggestion && !aiClassifResult && (
@@ -2562,22 +2556,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
               )}
             </div>
 
-            {/* (AI Assistant Box replaced by AIAssistantBanner above) */}
 
-            {/* Pipeline Debug Panel — visible only after fresh classification */}
-            {pipelineDebug && pipelineDebug.length > 0 && (
-              <details className="mb-3 border border-slate-200 rounded-xl overflow-hidden">
-                <summary className="px-4 py-2.5 bg-slate-50 cursor-pointer text-sm font-semibold text-slate-700 hover:bg-slate-100 flex items-center gap-2">
-                  <span className="text-base">{'\uD83D\uDD0D'}</span>
-                  Dettagli Pipeline AI ({pipelineDebug.length} step visibili)
-                </summary>
-                <div className="p-4 space-y-3 bg-white">
-                  {pipelineDebug.map((step, i) => (
-                    <PipelineStepDetailPanel key={i} step={step} />
-                  ))}
-                </div>
-              </details>
-            )}
 
             {/* Invoice lines table with classification */}
             <div className="overflow-hidden">
