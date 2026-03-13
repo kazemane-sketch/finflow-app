@@ -31,6 +31,7 @@ const PAGE_LABELS: Record<string, string> = {
 const TOOL_LABELS: Record<string, string> = {
   get_invoices: 'Cercando fatture',
   get_invoice_detail: 'Dettaglio fattura',
+  get_invoice_consulting_context: 'Contesto classificazione fattura',
   get_bank_transactions: 'Cercando movimenti',
   get_transaction_detail: 'Dettaglio movimento',
   get_open_installments: 'Rate aperte',
@@ -45,6 +46,7 @@ const TOOL_LABELS: Record<string, string> = {
   get_articles: 'Articoli',
   get_company_settings: 'Impostazioni azienda',
   get_reconciliation_stats: 'Statistiche riconciliazione',
+  apply_invoice_consultant_resolution: 'Applicando decisione fattura',
 }
 
 /* ─── main widget ─────────────────────────── */

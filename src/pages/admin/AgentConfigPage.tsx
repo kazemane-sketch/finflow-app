@@ -115,7 +115,7 @@ export default function AgentConfigPage() {
         <h1 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
           <Bot className="h-6 w-6 text-sky-600" /> Agent Config
         </h1>
-        <p className="text-sm text-slate-500 mt-1">System prompt, modello AI e parametri di ragionamento per ciascun agent</p>
+        <p className="text-sm text-slate-500 mt-1">System prompt, modello AI e parametri di ragionamento per ciascun agent. Il profilo `consulente` governa sia la chat Assistente AI sia il consulente inline in fattura.</p>
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
@@ -131,6 +131,7 @@ export default function AgentConfigPage() {
           const costPerCall = thinkingBudget > 0 && modelSupportsThinking
             ? (thinkingBudget / 1_000_000 * 10).toFixed(3)
             : '0.000'
+          const isUnifiedConsultant = agent.agent_type === 'consulente'
 
           return (
             <Card key={agent.id} className="flex flex-col">
@@ -159,10 +160,15 @@ export default function AgentConfigPage() {
                 {/* ── Model + Thinking Section ── */}
                 <div className="border rounded-lg p-3 space-y-3 bg-slate-50/50">
                   <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Modello e Ragionamento</p>
+                  {isUnifiedConsultant && (
+                    <p className="text-[11px] leading-relaxed text-amber-700 bg-amber-50 border border-amber-100 rounded-md px-2.5 py-2">
+                      Agente unificato: la chat Assistente AI usa `model` come profilo fast e `model_escalation` come profilo thinking; il consulente inline fattura usa sempre il profilo thinking/deep.
+                    </p>
+                  )}
 
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <Label className="text-xs">Modello primario</Label>
+                      <Label className="text-xs">{isUnifiedConsultant ? 'Modello fast / chat' : 'Modello primario'}</Label>
                       <select value={edit.model || ''} onChange={e => updateField(agent.id, 'model', e.target.value)}
                         className="mt-1 w-full h-9 border rounded-md px-2 text-xs bg-white">
                         {MODEL_OPTIONS.map(m => (
@@ -171,7 +177,7 @@ export default function AgentConfigPage() {
                       </select>
                     </div>
                     <div>
-                      <Label className="text-xs">Modello escalation</Label>
+                      <Label className="text-xs">{isUnifiedConsultant ? 'Modello thinking / inline' : 'Modello escalation'}</Label>
                       <select value={edit.model_escalation || ''} onChange={e => updateField(agent.id, 'model_escalation', e.target.value || null)}
                         className="mt-1 w-full h-9 border rounded-md px-2 text-xs bg-white">
                         <option value="">Nessuno</option>
@@ -184,7 +190,7 @@ export default function AgentConfigPage() {
 
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <Label className="text-xs">Thinking Budget</Label>
+                      <Label className="text-xs">{isUnifiedConsultant ? 'Thinking Budget fast' : 'Thinking Budget'}</Label>
                       <select
                         value={thinkingBudget}
                         onChange={e => updateField(agent.id, 'thinking_budget', Number(e.target.value))}
@@ -207,9 +213,9 @@ export default function AgentConfigPage() {
                       )}
                     </div>
                     <div className="space-y-2">
-                      {agent.agent_type === 'consulente' && (
+                      {isUnifiedConsultant && (
                         <div>
-                          <Label className="text-xs">Thinking Deep Mode</Label>
+                          <Label className="text-xs">Thinking deep / inline</Label>
                           <select
                             value={escalationThinkingBudget}
                             onChange={e => updateField(agent.id, 'thinking_budget_escalation', Number(e.target.value))}

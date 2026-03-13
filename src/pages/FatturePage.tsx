@@ -54,6 +54,7 @@ import { createMemoryFromClassification, createMemoryFromFiscalChoice, deleteInv
 import { extractProvinceSiglaFromAddress, loadCounterpartyHeaderInfo } from '@/lib/counterpartyService';
 import { deleteFiscalDecisionsForInvoice, saveFiscalDecision } from '@/lib/fiscalDecisionService';
 import { applyConsultantResolution, clearInvoiceDecisionTrail, type SupportingEvidence } from '@/lib/invoiceDecisionService';
+import { invokeAiAssistant } from '@/lib/aiAssistantClient';
 import ExportDialog from '@/components/ExportDialog';
 import SearchableSelect from '@/components/SearchableSelect';
 import { ConfidenceBadge, FiscalFlagsBadges, AIAssistantBanner } from '@/components/invoice';
@@ -1191,20 +1192,21 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
     setChatMessages(newMessages);
     setChatLoading(true);
     try {
-      const { data, error } = await supabase.functions.invoke('ai-fiscal-consultant', {
-        body: {
-          invoice_id: invoice.id,
-          line_ids: chatLineIds,
-          alert_context: chatAlertContext,
-          messages: newMessages,
-          company_id: company?.id,
-          consulting_mode: 'deep',
-        },
-      });
-      if (error) throw error;
+      const data = await invokeAiAssistant({
+        mode: 'invoice_consultant',
+        invoice_id: invoice.id,
+        line_ids: chatLineIds,
+        alert_context: chatAlertContext,
+        messages: newMessages,
+        company_id: company?.id,
+      }) as {
+        message?: string
+        action?: ConsultantAction
+      };
+
       const assistantMessage: ChatMessage = {
         role: 'assistant',
-        content: data.message,
+        content: data.message || 'Nessuna risposta disponibile.',
         action: data.action || undefined,
       };
       setChatMessages([...newMessages, assistantMessage]);
@@ -1215,7 +1217,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         setAiBannerStatus('consulting');
       }
     } catch (e: any) {
-      toast.error('Errore consulente AI: ' + (e.message || 'sconosciuto'));
+      toast.error('Errore Assistente AI: ' + (e.message || 'sconosciuto'));
       setChatMessages([...newMessages, { role: 'assistant', content: 'Mi dispiace, si è verificato un errore. Riprova.' }]);
     } finally {
       setChatLoading(false);

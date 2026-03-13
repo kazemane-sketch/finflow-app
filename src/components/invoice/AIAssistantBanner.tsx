@@ -36,6 +36,7 @@ export interface ConsultantAction {
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  thinking?: string | null
   action?: ConsultantAction
 }
 
@@ -258,9 +259,9 @@ function ConsultingState({
 
   return (
     <Shell
-      eyebrow="Consulente inline"
+      eyebrow="Assistente AI · Inline"
       title="Second opinion contestuale sulla fattura"
-      subtitle="Il consulente lavora sulla decisione corrente, con contesto aziendale e rischi espliciti."
+      subtitle="Stesso Assistente AI della piattaforma, qui in modalità thinking esteso sulla decisione corrente, con contesto aziendale e rischi espliciti."
       accent="blue"
     >
       <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white/90">

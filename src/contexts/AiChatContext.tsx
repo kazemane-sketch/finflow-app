@@ -6,8 +6,7 @@ import {
   type ReactNode,
 } from 'react'
 import { useCompany } from '@/hooks/useCompany'
-import { SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
-import { getValidAccessToken } from '@/lib/getValidAccessToken'
+import { invokeAiAssistant } from '@/lib/aiAssistantClient'
 
 /* ─── types ───────────────────────────────── */
 
@@ -95,30 +94,17 @@ export function AiChatProvider({ children }: { children: ReactNode }) {
       setLoading(true)
 
       try {
-        const token = await getValidAccessToken()
-
-        const res = await fetch(`${SUPABASE_URL}/functions/v1/ai-chat`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({
-            mode: 'chat',
-            company_id: companyId,
-            chat_id: chatId,
-            message: fullMessage,
-            model_preference: modelPreference,
-          }),
+        const data = await invokeAiAssistant({
+          mode: 'chat',
+          company_id: companyId,
+          chat_id: chatId,
+          message: fullMessage,
+          model_preference: modelPreference,
         })
-
-        const data = await res.json()
-        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
 
         // Set chat ID if new
         if (!chatId && data.chat_id) {
-          setChatId(data.chat_id)
+          setChatId(String(data.chat_id))
         }
 
         // Add assistant message (with thinking content if present)

@@ -12,11 +12,55 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const SONNET_MODEL = "claude-sonnet-4-6";
 const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const THINKING_MODEL = "claude-sonnet-4-6";
 const MAX_TOOL_ROUNDS = 10;
 const MAX_CHAT_HISTORY = 20;
+
+type AiChatMode = "chat" | "internal" | "invoice_consultant";
+type DecisionStatus = "pending" | "finalized" | "needs_review" | "unassigned";
+type RiskLevel = "low" | "medium" | "high";
+
+interface AgentConfigRow {
+  system_prompt: string;
+  model: string;
+  model_escalation: string | null;
+  temperature: number | null;
+  thinking_level: string | null;
+  thinking_budget: number | null;
+  thinking_budget_escalation: number | null;
+  max_output_tokens: number | null;
+}
+
+interface ConsultantLineUpdate {
+  line_id: string;
+  category_id?: string | null;
+  account_id?: string | null;
+  fiscal_flags?: Record<string, unknown> | null;
+  decision_status?: DecisionStatus;
+  reasoning_summary_final?: string | null;
+  final_confidence?: number | null;
+  note?: string | null;
+}
+
+interface ConsultantEvidence {
+  source: string;
+  label: string;
+  detail?: string | null;
+  ref?: string | null;
+}
+
+interface ApplyInvoiceConsultantResolutionArgs {
+  invoice_id: string;
+  recommended_conclusion?: string;
+  rationale_summary?: string;
+  risk_level?: RiskLevel;
+  expected_impact?: string;
+  decision_basis?: string[];
+  supporting_factors?: string[];
+  supporting_evidence?: ConsultantEvidence[];
+  line_updates: ConsultantLineUpdate[];
+}
 
 /* ─── helpers ──────────────────────────────── */
 
@@ -42,6 +86,92 @@ function parseJwt(token: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function stripJsonBlock(text: string): string {
+  return text.replace(/```json[\s\S]*?```/g, "").trim();
+}
+
+function parseResolutionAction(text: string): Record<string, unknown> | null {
+  const match = text.match(/```json\s*([\s\S]*?)\s*```/);
+  if (!match) return null;
+  try {
+    const parsed = JSON.parse(match[1].trim());
+    return parsed?.action && typeof parsed.action === "object" ? parsed.action : null;
+  } catch {
+    return null;
+  }
+}
+
+function clampConfidence(value: unknown): number | null {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  return Math.max(0, Math.min(100, Math.round(num)));
+}
+
+function sanitizeDecisionStatus(value: unknown): DecisionStatus | null {
+  return ["pending", "finalized", "needs_review", "unassigned"].includes(String(value))
+    ? String(value) as DecisionStatus
+    : null;
+}
+
+function sanitizeRiskLevel(value: unknown): RiskLevel | null {
+  return ["low", "medium", "high"].includes(String(value))
+    ? String(value) as RiskLevel
+    : null;
+}
+
+function sanitizeEvidenceArray(value: unknown): ConsultantEvidence[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => {
+      const source = String((entry as Record<string, unknown>)?.source || "").trim();
+      const label = String((entry as Record<string, unknown>)?.label || "").trim();
+      if (!source || !label) return null;
+      return {
+        source,
+        label,
+        detail: clip(String((entry as Record<string, unknown>)?.detail || ""), 800) || null,
+        ref: clip(String((entry as Record<string, unknown>)?.ref || ""), 300) || null,
+      };
+    })
+    .filter((entry): entry is ConsultantEvidence => Boolean(entry));
+}
+
+function sanitizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(
+    value
+      .map((entry) => String(entry || "").trim())
+      .filter(Boolean),
+  ));
+}
+
+function sanitizeLineUpdates(value: unknown): ConsultantLineUpdate[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => {
+      const row = entry as Record<string, unknown>;
+      const lineId = String(row?.line_id || "").trim();
+      if (!lineId) return null;
+      return {
+        line_id: lineId,
+        category_id: row.category_id === undefined ? undefined : (row.category_id ? String(row.category_id) : null),
+        account_id: row.account_id === undefined ? undefined : (row.account_id ? String(row.account_id) : null),
+        fiscal_flags: row.fiscal_flags && typeof row.fiscal_flags === "object"
+          ? row.fiscal_flags as Record<string, unknown>
+          : row.fiscal_flags === null
+            ? null
+            : undefined,
+        decision_status: sanitizeDecisionStatus(row.decision_status) || undefined,
+        reasoning_summary_final: row.reasoning_summary_final === undefined
+          ? undefined
+          : clip(String(row.reasoning_summary_final || ""), 3000) || null,
+        final_confidence: row.final_confidence === undefined ? undefined : clampConfidence(row.final_confidence),
+        note: row.note === undefined ? undefined : clip(String(row.note || ""), 1500) || null,
+      };
+    })
+    .filter((row): row is ConsultantLineUpdate => Boolean(row));
 }
 
 /* ─── tool definitions ────────────────────── */
@@ -91,6 +221,18 @@ const tools = [
   {
     name: "get_invoice_detail",
     description: "Dettaglio completo di una singola fattura: righe, importi, rate associate, extracted_summary AI.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        invoice_id: { type: "string", description: "UUID della fattura" },
+      },
+      required: ["invoice_id"],
+    },
+  },
+  {
+    name: "get_invoice_consulting_context",
+    description:
+      "Ritorna il contesto operativo completo di una fattura per consulenza/classificazione: righe con categoria, conto, fiscal_flags, motivazione finale, stato decisione, ultime note di commercialista/revisore e box fattura. Usalo quando devi capire o modificare la classificazione corrente di una fattura.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -304,6 +446,64 @@ const tools = [
         },
       },
       required: ["invoice_ids"],
+    },
+  },
+  {
+    name: "apply_invoice_consultant_resolution",
+    description:
+      "Applica una decisione di consulenza sulla classificazione corrente di una fattura, aggiornando invoice_lines e audit trail. Usalo solo quando l'utente chiede esplicitamente di applicare o correggere la classificazione.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        invoice_id: { type: "string", description: "UUID della fattura" },
+        recommended_conclusion: { type: "string", description: "Sintesi finale della decisione proposta" },
+        rationale_summary: { type: "string", description: "Motivazione sintetica finale" },
+        risk_level: { type: "string", enum: ["low", "medium", "high"], description: "Livello di rischio della proposta" },
+        expected_impact: { type: "string", description: "Impatto atteso della decisione" },
+        decision_basis: {
+          type: "array",
+          items: { type: "string" },
+          description: "Basi della decisione, es. reviewer_verdict, consultant_resolution",
+        },
+        supporting_factors: {
+          type: "array",
+          items: { type: "string" },
+          description: "Fattori di supporto o caveat sintetici",
+        },
+        supporting_evidence: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              source: { type: "string" },
+              label: { type: "string" },
+              detail: { type: "string" },
+              ref: { type: "string" },
+            },
+            required: ["source", "label"],
+          },
+          description: "Evidenze principali usate per motivare la decisione",
+        },
+        line_updates: {
+          type: "array",
+          description: "Patch per ciascuna riga da aggiornare",
+          items: {
+            type: "object",
+            properties: {
+              line_id: { type: "string" },
+              category_id: { type: "string" },
+              account_id: { type: "string" },
+              fiscal_flags: { type: "object" },
+              decision_status: { type: "string", enum: ["pending", "finalized", "needs_review", "unassigned"] },
+              reasoning_summary_final: { type: "string" },
+              final_confidence: { type: "number" },
+              note: { type: "string" },
+            },
+            required: ["line_id"],
+          },
+        },
+      },
+      required: ["invoice_id", "line_updates"],
     },
   },
   {
@@ -592,6 +792,99 @@ async function handleGetInvoiceDetail(sql: SqlClient, companyId: string, args: R
   // Remove raw_xml to keep response small
   const { raw_xml: _xml, ...invoiceClean } = invoice;
   return { invoice: invoiceClean, lines, installments };
+}
+
+async function handleGetInvoiceConsultingContext(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
+  const invoiceId = String(args.invoice_id || "").trim();
+  if (!invoiceId) return { error: "invoice_id richiesto" };
+
+  const [invoice] = await sql.unsafe(
+    `SELECT i.id, i.number, i.date, i.total_amount, i.direction, i.notes, i.classification_status,
+            i.counterparty->>'denom' as counterparty_name,
+            i.counterparty->>'piva' as counterparty_vat,
+            i.counterparty->>'cf' as counterparty_cf,
+            c.name as company_name
+     FROM invoices i
+     LEFT JOIN companies c ON c.id = i.company_id
+     WHERE i.id = $1 AND i.company_id = $2
+     LIMIT 1`,
+    [invoiceId, companyId],
+  );
+  if (!invoice) return { error: "Fattura non trovata" };
+
+  const [invoiceNotesRow, lastResolution] = await Promise.all([
+    sql.unsafe(
+      `SELECT invoice_notes
+       FROM invoice_classifications
+       WHERE invoice_id = $1
+       LIMIT 1`,
+      [invoiceId],
+    ),
+    sql.unsafe(
+      `SELECT resolution_status, recommended_conclusion, rationale_summary, risk_level, expected_impact, created_at
+       FROM invoice_consultant_resolutions
+       WHERE invoice_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [invoiceId],
+    ),
+  ]);
+
+  const lines = await sql.unsafe(
+    `SELECT
+        il.id,
+        il.line_number,
+        il.description,
+        il.quantity,
+        il.unit_price,
+        il.total_price,
+        il.vat_rate,
+        il.vat_nature,
+        il.category_id,
+        il.account_id,
+        il.fiscal_flags,
+        il.decision_status,
+        il.reasoning_summary_final,
+        il.final_confidence,
+        il.final_decision_source,
+        il.line_note,
+        il.line_note_source,
+        cat.name as category_name,
+        acc.code as account_code,
+        acc.name as account_name,
+        cp.rationale_summary as commercialista_summary,
+        cp.confidence as commercialista_confidence,
+        rv.rationale_summary as reviewer_summary,
+        rv.final_confidence as reviewer_confidence,
+        rv.red_flags as reviewer_red_flags
+     FROM invoice_lines il
+     LEFT JOIN categories cat ON cat.id = il.category_id
+     LEFT JOIN chart_of_accounts acc ON acc.id = il.account_id
+     LEFT JOIN LATERAL (
+       SELECT rationale_summary, confidence
+       FROM invoice_line_commercialista_proposals
+       WHERE invoice_line_id = il.id
+       ORDER BY created_at DESC
+       LIMIT 1
+     ) cp ON true
+     LEFT JOIN LATERAL (
+       SELECT rationale_summary, final_confidence, red_flags
+       FROM invoice_line_reviewer_verdicts
+       WHERE invoice_line_id = il.id
+       ORDER BY created_at DESC
+       LIMIT 1
+     ) rv ON true
+     WHERE il.invoice_id = $1
+     ORDER BY il.line_number ASC, il.created_at ASC`,
+    [invoiceId],
+  );
+
+  return {
+    invoice,
+    lines,
+    invoice_notes: invoiceNotesRow?.[0]?.invoice_notes || [],
+    last_consultant_resolution: lastResolution?.[0] || null,
+  };
 }
 
 async function handleGetBankTransactions(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
@@ -1553,6 +1846,152 @@ async function handleGetUserInstructions(
     ORDER BY created_at`;
 }
 
+async function handleApplyInvoiceConsultantResolution(
+  sql: SqlClient,
+  companyId: string,
+  args: Record<string, unknown>,
+) {
+  const invoiceId = String(args.invoice_id || "").trim();
+  if (!invoiceId) return { error: "invoice_id richiesto" };
+
+  const lineUpdates = sanitizeLineUpdates(args.line_updates);
+  if (lineUpdates.length === 0) return { error: "line_updates vuoto o non valido" };
+
+  const [invoice] = await sql`
+    SELECT id
+    FROM invoices
+    WHERE id = ${invoiceId} AND company_id = ${companyId}
+    LIMIT 1`;
+  if (!invoice) return { error: "Fattura non trovata" };
+
+  const currentLines = await sql.unsafe(
+    `SELECT id, category_id, account_id, fiscal_flags, line_note, line_note_source, line_note_updated_at
+     FROM invoice_lines
+     WHERE invoice_id = $1 AND id = ANY($2::uuid[])`,
+    [invoiceId, lineUpdates.map((update) => update.line_id)],
+  );
+
+  const currentMap = new Map(
+    (currentLines as Record<string, unknown>[]).map((row) => [String(row.id), row]),
+  );
+
+  for (const update of lineUpdates) {
+    if (!currentMap.has(update.line_id)) {
+      return { error: `La riga ${update.line_id} non appartiene alla fattura ${invoiceId}` };
+    }
+  }
+
+  const rationaleSummary = clip(String(args.rationale_summary || ""), 3000) || null;
+  const recommendedConclusion = clip(String(args.recommended_conclusion || ""), 2000) || null;
+  const riskLevel = sanitizeRiskLevel(args.risk_level);
+  const expectedImpact = clip(String(args.expected_impact || ""), 2000) || null;
+  const supportingEvidence = sanitizeEvidenceArray(args.supporting_evidence);
+  const decisionBasis = sanitizeStringArray(args.decision_basis);
+  const supportingFactors = sanitizeStringArray(args.supporting_factors);
+
+  const [resolutionRow] = await sql`
+    INSERT INTO invoice_consultant_resolutions (
+      company_id,
+      invoice_id,
+      invoice_line_ids,
+      resolution_status,
+      recommended_conclusion,
+      rationale_summary,
+      risk_level,
+      supporting_evidence,
+      expected_impact,
+      decision_patch,
+      source_payload,
+      applied_at
+    ) VALUES (
+      ${companyId},
+      ${invoiceId},
+      ${lineUpdates.map((update) => update.line_id)},
+      'applied',
+      ${recommendedConclusion},
+      ${rationaleSummary},
+      ${riskLevel},
+      ${JSON.stringify(supportingEvidence)}::jsonb,
+      ${expectedImpact},
+      ${JSON.stringify({ line_updates: lineUpdates })}::jsonb,
+      ${JSON.stringify(args)}::jsonb,
+      now()
+    )
+    RETURNING id`;
+
+  const resolutionId = String(resolutionRow.id);
+
+  for (const update of lineUpdates) {
+    const current = currentMap.get(update.line_id) as Record<string, unknown>;
+    const nextCategoryId = update.category_id === undefined ? (current.category_id as string | null) : update.category_id;
+    const nextAccountId = update.account_id === undefined ? (current.account_id as string | null) : update.account_id;
+    const nextFiscalFlags = update.fiscal_flags === undefined
+      ? (current.fiscal_flags as Record<string, unknown> | null)
+      : update.fiscal_flags;
+    const nextDecisionStatus = update.decision_status || "finalized";
+    const nextReasoning = update.reasoning_summary_final || rationaleSummary;
+    const nextConfidence = update.final_confidence ?? null;
+    const nextLineNote = update.note === undefined ? (current.line_note as string | null) : update.note;
+    const nextLineNoteSource = update.note === undefined ? (current.line_note_source as string | null) : "ai_consultant";
+    const nextLineNoteUpdatedAt = update.note === undefined
+      ? (current.line_note_updated_at as string | null)
+      : new Date().toISOString();
+
+    await sql`
+      UPDATE invoice_lines
+      SET category_id = ${nextCategoryId},
+          account_id = ${nextAccountId},
+          fiscal_flags = ${JSON.stringify(nextFiscalFlags ?? null)}::jsonb,
+          decision_status = ${nextDecisionStatus},
+          reasoning_summary_final = ${nextReasoning},
+          final_confidence = ${nextConfidence},
+          final_decision_source = 'consulente',
+          line_note = ${nextLineNote},
+          line_note_source = ${nextLineNoteSource},
+          line_note_updated_at = ${nextLineNoteUpdatedAt}
+      WHERE id = ${update.line_id} AND invoice_id = ${invoiceId}`;
+
+    await sql`
+      INSERT INTO invoice_line_final_decisions (
+        company_id,
+        invoice_id,
+        invoice_line_id,
+        decision_source,
+        decision_status,
+        applied_payload,
+        confidence,
+        rationale_summary,
+        decision_basis,
+        supporting_factors,
+        supporting_evidence
+      ) VALUES (
+        ${companyId},
+        ${invoiceId},
+        ${update.line_id},
+        'consulente',
+        ${nextDecisionStatus},
+        ${JSON.stringify({
+          resolution_id: resolutionId,
+          category_id: nextCategoryId,
+          account_id: nextAccountId,
+          fiscal_flags: nextFiscalFlags,
+          note: nextLineNote,
+        })}::jsonb,
+        ${nextConfidence},
+        ${nextReasoning},
+        ${decisionBasis},
+        ${supportingFactors},
+        ${JSON.stringify(supportingEvidence)}::jsonb
+      )`;
+  }
+
+  return {
+    applied: true,
+    resolution_id: resolutionId,
+    updated_lines: lineUpdates.length,
+  };
+}
+
 async function executeToolHandler(
   sql: SqlClient,
   companyId: string,
@@ -1568,6 +2007,8 @@ async function executeToolHandler(
       return handleSearchInvoices(sql, companyId, toolInput);
     case "get_invoice_detail":
       return handleGetInvoiceDetail(sql, companyId, toolInput);
+    case "get_invoice_consulting_context":
+      return handleGetInvoiceConsultingContext(sql, companyId, toolInput);
     case "get_bank_transactions":
       return handleGetBankTransactions(sql, companyId, toolInput);
     case "get_transaction_detail":
@@ -1596,6 +2037,8 @@ async function executeToolHandler(
       return handleGetClassificationStats(sql, companyId, toolInput);
     case "classify_invoice":
       return handleClassifyInvoice(sql, companyId, toolInput);
+    case "apply_invoice_consultant_resolution":
+      return handleApplyInvoiceConsultantResolution(sql, companyId, toolInput);
     case "get_chart_of_accounts":
       return handleGetChartOfAccounts(sql, companyId, toolInput);
     case "get_categories":
@@ -1615,6 +2058,38 @@ async function executeToolHandler(
     default:
       return { error: `Tool sconosciuto: ${toolName}` };
   }
+}
+
+async function loadConsultantAgentConfig(sql: SqlClient): Promise<AgentConfigRow | null> {
+  const rows = await sql<AgentConfigRow[]>`
+    SELECT system_prompt, model, model_escalation, temperature, thinking_level,
+           thinking_budget, thinking_budget_escalation, max_output_tokens
+    FROM agent_config
+    WHERE active = true AND agent_type = 'consulente'
+    LIMIT 1`;
+
+  return rows[0] || null;
+}
+
+function resolveAgentRuntime(
+  config: AgentConfigRow | null,
+  options: { preferThinking: boolean; forceThinking?: boolean },
+) {
+  const thinkingEnabled = options.forceThinking || options.preferThinking;
+  const model = thinkingEnabled
+    ? (config?.model_escalation || config?.model || THINKING_MODEL)
+    : (config?.model || HAIKU_MODEL);
+
+  return {
+    model,
+    thinkingEnabled,
+    temperature: config?.temperature ?? 0.1,
+    maxOutputTokens: config?.max_output_tokens ?? (thinkingEnabled ? 16000 : 4096),
+    thinkingBudget: thinkingEnabled
+      ? (config?.thinking_budget_escalation ?? config?.thinking_budget ?? 10000)
+      : (config?.thinking_budget ?? 0),
+    systemPrompt: config?.system_prompt?.trim() || "",
+  };
 }
 
 /* ─── Claude API with tool use loop ───────── */
@@ -1676,6 +2151,8 @@ MEMORIA AZIENDALE (search_company_memory):
 CLASSIFICAZIONE FATTURE:
 - get_classification_stats: per statistiche su quante fatture sono classificate, breakdown per categoria/CdC/conto. Usa per domande tipo "quante fatture sono classificate?", "distribuzione per categoria", "stato classificazione".
 - classify_invoice: per classificare automaticamente fatture specifiche (max 10). Usa matching deterministico + AI Haiku. Input: invoice_ids. Usa quando l'utente dice "classifica questa fattura", "classifica le fatture di [controparte]".
+- get_invoice_consulting_context: per leggere la decisione corrente di una fattura, incluse righe, categoria/conto attuali, fiscal_flags, reasoning finale e ultime motivazioni di commercialista/revisore.
+- apply_invoice_consultant_resolution: per applicare una correzione o una decisione finale sulla classificazione di una fattura. Usalo SOLO se l'utente chiede esplicitamente di applicare/modificare la classificazione.
 - get_invoices con filtro classified=false: per trovare fatture da classificare.
 - get_invoices con filtro category_name o cost_center_code: per trovare fatture classificate con categoria/CdC specifico.
 - get_company_stats include sezione "classificazione" con conteggi fatture classificate/AI/non classificate.
@@ -1705,13 +2182,21 @@ async function runAiChat(
   sql: SqlClient,
   companyId: string,
   model: string,
-  thinkingEnabled = false,
-  extraSystemContext = "",
+  options?: {
+    thinkingEnabled?: boolean;
+    extraSystemContext?: string;
+    maxOutputTokens?: number;
+    thinkingBudget?: number;
+  },
 ): Promise<{ content: string; thinking?: string; toolCalls: ToolCallInfo[]; tokensUsed: number }> {
   let currentMessages = [...messages];
   const allToolCalls: ToolCallInfo[] = [];
   let totalTokens = 0;
   let thinkingText = "";
+  const thinkingEnabled = options?.thinkingEnabled === true;
+  const extraSystemContext = options?.extraSystemContext || "";
+  const maxOutputTokens = options?.maxOutputTokens ?? (thinkingEnabled ? 16000 : 4096);
+  const thinkingBudget = options?.thinkingBudget ?? 10000;
 
   const anthropicKey = Deno.env.get("ANTHROPIC_API_KEY")!;
 
@@ -1733,15 +2218,15 @@ async function runAiChat(
       }
       return {
         model,
-        max_tokens: 16000,
-        thinking: { type: "enabled", budget_tokens: 10000 },
+        max_tokens: maxOutputTokens,
+        thinking: { type: "enabled", budget_tokens: thinkingBudget },
         messages: thinkingMessages,
         tools,
       };
     }
     return {
       model,
-      max_tokens: 4096,
+      max_tokens: maxOutputTokens,
       system: fullSystemPrompt,
       messages: currentMessages,
       tools,
@@ -1878,7 +2363,7 @@ Deno.serve(async (req) => {
     return json({ error: "Body JSON non valido" }, 400);
   }
 
-  const mode = String(body.mode || "chat");
+  const mode = String(body.mode || "chat") as AiChatMode;
   const companyId = String(body.company_id || "");
   if (!companyId) return json({ error: "company_id richiesto" }, 400);
 
@@ -1890,13 +2375,13 @@ Deno.serve(async (req) => {
       const task = String(body.task || "");
       const context = (body.context || {}) as Record<string, unknown>;
 
-      let systemPrompt = SYSTEM_PROMPT;
+      let extraSystemContext = "";
       let userContent = "";
       let model = HAIKU_MODEL;
 
       if (task === "reconciliation_suggest") {
         model = HAIKU_MODEL;
-        systemPrompt += "\n\nSei in modalità riconciliazione. Analizza il movimento bancario e suggerisci il miglior match con le rate/fatture fornite.";
+        extraSystemContext = "Sei in modalità riconciliazione. Analizza il movimento bancario e suggerisci il miglior match con le rate/fatture fornite.";
         userContent = `Analizza questo movimento bancario e suggerisci la migliore corrispondenza con le rate aperte.\n\nMovimento: ${JSON.stringify(context)}`;
       } else {
         userContent = `Task: ${task}\nContesto: ${JSON.stringify(context)}`;
@@ -1907,9 +2392,184 @@ Deno.serve(async (req) => {
         sql,
         companyId,
         model,
+        { extraSystemContext },
       );
 
       return json({ task, result: { content: result.content, toolCalls: result.toolCalls } });
+    }
+
+    const agentConfig = await loadConsultantAgentConfig(sql);
+
+    if (mode === "invoice_consultant") {
+      if (!userId) return json({ error: "Autenticazione richiesta" }, 401);
+
+      const invoiceId = String(body.invoice_id || "").trim();
+      if (!invoiceId) return json({ error: "invoice_id richiesto" }, 400);
+
+      const requestedLineIds = Array.isArray(body.line_ids)
+        ? body.line_ids.map((lineId) => String(lineId || "").trim()).filter(Boolean)
+        : [];
+      const alertContext = clip(String(body.alert_context || ""), 2000);
+      const messages = Array.isArray(body.messages)
+        ? body.messages
+          .map((message) => ({
+            role: String((message as Record<string, unknown>)?.role || "") === "assistant" ? "assistant" : "user",
+            content: clip(String((message as Record<string, unknown>)?.content || ""), 6000),
+          }))
+          .filter((message) => message.content)
+        : [];
+
+      if (messages.length === 0) return json({ error: "messages richiesti" }, 400);
+
+      const consultingContext = await handleGetInvoiceConsultingContext(sql, companyId, { invoice_id: invoiceId });
+      if ((consultingContext as Record<string, unknown>)?.error) {
+        return json(consultingContext, 404);
+      }
+
+      const contextPayload = consultingContext as {
+        invoice: Record<string, unknown>;
+        lines: Array<Record<string, unknown>>;
+        invoice_notes: unknown[];
+        last_consultant_resolution: Record<string, unknown> | null;
+      };
+
+      const invoice = contextPayload.invoice;
+      const visibleLines = requestedLineIds.length > 0
+        ? contextPayload.lines.filter((line) => requestedLineIds.includes(String(line.id)))
+        : contextPayload.lines;
+
+      const companyRow = await sql`
+        SELECT name, vat_number, business_sector
+        FROM companies
+        WHERE id = ${companyId}
+        LIMIT 1`;
+      const companyContext: CompanyContext | undefined = companyRow.length > 0
+        ? {
+            company_name: companyRow[0].name,
+            sector: companyRow[0].business_sector || "servizi",
+            vat_number: companyRow[0].vat_number,
+          }
+        : undefined;
+
+      const accountingPrompt = getAccountingSystemPrompt(companyContext);
+      const userInstructionsBlock = await getUserInstructionsBlock(sql, companyId);
+      const companyStats = await handleGetCompanyStats(sql, companyId, {});
+      const chartRows = await handleGetChartOfAccounts(sql, companyId, { section: "all" }) as Record<string, unknown>[];
+
+      const ragQuery = clip([
+        alertContext,
+        String(invoice.counterparty_name || ""),
+        ...visibleLines.map((line) => String(line.description || "")),
+      ].filter(Boolean).join(" | "), 1800);
+
+      let kbContext = "";
+      try {
+        const kbSearch = await handleSearchKnowledgeBase(sql, companyId, { query: ragQuery, limit: 5 }) as Record<string, unknown>;
+        const kbResults = Array.isArray(kbSearch.results) ? kbSearch.results as Record<string, unknown>[] : [];
+        kbContext = kbResults
+          .map((row) => `- ${row.file_name || "Documento"} [chunk ${row.chunk_index ?? "?"}] sim=${row.similarity || "0"}: ${clip(String(row.content || ""), 700)}`)
+          .join("\n");
+      } catch {
+        kbContext = "";
+      }
+
+      let memoryContext = "";
+      try {
+        const memorySearch = await handleSearchCompanyMemory(sql, companyId, {
+          query: ragQuery,
+          counterparty_name: invoice.counterparty_name,
+          limit: 8,
+        }) as Record<string, unknown>;
+        const memoryResults = Array.isArray(memorySearch.results) ? memorySearch.results as Record<string, unknown>[] : [];
+        memoryContext = memoryResults
+          .map((row) => `- [${row.fact_type || "general"}] sim=${row.similarity || "0"}: ${clip(String(row.fact_text || ""), 500)}`)
+          .join("\n");
+      } catch {
+        memoryContext = "";
+      }
+
+      const runtime = resolveAgentRuntime(agentConfig, { preferThinking: true, forceThinking: true });
+      const extraSystemContext = [
+        runtime.systemPrompt ? `IDENTITA AGENTE UNIFICATO:\n${runtime.systemPrompt}` : "",
+        `COMPETENZE CONTABILI DI BASE:\n${accountingPrompt}`,
+        userInstructionsBlock,
+        `MODALITA OPERATIVA:
+- Stai lavorando come consulente inline sulla fattura aperta.
+- Sei lo stesso agente della chat Assistente AI generale, con gli stessi strumenti di lettura e consulenza.
+- Qui lavori sempre in modalita thinking esteso.
+- Devi ragionare sulla decisione corrente di commercialista/revisore, non riclassificare tutto da zero senza motivo.
+- Se suggerisci una modifica applicabile, NON chiamare tool mutativi in autonomia in questa modalita: restituisci invece un blocco JSON opzionale con la proposta, che l'utente potra applicare dalla UI.
+- Il JSON opzionale deve avere forma:
+\`\`\`json
+{"action":{"type":"apply_consultant_resolution","recommended_conclusion":"...","rationale_summary":"...","risk_level":"low|medium|high","supporting_evidence":[{"source":"kb","label":"...","detail":"...","ref":"..."}],"expected_impact":"...","line_updates":[{"line_id":"uuid","category_id":"uuid|null","account_id":"uuid|null","fiscal_flags":{},"decision_status":"finalized|needs_review|unassigned","reasoning_summary_final":"...","final_confidence":72,"note":"..."}]}}
+\`\`\`
+- Se l'evidenza non basta, dichiara il dubbio e fai solo consulenza testuale o chiedi un chiarimento.
+- Non suggerire mai scorciatoie elusive o aggressive.`,
+        `CONTESTO FATTURA:
+- Azienda: ${invoice.company_name || "N/A"}
+- Fattura: ${invoice.number || "N/A"} del ${invoice.date || "N/A"}
+- Direzione: ${invoice.direction === "in" ? "Passiva (acquisto)" : "Attiva (vendita)"}
+- Controparte: ${invoice.counterparty_name || "N/A"} (P.IVA: ${invoice.counterparty_vat || "N/A"}, CF: ${invoice.counterparty_cf || "N/A"})
+- Totale: ${invoice.total_amount || "N/A"}
+- Note fattura: ${invoice.notes || "N/A"}
+- Stato classificazione: ${invoice.classification_status || "N/A"}`,
+        `RIGHE COINVOLTE:
+${visibleLines.map((line) => [
+  `- Riga ${line.line_number ?? "?"} [${line.id}] "${clip(String(line.description || ""), 220)}"`,
+  `tot=${line.total_price || "N/A"}`,
+  `IVA=${line.vat_rate || "N/A"}%`,
+  `cat=${line.category_name || "N/A"}`,
+  `conto=${line.account_code || "N/A"} ${line.account_name || ""}`.trim(),
+  `stato=${line.decision_status || "pending"}`,
+  `fonte=${line.final_decision_source || "N/A"}`,
+  `conf=${line.final_confidence || "N/A"}`,
+  `reasoning_final=${clip(String(line.reasoning_summary_final || ""), 220) || "N/A"}`,
+  `fiscal=${clip(JSON.stringify(line.fiscal_flags || {}), 220)}`,
+  `nota=${clip(String(line.line_note || ""), 180) || "N/A"}`,
+  `commercialista=${clip(String(line.commercialista_summary || ""), 180) || "N/A"}`,
+  `revisore=${clip(String(line.reviewer_summary || ""), 180) || "N/A"}`,
+].join(" | ")).join("\n")}`,
+        alertContext ? `ALERT / DUBBIO ATTIVO:\n${alertContext}` : "",
+        contextPayload.invoice_notes?.length ? `NOTE FISCALI / ALERT SALVATI:\n${clip(JSON.stringify(contextPayload.invoice_notes), 3000)}` : "",
+        contextPayload.last_consultant_resolution
+          ? `ULTIMA RISOLUZIONE CONSULENTE:\n${clip(JSON.stringify(contextPayload.last_consultant_resolution), 2000)}`
+          : "",
+        chartRows.length > 0
+          ? `PIANO DEI CONTI DISPONIBILE:\n${clip(chartRows.map((row) => `${row.code} ${row.name} (${row.section})`).join("\n"), 3200)}`
+          : "",
+        kbContext ? `EVIDENZE KB:\n${kbContext}` : "",
+        memoryContext ? `MEMORIA AZIENDALE (contestuale, non confermata):\n${memoryContext}` : "",
+        `STATO AZIENDALE AGGREGATO:\n${clip(JSON.stringify(companyStats), 2500)}`,
+      ].filter(Boolean).join("\n\n");
+
+      const result = await runAiChat(
+        messages,
+        sql,
+        companyId,
+        runtime.model,
+        {
+          thinkingEnabled: true,
+          extraSystemContext,
+          maxOutputTokens: runtime.maxOutputTokens,
+          thinkingBudget: runtime.thinkingBudget,
+        },
+      );
+
+      const action = parseResolutionAction(result.content);
+      const message = stripJsonBlock(result.content);
+
+      return json({
+        message,
+        action,
+        thinking: result.thinking || null,
+        consultant_mode: "thinking",
+        model_used: runtime.model,
+        tool_calls: result.toolCalls.map((tc) => ({
+          name: tc.name,
+          args: tc.args,
+          result_count: Array.isArray(tc.result) ? tc.result.length : 1,
+        })),
+      });
     }
 
     /* ──── MODE: CHAT (Layer 2) ──── */
@@ -1919,7 +2579,9 @@ Deno.serve(async (req) => {
     if (!userMessage) return json({ error: "Messaggio vuoto" }, 400);
 
     const modelPreference = String(body.model_preference || "fast");
-    const chatModel = modelPreference === "thinking" ? THINKING_MODEL : HAIKU_MODEL;
+    const runtime = resolveAgentRuntime(agentConfig, {
+      preferThinking: modelPreference === "thinking",
+    });
 
     let chatId = body.chat_id ? String(body.chat_id) : null;
     let isNewChat = false;
@@ -1959,12 +2621,12 @@ Deno.serve(async (req) => {
 
     // Load shared accounting context + user instructions
     const companyRow = await sql`
-      SELECT name, vat_number FROM companies WHERE id = ${companyId} LIMIT 1
+      SELECT name, vat_number, business_sector FROM companies WHERE id = ${companyId} LIMIT 1
     `;
     const companyContext: CompanyContext | undefined = companyRow.length > 0
       ? {
           company_name: companyRow[0].name,
-          sector: 'servizi',
+          sector: companyRow[0].business_sector || 'servizi',
           vat_number: companyRow[0].vat_number,
         }
       : undefined;
@@ -1973,13 +2635,23 @@ Deno.serve(async (req) => {
     const userInstructionsBlock = await getUserInstructionsBlock(sql, companyId);
 
     const instructionsContext = [
+      runtime.systemPrompt ? `IDENTITA AGENTE UNIFICATO (Assistente AI / Consulente):\n${runtime.systemPrompt}` : "",
       `COMPETENZE CONTABILI DI BASE:\n${accountingPrompt}`,
       userInstructionsBlock,
     ].filter(Boolean).join("\n\n");
 
-    // Run AI (model based on user preference: fast=haiku, thinking=sonnet with extended thinking)
-    const isThinking = modelPreference === "thinking";
-    const result = await runAiChat(claudeMessages, sql, companyId, chatModel, isThinking, instructionsContext);
+    const result = await runAiChat(
+      claudeMessages,
+      sql,
+      companyId,
+      runtime.model,
+      {
+        thinkingEnabled: runtime.thinkingEnabled,
+        extraSystemContext: instructionsContext,
+        maxOutputTokens: runtime.maxOutputTokens,
+        thinkingBudget: runtime.thinkingBudget,
+      },
+    );
 
     // Save messages
     await sql`
@@ -1998,7 +2670,7 @@ Deno.serve(async (req) => {
     // Save assistant response
     await sql`
       INSERT INTO ai_messages (chat_id, role, content, tokens_used, model)
-      VALUES (${chatId}, 'assistant', ${result.content}, ${result.tokensUsed}, ${chatModel})
+      VALUES (${chatId}, 'assistant', ${result.content}, ${result.tokensUsed}, ${runtime.model})
     `;
 
     // Update chat metadata
