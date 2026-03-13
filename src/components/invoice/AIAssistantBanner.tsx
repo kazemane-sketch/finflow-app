@@ -258,58 +258,61 @@ function ConsultingState({
   }
 
   return (
-    <Shell
-      eyebrow="Consulente AI · Inline"
-      title="Second opinion contestuale sulla fattura"
-      subtitle="Stesso motore del chat Assistente AI della piattaforma, qui presentato come Consulente AI in modalità thinking esteso sulla decisione corrente."
-      accent="blue"
-    >
-      <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white/90">
-        <div ref={scrollRef} className="max-h-80 space-y-3 overflow-y-auto px-4 py-4">
-          {!messages?.length && (
-            <p className="text-[12px] text-slate-400">Nessun messaggio ancora. Puoi chiedere chiarimenti o una proposta prudente applicabile.</p>
-          )}
-          {messages?.map((message, index) => (
-            <div key={index} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[88%] rounded-2xl px-3 py-2.5 text-[12px] leading-relaxed ${
-                message.role === 'user'
-                  ? 'bg-slate-900 text-white'
-                  : 'bg-slate-100 text-slate-700'
-              }`}>
-                {message.content}
-              </div>
+    <div>
+      {/* Indigo header bar */}
+      <div className="flex items-center gap-2.5 px-5 py-3 bg-gradient-to-r from-indigo-600 to-indigo-500">
+        <span className="text-white/80 text-sm">{'\u2728'}</span>
+        <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-white">Consulente AI Inline</span>
+        <span className="text-[11px] text-white/70">{alertTitle || 'Second opinion contestuale sulla fattura'}</span>
+      </div>
+
+      {/* Chat area */}
+      <div ref={scrollRef} className="max-h-80 space-y-3 overflow-y-auto px-5 py-4">
+        {!messages?.length && (
+          <p className="text-[12px] text-slate-400">Nessun messaggio ancora. Puoi chiedere chiarimenti o una proposta prudente applicabile.</p>
+        )}
+        {messages?.map((message, index) => (
+          <div key={index} className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div className={`max-w-[88%] rounded-2xl px-3.5 py-2.5 text-[12px] leading-relaxed ${
+              message.role === 'user'
+                ? 'bg-indigo-600 text-white'
+                : 'bg-slate-100 text-slate-700'
+            }`}>
+              {message.content}
             </div>
-          ))}
-          {loading && (
-            <div className="flex justify-start">
-              <div className="rounded-2xl bg-slate-100 px-3 py-2.5 text-[12px] text-slate-500">
-                Sto valutando il caso con thinking esteso...
-              </div>
-            </div>
-          )}
-        </div>
-        <div className="border-t border-slate-200 px-4 py-3">
-          <div className="flex flex-col gap-2 sm:flex-row">
-            <input
-              type="text"
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => event.key === 'Enter' && !event.shiftKey && handleSubmit()}
-              placeholder={placeholder}
-              disabled={loading}
-              className="flex-1 rounded-xl border border-slate-200 px-3 py-2 text-[12px] text-slate-700 outline-none transition focus:border-blue-300 focus:ring-2 focus:ring-blue-100"
-            />
-            <button
-              onClick={handleSubmit}
-              disabled={loading || !input.trim()}
-              className="rounded-xl bg-blue-600 px-4 py-2 text-[12px] font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              Invia
-            </button>
           </div>
+        ))}
+        {loading && (
+          <div className="flex justify-start">
+            <div className="rounded-2xl bg-slate-100 px-3.5 py-2.5 text-[12px] text-slate-500">
+              Sto valutando il caso con thinking esteso...
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Input area */}
+      <div className="border-t border-slate-100 px-5 py-3">
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) => event.key === 'Enter' && !event.shiftKey && handleSubmit()}
+            placeholder="Scrivi un messaggio..."
+            disabled={loading}
+            className="flex-1 rounded-full border border-slate-200 px-4 py-2 text-[12px] text-slate-700 outline-none transition focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
+          />
+          <button
+            onClick={handleSubmit}
+            disabled={loading || !input.trim()}
+            className="rounded-xl bg-indigo-600 px-4 py-2 text-[12px] font-medium text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Invia
+          </button>
         </div>
       </div>
-    </Shell>
+    </div>
   )
 }
 

@@ -3233,7 +3233,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
   const informationalTotal = skippedLineCount + groupedLineCount;
 
   return (
-    <div className="flex flex-col h-full bg-slate-50/50" id="invoice-detail-print">
+    <div className="flex flex-col h-full bg-slate-50/50 overflow-y-auto" id="invoice-detail-print">
         {/* CARD 1 — Counterparty header */}
         <div className="mx-4 mt-3 bg-white border border-slate-200 rounded-xl flex-shrink-0 shadow-sm">
           {/* Row 1: Counterparty name + amount hero */}
@@ -3312,7 +3312,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
         </div>
 
       {/* CARD 2 — AI Assistant */}
-      <div className="mx-4 mt-3 bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden flex-shrink-0">
+      <div className="mx-4 mt-3 flex-shrink-0">
         <AIAssistantBanner
           status={
             aiBannerStatus === 'consulting' ? 'consulting' :
@@ -3353,7 +3353,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
       </div>
 
       {/* CARD 3 — Tabs + content */}
-      <div className="mx-4 mt-3 flex-1 min-h-0 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+      <div className="mx-4 mt-3 mb-3 flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
         {/* Tab bar */}
         <div className="flex border-b border-slate-200 flex-shrink-0 px-5 gap-1">
           {DETAIL_TABS.map(tab => (
@@ -3374,8 +3374,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
           ))}
         </div>
 
-        {/* TAB CONTENT (scrollable) */}
-        <div className="flex-1 overflow-y-auto">
+        {/* TAB CONTENT */}
+        <div className="flex-1">
         {/* XML viewer (always visible when toggled) */}
         {showXml && detail?.raw_xml && (
           <div className="mx-4 mt-3 bg-gray-900 rounded-lg overflow-hidden border print:hidden">
@@ -3442,8 +3442,8 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
           <>
         {/* ═══ TAB: DETTAGLIO ═══ */}
         {activeTab === 'dettaglio' && (
-          <div className="px-5 pt-3 pb-2 space-y-3">
-            <div className="flex items-center gap-3 flex-wrap">
+          <div className="pt-1 pb-2 space-y-0">
+            <div className="flex items-center gap-3 flex-wrap px-4">
               {aiClassifStatus === 'error' && (
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-red-600">Errore AI</span>
@@ -3508,7 +3508,7 @@ function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceData, refe
             )}
 
             {/* Invoice lines table with classification */}
-            <div className="border border-slate-200 rounded-lg bg-white overflow-hidden">
+            <div className="overflow-hidden">
               <div className="flex items-center justify-between px-4 py-2 border-b border-slate-100">
                 <span className="text-[11px] font-medium text-slate-500">
                   {classifiedLineCount}/{visibleLineCount - informationalTotal} classificate
@@ -5643,10 +5643,10 @@ export default function FatturePage() {
         <button
           onClick={runBatchAiClassification}
           title={batchClassifRunning ? 'Ferma classificazione' : 'Classifica automaticamente categoria, conto e CdC'}
-          className={`inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors ${
+          className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold rounded-lg border transition-colors ${
             batchClassifRunning
               ? 'text-red-700 bg-red-50 border-red-200 hover:bg-red-100'
-              : 'text-slate-700 bg-white border-slate-300 hover:bg-slate-50'
+              : 'text-indigo-600 bg-indigo-50 border-indigo-100 hover:bg-indigo-100'
           }`}
         >
           {batchClassifRunning
@@ -5654,10 +5654,10 @@ export default function FatturePage() {
             : <>{'\u2728'} Classifica AI</>
           }
         </button>
-        <button onClick={() => setExportOpen(true)} className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50">
-          Export
+        <button onClick={() => setExportOpen(true)} className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50">
+          {'\u2193'} Export
         </button>
-        <button onClick={() => fileRef.current?.click()} className="px-3 py-1.5 text-xs font-semibold bg-slate-900 text-white rounded-lg hover:bg-slate-800">+ Importa</button>
+        <button onClick={() => fileRef.current?.click()} className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-indigo-600 text-white border border-indigo-600 rounded-lg hover:bg-indigo-700">+ Importa</button>
         <input ref={fileRef} type="file" multiple accept=".xml,.p7m,.zip" onChange={e => e.target.files && handleImport(e.target.files)} className="hidden" />
       </div>
 
