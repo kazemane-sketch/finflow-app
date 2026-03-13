@@ -259,9 +259,9 @@ function ConsultingState({
 
   return (
     <Shell
-      eyebrow="Assistente AI · Inline"
+      eyebrow="Consulente AI · Inline"
       title="Second opinion contestuale sulla fattura"
-      subtitle="Stesso Assistente AI della piattaforma, qui in modalità thinking esteso sulla decisione corrente, con contesto aziendale e rischi espliciti."
+      subtitle="Stesso motore del chat Assistente AI della piattaforma, qui presentato come Consulente AI in modalità thinking esteso sulla decisione corrente."
       accent="blue"
     >
       <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white/90">

@@ -3,7 +3,7 @@
 
 UPDATE public.agent_config
 SET
-  display_name = 'Assistente / Consulente AI',
+  display_name = 'Consulente AI',
   description = 'Agente unico usato sia nella chat Assistente AI sia nel consulente inline della fattura',
   system_prompt = COALESCE(
     NULLIF(system_prompt, ''),
