@@ -763,6 +763,8 @@ export async function runClassificationPipeline(
     if (fv1) {
       const inputLine = enrichedLines.find((l) => l.line_id === proposal.line_id)
       const fiscalInput: FiscalInput = {
+        direction: direction as 'in' | 'out',
+        vat_nature: inputLine?.vat_nature ?? null,
         total_price: inputLine?.total_price || 0,
         vat_rate: inputLine?.vat_rate ?? null,
         iva_xml: inputLine?.iva_importo ?? null,
@@ -770,6 +772,7 @@ export async function runClassificationPipeline(
         deducibilita_ires_pct: fv1.deducibilita_ires_pct ?? 100,
         irap_mode: (fv1.irap_mode as FiscalInput['irap_mode']) || 'follows_ires',
         irap_pct: fv1.irap_pct,
+        reverse_charge: fv1.reverse_charge || false,
         ritenuta_applicabile: fv1.ritenuta_applicabile || false,
         ritenuta_aliquota_pct: fv1.ritenuta_aliquota_pct,
         ritenuta_base_pct: fv1.ritenuta_base_pct,

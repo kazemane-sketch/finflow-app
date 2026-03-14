@@ -1,9 +1,11 @@
 /**
- * fiscalCalculator.ts — Pure math for fiscal amounts.
- * The AI chooses percentages/modes; this module does the arithmetic.
+ * fiscalCalculator.ts — Pure math for fiscal amounts + deterministic tax code mapping.
+ * The AI chooses percentages/modes; this module does the arithmetic and resolves the tax code.
  */
 
 export interface FiscalInput {
+  direction: 'in' | 'out'
+  vat_nature: string | null
   total_price: number
   vat_rate: number | null
   iva_xml: number | null
@@ -11,6 +13,7 @@ export interface FiscalInput {
   deducibilita_ires_pct: number
   irap_mode: 'follows_ires' | 'fully_indeducible' | 'custom_pct' | 'personale'
   irap_pct?: number
+  reverse_charge: boolean
   ritenuta_applicabile: boolean
   ritenuta_aliquota_pct?: number
   ritenuta_base_pct?: number
@@ -18,6 +21,12 @@ export interface FiscalInput {
   competenza_dal?: string
   competenza_al?: string
   anno_esercizio: number
+}
+
+export interface ResolvedTaxCode {
+  codice: string
+  description: string
+  match_confidence: number
 }
 
 export interface FiscalOutput {
@@ -32,6 +41,74 @@ export interface FiscalOutput {
   importo_competenza: number
   importo_risconto: number
   ritenuta_importo: number | null
+  tax_code_resolved: ResolvedTaxCode
+}
+
+/**
+ * Deterministic mapping: (direction + aliquota + natura + detraibilità) → tax_code.
+ * The AI does NOT choose the tax code — only iva_detraibilita_pct and reverse_charge.
+ * This function translates into a tax code for accounting registration.
+ */
+export function risolveTaxCode(input: {
+  direction: 'in' | 'out'
+  vat_rate: number | null
+  vat_nature: string | null
+  iva_detraibilita_pct: number
+  reverse_charge: boolean
+}): ResolvedTaxCode {
+  const { direction, vat_rate, vat_nature, iva_detraibilita_pct, reverse_charge } = input
+  const rate = vat_rate ?? 0
+  const natura = (vat_nature || '').toUpperCase().trim()
+
+  // 1. Reverse charge (natura N6.x)
+  if (reverse_charge || natura.startsWith('N6')) {
+    return { codice: 'RC_N6', description: 'Reverse charge', match_confidence: 1.0 }
+  }
+
+  // 2. Natura codes (operazioni senza IVA)
+  if (natura === 'N1') {
+    return { codice: 'N1_ART15', description: 'Escluse art. 15', match_confidence: 1.0 }
+  }
+  if (natura.startsWith('N2')) {
+    return { codice: 'N2_NON_SOGG', description: 'Non soggette', match_confidence: 1.0 }
+  }
+  if (natura.startsWith('N3')) {
+    return { codice: 'N3_NON_IMP', description: 'Non imponibili', match_confidence: 1.0 }
+  }
+  if (natura === 'N4') {
+    return { codice: 'N4_ESENTE', description: 'Esenti art. 10', match_confidence: 1.0 }
+  }
+  if (natura === 'N5' || natura === 'N7') {
+    return { codice: 'N4_ESENTE', description: `Natura ${natura} (fallback esente)`, match_confidence: 0.5 }
+  }
+
+  // 3. Vendite
+  if (direction === 'out') {
+    if (rate >= 20) return { codice: 'VEND_22', description: 'Vendita 22%', match_confidence: 1.0 }
+    if (rate >= 8) return { codice: 'VEND_10', description: 'Vendita 10%', match_confidence: 1.0 }
+    if (rate >= 3) return { codice: 'VEND_4', description: 'Vendita 4%', match_confidence: 1.0 }
+    return { codice: 'VEND_22', description: 'Vendita (fallback 22%)', match_confidence: 0.5 }
+  }
+
+  // 4. Acquisti con detraibilità parziale
+  if (iva_detraibilita_pct <= 0) {
+    return { codice: 'ACQ_IND_0', description: 'IVA totalmente indetraibile', match_confidence: 1.0 }
+  }
+  if (iva_detraibilita_pct <= 45) {
+    return { codice: 'ACQ_AUTO_40', description: 'Auto promiscua (detr. 40%)', match_confidence: 1.0 }
+  }
+  if (iva_detraibilita_pct <= 55) {
+    return { codice: 'ACQ_TEL_50', description: 'Telefonia (detr. 50%)', match_confidence: 1.0 }
+  }
+
+  // 5. Acquisti ordinari (detraibilità 100%)
+  if (rate >= 20) return { codice: 'ACQ_22', description: 'Acquisto 22%', match_confidence: 1.0 }
+  if (rate >= 8) return { codice: 'ACQ_10', description: 'Acquisto 10%', match_confidence: 1.0 }
+  if (rate >= 4) return { codice: 'ACQ_5', description: 'Acquisto 5%', match_confidence: 1.0 }
+  if (rate > 0) return { codice: 'ACQ_4', description: 'Acquisto 4%', match_confidence: 1.0 }
+
+  // 6. Fallback: aliquota 0 senza natura → probabilmente esente
+  return { codice: 'N4_ESENTE', description: 'Aliquota 0% senza natura (fallback)', match_confidence: 0.3 }
 }
 
 export function calcolaImportiFiscali(input: FiscalInput): FiscalOutput {
@@ -108,6 +185,15 @@ export function calcolaImportiFiscali(input: FiscalInput): FiscalOutput {
     )
   }
 
+  // Deterministic tax code resolution
+  const tax_code_resolved = risolveTaxCode({
+    direction: input.direction,
+    vat_rate: input.vat_rate,
+    vat_nature: input.vat_nature,
+    iva_detraibilita_pct: input.iva_detraibilita_pct,
+    reverse_charge: input.reverse_charge,
+  })
+
   return {
     iva_importo,
     iva_detraibile,
@@ -120,6 +206,7 @@ export function calcolaImportiFiscali(input: FiscalInput): FiscalOutput {
     importo_competenza,
     importo_risconto,
     ritenuta_importo,
+    tax_code_resolved,
   }
 }
 
