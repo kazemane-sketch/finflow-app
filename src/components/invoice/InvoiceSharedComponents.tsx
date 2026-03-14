@@ -40,7 +40,21 @@ export function Row({ l, v, accent, bold }: { l: string; v?: string | null; acce
 
 export function getFinalReasoningSummary(detail?: LineDetailData | null): string | null {
   if (!detail) return null;
-  return detail.reasoning_summary_final || detail.fiscal_reasoning || detail.classification_reasoning || null;
+  const val = detail.reasoning_summary_final || detail.fiscal_reasoning || detail.classification_reasoning || null;
+  
+  if (typeof val === 'object' && val !== null) {
+    // If it's an array or object, try to extract a sensible string or stringify it safely
+    try {
+      if ('message' in val && typeof (val as any).message === 'string') return (val as any).message;
+      if ('reason' in val && typeof (val as any).reason === 'string') return (val as any).reason;
+      if ('it' in val && typeof (val as any).it === 'string') return (val as any).it; // fallback for translations
+      return JSON.stringify(val);
+    } catch {
+      return String(val);
+    }
+  }
+  
+  return val ? String(val) : null;
 }
 
 export function getPendingDecisionReason(detail?: LineDetailData | null): string | null {
