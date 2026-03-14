@@ -732,7 +732,14 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
     || hasAnyLineProjects(lineProjects)
     || cdcRows.length > 0
     || invProjects.length > 0
-  ), [classification, lineClassifs, lineArticleMap, aiSuggestions, lineProjects, cdcRows, invProjects]);
+    || Object.keys(lineConfidences).length > 0
+    || Object.keys(lineReviewFlags).length > 0
+    || Object.keys(lineDetails).length > 0
+    || Object.keys(lineFiscalFlags).length > 0
+    || Object.keys(lineActions).length > 0
+    || invoiceNotes.length > 0
+    || pipelineDebug != null
+  ), [classification, lineClassifs, lineArticleMap, aiSuggestions, lineProjects, cdcRows, invProjects, lineConfidences, lineReviewFlags, lineDetails, lineFiscalFlags, lineActions, invoiceNotes, pipelineDebug]);
 
   useEffect(() => {
     setArticles(referenceData.articles);
