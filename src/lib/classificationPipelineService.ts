@@ -3,10 +3,9 @@
  *
  * Pipeline steps:
  *   1. classify-v2-deterministic → exact/history evidence gate
- *   2. classify-v2-classify      → commercialista invoice-wide proposal
+ *   2. classify-v2-classify      → commercialista with function calling (classifica + fiscalità)
  *   3. classify-v2-cdc           → cost center assignment
- *   4. fiscal-reviewer           → reviewer final verdict + alerts
- *   5. Persist results + audit trail
+ *   4. Persist results + audit trail (with conditional CFO if needs_consultant)
  */
 
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
@@ -19,6 +18,7 @@ import {
   type SupportingEvidence,
   type WeakFieldState,
 } from '@/lib/invoiceDecisionService'
+import { calcolaImportiFiscali, type FiscalInput, type FiscalOutput } from '@/lib/fiscalCalculator'
 
 /* ─── Types ──────────────────────────────────── */
 
@@ -78,11 +78,39 @@ interface ClassifyResult {
   suggest_new_category?: Record<string, string> | null
 }
 
+interface FiscalV1 {
+  tax_code: string | null
+  iva_detraibilita_pct: number
+  deducibilita_ires_pct: number
+  irap_mode: string
+  irap_pct?: number
+  ritenuta_applicabile: boolean
+  ritenuta_tipo?: string
+  ritenuta_aliquota_pct?: number
+  ritenuta_base_pct?: number
+  cassa_previdenziale_pct?: number
+  reverse_charge: boolean
+  split_payment: boolean
+  bene_strumentale: boolean
+  asset_candidate: boolean
+  asset_category_guess?: string
+  ammortamento_aliquota_proposta?: number
+  debt_related: boolean
+  debt_type?: string
+  competenza_dal?: string
+  competenza_al?: string
+  costo_personale: boolean
+  warning_flags: string[]
+  fiscal_reasoning_short: string
+}
+
 interface CommercialistaPayload {
   invoice_summary: string | null
   evidence_refs: string[]
   needs_consultant_hint: boolean
-  line_proposals: ClassifyResult[]
+  needs_consultant?: boolean
+  consultant_reason?: string | null
+  line_proposals: (ClassifyResult & { fiscal_v1?: FiscalV1 | null; doubts?: { question: string; impact: string }[] })[]
 }
 
 interface CdcAllocation {
@@ -173,6 +201,9 @@ export interface PipelineResult {
     fiscal_reasoning?: string | null
     fiscal_thinking?: string | null
     fiscal_confidence?: number | null
+    // V1 typed fiscal fields
+    fiscal_v1?: FiscalV1 | null
+    fiscal_computed?: FiscalOutput | null
   }[]
   alerts: FiscalAlert[]
   commercialista?: CommercialistaPayload
@@ -193,7 +224,7 @@ export interface PipelineEvents {
   onLog?: (text: string) => void
 }
 
-const PIPELINE_TOTAL_STEPS = 5
+const PIPELINE_TOTAL_STEPS = 4
 
 type FinalLineResult = PipelineResult['lines'][number]
 
@@ -372,7 +403,9 @@ async function persistPipelineResults(
 
   for (const lr of result.lines) {
     throwIfAborted(signal)
-    await supabase.from('invoice_lines').update({
+    const fv1 = (lr as any).fiscal_v1 as FiscalV1 | null | undefined
+    const fc = (lr as any).fiscal_computed as FiscalOutput | null | undefined
+    const updatePayload: Record<string, unknown> = {
       category_id: lr.category_id,
       account_id: lr.account_id,
       fiscal_flags: lr.fiscal_flags,
@@ -388,7 +421,47 @@ async function persistPipelineResults(
       reasoning_summary_final: lr.reasoning_summary_final,
       final_confidence: Math.round(lr.confidence),
       final_decision_source: lr.final_decision_source,
-    } as any).eq('id', lr.line_id)
+    }
+    // V1 typed fiscal columns
+    if (fv1) {
+      updatePayload.iva_detraibilita_pct = fv1.iva_detraibilita_pct ?? 100
+      updatePayload.reverse_charge = fv1.reverse_charge || false
+      updatePayload.split_payment = fv1.split_payment || false
+      updatePayload.deducibilita_ires_pct = fv1.deducibilita_ires_pct ?? 100
+      updatePayload.irap_mode = fv1.irap_mode || 'follows_ires'
+      updatePayload.irap_pct = fv1.irap_pct ?? null
+      updatePayload.costo_personale = fv1.costo_personale || false
+      updatePayload.ritenuta_applicabile = fv1.ritenuta_applicabile || false
+      updatePayload.ritenuta_tipo = fv1.ritenuta_tipo || null
+      updatePayload.ritenuta_aliquota_pct = fv1.ritenuta_aliquota_pct ?? null
+      updatePayload.ritenuta_base_pct = fv1.ritenuta_base_pct ?? 100
+      updatePayload.cassa_previdenziale_pct = fv1.cassa_previdenziale_pct ?? null
+      updatePayload.bene_strumentale = fv1.bene_strumentale || false
+      updatePayload.asset_candidate = fv1.asset_candidate || false
+      updatePayload.asset_category_guess = fv1.asset_category_guess || null
+      updatePayload.ammortamento_aliquota_proposta = fv1.ammortamento_aliquota_proposta ?? null
+      updatePayload.debt_related = fv1.debt_related || false
+      updatePayload.debt_type = fv1.debt_type || null
+      updatePayload.competenza_dal = fv1.competenza_dal || null
+      updatePayload.competenza_al = fv1.competenza_al || null
+      updatePayload.warning_flags = fv1.warning_flags || []
+      updatePayload.fiscal_reasoning_short = fv1.fiscal_reasoning_short || null
+    }
+    // Computed fiscal amounts
+    if (fc) {
+      updatePayload.iva_importo = fc.iva_importo
+      updatePayload.iva_detraibile = fc.iva_detraibile
+      updatePayload.iva_indetraibile = fc.iva_indetraibile
+      updatePayload.iva_importo_source = fc.iva_importo_source
+      updatePayload.costo_fiscale = fc.costo_fiscale
+      updatePayload.importo_deducibile_ires = fc.importo_deducibile_ires
+      updatePayload.importo_indeducibile_ires = fc.importo_indeducibile_ires
+      updatePayload.importo_deducibile_irap = fc.importo_deducibile_irap
+      updatePayload.importo_competenza = fc.importo_competenza
+      updatePayload.importo_risconto = fc.importo_risconto
+      updatePayload.ritenuta_importo = fc.ritenuta_importo
+    }
+    await supabase.from('invoice_lines').update(updatePayload as any).eq('id', lr.line_id)
 
     const { error: deleteProjectsError } = await supabase
       .from('invoice_line_projects')
@@ -423,8 +496,8 @@ async function persistPipelineResults(
       assigned_by: 'ai_auto',
       verified: false,
       ai_confidence: avgConf,
-      ai_reasoning: result.reviewer?.invoice_summary_final
-        || result.commercialista?.invoice_summary
+      ai_reasoning: result.commercialista?.invoice_summary
+        || result.reviewer?.invoice_summary_final
         || `Verdetto AI consolidato su ${classified.length} righe`,
       invoice_notes: result.alerts.length > 0 ? JSON.stringify(result.alerts) : null,
     } as any, { onConflict: 'invoice_id' })
@@ -509,6 +582,36 @@ export async function runClassificationPipeline(
     // ignore
   }
 
+  // Load IVA data per line from invoice_vat_entries
+  let ivaByLine = new Map<string, { iva_importo: number; vat_nature: string | null }>()
+  try {
+    const lineIds = lines.map((l) => l.line_id)
+    const { data: vatEntries } = await supabase
+      .from('invoice_vat_entries')
+      .select('invoice_line_id, tax_amount, vat_nature')
+      .in('invoice_line_id', lineIds)
+    if (vatEntries) {
+      for (const ve of vatEntries) {
+        ivaByLine.set(ve.invoice_line_id, {
+          iva_importo: ve.tax_amount || 0,
+          vat_nature: ve.vat_nature || null,
+        })
+      }
+    }
+  } catch {
+    // ignore — IVA data is supplementary
+  }
+
+  // Enrich lines with IVA data for the commercialista
+  const enrichedLines = lines.map((line) => {
+    const iva = ivaByLine.get(line.line_id)
+    return {
+      ...line,
+      iva_importo: iva?.iva_importo ?? null,
+      vat_nature: iva?.vat_nature ?? null,
+    }
+  })
+
   const commonBody = {
     company_id: companyId,
     invoice_id: invoiceId,
@@ -542,10 +645,10 @@ export async function runClassificationPipeline(
     `Gate completato: ${resolved.length} evidenze determinate, ${unresolved.length} righe senza exact match pieno`,
   )
 
-  reporter.beginStage('Commercialista', 'Propongo classificazione e fiscalita su fattura intera')
+  reporter.beginStage('Commercialista', 'Classifico e determino fiscalità con function calling')
   const step2 = await callEdge('classify-v2-classify', {
     ...commonBody,
-    lines: lines.map((line) => ({
+    lines: enrichedLines.map((line) => ({
       ...line,
       matched_groups: matchedGroupsMap.get(line.line_id) || [],
     })),
@@ -565,7 +668,9 @@ export async function runClassificationPipeline(
   const commercialista: CommercialistaPayload = {
     invoice_summary: step2.commercialista?.invoice_summary || null,
     evidence_refs: Array.isArray(step2.commercialista?.evidence_refs) ? step2.commercialista.evidence_refs : [],
-    needs_consultant_hint: Boolean(step2.commercialista?.needs_consultant_hint),
+    needs_consultant_hint: Boolean(step2.commercialista?.needs_consultant_hint || step2.commercialista?.needs_consultant),
+    needs_consultant: Boolean(step2.commercialista?.needs_consultant),
+    consultant_reason: step2.commercialista?.consultant_reason || null,
     line_proposals: Array.isArray(step2.commercialista?.line_proposals)
       ? step2.commercialista.line_proposals
       : (step2.classifications || []),
@@ -670,6 +775,44 @@ export async function runClassificationPipeline(
     reporter.finishStage('Attribuzione CdC', `CdC: warning non bloccante (${error instanceof Error ? error.message : 'errore sconosciuto'})`)
   }
 
+  // ─── Fiscal Calculator: compute amounts from AI percentages ──────
+  const invoiceDate = new Date()
+  try {
+    const { data: inv } = await supabase.from('invoices').select('date').eq('id', invoiceId).single()
+    if (inv?.date) invoiceDate.setTime(new Date(inv.date).getTime())
+  } catch { /* use current year */ }
+  const annoEsercizio = invoiceDate.getFullYear()
+
+  for (const proposal of commercialista.line_proposals) {
+    const current = lineResults.get(proposal.line_id)
+    if (!current) continue
+    const fv1 = (proposal as any).fiscal_v1 as FiscalV1 | null | undefined
+    if (fv1) {
+      const inputLine = enrichedLines.find((l) => l.line_id === proposal.line_id)
+      const fiscalInput: FiscalInput = {
+        total_price: inputLine?.total_price || 0,
+        vat_rate: inputLine?.vat_rate ?? null,
+        iva_xml: inputLine?.iva_importo ?? null,
+        iva_detraibilita_pct: fv1.iva_detraibilita_pct ?? 100,
+        deducibilita_ires_pct: fv1.deducibilita_ires_pct ?? 100,
+        irap_mode: (fv1.irap_mode as FiscalInput['irap_mode']) || 'follows_ires',
+        irap_pct: fv1.irap_pct,
+        ritenuta_applicabile: fv1.ritenuta_applicabile || false,
+        ritenuta_aliquota_pct: fv1.ritenuta_aliquota_pct,
+        ritenuta_base_pct: fv1.ritenuta_base_pct,
+        cassa_previdenziale_pct: fv1.cassa_previdenziale_pct,
+        competenza_dal: fv1.competenza_dal,
+        competenza_al: fv1.competenza_al,
+        anno_esercizio: annoEsercizio,
+      }
+      const computed = calcolaImportiFiscali(fiscalInput);
+      (current as any).fiscal_v1 = fv1;
+      (current as any).fiscal_computed = computed
+      current.fiscal_reasoning = fv1.fiscal_reasoning_short || current.fiscal_reasoning
+    }
+  }
+
+  // ─── Conditional CFO: only if commercialista flagged needs_consultant ──────
   let alerts: FiscalAlert[] = []
   let fiscalIssues = 0
   const reviewerPayload: ReviewerPayload = {
@@ -679,117 +822,65 @@ export async function runClassificationPipeline(
     red_flags: [],
   }
 
-  reporter.beginStage('Revisore', 'Consolido il verdetto finale riga per riga')
-  try {
-    const reviewLines = lines.map((line) => {
-      const current = lineResults.get(line.line_id)
-      const ruleResolved = deterministicMap.get(line.line_id)
-      const hasFiscalFromRule = !!(ruleResolved?.fiscal_flags && Object.keys(ruleResolved.fiscal_flags).length > 0)
-      return {
-        line_id: line.line_id,
-        description: line.description,
-        total_price: line.total_price,
-        vat_rate: line.vat_rate,
-        category_id: current?.category_id || null,
-        category_name: null,
-        account_id: current?.account_id || null,
-        account_code: current?.account_code || null,
-        account_name: null,
-        confidence: current?.confidence || 0,
-        fiscal_flags: defaultFiscalFlags(current?.fiscal_flags),
-        source: current?.source || 'unknown',
-        fiscal_flags_source: hasFiscalFromRule ? 'rule_confirmed' : 'to_review',
-        fiscal_flags_preset: hasFiscalFromRule ? ruleResolved?.fiscal_flags : null,
-      }
-    }).filter((line) => {
-      const current = lineResults.get(line.line_id)
-      return current && (current.account_id || current.category_id || current.confidence > 0)
-    })
-
-    if (reviewLines.length > 0) {
-      const step4 = await callEdge('fiscal-reviewer', {
-        ...commonBody,
-        lines: reviewLines,
-        ...(contractRefs?.length ? { contract_refs: contractRefs } : {}),
+  if (commercialista.needs_consultant) {
+    reporter.beginStage('Consulente CFO', 'Revisione fiscale approfondita')
+    try {
+      const cfoResult = await callEdge('ai-fiscal-consultant', {
+        invoice_id: invoiceId,
+        company_id: companyId,
+        line_ids: lines.map((l) => l.line_id),
+        alert_context: commercialista.consultant_reason || '',
+        consulting_mode: 'pipeline',
+        commercialista_result: {
+          invoice_summary: commercialista.invoice_summary,
+          consultant_reason: commercialista.consultant_reason,
+          lines: commercialista.line_proposals,
+        },
+        direction,
+        counterparty_vat_key: counterpartyVatKey,
       }, signal)
       throwIfAborted(signal)
 
-      const reviews: ReviewResult[] = step4.reviews || []
-      alerts = step4.alerts || []
-      reviewerPayload.invoice_summary_final = step4.reviewer_verdict?.invoice_summary_final || null
-      reviewerPayload.line_verdicts = Array.isArray(step4.reviewer_verdict?.line_verdicts)
-        ? step4.reviewer_verdict.line_verdicts
-        : []
-      reviewerPayload.escalation_candidates = Array.isArray(step4.reviewer_verdict?.escalation_candidates)
-        ? step4.reviewer_verdict.escalation_candidates
-        : []
-      reviewerPayload.red_flags = Array.isArray(step4.reviewer_verdict?.red_flags)
-        ? step4.reviewer_verdict.red_flags
-        : []
-      const fiscalThinking: string | null = step4.thinking || null
-
-      if (step4._debug) {
+      if (cfoResult._debug || cfoResult.tool_calls) {
         debugSteps.push({
-          step: 'reviewer',
-          prompt_sent: step4._debug.prompt_sent,
-          raw_response: step4._debug.raw_response,
-          model_used: step4._debug.model_used,
-          agent_config_loaded: step4._debug.agent_config_loaded,
-          agent_rules_count: step4._debug.agent_rules_count,
-          kb_notes_used: step4._debug.kb_notes_used,
-          kb_note_titles: step4._debug.kb_note_titles,
-          company_ateco: step4._debug.company_ateco,
-          extra: {
-            counterparty_ateco: step4._debug.counterparty_ateco,
-            counterparty_legal_type: step4._debug.counterparty_legal_type,
-            pre_resolved_decisions: step4._debug.pre_resolved_decisions,
-            rule_confirmed_lines: step4._debug.rule_confirmed_lines,
-            escalation_candidates: reviewerPayload.escalation_candidates,
-          },
+          step: 'consulente_cfo',
+          model_used: cfoResult.model_used,
+          extra: { tool_calls: cfoResult.tool_calls, action: cfoResult.action },
         })
       }
 
-      for (const review of reviews) {
-        const current = lineResults.get(review.line_id)
-        if (!current) continue
-        current.fiscal_flags = defaultFiscalFlags(review.fiscal_flags_corrected)
-        current.confidence = Math.max(0, Math.min(100, current.confidence + (review.confidence_adjustment || 0)))
-        current.fiscal_reasoning = review.issues?.length ? review.issues.join('; ') : 'Nessun problema fiscale rilevato'
-        current.fiscal_thinking = fiscalThinking
-        current.fiscal_confidence = current.confidence
-        if (review.issues?.length) fiscalIssues += review.issues.length
+      // Apply CFO overrides if any
+      if (cfoResult.action?.line_overrides && Array.isArray(cfoResult.action.line_overrides)) {
+        for (const override of cfoResult.action.line_overrides) {
+          const current = lineResults.get(override.line_id)
+          if (!current) continue
+          if (override.field === 'account_id' && override.new_value) current.account_id = override.new_value
+          if (override.field === 'category_id' && override.new_value) current.category_id = override.new_value
+          current.final_decision_source = 'consulente' as FinalDecisionSource
+          current.fiscal_reasoning = override.reasoning || current.fiscal_reasoning
+        }
+        fiscalIssues += cfoResult.action.line_overrides.length
       }
 
-      const verdictMap = new Map(reviewerPayload.line_verdicts.map((row) => [row.line_id, row]))
-      for (const line of lines) {
-        const current = lineResults.get(line.line_id)
-        if (!current) continue
-        const verdict = verdictMap.get(line.line_id)
-        if (verdict) {
-          current.decision_status = verdict.decision_status
-          current.reasoning_summary_final = verdict.rationale_summary || current.reasoning_summary_final
-          current.decision_basis = normalizeStringArray(verdict.decision_basis)
-          current.supporting_factors = normalizeStringArray(verdict.supporting_factors)
-          current.supporting_evidence = normalizeEvidence(verdict.supporting_evidence).concat(current.supporting_evidence)
-          current.final_decision_source = 'revisore'
-          current.fiscal_reasoning = verdict.rationale_summary || current.fiscal_reasoning
-        } else {
-          current.decision_status = current.account_id || current.category_id ? 'finalized' : 'unassigned'
-          current.final_decision_source = current.final_decision_source === 'none' ? 'commercialista' : current.final_decision_source
-        }
+      reviewerPayload.invoice_summary_final = cfoResult.action?.review_summary || cfoResult.message || null
 
-        if (current.decision_status !== 'finalized') {
-          current.final_decision_source = 'revisore'
-        }
-      }
-
-      reporter.finishStage('Revisore', `Revisore: ${reviews.length} revisioni, ${alerts.length} alert, ${reviewerPayload.escalation_candidates.length} escalation`)
-    } else {
-      reporter.finishStage('Revisore', 'Revisore saltato: nessuna proposta sostanziale da consolidare')
+      reporter.finishStage('Consulente CFO', `CFO: ${fiscalIssues} override, risk=${cfoResult.action?.risk_level || 'N/A'}`)
+    } catch (error) {
+      console.warn('[pipeline] CFO step failed (non-blocking):', error)
+      reporter.finishStage('Consulente CFO', `CFO: warning non bloccante (${error instanceof Error ? error.message : 'errore sconosciuto'})`)
     }
-  } catch (error) {
-    console.warn('[pipeline] Reviewer failed (non-blocking):', error)
-    reporter.finishStage('Revisore', `Revisore: warning non bloccante (${error instanceof Error ? error.message : 'errore sconosciuto'})`)
+  }
+
+  // Finalize decision status for all lines
+  for (const line of lines) {
+    const current = lineResults.get(line.line_id)
+    if (!current) continue
+    if (current.decision_status === 'pending') {
+      current.decision_status = current.account_id || current.category_id ? 'finalized' : 'unassigned'
+      if (current.final_decision_source === 'none') {
+        current.final_decision_source = current.account_id || current.category_id ? 'commercialista' : 'none'
+      }
+    }
   }
 
   const finalLines = lines.map((line) => lineResults.get(line.line_id) || buildInitialResult(line))
@@ -798,12 +889,6 @@ export async function runClassificationPipeline(
       finalLine.reasoning_summary_final = finalLine.decision_status === 'unassigned'
         ? 'Decisione non applicata: evidenza insufficiente sulla riga'
         : finalLine.classification_reasoning || finalLine.fiscal_reasoning || finalLine.reasoning
-    }
-    if (finalLine.decision_status === 'pending') {
-      finalLine.decision_status = finalLine.account_id || finalLine.category_id ? 'finalized' : 'unassigned'
-      if (finalLine.final_decision_source === 'none') {
-        finalLine.final_decision_source = finalLine.account_id || finalLine.category_id ? 'commercialista' : 'none'
-      }
     }
   }
 

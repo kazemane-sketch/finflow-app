@@ -6,13 +6,18 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { supabase } from '@/integrations/supabase/client'
 import { toast } from 'sonner'
-import { Bot, Loader2, Save, Brain, Cpu, Zap } from 'lucide-react'
+import { Bot, Loader2, Save, Brain, Cpu, Zap, Wrench } from 'lucide-react'
 
 interface AgentConfig {
   id: string; agent_type: string; display_name: string; description: string | null;
   system_prompt: string; model: string; model_escalation: string | null;
   temperature: number; thinking_level: string; thinking_budget: number | null; thinking_budget_escalation: number | null;
   max_output_tokens: number; version: number; updated_at: string;
+}
+
+interface AgentTool {
+  id: string; agent_type: string; tool_name: string; display_name: string;
+  description: string | null; is_enabled: boolean; sort_order: number;
 }
 
 const MODEL_OPTIONS = [
@@ -58,6 +63,7 @@ const AGENT_ICONS: Record<string, typeof Bot> = {
 
 export default function AgentConfigPage() {
   const [agents, setAgents] = useState<AgentConfig[]>([])
+  const [tools, setTools] = useState<AgentTool[]>([])
   const [loading, setLoading] = useState(true)
   const [edits, setEdits] = useState<Record<string, Partial<AgentConfig>>>({})
   const [saving, setSaving] = useState<string | null>(null)
@@ -68,9 +74,13 @@ export default function AgentConfigPage() {
 
   async function loadAgents() {
     setLoading(true)
-    const { data } = await supabase.from('agent_config').select('*').eq('active', true).order('agent_type')
-    const items = ((data as any[]) || []).filter(a => a.agent_type !== 'kb_classifier')
+    const [{ data: agentData }, { data: toolData }] = await Promise.all([
+      supabase.from('agent_config').select('*').eq('active', true).order('agent_type'),
+      supabase.from('agent_tools').select('*').order('sort_order') as any,
+    ])
+    const items = ((agentData as any[]) || []).filter(a => a.agent_type !== 'kb_classifier')
     setAgents(items)
+    setTools((toolData as AgentTool[]) || [])
     const editMap: Record<string, Partial<AgentConfig>> = {}
     items.forEach(a => { editMap[a.id] = { ...a } })
     setEdits(editMap)
@@ -258,6 +268,30 @@ export default function AgentConfigPage() {
                     </div>
                   </div>
                 </div>
+
+                {/* ── Tool Catalog ── */}
+                {(() => {
+                  const agentTools = tools.filter(t => t.agent_type === agent.agent_type)
+                  if (agentTools.length === 0) return null
+                  return (
+                    <div className="border rounded-lg p-3 space-y-2 bg-slate-50/50">
+                      <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">
+                        <Wrench className="h-3 w-3" />
+                        Tool disponibili ({agentTools.length})
+                      </p>
+                      <div className="grid grid-cols-1 gap-1">
+                        {agentTools.map(tool => (
+                          <div key={tool.id} className="flex items-center gap-2 text-xs py-0.5">
+                            <span className={`h-1.5 w-1.5 rounded-full ${tool.is_enabled ? 'bg-emerald-500' : 'bg-red-400'}`} />
+                            <span className="font-mono text-[11px] text-slate-700">{tool.tool_name}</span>
+                            <span className="text-slate-400">—</span>
+                            <span className="text-slate-500 truncate">{tool.description || tool.display_name}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })()}
 
                 {/* ── System Prompt ── */}
                 <div className="flex-1 flex flex-col">

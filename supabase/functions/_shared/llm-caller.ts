@@ -202,7 +202,7 @@ async function callOpenAI(prompt: string, config: LLMConfig, key?: string): Prom
   
   // O1/O3 reasoning usually isn't returned in the API, or is returned differently depending on tier
   // Deno doesn't give us native access to it via standard chat completions unless special headers are used
-  const thinking = ""; 
+  const thinking = "";
 
   let structured = null;
   try {
@@ -212,4 +212,120 @@ async function callOpenAI(prompt: string, config: LLMConfig, key?: string): Prom
   }
 
   return { text, thinking, structured };
+}
+
+/* ─── Gemini Function Calling (multi-turn tool loop) ─── */
+
+export interface ToolDeclaration {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+export interface GeminiToolsConfig {
+  model: string;
+  temperature: number;
+  maxOutputTokens: number;
+}
+
+/**
+ * Calls Gemini with native function calling support.
+ * Loops until Gemini produces a text-only response or maxIterations is reached.
+ */
+export async function callGeminiWithTools(
+  systemPrompt: string,
+  userPrompt: string,
+  tools: ToolDeclaration[],
+  toolHandler: (name: string, args: Record<string, unknown>) => Promise<unknown>,
+  config: GeminiToolsConfig,
+  geminiKey: string,
+  maxIterations = 10,
+): Promise<LLMResponse & { tool_calls_log: { name: string; args: Record<string, unknown> }[] }> {
+  if (!geminiKey) throw new Error("GEMINI_API_KEY mancante");
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent?key=${geminiKey}`;
+
+  const geminiTools = [{
+    functionDeclarations: tools.map((t) => ({
+      name: t.name,
+      description: t.description,
+      parameters: t.parameters,
+    })),
+  }];
+
+  const contents: Array<{ role: string; parts: Array<Record<string, unknown>> }> = [
+    { role: "user", parts: [{ text: userPrompt }] },
+  ];
+
+  const toolCallsLog: { name: string; args: Record<string, unknown> }[] = [];
+
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    const payload: Record<string, unknown> = {
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents,
+      tools: geminiTools,
+      toolConfig: { functionCallingConfig: { mode: "AUTO" } },
+      generationConfig: {
+        maxOutputTokens: config.maxOutputTokens,
+        temperature: config.temperature,
+      },
+    };
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Gemini API ${resp.status}: ${errText.slice(0, 500)}`);
+    }
+
+    const data = await resp.json();
+    const candidate = data?.candidates?.[0];
+    const parts = candidate?.content?.parts || [];
+
+    const functionCalls = parts.filter((p: any) => p.functionCall);
+
+    if (functionCalls.length === 0) {
+      let text = "";
+      let thinking = "";
+      for (const p of parts) {
+        if (p.thought && p.text) thinking += p.text;
+        else if (p.text) text += p.text;
+      }
+
+      let structured = null;
+      try { structured = extractJson(text); } catch { /* ignore */ }
+
+      return { text, thinking, structured, tool_calls_log: toolCallsLog };
+    }
+
+    contents.push({ role: "model", parts });
+
+    const functionResponseParts: Array<Record<string, unknown>> = [];
+    for (const fc of functionCalls) {
+      const { name, args } = fc.functionCall;
+      toolCallsLog.push({ name, args: args || {} });
+      console.log(`[callGeminiWithTools] Tool call: ${name}(${JSON.stringify(args || {}).slice(0, 200)})`);
+
+      try {
+        const result = await toolHandler(name, args || {});
+        functionResponseParts.push({
+          functionResponse: { name, response: { result } },
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[callGeminiWithTools] Tool error ${name}: ${msg}`);
+        functionResponseParts.push({
+          functionResponse: { name, response: { error: msg } },
+        });
+      }
+    }
+
+    contents.push({ role: "user", parts: functionResponseParts });
+  }
+
+  throw new Error(`callGeminiWithTools: max iterations (${maxIterations}) reached without final response`);
 }

@@ -1,40 +1,21 @@
-// classify-v2-classify — Stage B: Classification
-// Takes understanding results from Stage A and assigns account, category, article.
-// Loads ALL active accounts (Stage A sections are prompt GUIDANCE, not a hard filter).
-// Produces: category_id, account_id, article_code, phase_code, confidence, fiscal_flags.
+// classify-v2-classify — Stage B: Classification with Function Calling
+// Commercialista AI (Gemini 2.5 Pro) classifies ALL invoice lines in ONE call.
+// Uses 7 tools on-demand instead of preloading all context into the prompt.
 //
-// v3: Reads agent_config, agent_rules, knowledge_base from Admin Panel DB.
+// Tools: cerca_conti, get_defaults_conto, storico_controparte,
+//        get_tax_codes, get_parametro_fiscale, get_profilo_controparte, consulta_kb
 
 import postgres from "npm:postgres@3.4.5";
-import {
-  getCompanyMemoryBlock,
-  getUserInstructionsBlock,
-  type CompanyContext,
-  type MemoryFact,
-} from "../_shared/accounting-system-prompt.ts";
-import {
-  filterCompanyMemoryForInvoiceClassification,
-  getInvoiceContractRefs,
-  type CompanyMemoryQueryRow,
-} from "../_shared/company-memory-filter.ts";
-import {
-  formatKbAdvisoryNotesContext,
-  formatKbSourceChunksContext,
-  inferKbCounterpartyTags,
-  inferKbOperationTags,
-  loadKbAdvisoryContext,
-  shouldConsultKbAdvisory,
-} from "../_shared/kb-advisory.ts";
-import { callLLM } from "../_shared/llm-caller.ts";
+import { callGeminiWithTools, type ToolDeclaration } from "../_shared/llm-caller.ts";
+import { callGeminiEmbedding, toVectorLiteral } from "../_shared/embeddings.ts";
+import { loadKbAdvisoryContext } from "../_shared/kb-advisory.ts";
+import { extractJson } from "../_shared/json-helpers.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
-
-const EMBEDDING_MODEL = "gemini-embedding-001";
-const EXPECTED_DIMS = 3072;
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -51,6 +32,9 @@ interface InputLine {
   quantity: number | null;
   unit_price: number | null;
   total_price: number | null;
+  vat_rate: number | null;
+  vat_nature: string | null;
+  iva_importo: number | null;
   matched_groups: string[];
 }
 
@@ -65,149 +49,138 @@ interface ExactMatchEvidence {
   phase_id?: string | null;
 }
 
-interface Understanding {
-  line_id: string;
-  operation_type: string;
-  account_sections: string[];
-  is_NOT: string[];
-  reasoning: string;
-}
-
-interface FiscalFlags {
-  ritenuta_acconto: { aliquota: number; base: string } | null;
+interface FiscalOutput {
+  tax_code: string | null;
+  iva_detraibilita_pct: number;
+  deducibilita_ires_pct: number;
+  irap_mode: string;
+  irap_pct?: number;
+  ritenuta_applicabile: boolean;
+  ritenuta_tipo?: string;
+  ritenuta_aliquota_pct?: number;
+  ritenuta_base_pct?: number;
+  cassa_previdenziale_pct?: number;
   reverse_charge: boolean;
   split_payment: boolean;
   bene_strumentale: boolean;
-  deducibilita_pct: number;
-  iva_detraibilita_pct: number;
-  note: string | null;
+  asset_candidate: boolean;
+  asset_category_guess?: string;
+  ammortamento_aliquota_proposta?: number;
+  debt_related: boolean;
+  debt_type?: string;
+  competenza_dal?: string;
+  competenza_al?: string;
+  costo_personale: boolean;
+  warning_flags: string[];
+  fiscal_reasoning_short: string;
 }
 
-interface WeakField<T = string | null> {
-  value: T | null;
-  state: "assigned" | "unassigned" | "needs_review";
-}
-
-interface SupportingEvidence {
-  source: string;
-  label: string;
-  detail?: string | null;
-  ref?: string | null;
-}
-
-interface ClassifyResult {
+interface LineProposal {
   line_id: string;
-  article_code: string | null;
-  phase_code: string | null;
-  category_id: string | null;
-  category_name: string | null;
-  account_id: string | null;
   account_code: string | null;
+  account_id: string | null;
+  category_id: string | null;
   confidence: number;
   reasoning: string;
-  fiscal_flags: FiscalFlags;
-  rationale_summary?: string | null;
-  decision_basis?: string[];
-  supporting_factors?: string[];
-  supporting_evidence?: SupportingEvidence[];
-  weak_fields?: {
-    category?: WeakField;
-    account?: WeakField;
-    article?: WeakField;
-    phase?: WeakField;
-    cost_center?: WeakField;
-  };
-  exact_match_evidence_used?: boolean;
-  suggest_new_account?: {
-    code: string; name: string; section: string; parent_code: string; reason: string;
-  } | null;
-  suggest_new_category?: {
-    name: string; type: string; reason: string;
-  } | null;
+  fiscal: FiscalOutput;
+  doubts: { question: string; impact: string }[];
 }
 
 interface CommercialistaResponse {
-  invoice_summary?: string | null;
-  evidence_refs?: string[];
-  needs_consultant_hint?: boolean;
-  line_proposals: ClassifyResult[];
+  invoice_summary: string;
+  needs_consultant: boolean;
+  consultant_reason: string | null;
+  lines: LineProposal[];
 }
 
-/* ─── Admin Panel types ─────────────────── */
-
 interface AgentConfig {
-  agent_type: string;
   system_prompt: string;
   model: string;
-  model_escalation?: string | null;
   temperature: number;
-  thinking_level: string;
-  thinking_budget?: number | null;
+  thinking_budget: number | null;
   max_output_tokens: number;
 }
 
-interface AgentRule {
-  title: string;
-  rule_text: string;
-  trigger_keywords: string[];
-  sort_order: number;
-}
+/* ─── Tool Declarations ──────────────────── */
 
-/* ─── Format helpers ─────────────────────── */
-
-function formatAgentRules(rules: AgentRule[]): string {
-  if (rules.length === 0) return "";
-  const lines = ["=== REGOLE OPERATIVE ==="];
-  rules.forEach((r, i) => {
-    lines.push(`${i + 1}. [${r.title}] — ${r.rule_text}`);
-  });
-  return lines.join("\n");
-}
-
-/* ─── Direction enforcement ──────────────── */
-
-const SECTIONS_FOR_DIRECTION: Record<string, { primary: string[]; allowed: string[] }> = {
-  in: {
-    primary: ["cost_production", "cost_personnel", "depreciation", "other_costs"],
-    allowed: ["cost_production", "cost_personnel", "depreciation", "other_costs", "financial", "extraordinary", "assets", "liabilities"],
+const TOOL_DECLARATIONS: ToolDeclaration[] = [
+  {
+    name: "cerca_conti",
+    description: "Cerca nel piano dei conti dell'azienda per parole chiave e/o sezione. Restituisce codice, nome, sezione e defaults fiscali dei conti trovati.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        query: { type: "STRING", description: "Parole chiave per cercare nel nome/codice del conto (es. 'carburante', 'leasing', 'telefono')" },
+        section: { type: "STRING", description: "Filtra per sezione: assets, liabilities, equity, revenue, cost_production, cost_personnel, depreciation, other_costs, financial, extraordinary" },
+      },
+      required: ["query"],
+    },
   },
-  out: {
-    primary: ["revenue"],
-    allowed: ["revenue", "financial", "extraordinary", "assets", "liabilities"],
+  {
+    name: "get_defaults_conto",
+    description: "Legge i default fiscali di un conto specifico: tax_code, IRES%, IRAP mode, needs_user_confirmation, note_fiscali.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        account_code: { type: "STRING", description: "Codice del conto (es. '61.20.010')" },
+      },
+      required: ["account_code"],
+    },
   },
-};
-
-const CAT_TYPES_FOR_DIRECTION: Record<string, string[]> = {
-  in: ["expense", "both"],
-  out: ["revenue", "both"],
-};
-
-/* ─── Embedding helper ───────────────────── */
-
-function toVectorLiteral(values: number[]): string {
-  return `[${values.map((v) => (Number.isFinite(v) ? v.toFixed(8) : "0")).join(",")}]`;
-}
-
-async function callGeminiEmbedding(apiKey: string, text: string): Promise<number[]> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:embedContent?key=${apiKey}`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: `models/${EMBEDDING_MODEL}`,
-      content: { parts: [{ text }] },
-      taskType: "RETRIEVAL_QUERY",
-      outputDimensionality: EXPECTED_DIMS,
-    }),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(`Gemini embedding error: ${payload?.error?.message || response.status}`);
-  const values = payload?.embedding?.values;
-  if (!Array.isArray(values) || values.length !== EXPECTED_DIMS) throw new Error("Bad embedding dims");
-  return values.map((v: unknown) => Number(v));
-}
-
-// Extracted to json-helpers.ts
+  {
+    name: "storico_controparte",
+    description: "Cerca classificazioni confermate per questa controparte. Mostra descrizione, conto, categoria e frequenza.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        description_hint: { type: "STRING", description: "Parole chiave opzionali per filtrare le righe dello storico (es. 'canone', 'manutenzione')" },
+      },
+    },
+  },
+  {
+    name: "get_tax_codes",
+    description: "Cerca codici IVA disponibili. Filtra per aliquota, tipo (acquisto/vendita/entrambi) o natura.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        aliquota: { type: "NUMBER", description: "Aliquota IVA (es. 22, 10, 4)" },
+        tipo: { type: "STRING", description: "Tipo: acquisto, vendita, entrambi" },
+        natura: { type: "STRING", description: "Natura IVA (es. N1, N2.1, N6.1)" },
+      },
+    },
+  },
+  {
+    name: "get_parametro_fiscale",
+    description: "Cerca parametri normativi fiscali: soglie, aliquote, limiti di deducibilità. Filtra per codice, categoria o parola chiave.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        codice: { type: "STRING", description: "Codice parametro specifico (es. 'art_164_auto_promiscua_deduc')" },
+        categoria: { type: "STRING", description: "Categoria: ires, iva, irap, ritenute, cespiti, soglie, bollo" },
+        query: { type: "STRING", description: "Ricerca testuale nel nome/normativa" },
+      },
+    },
+  },
+  {
+    name: "get_profilo_controparte",
+    description: "Legge il profilo fiscale della controparte: tipo soggetto, ritenuta, cassa previdenziale, split payment, paese.",
+    parameters: {
+      type: "OBJECT",
+      properties: {},
+    },
+  },
+  {
+    name: "consulta_kb",
+    description: "Cerca nella knowledge base aziendale note consultive e fonti normative. Usa per casi fiscalmente complessi (leasing, auto, reverse charge, ritenute, cespiti).",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        query: { type: "STRING", description: "Domanda o argomento da cercare nella KB (es. 'deducibilità auto promiscua SRL', 'reverse charge servizi edili')" },
+      },
+      required: ["query"],
+    },
+  },
+];
 
 /* ─── Main ───────────────────────────────── */
 
@@ -217,26 +190,25 @@ Deno.serve(async (req) => {
 
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
-  const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
-  const openaiKey = (Deno.env.get("OPENAI_API_KEY") ?? "").trim();
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL non configurato" }, 503);
+  if (!geminiKey) return json({ error: "GEMINI_API_KEY non configurato" }, 503);
 
   let body: {
     company_id?: string;
     invoice_id?: string;
     lines?: InputLine[];
-    understandings?: Understanding[];
     deterministic_matches?: ExactMatchEvidence[];
     direction?: string;
     counterparty_name?: string;
     counterparty_vat_key?: string;
+    invoice_notes?: string;
+    invoice_causale?: string;
   };
   try { body = await req.json(); } catch { return json({ error: "Body JSON non valido" }, 400); }
 
   const companyId = body.company_id;
   const invoiceId = body.invoice_id;
   const lines = body.lines || [];
-  const understandings = body.understandings || [];
   const deterministicMatches = body.deterministic_matches || [];
   const direction = body.direction || "in";
   const counterpartyName = body.counterparty_name || "N.D.";
@@ -248,482 +220,444 @@ Deno.serve(async (req) => {
   if (!invoiceId) return json({ error: "invoice_id richiesto" }, 400);
   if (lines.length === 0) return json({ error: "lines vuote" }, 400);
 
-  const sql = postgres(dbUrl, { max: 2 });
+  const sql = postgres(dbUrl, { max: 3 });
 
   try {
-    // Build understanding map
-    const underMap = new Map(understandings.map((u) => [u.line_id, u]));
-    const exactMatchMap = new Map(deterministicMatches.map((match) => [match.line_id, match]));
-
-    const allowedCatTypes = CAT_TYPES_FOR_DIRECTION[direction] || CAT_TYPES_FOR_DIRECTION["in"];
-    const lineDescriptions = lines.map((l) => l.description || "");
-
-    // ─── Load context + Admin Panel infrastructure in parallel ──────
-    const [articles, categories, accounts, phases, companyRow, invoiceRow, agentConfigs, agentRules] = await Promise.all([
-      sql`SELECT id, code, name, description, keywords FROM articles WHERE company_id = ${companyId} AND active = true ORDER BY code`,
-      sql`SELECT id, name, type FROM categories WHERE company_id = ${companyId} AND active = true AND type = ANY(${allowedCatTypes}::text[]) ORDER BY sort_order, name`,
-      sql`SELECT id, code, name, section FROM chart_of_accounts WHERE company_id = ${companyId} AND active = true AND is_header = false ORDER BY code`,
-      sql`SELECT id, article_id, code, name, phase_type, is_counting_point, invoice_direction FROM article_phases WHERE company_id = ${companyId} AND active = true ORDER BY article_id, sort_order`,
-      sql`SELECT name, vat_number, ateco_code FROM companies WHERE id = ${companyId} LIMIT 1`,
-      sql`SELECT primary_contract_ref, contract_refs FROM invoices WHERE id = ${invoiceId} LIMIT 1`,
-      // Agent config for commercialista
+    // ─── Load minimal context (company, counterparty, invoice, agent config) ──────
+    const [companyRow, invoiceRow, counterpartyRow, agentConfigs] = await Promise.all([
+      sql`SELECT name, vat_number, ateco_code, ateco_description, fiscal_regime, iva_per_cassa
+          FROM companies WHERE id = ${companyId} LIMIT 1`,
+      sql`SELECT total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount,
+                 date, doc_type, direction, notes, raw_xml
+          FROM invoices WHERE id = ${invoiceId} LIMIT 1`,
+      counterpartyVatKey
+        ? sql`SELECT name, vat_number, fiscal_code, legal_type, ateco_code, ateco_description,
+                     tipo_soggetto, soggetto_a_ritenuta, cassa_previdenziale, split_payment_soggetto,
+                     paese_residenza, business_sector
+              FROM counterparties
+              WHERE company_id = ${companyId}
+                AND vat_key = ${counterpartyVatKey.toUpperCase().replace(/^IT/i, "").replace(/[^A-Z0-9]/gi, "")}
+              LIMIT 1`
+        : Promise.resolve([]),
       sql<AgentConfig[]>`
-        SELECT agent_type, system_prompt, model, model_escalation, temperature, thinking_level, thinking_budget, max_output_tokens
+        SELECT system_prompt, model, temperature, thinking_budget, max_output_tokens
         FROM agent_config WHERE active = true AND agent_type = 'commercialista'
         LIMIT 1`,
-      // Agent rules for commercialista
-      sql<AgentRule[]>`
-        SELECT title, rule_text, trigger_keywords, sort_order
-        FROM agent_rules WHERE active = true AND agent_type = 'commercialista'
-        ORDER BY sort_order`,
     ]);
 
-    const companyName = companyRow[0]?.name || "";
-    const companyVat = companyRow[0]?.vat_number || "";
-    const companyAteco = companyRow[0]?.ateco_code || "";
+    const company = companyRow[0];
+    const invoice = invoiceRow[0];
+    const counterparty = counterpartyRow[0] || null;
     const agentConfig = agentConfigs[0] || null;
-    const invoiceContractRefs = getInvoiceContractRefs(
-      invoiceRow[0]?.primary_contract_ref || null,
-      invoiceRow[0]?.contract_refs || null,
-    );
 
-    console.log(`[classify-v2] Loaded: ${accounts.length} accounts (ALL sections), ${categories.length} cats, ${articles.length} articles`);
-    console.log(`[classify-v2] Admin Panel: config=${agentConfig ? "✓" : "✗"} rules=${agentRules.length}`);
+    if (!company) return json({ error: "Company non trovata" }, 404);
+    if (!invoice) return json({ error: "Invoice non trovata" }, 404);
 
-    // Counterparty info
-    let counterpartyInfo = counterpartyName;
-    let counterpartyAtecoFull = "";
-    let counterpartyLegalType = "";
-    let counterpartyBusinessSector = "";
-    if (counterpartyVatKey) {
-      const vatKey = counterpartyVatKey.toUpperCase().replace(/^IT/i, "").replace(/[^A-Z0-9]/gi, "");
-      if (vatKey) {
-        const [cpRow] = await sql`
-          SELECT ateco_code, ateco_description, business_sector, legal_type, address
-          FROM counterparties WHERE company_id = ${companyId} AND vat_key = ${vatKey} LIMIT 1`;
-        if (cpRow) {
-          const parts = [`P.IVA: ${counterpartyVatKey}`];
-          if (cpRow.ateco_code) { parts.push(`ATECO: ${cpRow.ateco_code} ${cpRow.ateco_description || ""}`); counterpartyAtecoFull = cpRow.ateco_code; }
-          if (cpRow.business_sector) {
-            parts.push(`Settore: ${cpRow.business_sector}`);
-            counterpartyBusinessSector = cpRow.business_sector;
-          }
-          if (cpRow.legal_type) { parts.push(`Tipo: ${cpRow.legal_type}`); counterpartyLegalType = cpRow.legal_type; }
-          if (cpRow.address) parts.push(`Sede: ${cpRow.address}`);
-          counterpartyInfo += ` — ${parts.join(" — ")}`;
-        }
-      }
-    }
+    // ─── Build system prompt ──────
+    const systemPrompt = agentConfig?.system_prompt || `Sei un commercialista italiano senior specializzato in PMI.
 
-    // Company context
-    const companyContext: CompanyContext | undefined = companyRow.length > 0
-      ? { company_name: companyName, sector: "servizi", vat_number: companyVat, ateco_code: companyAteco }
-      : undefined;
+COMPITO: Classifica ogni riga della fattura. Per ciascuna:
+1. Cerca il conto giusto nel piano dei conti (tool: cerca_conti)
+2. Verifica lo storico della controparte (tool: storico_controparte)
+3. Determina IVA, deducibilità IRES, IRAP, ritenute, competenza, cespiti
+4. Se la riga è fiscalmente complessa (leasing, auto, RC), consulta la KB
+5. Se hai dubbi, segnalali — MAI tirare a indovinare
 
-    // User instructions
-    const userInstructionsBlock = await getUserInstructionsBlock(sql, companyId);
+REGOLE:
+- L'aliquota IVA in fattura è un DATO DI FATTO — non contraddirla
+- Percentuali: SEMPRE numeri 0-100
+- Quando non sai: default CONSERVATIVO + dubbio
+- Se il conto ha needs_user_confirmation=true: SEMPRE dubbio
+- Fattura ATTIVA (vendita) → MAI passività
+- SRL/SPA → MAI ritenuta d'acconto`;
 
-    // Memory via embedding
-    let memoryBlock = "";
-    let queryVecLiteral = "";
-    try {
-      const queryText = lines.map((l) => l.description).join(" | ") + ` | ${counterpartyName}`;
-      const queryVec = await callGeminiEmbedding(geminiKey, queryText);
-      queryVecLiteral = toVectorLiteral(queryVec);
-      const memRows = await sql.unsafe(
-        `SELECT
-            cm.fact_text,
-            cm.fact_type,
-            cm.source,
-            cm.metadata,
-            src.primary_contract_ref AS source_primary_contract_ref,
-            src.contract_refs AS source_contract_refs,
-            src.classification_status AS source_classification_status,
-            (1 - (cm.embedding <=> $1::halfvec(3072)))::float as similarity
-         FROM company_memory cm
-         LEFT JOIN invoices src
-           ON src.id = CASE
-             WHEN cm.metadata ? 'source_invoice_id'
-              AND (cm.metadata->>'source_invoice_id') ~* '^[0-9a-f-]{36}$'
-             THEN (cm.metadata->>'source_invoice_id')::uuid
-             ELSE NULL
-           END
-         WHERE cm.company_id = $2 AND cm.active = true AND cm.embedding IS NOT NULL
-         ORDER BY cm.embedding <=> $1::halfvec(3072) LIMIT 15`,
-        [queryVecLiteral, companyId],
-      );
-      const memFacts = filterCompanyMemoryForInvoiceClassification(
-        (memRows as CompanyMemoryQueryRow[]).filter((row) => (row.similarity || 0) >= 0.40),
-        lines.map((line) => line.description || ""),
-        invoiceContractRefs,
-      );
-      memoryBlock = getCompanyMemoryBlock(memFacts);
-    } catch (e) {
-      console.warn("[classify-v2] Memory embedding failed:", e);
-    }
+    // ─── Build user prompt with full invoice data ──────
+    const exactMatchMap = new Map(deterministicMatches.map((m) => [m.line_id, m]));
 
-    let kbNotesSection = "";
-    let kbChunksSection = "";
-    let kbNoteTitles: string[] = [];
-    let kbChunkDebug: { title: string; similarity: number }[] = [];
-    if (queryVecLiteral && shouldConsultKbAdvisory({
-      mode: "commercialista",
-      lineDescriptions,
-      exactMatchCount: deterministicMatches.length,
-      totalLines: lines.length,
-    })) {
-      try {
-        const advisoryContext = await loadKbAdvisoryContext(sql, {
-          companyId,
-          audience: "commercialista",
-          queryVecLiteral,
-          companyAteco,
-          counterpartyName,
-          counterpartyTags: inferKbCounterpartyTags(
-            counterpartyName,
-            counterpartyLegalType,
-            counterpartyBusinessSector,
-          ),
-          operationTags: inferKbOperationTags(lineDescriptions),
-          invoiceAmount: lines.reduce((sum, line) => sum + Number(line.total_price || 0), 0),
-          noteLimit: 2,
-          chunkLimit: 2,
-        });
-        if (advisoryContext.notes.length > 0) {
-          kbNotesSection = `=== NOTE CONSULTIVE KB ===\n${formatKbAdvisoryNotesContext(advisoryContext.notes)}`;
-          kbNoteTitles = advisoryContext.notes.map((note) => note.title);
-        }
-        if (advisoryContext.chunks.length > 0) {
-          kbChunksSection = `=== FONTI KB CITABILI ===\n${formatKbSourceChunksContext(advisoryContext.chunks)}`;
-          kbChunkDebug = advisoryContext.chunks.map((chunk) => ({
-            title: chunk.section_title || chunk.doc_title || "Documento",
-            similarity: chunk.similarity,
-          }));
-        }
-        console.log(`[classify-v2] KB advisory notes=${advisoryContext.notes.length} chunks=${advisoryContext.chunks.length}`);
-      } catch (e) {
-        console.warn("[classify-v2] KB advisory retrieval failed:", e);
-      }
-    }
-
-    // Cross-counterparty article history
-    let articleHistorySection = "";
-    try {
-      const artHist = await sql`
-        SELECT il.description, art.code as article_code, art.name as article_name,
-               ap.code as phase_code, ap.name as phase_name, count(*)::int as count
-        FROM invoice_line_articles ila
-        JOIN articles art ON ila.article_id = art.id
-        LEFT JOIN article_phases ap ON ila.phase_id = ap.id
-        JOIN invoice_lines il ON ila.invoice_line_id = il.id
-        JOIN invoices i ON ila.invoice_id = i.id
-        WHERE ila.company_id = ${companyId} AND ila.verified = true AND i.direction = ${direction}
-        GROUP BY il.description, art.code, art.name, ap.code, ap.name
-        HAVING count(*) >= 2 ORDER BY count(*) DESC LIMIT 20`;
-      if (artHist.length > 0) {
-        articleHistorySection = `\nSTORICO ARTICOLI (pattern confermati):\n` +
-          artHist.map((ah: any) => `- "${ah.description}" → art:${ah.article_code}${ah.phase_code ? ` fase:${ah.phase_code}` : ""} [${ah.count}x]`).join("\n");
-      }
-    } catch { /* ignore */ }
-
-    // Counterparty history (top 15)
-    let historySection = "";
-    if (counterpartyVatKey) {
-      const vatKey = counterpartyVatKey.toUpperCase().replace(/^IT/i, "").replace(/[^A-Z0-9]/gi, "");
-      if (vatKey) {
-        const hist = await sql`
-          SELECT il.description, c.name as category_name, a.code as account_code, a.name as account_name
-          FROM invoice_lines il
-          JOIN invoices i ON il.invoice_id = i.id
-          LEFT JOIN categories c ON il.category_id = c.id
-          LEFT JOIN chart_of_accounts a ON il.account_id = a.id
-          WHERE i.company_id = ${companyId} AND i.direction = ${direction}
-            AND i.counterparty_id = (SELECT id FROM counterparties WHERE vat_key = ${vatKey} AND company_id = ${companyId} LIMIT 1)
-            AND i.classification_status = 'confirmed'
-            AND il.category_id IS NOT NULL
-          ORDER BY i.date DESC LIMIT 15`;
-        if (hist.length > 0) {
-          historySection = `STORICO CONTROPARTE:\n` +
-            hist.map((h: any) => `"${h.description}" → cat:${h.category_name}, conto:${h.account_code} ${h.account_name}`).join("\n");
-        }
-      }
-    }
-
-    // Build phases-by-article
-    const phasesByArticle = new Map<string, typeof phases>();
-    for (const p of phases as any[]) {
-      if (!phasesByArticle.has(p.article_id)) phasesByArticle.set(p.article_id, []);
-      phasesByArticle.get(p.article_id)!.push(p);
-    }
-
-    // Build compact sections for prompt
-    const catSection = (categories as any[]).map((c) => `- ${c.id}: ${c.name} (${c.type})`).join("\n");
-    const accSection = (accounts as any[]).map((a) => `- ${a.id}: ${a.code} ${a.name} (${a.section})`).join("\n");
-
-    let artSection = "";
-    for (const a of articles as any[]) {
-      const ps = phasesByArticle.get(a.id);
-      const kwPart = a.keywords?.length ? ` [${a.keywords.join(", ")}]` : "";
-      if (ps && ps.length > 0) {
-        artSection += `- ${a.code} (${a.name})${kwPart}:\n${ps.map((p: any) => `  ${p.code}: ${p.name}`).join("\n")}\n`;
-      } else {
-        artSection += `- ${a.code} (${a.name})${kwPart}\n`;
-      }
-    }
-
-    // Lines with understanding context
-    const lineEntries = lines.map((l, i) => {
-      const u = underMap.get(l.line_id);
+    const linesText = lines.map((l, i) => {
       const exactMatch = exactMatchMap.get(l.line_id);
-      const uCtx = u ? ` → COMPRENSIONE: "${u.operation_type}" sections=${u.account_sections.join(",")}${u.is_NOT.length ? ` NOT=[${u.is_NOT.join("; ")}]` : ""}` : "";
       const exactCtx = exactMatch
-        ? ` → EXACT_MATCH_EVIDENCE: source=${exactMatch.source} conf=${exactMatch.confidence} note="${exactMatch.reasoning}"`
+        ? `\n   EVIDENZA DETERMINISTICA: source=${exactMatch.source} conf=${exactMatch.confidence} "${exactMatch.reasoning}"`
         : "";
-      return `${i + 1}. [${l.line_id}] "${l.description || "N/D"}" qty=${l.quantity ?? "N/D"} tot=${l.total_price ?? "N/D"}${uCtx}${exactCtx}`;
+      return `${i + 1}. [${l.line_id}] "${l.description || "N/D"}"
+   Qtà: ${l.quantity ?? "N/D"}, P.Unit: €${l.unit_price ?? "N/D"}, Imponibile: €${l.total_price ?? "N/D"}, IVA: ${l.vat_rate ?? "N/D"}%, Natura: ${l.vat_nature || "N/D"}, IVA importo: €${l.iva_importo ?? "N/D"}${exactCtx}`;
     }).join("\n");
 
-    // ─── Build prompt with Admin Panel data ──────────────────
-    const promptParts: string[] = [];
+    const cpInfo = counterparty
+      ? `${counterparty.name || counterpartyName} (P.IVA: ${counterparty.vat_number || "N/D"})
+Tipo: ${counterparty.tipo_soggetto || counterparty.legal_type || "N/D"} | ATECO: ${counterparty.ateco_code || "N/D"} ${counterparty.ateco_description || ""}
+Ritenuta: ${counterparty.soggetto_a_ritenuta ? "SI" : "NO"} | Cassa: ${counterparty.cassa_previdenziale || "NO"} | Split: ${counterparty.split_payment_soggetto ? "SI" : "NO"} | Paese: ${counterparty.paese_residenza || "IT"}`
+      : `${counterpartyName} (P.IVA: ${counterpartyVatKey || "N/D"})`;
 
-    // 1. System prompt from agent_config (or fallback)
-    if (agentConfig?.system_prompt) {
-      promptParts.push(agentConfig.system_prompt);
-    } else {
-      promptParts.push("Sei un COMMERCIALISTA SENIOR italiano. Classifica ogni riga della fattura.");
-    }
-    promptParts.push("");
+    const userPrompt = `FATTURA DA CLASSIFICARE:
+Numero: ${invoice.number || "N/D"} | Data: ${invoice.date || "N/D"} | Tipo: ${invoice.doc_type || "N/D"}
+Direzione: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
+Totale: €${invoice.total_amount || "N/D"} | Imponibile: €${invoice.taxable_amount || "N/D"} | IVA: €${invoice.tax_amount || "N/D"}
+Ritenuta: €${invoice.withholding_amount || 0} | Bollo: €${invoice.stamp_amount || 0}
+${invoiceNotes ? `Note: ${invoiceNotes}` : ""}${invoiceCausale ? ` | Causale XML: ${invoiceCausale}` : ""}
 
-    // 2. Agent rules (CRITICAL: BEFORE lines and context)
-    const rulesBlock = formatAgentRules(agentRules);
-    if (rulesBlock) {
-      promptParts.push(rulesBlock);
-      promptParts.push("");
-    }
+CONTROPARTE:
+${cpInfo}
 
-    // 3. KB consultiva mirata
-    if (kbNotesSection) {
-      promptParts.push(kbNotesSection);
-      promptParts.push("");
-    }
-    if (kbChunksSection) {
-      promptParts.push(kbChunksSection);
-      promptParts.push("");
-    }
+AZIENDA:
+${company.name} (P.IVA: ${company.vat_number || "N/D"})
+ATECO: ${company.ateco_code || "N/D"} ${company.ateco_description || ""} | Regime: ${company.fiscal_regime || "ordinario"} | IVA per cassa: ${company.iva_per_cassa ? "SI" : "NO"}
 
-    // 4. Company + counterparty context
-    promptParts.push("=== CONTESTO AZIENDA ===");
-    promptParts.push(`AZIENDA: ${companyName} (P.IVA: ${companyVat})`);
-    if (companyAteco) promptParts.push(`ATECO: ${companyAteco}`);
-    promptParts.push(`CONTROPARTE: ${counterpartyInfo}`);
-    promptParts.push(`DIREZIONE: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}`);
-    promptParts.push("");
+RIGHE:
+${linesText}
 
-    // 4b. Invoice notes + causale context
-    if (invoiceNotes || invoiceCausale) {
-      promptParts.push("=== INFORMAZIONI AGGIUNTIVE FATTURA ===");
-      if (invoiceCausale) promptParts.push(`Causale fattura (dall'XML): ${invoiceCausale}`);
-      if (invoiceNotes) promptParts.push(`Note utente: ${invoiceNotes}`);
-      promptParts.push("Usa queste informazioni per capire meglio la natura dell'operazione.");
-      promptParts.push("===");
-      promptParts.push("");
-    }
+ISTRUZIONI:
+USA I TOOL per cercare conti, storico, KB. Ragiona. Poi rispondi JSON.
 
-    // 5. User instructions + memory
-    if (userInstructionsBlock) promptParts.push(userInstructionsBlock);
-    if (memoryBlock) promptParts.push(memoryBlock);
-    promptParts.push("");
-
-    // 6. Evidence policy
-    promptParts.push(`IMPORTANTE — POLITICA DELLE EVIDENZE:
-Le evidenze di exact match, la memoria aziendale e le note/fonti KB sono supporti al giudizio, non verdetti automatici.
-Se un exact match e il contesto attuale coincidono davvero, puoi seguirlo.
-Se le evidenze sono parziali, rumorose o non equivalenti, abbassa la confidence e lascia i campi deboli come needs_review o unassigned.
-Le comprensioni eventualmente presenti sono una guida, non un vincolo assoluto.`);
-    promptParts.push("");
-
-    // 7. Charts of accounts, categories, articles
-    promptParts.push(`CATEGORIE:\n${catSection}`);
-    promptParts.push("");
-    promptParts.push(`CONTI (tutti i conti attivi dell'azienda):\n${accSection}`);
-    promptParts.push("");
-    if (artSection) { promptParts.push(`ARTICOLI:\n${artSection}`); promptParts.push(""); }
-    if (historySection) { promptParts.push(historySection); promptParts.push(""); }
-    if (articleHistorySection) { promptParts.push(articleHistorySection); promptParts.push(""); }
-
-    // 8. Lines
-    promptParts.push(`RIGHE:\n${lineEntries}`);
-    promptParts.push("");
-
-    // 9. Output format
-    promptParts.push(`REGOLE DI CLASSIFICAZIONE:
-- category_id e account_id: SEMPRE UUID dalla lista sopra
-- article_code + phase_code: solo se il materiale corrisponde
-- confidence 0-100 (dubbio → bassa, mai confidence alta su scelte incerte)
-- fiscal_flags per OGNI riga: ritenuta_acconto (solo professionisti), reverse_charge, split_payment, bene_strumentale (solo beni FISICI > 516€), deducibilita_pct, iva_detraibilita_pct, note
-- Righe con tot=0: informative, confidence 30-50
-- Se l'evidenza non basta, puoi lasciare category_id/account_id null e marcare i campi deboli come needs_review o unassigned
-
-Rispondi con un JSON object (no markdown):
+OUTPUT (JSON, no markdown):
 {
-  "invoice_summary":"breve sintesi dell'impostazione della fattura",
-  "evidence_refs":["kb:Titolo","memory:Pattern aziendale"],
-  "needs_consultant_hint":false,
-  "line_proposals":[
-    {
-      "line_id":"uuid",
-      "article_code":"CODE"|null,
-      "phase_code":"code"|null,
-      "category_id":"uuid"|null,
-      "category_name":"nome"|null,
-      "account_id":"uuid"|null,
-      "account_code":"codice"|null,
-      "confidence":0-100,
-      "reasoning":"max 30 parole",
-      "rationale_summary":"sintesi professionale della scelta o del non deciso",
-      "decision_basis":["fattura intera","kb","memoria aziendale"],
-      "supporting_factors":["fattore 1","fattore 2"],
-      "supporting_evidence":[{"source":"kb","label":"Titolo KB","detail":"breve dettaglio"}],
-      "weak_fields":{
-        "category":{"value":"uuid"|null,"state":"assigned"|"unassigned"|"needs_review"},
-        "account":{"value":"uuid"|null,"state":"assigned"|"unassigned"|"needs_review"},
-        "article":{"value":"CODE"|null,"state":"assigned"|"unassigned"|"needs_review"},
-        "phase":{"value":"code"|null,"state":"assigned"|"unassigned"|"needs_review"},
-        "cost_center":{"value":null,"state":"unassigned"}
-      },
-      "exact_match_evidence_used":false,
-      "fiscal_flags":{"ritenuta_acconto":null,"reverse_charge":false,"split_payment":false,"bene_strumentale":false,"deducibilita_pct":100,"iva_detraibilita_pct":100,"note":null},
-      "suggest_new_account":null,
-      "suggest_new_category":null
+  "invoice_summary": "...",
+  "needs_consultant": false,
+  "consultant_reason": null,
+  "lines": [{
+    "line_id": "uuid",
+    "account_code": "...",
+    "account_id": "uuid",
+    "category_id": "uuid"|null,
+    "confidence": 85,
+    "reasoning": "...",
+    "fiscal": {
+      "tax_code": "22",
+      "iva_detraibilita_pct": 100,
+      "deducibilita_ires_pct": 100,
+      "irap_mode": "follows_ires",
+      "ritenuta_applicabile": false,
+      "reverse_charge": false,
+      "split_payment": false,
+      "bene_strumentale": false,
+      "asset_candidate": false,
+      "debt_related": false,
+      "costo_personale": false,
+      "warning_flags": [],
+      "fiscal_reasoning_short": "..."
+    },
+    "doubts": [{"question": "...", "impact": "..."}]
+  }]
+}`;
+
+    // ─── Build tool handler ──────
+    const companyAteco = company.ateco_code || "";
+
+    async function toolHandler(name: string, args: Record<string, unknown>): Promise<unknown> {
+      switch (name) {
+        case "cerca_conti": {
+          const query = String(args.query || "").trim();
+          const section = args.section ? String(args.section) : null;
+          let rows;
+          if (section) {
+            rows = await sql`
+              SELECT id, code, name, section, default_tax_code_id, default_ires_pct,
+                     default_irap_mode, needs_user_confirmation, note_fiscali
+              FROM chart_of_accounts
+              WHERE company_id = ${companyId} AND active = true AND is_header = false
+                AND section = ${section}
+                AND (name ILIKE ${'%' + query + '%'} OR code ILIKE ${'%' + query + '%'})
+              ORDER BY code LIMIT 15`;
+          } else {
+            rows = await sql`
+              SELECT id, code, name, section, default_tax_code_id, default_ires_pct,
+                     default_irap_mode, needs_user_confirmation, note_fiscali
+              FROM chart_of_accounts
+              WHERE company_id = ${companyId} AND active = true AND is_header = false
+                AND (name ILIKE ${'%' + query + '%'} OR code ILIKE ${'%' + query + '%'})
+              ORDER BY code LIMIT 15`;
+          }
+          return rows;
+        }
+
+        case "get_defaults_conto": {
+          const code = String(args.account_code || "");
+          const [row] = await sql`
+            SELECT id, code, name, section, default_tax_code_id, default_ires_pct,
+                   default_irap_mode, default_irap_pct, needs_user_confirmation, note_fiscali,
+                   tc.codice AS tax_code, tc.descrizione AS tax_desc, tc.aliquota AS tax_aliquota,
+                   tc.detraibilita_pct AS tax_detraibilita
+            FROM chart_of_accounts coa
+            LEFT JOIN tax_codes tc ON coa.default_tax_code_id = tc.id
+            WHERE coa.company_id = ${companyId} AND coa.code = ${code}
+            LIMIT 1`;
+          return row || { error: `Conto ${code} non trovato` };
+        }
+
+        case "storico_controparte": {
+          if (!counterpartyVatKey) return { message: "Nessuna P.IVA controparte disponibile" };
+          const vatKey = counterpartyVatKey.toUpperCase().replace(/^IT/i, "").replace(/[^A-Z0-9]/gi, "");
+          const hint = String(args.description_hint || "").trim();
+          let rows;
+          if (hint) {
+            rows = await sql`
+              SELECT il.description, c.name AS category_name, a.code AS account_code, a.name AS account_name,
+                     count(*)::int AS count
+              FROM invoice_lines il
+              JOIN invoices i ON il.invoice_id = i.id
+              LEFT JOIN categories c ON il.category_id = c.id
+              LEFT JOIN chart_of_accounts a ON il.account_id = a.id
+              WHERE i.company_id = ${companyId} AND i.direction = ${direction}
+                AND i.counterparty_id = (SELECT id FROM counterparties WHERE vat_key = ${vatKey} AND company_id = ${companyId} LIMIT 1)
+                AND i.classification_status = 'confirmed'
+                AND il.category_id IS NOT NULL
+                AND il.description ILIKE ${'%' + hint + '%'}
+              GROUP BY il.description, c.name, a.code, a.name
+              ORDER BY count DESC LIMIT 10`;
+          } else {
+            rows = await sql`
+              SELECT il.description, c.name AS category_name, a.code AS account_code, a.name AS account_name,
+                     count(*)::int AS count
+              FROM invoice_lines il
+              JOIN invoices i ON il.invoice_id = i.id
+              LEFT JOIN categories c ON il.category_id = c.id
+              LEFT JOIN chart_of_accounts a ON il.account_id = a.id
+              WHERE i.company_id = ${companyId} AND i.direction = ${direction}
+                AND i.counterparty_id = (SELECT id FROM counterparties WHERE vat_key = ${vatKey} AND company_id = ${companyId} LIMIT 1)
+                AND i.classification_status = 'confirmed'
+                AND il.category_id IS NOT NULL
+              GROUP BY il.description, c.name, a.code, a.name
+              ORDER BY count DESC LIMIT 15`;
+          }
+          return rows.length > 0 ? rows : { message: "Nessuno storico confermato per questa controparte" };
+        }
+
+        case "get_tax_codes": {
+          const aliquota = args.aliquota != null ? Number(args.aliquota) : null;
+          const tipo = args.tipo ? String(args.tipo) : null;
+          const natura = args.natura ? String(args.natura) : null;
+          let rows;
+          if (natura) {
+            rows = await sql`
+              SELECT codice, descrizione, aliquota, detraibilita_pct, natura, tipo, normativa_ref
+              FROM tax_codes WHERE (company_id IS NULL OR company_id = ${companyId}) AND is_active = true
+                AND natura = ${natura}
+              ORDER BY sort_order LIMIT 10`;
+          } else if (aliquota != null && tipo) {
+            rows = await sql`
+              SELECT codice, descrizione, aliquota, detraibilita_pct, natura, tipo, normativa_ref
+              FROM tax_codes WHERE (company_id IS NULL OR company_id = ${companyId}) AND is_active = true
+                AND aliquota = ${aliquota} AND tipo IN (${tipo}, 'entrambi')
+              ORDER BY sort_order LIMIT 10`;
+          } else if (aliquota != null) {
+            rows = await sql`
+              SELECT codice, descrizione, aliquota, detraibilita_pct, natura, tipo, normativa_ref
+              FROM tax_codes WHERE (company_id IS NULL OR company_id = ${companyId}) AND is_active = true
+                AND aliquota = ${aliquota}
+              ORDER BY sort_order LIMIT 10`;
+          } else {
+            rows = await sql`
+              SELECT codice, descrizione, aliquota, detraibilita_pct, natura, tipo, normativa_ref
+              FROM tax_codes WHERE (company_id IS NULL OR company_id = ${companyId}) AND is_active = true
+              ORDER BY sort_order LIMIT 20`;
+          }
+          return rows;
+        }
+
+        case "get_parametro_fiscale": {
+          const codice = args.codice ? String(args.codice) : null;
+          const categoria = args.categoria ? String(args.categoria) : null;
+          const query = args.query ? String(args.query) : null;
+          const invoiceDate = invoice.date || new Date().toISOString().slice(0, 10);
+
+          if (codice) {
+            const [row] = await sql`
+              SELECT codice, nome, categoria, valore_numerico, valore_testo, unita, normativa_ref, normativa_dettaglio
+              FROM fiscal_parameters
+              WHERE codice = ${codice} AND valido_dal <= ${invoiceDate}::date
+                AND (valido_al IS NULL OR valido_al >= ${invoiceDate}::date)
+              LIMIT 1`;
+            return row || { error: `Parametro ${codice} non trovato o non valido alla data fattura` };
+          }
+          if (categoria) {
+            return await sql`
+              SELECT codice, nome, valore_numerico, valore_testo, unita, normativa_ref
+              FROM fiscal_parameters
+              WHERE categoria = ${categoria} AND valido_dal <= ${invoiceDate}::date
+                AND (valido_al IS NULL OR valido_al >= ${invoiceDate}::date)
+              ORDER BY codice LIMIT 15`;
+          }
+          if (query) {
+            return await sql`
+              SELECT codice, nome, valore_numerico, valore_testo, unita, normativa_ref
+              FROM fiscal_parameters
+              WHERE (nome ILIKE ${'%' + query + '%'} OR normativa_ref ILIKE ${'%' + query + '%'})
+                AND valido_dal <= ${invoiceDate}::date
+                AND (valido_al IS NULL OR valido_al >= ${invoiceDate}::date)
+              ORDER BY codice LIMIT 10`;
+          }
+          return { error: "Specifica codice, categoria o query" };
+        }
+
+        case "get_profilo_controparte": {
+          if (!counterparty) return { message: "Controparte non trovata nel database" };
+          return {
+            name: counterparty.name,
+            vat_number: counterparty.vat_number,
+            tipo_soggetto: counterparty.tipo_soggetto || counterparty.legal_type || null,
+            ateco_code: counterparty.ateco_code,
+            ateco_description: counterparty.ateco_description,
+            soggetto_a_ritenuta: counterparty.soggetto_a_ritenuta || false,
+            cassa_previdenziale: counterparty.cassa_previdenziale || null,
+            split_payment_soggetto: counterparty.split_payment_soggetto || false,
+            paese_residenza: counterparty.paese_residenza || "IT",
+            business_sector: counterparty.business_sector || null,
+          };
+        }
+
+        case "consulta_kb": {
+          const kbQuery = String(args.query || "");
+          try {
+            const queryVec = await callGeminiEmbedding(geminiKey, kbQuery);
+            const queryVecLiteral = toVectorLiteral(queryVec);
+            const result = await loadKbAdvisoryContext(sql, {
+              companyId,
+              audience: "commercialista",
+              queryVecLiteral,
+              companyAteco,
+              noteLimit: 3,
+              chunkLimit: 3,
+            });
+            return {
+              notes: result.notes.map((n) => ({
+                title: n.title,
+                short_answer: n.short_answer,
+                source_refs: n.source_refs,
+                numeric_facts: n.numeric_facts,
+              })),
+              chunks: result.chunks.map((c) => ({
+                doc_title: c.doc_title,
+                section_title: c.section_title,
+                article_reference: c.article_reference,
+                content: c.content.slice(0, 500),
+              })),
+            };
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn("[classify-v2] consulta_kb failed:", msg);
+            return { error: `KB search failed: ${msg}` };
+          }
+        }
+
+        default:
+          return { error: `Tool sconosciuto: ${name}` };
+      }
     }
-  ]
-}`);
 
-    const prompt = promptParts.join("\n");
-
-    // ─── Call unified LLM ────
-    const model = agentConfig?.model || "gemini-2.5-flash";
+    // ─── Call Gemini with tools ──────
+    const model = agentConfig?.model || "gemini-2.5-pro";
     const temperature = agentConfig?.temperature ?? 0.2;
-    const thinkingLevel = agentConfig?.thinking_level || "medium";
-    const thinkingBudgets: Record<string, number> = {
-      none: 0, low: 1024, medium: 8192, high: 24576,
-    };
-    const budget = agentConfig?.thinking_budget ?? thinkingBudgets[thinkingLevel] ?? 8192;
+    const maxOutputTokens = agentConfig?.max_output_tokens || 32768;
+
+    console.log(`[classify-v2] Starting function calling pipeline: model=${model}, lines=${lines.length}`);
 
     let llmResp;
     try {
-      llmResp = await callLLM(prompt, {
-        model,
-        temperature,
-        thinkingBudget: budget,
-        maxOutputTokens: agentConfig?.max_output_tokens || 32768,
-        systemPrompt: agentConfig?.system_prompt || "Sei un COMMERCIALISTA SENIOR italiano. Classifica ogni riga della fattura."
-      }, { geminiKey, anthropicKey, openaiKey });
+      llmResp = await callGeminiWithTools(
+        systemPrompt,
+        userPrompt,
+        TOOL_DECLARATIONS,
+        toolHandler,
+        { model, temperature, maxOutputTokens },
+        geminiKey,
+        10,
+      );
     } catch (e: any) {
+      console.error("[classify-v2] LLM call failed:", e.message);
       await sql.end();
       return json({ error: e.message }, 502);
     }
 
-    let structuredResponse: CommercialistaResponse = { line_proposals: [] };
+    console.log(`[classify-v2] Completed: ${llmResp.tool_calls_log.length} tool calls made`);
+
+    // ─── Parse response ──────
+    let parsed: CommercialistaResponse = {
+      invoice_summary: "",
+      needs_consultant: false,
+      consultant_reason: null,
+      lines: [],
+    };
+
     if (llmResp.structured) {
-      if (Array.isArray(llmResp.structured)) {
-        structuredResponse = { line_proposals: llmResp.structured as ClassifyResult[] };
-      } else if (typeof llmResp.structured === "object") {
-        structuredResponse = {
-          invoice_summary: typeof llmResp.structured.invoice_summary === "string" ? llmResp.structured.invoice_summary : null,
-          evidence_refs: Array.isArray(llmResp.structured.evidence_refs) ? llmResp.structured.evidence_refs as string[] : [],
-          needs_consultant_hint: Boolean(llmResp.structured.needs_consultant_hint),
-          line_proposals: Array.isArray(llmResp.structured.line_proposals) ? llmResp.structured.line_proposals as ClassifyResult[] : [],
-        };
-      }
-    }
-
-    let results: ClassifyResult[] = structuredResponse.line_proposals || [];
-
-    // Validate UUIDs — ensure account_id and category_id exist in our loaded data
-    const validAccIds = new Set((accounts as any[]).map((a) => a.id));
-    const validCatIds = new Set((categories as any[]).map((c) => c.id));
-
-    for (const r of results) {
-      if (r.account_id && !validAccIds.has(r.account_id)) {
-        if (r.account_code) {
-          const match = (accounts as any[]).find((a) => a.code === r.account_code);
-          if (match) r.account_id = match.id;
-          else r.account_id = null;
-        } else {
-          r.account_id = null;
-        }
-      }
-      if (r.category_id && !validCatIds.has(r.category_id)) {
-        if (r.category_name) {
-          const match = (categories as any[]).find((c) => c.name.toLowerCase() === r.category_name!.toLowerCase());
-          if (match) r.category_id = match.id;
-          else r.category_id = null;
-        } else {
-          r.category_id = null;
-        }
-      }
-      if (!r.rationale_summary) r.rationale_summary = r.reasoning || null;
-      if (!Array.isArray(r.decision_basis)) r.decision_basis = [];
-      if (!Array.isArray(r.supporting_factors)) r.supporting_factors = [];
-      if (!Array.isArray(r.supporting_evidence)) r.supporting_evidence = [];
-      r.weak_fields = {
-        category: r.weak_fields?.category || { value: r.category_id || null, state: r.category_id ? "assigned" : "needs_review" },
-        account: r.weak_fields?.account || { value: r.account_id || null, state: r.account_id ? "assigned" : "needs_review" },
-        article: r.weak_fields?.article || { value: r.article_code || null, state: r.article_code ? "assigned" : "unassigned" },
-        phase: r.weak_fields?.phase || { value: r.phase_code || null, state: r.phase_code ? "assigned" : "unassigned" },
-        cost_center: r.weak_fields?.cost_center || { value: null, state: "unassigned" },
+      const s = llmResp.structured;
+      parsed = {
+        invoice_summary: s.invoice_summary || "",
+        needs_consultant: Boolean(s.needs_consultant),
+        consultant_reason: s.consultant_reason || null,
+        lines: Array.isArray(s.lines) ? s.lines : [],
       };
     }
+
+    // ─── Build backward-compatible response ──────
+    // Map line proposals to the format expected by classificationPipelineService
+    const classifications = parsed.lines.map((lp) => ({
+      line_id: lp.line_id,
+      article_code: null,
+      phase_code: null,
+      category_id: lp.category_id,
+      category_name: null,
+      account_id: lp.account_id,
+      account_code: lp.account_code,
+      confidence: lp.confidence || 0,
+      reasoning: lp.reasoning || "",
+      rationale_summary: lp.reasoning || null,
+      decision_basis: ["function_calling"],
+      supporting_factors: [],
+      supporting_evidence: [],
+      weak_fields: {
+        category: { value: lp.category_id, state: lp.category_id ? "assigned" : "needs_review" },
+        account: { value: lp.account_id, state: lp.account_id ? "assigned" : "needs_review" },
+        article: { value: null, state: "unassigned" },
+        phase: { value: null, state: "unassigned" },
+        cost_center: { value: null, state: "unassigned" },
+      },
+      exact_match_evidence_used: false,
+      fiscal_flags: {
+        ritenuta_acconto: lp.fiscal?.ritenuta_applicabile
+          ? { aliquota: lp.fiscal.ritenuta_aliquota_pct || 20, base: `${lp.fiscal.ritenuta_base_pct || 100}%` }
+          : null,
+        reverse_charge: lp.fiscal?.reverse_charge || false,
+        split_payment: lp.fiscal?.split_payment || false,
+        bene_strumentale: lp.fiscal?.bene_strumentale || false,
+        deducibilita_pct: lp.fiscal?.deducibilita_ires_pct ?? 100,
+        iva_detraibilita_pct: lp.fiscal?.iva_detraibilita_pct ?? 100,
+        note: lp.fiscal?.fiscal_reasoning_short || null,
+      },
+      // New v1 fiscal fields (passed through to pipeline)
+      fiscal_v1: lp.fiscal || null,
+      doubts: lp.doubts || [],
+      suggest_new_account: null,
+      suggest_new_category: null,
+    }));
 
     await sql.end();
 
     return json({
-      classifications: results,
+      classifications,
       commercialista: {
-        invoice_summary: structuredResponse.invoice_summary || null,
-        evidence_refs: structuredResponse.evidence_refs || [],
-        needs_consultant_hint: structuredResponse.needs_consultant_hint || false,
-        line_proposals: results,
+        invoice_summary: parsed.invoice_summary,
+        evidence_refs: [],
+        needs_consultant_hint: parsed.needs_consultant,
+        needs_consultant: parsed.needs_consultant,
+        consultant_reason: parsed.consultant_reason,
+        line_proposals: classifications,
       },
-      thinking: llmResp?.thinking || null,
-      prompt_length: prompt.length,
-      accounts_shown: accounts.length,
-      categories_shown: categories.length,
+      thinking: llmResp.thinking || null,
+      prompt_length: userPrompt.length,
       model_used: model,
-      kb_notes_used: kbNoteTitles.length,
-      agent_rules_used: agentRules.length,
+      tool_calls: llmResp.tool_calls_log,
+      tool_calls_count: llmResp.tool_calls_log.length,
       _debug: {
-        prompt_sent: prompt,
-        raw_response: llmResp?.text || null,
+        raw_response: llmResp.text || null,
         model_used: model,
         agent_config_loaded: !!agentConfig,
-        agent_rules_count: agentRules.length,
-        kb_notes_used: kbNoteTitles.length,
-        kb_note_titles: kbNoteTitles,
-        company_ateco: companyAteco,
-        accounts_by_section: Object.fromEntries(
-          [...new Set((accounts as any[]).map(a => a.section))].map(s => [
-            s, (accounts as any[]).filter(a => a.section === s).length,
-          ])
-        ),
-        understandings_received: understandings.map(u => ({
-          line_id: u.line_id,
-          operation_type: u.operation_type,
-          account_sections: u.account_sections,
-          is_NOT: u.is_NOT,
-        })),
-        deterministic_matches_received: deterministicMatches.length,
-        history_count: historySection ? historySection.split("\n").length : 0,
-        memory_facts_count: memoryBlock ? memoryBlock.split("\n").length : 0,
-        invoice_notes: invoiceNotes ? invoiceNotes.slice(0, 200) : null,
-        invoice_causale: invoiceCausale ? invoiceCausale.slice(0, 200) : null,
-        kb_chunks_used: kbChunkDebug.length,
-        kb_chunks: kbChunkDebug,
+        tool_calls: llmResp.tool_calls_log,
       },
     });
   } catch (err) {
     await sql.end().catch(() => {});
     const msg = err instanceof Error ? err.message : String(err);
+    console.error("[classify-v2] Error:", msg);
     return json({ error: msg }, 500);
   }
 });
