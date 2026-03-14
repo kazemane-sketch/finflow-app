@@ -440,6 +440,7 @@ Deno.serve(async (req) => {
           companyId,
           audience: "revisore",
           queryVecLiteral,
+          queryText: ragQueryText,
           companyAteco,
           counterpartyName,
           counterpartyTags: inferKbCounterpartyTags(

@@ -2842,6 +2842,7 @@ Deno.serve(async (req) => {
             companyId,
             audience: "both",
             queryVecLiteral,
+            queryText: ragQuery,
             companyAteco: String(invoice.company_ateco || companyRow[0]?.ateco_code || ""),
             counterpartyName: String(invoice.counterparty_name || ""),
             counterpartyTags: inferKbCounterpartyTags(

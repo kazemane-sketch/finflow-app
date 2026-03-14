@@ -12,7 +12,7 @@ interface AgentConfig {
   id: string; agent_type: string; display_name: string; description: string | null;
   system_prompt: string; model: string; model_escalation: string | null;
   temperature: number; thinking_level: string; thinking_budget: number | null; thinking_budget_escalation: number | null;
-  max_output_tokens: number; version: number; updated_at: string;
+  max_output_tokens: number; version: number; updated_at: string; react_mode?: boolean;
 }
 
 interface AgentTool {
@@ -109,6 +109,7 @@ export default function AgentConfigPage() {
         thinking_budget: edit.thinking_budget != null ? Number(edit.thinking_budget) : null,
         thinking_budget_escalation: edit.thinking_budget_escalation != null ? Number(edit.thinking_budget_escalation) : null,
         max_output_tokens: Number(edit.max_output_tokens ?? agent.max_output_tokens),
+        react_mode: Boolean(edit.react_mode ?? agent.react_mode ?? false),
         version: agent.version + 1,
         updated_at: new Date().toISOString(),
       } as any).eq('id', agent.id)
@@ -259,11 +260,20 @@ export default function AgentConfigPage() {
                           <span className="text-xs font-mono w-8 text-right">{(edit.temperature ?? 0.1).toFixed(2)}</span>
                         </div>
                       </div>
-                      <div>
-                        <Label className="text-xs">Max output tokens</Label>
-                        <Input type="number" value={edit.max_output_tokens ?? 65536}
-                          onChange={e => updateField(agent.id, 'max_output_tokens', Number(e.target.value))}
-                          className="mt-1 w-full text-xs h-8" />
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <Label className="text-xs">Max output tokens</Label>
+                          <Input type="number" value={edit.max_output_tokens ?? 65536}
+                            onChange={e => updateField(agent.id, 'max_output_tokens', Number(e.target.value))}
+                            className="mt-1 w-full text-xs h-8" />
+                        </div>
+                        <div className="flex items-center gap-2 pt-5">
+                          <input type="checkbox" id={`react-${agent.id}`} 
+                            checked={edit.react_mode ?? agent.react_mode ?? false} 
+                            onChange={e => updateField(agent.id, 'react_mode', e.target.checked)}
+                            className="h-4 w-4 bg-white border rounded" />
+                          <Label htmlFor={`react-${agent.id}`} className="text-xs select-none cursor-pointer">ReAct Mode</Label>
+                        </div>
                       </div>
                     </div>
                   </div>

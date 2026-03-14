@@ -100,6 +100,7 @@ interface AgentConfig {
   temperature: number;
   thinking_budget: number | null;
   max_output_tokens: number;
+  react_mode: boolean;
 }
 
 /* ─── Tool Declarations ──────────────────── */
@@ -399,7 +400,7 @@ Deno.serve(async (req) => {
               LIMIT 1`
         : Promise.resolve([]),
       sql<AgentConfig[]>`
-        SELECT system_prompt, model, temperature, thinking_budget, max_output_tokens
+        SELECT system_prompt, model, temperature, thinking_budget, max_output_tokens, react_mode
         FROM agent_config WHERE active = true AND agent_type = 'commercialista'
         LIMIT 1`,
     ]);
@@ -413,7 +414,7 @@ Deno.serve(async (req) => {
     if (!invoice) return json({ error: "Invoice non trovata" }, 404);
 
     // ─── Build system prompt ──────
-    const systemPrompt = agentConfig?.system_prompt || `Sei un commercialista italiano senior specializzato in PMI.
+    let systemPrompt = agentConfig?.system_prompt || `Sei un commercialista italiano senior specializzato in PMI.
 
 COMPITO: Classifica ogni riga della fattura. Per ciascuna:
 1. Cerca il conto giusto nel piano dei conti (tool: cerca_conti)
@@ -429,6 +430,10 @@ REGOLE:
 - Se il conto ha needs_user_confirmation=true: SEMPRE dubbio
 - Fattura ATTIVA (vendita) → MAI passività
 - SRL/SPA → MAI ritenuta d'acconto`;
+
+    if (agentConfig?.react_mode) {
+      systemPrompt += `\n\n[MODALITÀ REACT ATTIVA]: Stai operando in modalità ReAct (Reasoning + Acting). Prima di terminare e fornire il JSON finale, DEVI usare il tool 'valida_classificazione_proposta' passando le tue ipotesi preliminari per simulare e validare la bontà delle tue scelte. Solo dopo aver ricevuto l'esito della validazione e riflettuto su di esso, potrai procedere a emettere la classificazione finale.`;
+    }
 
     // ─── Build user prompt with full invoice data ──────
     const exactMatchMap = new Map(deterministicMatches.map((m) => [m.line_id, m]));
@@ -737,6 +742,7 @@ OUTPUT (JSON, no markdown):
               companyId,
               audience: "commercialista",
               queryVecLiteral,
+              queryText: kbQuery,
               companyAteco,
               noteLimit: 3,
               chunkLimit: 3,
@@ -762,6 +768,19 @@ OUTPUT (JSON, no markdown):
           }
         }
 
+        case "valida_classificazione_proposta": {
+          const proposta = args.proposte_righe as any[];
+          if (!proposta || !Array.isArray(proposta)) {
+            return { error: "parametro proposte_righe mancante o non array" };
+          }
+          let feedback = "Esito validazione (SIMULATA):\n";
+          for (const p of proposta) {
+            feedback += `- Riga [${p.line_id}]: IPOTESI [${p.account_code || "N.D."}]. Procedi con l'output finale assicurandoti che l'aliquota IVA (${p.vat_rate_ipotesi}%) sia compatibile con la normativa e che la percentuale di deducibilità sia giustificata dai fatti.\n`;
+          }
+          feedback += "\nValidazione completata. Ora procedi emettendo l'output JSON finale strutturato.";
+          return { message: feedback };
+        }
+
         default:
           return { error: `Tool sconosciuto: ${name}` };
       }
@@ -772,6 +791,24 @@ OUTPUT (JSON, no markdown):
     const temperature = agentConfig?.temperature ?? 0.2;
     const maxOutputTokens = agentConfig?.max_output_tokens || 32768;
 
+    const dynamicTools = [...TOOL_DECLARATIONS];
+    if (agentConfig?.react_mode) {
+      dynamicTools.push({
+        name: "valida_classificazione_proposta",
+        description: "Modalità ReAct: Simula e valida la classificazione preliminare PRIMA di produrre il json finale. DEVI usare questo tool obbligatoriamente.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            proposte_righe: {
+              type: "ARRAY",
+              description: "Array contenente la bozza di classificazione per ogni riga, per validarla",
+              items: { type: "OBJECT" },
+            },
+          },
+        },
+      });
+    }
+
     console.log(`[classify-v2] Starting function calling pipeline: model=${model}, lines=${lines.length}`);
 
     let llmResp;
@@ -779,7 +816,7 @@ OUTPUT (JSON, no markdown):
       llmResp = await callLLMWithTools(
         systemPrompt,
         userPrompt,
-        TOOL_DECLARATIONS,
+        dynamicTools,
         toolHandler,
         { model, temperature, maxOutputTokens },
         { geminiKey, anthropicKey, openaiKey },

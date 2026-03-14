@@ -77,6 +77,7 @@ interface AdvisoryContextArgs {
   companyId: string;
   audience: AdvisoryAudience;
   queryVecLiteral: string;
+  queryText?: string;
   companyAteco?: string | null;
   counterpartyName?: string | null;
   counterpartyTags?: string[];
@@ -317,7 +318,10 @@ export async function loadKbAdvisoryContext(sql: SqlClient, args: AdvisoryContex
              kd.applies_to_counterparty AS source_applies_to_counterparty,
              kd.amount_threshold_min AS source_amount_threshold_min,
              kd.amount_threshold_max AS source_amount_threshold_max,
-             (1 - (kb.embedding <=> $1::halfvec(3072)))::float AS similarity
+             (
+               0.7 * (1 - (kb.embedding <=> $1::halfvec(3072))) +
+               0.3 * GREATEST(similarity(COALESCE(kb.title, ''), $3), similarity(COALESCE(kb.content, ''), $3))
+             )::float AS similarity
            FROM knowledge_base kb
            LEFT JOIN kb_documents kd ON kd.id = kb.source_document_id
            WHERE kb.active = true
@@ -328,9 +332,12 @@ export async function loadKbAdvisoryContext(sql: SqlClient, args: AdvisoryContex
              AND (kb.audience = $2 OR kb.audience = 'both')
              AND kb.effective_from <= CURRENT_DATE
              AND kb.effective_to >= CURRENT_DATE
-           ORDER BY kb.embedding <=> $1::halfvec(3072)
+           ORDER BY (
+             0.7 * (1 - (kb.embedding <=> $1::halfvec(3072))) +
+             0.3 * GREATEST(similarity(COALESCE(kb.title, ''), $3), similarity(COALESCE(kb.content, ''), $3))
+           ) DESC
            LIMIT 24`,
-          [args.queryVecLiteral, args.audience],
+          [args.queryVecLiteral, args.audience, args.queryText || ""],
         )
       : Promise.resolve([]),
     chunkLimit > 0
@@ -349,15 +356,21 @@ export async function loadKbAdvisoryContext(sql: SqlClient, args: AdvisoryContex
              kd.applies_to_counterparty,
              kd.amount_threshold_min,
              kd.amount_threshold_max,
-             (1 - (kc.embedding <=> $1::halfvec(3072)))::float AS similarity
+             (
+               0.7 * (1 - (kc.embedding <=> $1::halfvec(3072))) +
+               0.3 * similarity(COALESCE(kc.content, ''), $3)
+             )::float AS similarity
            FROM kb_chunks kc
            JOIN kb_documents kd ON kd.id = kc.document_id
            WHERE (kc.company_id IS NULL OR kc.company_id = $2)
              AND kd.status = 'ready'
              AND kd.active = true
-           ORDER BY kc.embedding <=> $1::halfvec(3072)
+           ORDER BY (
+             0.7 * (1 - (kc.embedding <=> $1::halfvec(3072))) +
+             0.3 * similarity(COALESCE(kc.content, ''), $3)
+           ) DESC
            LIMIT 24`,
-          [args.queryVecLiteral, args.companyId],
+          [args.queryVecLiteral, args.companyId, args.queryText || ""],
         )
       : Promise.resolve([]),
   ]);

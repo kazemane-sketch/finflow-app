@@ -371,6 +371,7 @@ Deno.serve(async (req) => {
                 companyId: company_id,
                 audience: "commercialista",
                 queryVecLiteral,
+                queryText: kbQuery,
                 companyAteco,
                 noteLimit: 3,
                 chunkLimit: 3,
