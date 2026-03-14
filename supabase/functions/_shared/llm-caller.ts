@@ -157,7 +157,7 @@ async function callAnthropic(prompt: string, config: LLMConfig, key?: string): P
 async function callOpenAI(prompt: string, config: LLMConfig, key?: string): Promise<LLMResponse> {
   if (!key) throw new Error("OPENAI_API_KEY mancante");
 
-  const isReasoningModel = config.model.startsWith("o1") || config.model.startsWith("o3");
+  const isReasoningModel = config.model.startsWith("o1") || config.model.startsWith("o3") || config.model.startsWith("gpt-5");
   
   const messages = [
     { role: isReasoningModel ? "developer" : "system", content: config.systemPrompt },

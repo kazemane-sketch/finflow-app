@@ -26,6 +26,8 @@ const MODEL_OPTIONS = [
   { value: 'gpt-4o-mini', label: 'GPT-4o Mini', desc: 'Economico, veloce, per task semplici' },
   { value: 'o3-mini', label: 'o3 Mini', desc: 'Focus su ragionamento (reasoning effort configurabile)' },
   { value: 'o1', label: 'o1', desc: 'Massimo ragionamento (ragionamento profondo)' },
+  { value: 'gpt-5.3', label: 'GPT-5.3', desc: 'Sperimentale (Supporta Reasoning)' },
+  { value: 'gpt-5.4', label: 'GPT-5.4', desc: 'Sperimentale (Supporta Reasoning)' },
 ]
 
 const THINKING_BUDGET_OPTIONS = [
