@@ -798,6 +798,15 @@ OUTPUT (JSON, no markdown):
     const accountByCode = new Map(allAccounts.map((a: any) => [a.code, a]));
 
     for (const line of normalizedLines) {
+      // Validate irap_mode against DB check constraint
+      if (line.fiscal) {
+        const validModes = ['follows_ires', 'fully_indeducible', 'custom_pct', 'personale'];
+        if (!validModes.includes(line.fiscal.irap_mode)) {
+          console.warn(`[classify-v2] Invalid irap_mode "${line.fiscal.irap_mode}" for line ${line.line_id}, falling back to "follows_ires"`);
+          line.fiscal.irap_mode = 'follows_ires';
+        }
+      }
+
       // Resolve account_code → account_id
       if (line.account_code && !line.account_id) {
         const match = accountByCode.get(line.account_code);
