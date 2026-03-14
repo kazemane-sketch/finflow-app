@@ -492,26 +492,63 @@ OUTPUT (JSON, no markdown):
         case "cerca_conti": {
           const query = String(args.query || "").trim();
           const section = args.section ? String(args.section) : null;
-          let rows;
-          if (section) {
-            rows = await sql`
-              SELECT id, code, name, section, default_tax_code_id, default_ires_pct,
-                     default_irap_mode, needs_user_confirmation, note_fiscali
+          const sectionFilter = section ? sql`AND section = ${section}` : sql``;
+          
+          // Query 1: ILIKE + trigram (sempre)
+          const rows = await sql`
+            SELECT id, code, name, section,
+                   default_tax_code_id, default_ires_pct,
+                   default_irap_mode, needs_user_confirmation, note_fiscali,
+                   GREATEST(
+                     CASE WHEN name ILIKE ${'%' + query + '%'} OR code ILIKE ${'%' + query + '%'} THEN 0.9 ELSE 0 END,
+                     word_similarity(${query}, name)
+                   ) AS relevance
+            FROM chart_of_accounts
+            WHERE company_id = ${companyId} AND active = true AND is_header = false
+              ${sectionFilter}
+              AND (
+                name ILIKE ${'%' + query + '%'}
+                OR code ILIKE ${'%' + query + '%'}
+                OR word_similarity(${query}, name) > 0.15
+              )
+            ORDER BY relevance DESC, code
+            LIMIT 15`;
+
+          // Query 2: numeric pattern search (solo se ci sono numeri nella query)
+          const numericPatterns = (query.match(/\d{4,}/g) || [])
+            .map(n => n.replace(/^0+/, ''))
+            .filter(n => n.length >= 4);
+          
+          let numericRows: any[] = [];
+          if (numericPatterns.length > 0 && rows.length < 10) {
+            // Cerca conti che contengono uno dei numeri estratti
+            const numericConditions = numericPatterns.map(n => `%${n}%`);
+            numericRows = await sql`
+              SELECT id, code, name, section,
+                     default_tax_code_id, default_ires_pct,
+                     default_irap_mode, needs_user_confirmation, note_fiscali,
+                     0.85::float AS relevance
               FROM chart_of_accounts
               WHERE company_id = ${companyId} AND active = true AND is_header = false
-                AND section = ${section}
-                AND (name ILIKE ${'%' + query + '%'} OR code ILIKE ${'%' + query + '%'})
-              ORDER BY code LIMIT 15`;
-          } else {
-            rows = await sql`
-              SELECT id, code, name, section, default_tax_code_id, default_ires_pct,
-                     default_irap_mode, needs_user_confirmation, note_fiscali
-              FROM chart_of_accounts
-              WHERE company_id = ${companyId} AND active = true AND is_header = false
-                AND (name ILIKE ${'%' + query + '%'} OR code ILIKE ${'%' + query + '%'})
-              ORDER BY code LIMIT 15`;
+                ${sectionFilter}
+                AND (name ILIKE ANY(${numericConditions}) OR code ILIKE ANY(${numericConditions}))
+              ORDER BY code
+              LIMIT 10`;
           }
-          return rows;
+
+          // Merge e deduplica
+          const seen = new Set(rows.map((r: any) => r.id));
+          const merged = [...rows];
+          for (const nr of numericRows) {
+            if (!seen.has(nr.id)) {
+              merged.push(nr);
+              seen.add(nr.id);
+            }
+          }
+          
+          // Ordina per relevance e limita
+          merged.sort((a: any, b: any) => (b.relevance || 0) - (a.relevance || 0));
+          return merged.slice(0, 15);
         }
 
         case "get_defaults_conto": {
