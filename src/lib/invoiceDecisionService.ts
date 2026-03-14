@@ -196,11 +196,61 @@ export async function saveConsultantResolution(
   return data.id as string
 }
 
+function isUUID(s: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)
+}
+
 export async function applyConsultantResolution(
   companyId: string,
   invoiceId: string,
   payload: ConsultantResolutionPayload,
 ): Promise<string> {
+  // ─── Resolve non-UUID values in line_updates ──────
+  for (const update of payload.line_updates || []) {
+    // Resolve account_id: if not a valid UUID, treat as account code
+    if (update.account_id && !isUUID(update.account_id)) {
+      const { data: acc } = await supabase
+        .from('chart_of_accounts')
+        .select('id')
+        .eq('company_id', companyId)
+        .eq('code', update.account_id)
+        .eq('active', true)
+        .limit(1)
+        .single()
+      if (acc) {
+        update.account_id = acc.id
+      } else {
+        // Try partial match (without dots)
+        const cleanCode = update.account_id.replace(/\./g, '')
+        const { data: accFuzzy } = await supabase
+          .from('chart_of_accounts')
+          .select('id, code')
+          .eq('company_id', companyId)
+          .eq('active', true)
+          .ilike('code', `%${cleanCode}%`)
+          .limit(1)
+          .single()
+        update.account_id = accFuzzy?.id || null
+      }
+    }
+
+    // Resolve category_id: if not a valid UUID, treat as category name/slug
+    if (update.category_id && !isUUID(update.category_id)) {
+      const searchTerm = update.category_id
+        .replace(/_/g, ' ')    // cat_leasing → cat leasing
+        .replace(/^cat\s*/i, '') // cat leasing → leasing
+      const { data: cat } = await supabase
+        .from('categories')
+        .select('id')
+        .eq('company_id', companyId)
+        .eq('active', true)
+        .ilike('name', `%${searchTerm}%`)
+        .limit(1)
+        .single()
+      update.category_id = cat?.id || null
+    }
+  }
+
   const resolutionId = await saveConsultantResolution(companyId, invoiceId, {
     ...payload,
     resolution_status: 'applied',

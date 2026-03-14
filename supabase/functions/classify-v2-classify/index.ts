@@ -135,6 +135,7 @@ const TOOL_DECLARATIONS: ToolDeclaration[] = [
       type: "OBJECT",
       properties: {
         description_hint: { type: "STRING", description: "Parole chiave opzionali per filtrare le righe dello storico (es. 'canone', 'manutenzione')" },
+        contract_ref: { type: "STRING", description: "Opzionale: numero contratto dalla fattura per matching esatto" },
       },
     },
   },
@@ -371,7 +372,7 @@ Deno.serve(async (req) => {
       sql`SELECT name, vat_number, ateco_code, ateco_description, fiscal_regime, iva_per_cassa
           FROM companies WHERE id = ${companyId} LIMIT 1`,
       sql`SELECT total_amount, taxable_amount, tax_amount, withholding_amount, stamp_amount,
-                 date, doc_type, direction, notes, raw_xml
+                 date, doc_type, direction, notes, raw_xml, number, primary_contract_ref, contract_refs
           FROM invoices WHERE id = ${invoiceId} LIMIT 1`,
       counterpartyVatKey
         ? sql`SELECT name, vat_number, fiscal_code, legal_type, ateco_code, ateco_description,
@@ -437,7 +438,7 @@ Numero: ${invoice.number || "N/D"} | Data: ${invoice.date || "N/D"} | Tipo: ${in
 Direzione: ${direction === "in" ? "PASSIVA (acquisto)" : "ATTIVA (vendita)"}
 Totale: €${invoice.total_amount || "N/D"} | Imponibile: €${invoice.taxable_amount || "N/D"} | IVA: €${invoice.tax_amount || "N/D"}
 Ritenuta: €${invoice.withholding_amount || 0} | Bollo: €${invoice.stamp_amount || 0}
-${invoiceNotes ? `Note: ${invoiceNotes}` : ""}${invoiceCausale ? ` | Causale XML: ${invoiceCausale}` : ""}
+${invoice.primary_contract_ref ? `Rif. Contratto: ${invoice.primary_contract_ref}\n` : ''}${invoice.contract_refs && Array.isArray(invoice.contract_refs) && invoice.contract_refs.length > 0 ? `Riferimenti aggiuntivi: ${JSON.stringify(invoice.contract_refs)}\n` : ''}${invoiceNotes ? `Note: ${invoiceNotes}` : ""}${invoiceCausale ? ` | Causale XML: ${invoiceCausale}` : ""}
 
 CONTROPARTE:
 ${cpInfo}
@@ -531,6 +532,23 @@ OUTPUT (JSON, no markdown):
           if (!counterpartyVatKey) return { message: "Nessuna P.IVA controparte disponibile" };
           const vatKey = counterpartyVatKey.toUpperCase().replace(/^IT/i, "").replace(/[^A-Z0-9]/gi, "");
           const hint = String(args.description_hint || "").trim();
+          const contractRef = args.contract_ref ? String(args.contract_ref) : null;
+          
+          let contractHistory: any[] = [];
+          if (contractRef) {
+            contractHistory = await sql`
+              SELECT il.description, c.name AS category_name, a.code AS account_code, a.name AS account_name, i.primary_contract_ref
+              FROM invoice_lines il
+              JOIN invoices i ON il.invoice_id = i.id
+              LEFT JOIN categories c ON il.category_id = c.id
+              LEFT JOIN chart_of_accounts a ON il.account_id = a.id
+              WHERE i.company_id = ${companyId}
+                AND i.primary_contract_ref = ${contractRef}
+                AND i.classification_status = 'confirmed'
+                AND il.account_id IS NOT NULL
+              ORDER BY i.date DESC LIMIT 5`;
+          }
+
           let rows;
           if (hint) {
             rows = await sql`
@@ -562,7 +580,8 @@ OUTPUT (JSON, no markdown):
               GROUP BY il.description, c.name, a.code, a.name
               ORDER BY count DESC LIMIT 15`;
           }
-          return rows.length > 0 ? rows : { message: "Nessuno storico confermato per questa controparte" };
+          const historyResult = rows.length > 0 ? rows : { message: "Nessuno storico confermato per questa controparte" };
+          return { history: historyResult, contract_history: contractHistory.length > 0 ? contractHistory : undefined };
         }
 
         case "get_tax_codes": {
@@ -671,8 +690,8 @@ OUTPUT (JSON, no markdown):
               })),
               chunks: result.chunks.map((c) => ({
                 doc_title: c.doc_title,
-                section_title: c.section_title,
-                article_reference: c.article_reference,
+                section_title: c.section_title || "",
+                article_reference: c.article_reference || "",
                 content: c.content.slice(0, 500),
               })),
             };
@@ -750,10 +769,11 @@ OUTPUT (JSON, no markdown):
         } else {
           // Try partial match (code with/without dots)
           const cleanCode = line.account_code.replace(/\./g, "");
-          for (const [code, acc] of accountByCode) {
-            if (code.replace(/\./g, "") === cleanCode) {
-              line.account_id = (acc as any).id;
-              line.account_code = code;
+          for (const [codeStr, acc] of Array.from(accountByCode.entries())) {
+            const accObj = acc as any;
+            if (String(codeStr).replace(/\./g, "") === cleanCode) {
+              line.account_id = accObj.id;
+              line.account_code = String(codeStr);
               break;
             }
           }
