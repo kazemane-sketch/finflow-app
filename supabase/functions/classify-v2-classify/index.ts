@@ -425,6 +425,7 @@ REGOLE:
 - Percentuali: SEMPRE numeri 0-100
 - Quando non sai: default CONSERVATIVO + dubbio
 - Se il conto ha needs_user_confirmation=true: SEMPRE dubbio
+- Se la fattura contiene un riferimento contratto e la riga è un leasing/canone numerato, verifica se esiste già un conto dedicato compatibile prima di proporre un nuovo conto
 - Fattura ATTIVA (vendita) → MAI passività
 - SRL/SPA → MAI ritenuta d'acconto`;
 
@@ -509,6 +510,13 @@ OUTPUT (JSON, no markdown):
           const query = String(args.query || "").trim();
           const section = args.section ? String(args.section) : null;
           const sectionFilter = section ? sql`AND section = ${section}` : sql``;
+          const implicitContractRefs =
+            /leasing|locazione finanziaria|canone/i.test(query)
+              ? [
+                invoice.primary_contract_ref ? String(invoice.primary_contract_ref) : "",
+                ...(Array.isArray(invoice.contract_refs) ? invoice.contract_refs.map((value) => String(value || "")) : []),
+              ].map((value) => value.trim()).filter(Boolean)
+              : [];
           
           // Query 1: ILIKE + trigram (sempre)
           const rows = await sql`
@@ -535,18 +543,22 @@ OUTPUT (JSON, no markdown):
             .map(n => n.replace(/^0+/, ''))
             .filter(n => n.length >= 4);
 
-          // Se c'è un contract_ref, estrai i numeri e aggiungili alla ricerca
-          if (args.contract_ref) {
-            const contractNums = (String(args.contract_ref).match(/\d{4,}/g) || [])
+          // Se c'è un contract_ref esplicito o implicito dalla fattura, estrai i numeri e aggiungili
+          for (const ref of [
+            args.contract_ref ? String(args.contract_ref) : "",
+            ...implicitContractRefs,
+          ].filter(Boolean)) {
+            const contractNums = (String(ref).match(/\d{4,}/g) || [])
               .map((n: string) => n.replace(/^0+/, ''))
               .filter((n: string) => n.length >= 4);
             numericPatterns.push(...contractNums);
           }
+          const uniqueNumericPatterns = Array.from(new Set(numericPatterns));
           
           let numericRows: any[] = [];
-          if (numericPatterns.length > 0 && rows.length < 10) {
+          if (uniqueNumericPatterns.length > 0) {
             // Cerca conti che contengono uno dei numeri estratti
-            const numericConditions = numericPatterns.map(n => `%${n}%`);
+            const numericConditions = uniqueNumericPatterns.map(n => `%${n}%`);
             numericRows = await sql`
               SELECT id, code, name, section,
                      default_tax_code_id, default_ires_pct,
@@ -565,6 +577,8 @@ OUTPUT (JSON, no markdown):
           const merged = [...rows];
           for (const nr of numericRows) {
             if (!seen.has(nr.id)) {
+              const haystack = `${nr.code || ''} ${nr.name || ''}`.replace(/\D/g, '');
+              nr.relevance = uniqueNumericPatterns.some((pattern) => haystack.includes(pattern)) ? 0.99 : (nr.relevance || 0.85);
               merged.push(nr);
               seen.add(nr.id);
             }
