@@ -30,7 +30,7 @@ const STATUS_COLORS: Record<string, string> = {
 }
 
 interface KBRule {
-  knowledge_kind?: 'advisory_note' | 'numeric_fact' | 'legacy_rule'
+  knowledge_kind?: 'advisory_note' | 'numeric_fact'
   id: string; domain: string; audience: string; title: string; content: string;
   summary_structured?: Record<string, any>;
   applicability?: Record<string, any>;
@@ -100,7 +100,12 @@ export default function KnowledgeBasePage() {
 
   const loadRules = useCallback(async () => {
     setLoading(true)
-    let q = supabase.from('knowledge_base').select('*').order('priority', { ascending: false }).order('updated_at', { ascending: false })
+    let q = supabase
+      .from('knowledge_base')
+      .select('*')
+      .neq('knowledge_kind', 'legacy_rule')
+      .order('priority', { ascending: false })
+      .order('updated_at', { ascending: false })
     if (filterDomain) q = q.eq('domain', filterDomain)
     if (filterAudience) q = q.eq('audience', filterAudience)
     if (filterStatus) q = q.eq('status', filterStatus)

@@ -27,7 +27,7 @@ interface KBChunk {
 }
 
 interface CandidateRule {
-  knowledge_kind?: 'advisory_note' | 'numeric_fact' | 'legacy_rule'
+  knowledge_kind?: 'advisory_note' | 'numeric_fact'
   domain: string; audience: string; title: string; content: string;
   normativa_ref: string[]; fiscal_values: Record<string, unknown>;
   summary_structured?: Record<string, unknown>;
