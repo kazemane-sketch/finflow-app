@@ -433,7 +433,7 @@ REGOLE:
 - SRL/SPA → MAI ritenuta d'acconto`;
 
     if (agentConfig?.react_mode) {
-      systemPrompt += `\n\n[MODALITÀ REACT ATTIVA]: Stai operando in modalità ReAct (Reasoning + Acting). Prima di terminare e fornire il JSON finale, DEVI usare il tool 'valida_classificazione_proposta' passando le tue ipotesi preliminari per simulare e validare la bontà delle tue scelte. Solo dopo aver ricevuto l'esito della validazione e riflettuto su di esso, potrai procedere a emettere la classificazione finale.`;
+      systemPrompt += `\n\n[MODALITÀ REACT ATTIVA]: Stai operando in modalità ReAct (Reasoning + Acting). Prima di terminare e fornire il JSON finale, DEVI obbligatoriamente usare il tool 'stendi_bozza_e_fai_autocritica' per le righe incerte o complesse (es. contratti, leasing, assicurazioni). Questo tool non ti darà validazioni esterne: serve a te per mettere per iscritto la tua ipotesi, giustificarla e, soprattutto, trovare possibili falle o assunzioni non provate (es. basate solo sull'ATECO) prima di prendere la decisione finale. Solo dopo esserti auto-criticato potrai emettere la classificazione JSON definitiva.`;
     }
 
     // ─── Build user prompt with full invoice data ──────
@@ -812,16 +812,15 @@ OUTPUT (JSON, no markdown):
           }
         }
 
-        case "valida_classificazione_proposta": {
-          const proposta = args.proposte_righe as any[];
-          if (!proposta || !Array.isArray(proposta)) {
-            return { error: "parametro proposte_righe mancante o non array" };
-          }
-          let feedback = "Esito validazione (SIMULATA):\n";
-          for (const p of proposta) {
-            feedback += `- Riga [${p.line_id}]: IPOTESI [${p.account_code || "N.D."}]. Procedi con l'output finale assicurandoti che l'aliquota IVA (${p.vat_rate_ipotesi}%) sia compatibile con la normativa e che la percentuale di deducibilità sia giustificata dai fatti.\n`;
-          }
-          feedback += "\nValidazione completata. Ora procedi emettendo l'output JSON finale strutturato.";
+        case "stendi_bozza_e_fai_autocritica": {
+          const { ipotesi_iniziale, ragioni_a_favore, cosa_potrebbe_essere_sbagliato_o_mancante, decisione_se_coinvolgere_cfo } = args;
+          
+          let feedback = "Appunti di ragionamento registrati nel buffer interno:\n";
+          feedback += `- Ipotesi: ${ipotesi_iniziale}\n`;
+          feedback += `- Autocritica (Falle/Assunzioni): ${cosa_potrebbe_essere_sbagliato_o_mancante}\n`;
+          feedback += `- CFO: ${decisione_se_coinvolgere_cfo}\n\n`;
+          feedback += "ISTRUZIONE DI SISTEMA: Ora RILEGGI attentamente la tua stessa autocritica. Se hai evidenziato che la tua ipotesi si basa su assunzioni non provate (es. deduci la natura del hardware solo dall'ATECO ma non hai il dettaglio in fattura), DEVI essere conservativo: imposta needs_consultant a true, metti i dubbi in 'doubts' e abbassa la confidence. Poi procedi con l'output JSON finale.";
+          
           return { message: feedback };
         }
 
@@ -838,17 +837,17 @@ OUTPUT (JSON, no markdown):
     const dynamicTools = [...TOOL_DECLARATIONS];
     if (agentConfig?.react_mode) {
       dynamicTools.push({
-        name: "valida_classificazione_proposta",
-        description: "Modalità ReAct: Simula e valida la classificazione preliminare PRIMA di produrre il json finale. DEVI usare questo tool obbligatoriamente.",
+        name: "stendi_bozza_e_fai_autocritica",
+        description: "Modalità ReAct: Usa questo tool per scrivere la tua ipotesi e fare autocritica prima di decidere. Obbligatorio per righe complesse.",
         parameters: {
           type: "OBJECT",
           properties: {
-            proposte_righe: {
-              type: "ARRAY",
-              description: "Array contenente la bozza di classificazione per ogni riga, per validarla",
-              items: { type: "OBJECT" },
-            },
+            ipotesi_iniziale: { type: "STRING", description: "Qual è la tua classificazione preliminare (es. conto, deducibilità)?" },
+            ragioni_a_favore: { type: "STRING", description: "Perché pensi che questa ipotesi sia corretta?" },
+            cosa_potrebbe_essere_sbagliato_o_mancante: { type: "STRING", description: "AUTOCRITICA (Estremamente importante): C'è qualche assunzione (es. basata su ATECO o descrizione generica)? Manca il nesso con un bene specifico? Potrebbe essere un conto diverso?" },
+            decisione_se_coinvolgere_cfo: { type: "STRING", description: "Alla luce dell'autocritica, ritieni necessario che il CFO o l'utente confermino la destinazione d'uso o il tipo di bene?" }
           },
+          required: ["ipotesi_iniziale", "ragioni_a_favore", "cosa_potrebbe_essere_sbagliato_o_mancante", "decisione_se_coinvolgere_cfo"],
         },
       });
     }
