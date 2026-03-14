@@ -374,7 +374,7 @@ function BrainActivationCard({ companyId }: { companyId: string }) {
       <CardContent className="space-y-3">
         <p className="text-xs text-gray-500">
           Calcola gli embeddings vettoriali per tutti i conti, categorie, articoli, centri di costo
-          e la memoria aziendale. Necessario per la classificazione AI intelligente (Haiku pre-flight).
+          e la memoria aziendale. Necessario per la classificazione AI intelligente.
           Gli embeddings vengono aggiornati automaticamente ad ogni modifica, ma puoi forzare un ricalcolo completo.
         </p>
 

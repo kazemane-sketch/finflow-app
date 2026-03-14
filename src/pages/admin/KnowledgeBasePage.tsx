@@ -9,7 +9,7 @@ import { toast } from 'sonner'
 import { Plus, X, Search, Loader2, Pencil, Trash2, BookOpen } from 'lucide-react'
 
 const DOMAINS = ['iva', 'ires_irap', 'ritenute', 'classificazione', 'settoriale', 'operativo', 'aggiornamenti'] as const
-const AUDIENCES = ['commercialista', 'revisore', 'both'] as const
+const AUDIENCES = ['commercialista', 'consulente', 'both'] as const
 const STATUSES = ['draft', 'approved', 'rejected', 'superseded'] as const
 
 const DOMAIN_LABELS: Record<string, string> = {
@@ -23,7 +23,7 @@ const DOMAIN_COLORS: Record<string, string> = {
   settoriale: 'bg-amber-100 text-amber-700', operativo: 'bg-slate-100 text-slate-700',
   aggiornamenti: 'bg-cyan-100 text-cyan-700',
 }
-const AUDIENCE_LABELS: Record<string, string> = { commercialista: 'Commercialista', revisore: 'Revisore', both: 'Entrambi' }
+const AUDIENCE_LABELS: Record<string, string> = { commercialista: 'Commercialista', consulente: 'Consulente', both: 'Entrambi' }
 const STATUS_COLORS: Record<string, string> = {
   approved: 'bg-green-100 text-green-700', draft: 'bg-yellow-100 text-yellow-700',
   rejected: 'bg-red-100 text-red-700', superseded: 'bg-gray-100 text-gray-500',

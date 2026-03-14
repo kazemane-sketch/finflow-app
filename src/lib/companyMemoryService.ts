@@ -3,7 +3,7 @@
  *
  * Ogni conferma/correzione dell'utente genera un "fatto" in company_memory.
  * L'edge function classify-invoice-lines usa questi fatti (via embedding search)
- * per produrre suggerimenti piu precisi a costo ridotto (Haiku + pre-flight).
+ * per produrre suggerimenti più precisi nella classificazione AI.
  *
  * Pattern:
  *   1. Utente conferma → createMemoryFrom*() → insert in company_memory

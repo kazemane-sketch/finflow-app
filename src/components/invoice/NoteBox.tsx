@@ -12,7 +12,7 @@ interface Props {
 const SOURCE_LABELS: Record<string, string> = {
   user: 'Utente',
   ai_consultant: 'Consulente AI',
-  ai_reviewer: 'Revisore',
+  ai_reviewer: 'AI',
 };
 
 /** Note card — Test Lab style */

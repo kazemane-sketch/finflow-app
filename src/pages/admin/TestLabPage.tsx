@@ -200,7 +200,7 @@ export default function TestLabPage() {
   }, [handleFileDrop])
 
   // Run agent
-  const runAgent = async (agentType: 'commercialista' | 'revisore' | 'both') => {
+  const runAgent = async (agentType: 'commercialista' | 'consulente' | 'both') => {
     if (!parsed) return
     setLoading(true)
     setLoadingAgent(agentType === 'both' ? 'commercialista' : agentType)
@@ -477,8 +477,8 @@ export default function TestLabPage() {
               <Button onClick={() => runAgent('commercialista')} className="bg-blue-600 hover:bg-blue-700">
                 <Play className="h-3.5 w-3.5 mr-1.5" /> Commercialista
               </Button>
-              <Button variant="outline" onClick={() => runAgent('revisore')}>
-                <Play className="h-3.5 w-3.5 mr-1.5" /> Revisore
+              <Button variant="outline" onClick={() => runAgent('consulente')}>
+                <Play className="h-3.5 w-3.5 mr-1.5" /> Consulente CFO
               </Button>
               <Button onClick={() => runAgent('both')} className="bg-purple-600 hover:bg-purple-700">
                 <Play className="h-3.5 w-3.5 mr-1.5" /> Entrambi (chain)
@@ -528,7 +528,7 @@ export default function TestLabPage() {
                       : 'border-transparent text-slate-500 hover:text-slate-700'
                   }`}
                 >
-                  {key === 'commercialista' ? '📊 Commercialista' : '🔍 Revisore'}
+                  {key === 'commercialista' ? '📊 Commercialista' : '💼 Consulente CFO'}
                 </button>
               ))}
             </div>
@@ -541,7 +541,7 @@ export default function TestLabPage() {
             if (agent.error) return (
               <div className="bg-red-50 rounded-lg p-4 text-sm text-red-700">{agent.error}</div>
             )
-            const isRevisore = activeTab === 'revisore'
+            const isConsulente = activeTab === 'consulente'
 
             return (
               <div className="space-y-4">
@@ -550,7 +550,7 @@ export default function TestLabPage() {
                   <div className="px-4 py-2.5 bg-slate-50 border-b flex items-center gap-2">
                     <Brain className="h-4 w-4 text-purple-500" />
                     <h3 className="text-sm font-bold text-slate-800">
-                      {isRevisore ? 'Revisione fiscale' : 'Classificazione'}
+                      {isConsulente ? 'Consulenza fiscale' : 'Classificazione'}
                     </h3>
                     <span className="text-[10px] text-slate-400 ml-auto">
                       {agent.parsed_result?.length || 0} righe
@@ -562,14 +562,14 @@ export default function TestLabPage() {
                         <tr>
                           <th className="px-3 py-2 w-8">#</th>
                           <th className="px-3 py-2">Descrizione</th>
-                          {!isRevisore && (
+                          {!isConsulente && (
                             <>
                               <th className="px-3 py-2">Conto suggerito</th>
                               <th className="px-3 py-2 w-28">Sezione</th>
                               <th className="px-3 py-2">Categoria</th>
                             </>
                           )}
-                          {isRevisore && (
+                          {isConsulente && (
                             <>
                               <th className="px-3 py-2">Deducibilità</th>
                               <th className="px-3 py-2">IVA detr.</th>
@@ -589,7 +589,7 @@ export default function TestLabPage() {
                               <td className="px-3 py-2 text-slate-800 max-w-[200px] truncate" title={line?.descrizione}>
                                 {(line?.descrizione || '').slice(0, 40)}{(line?.descrizione || '').length > 40 ? '...' : ''}
                               </td>
-                              {!isRevisore && (
+                              {!isConsulente && (
                                 <>
                                   <td className="px-3 py-2 font-medium text-slate-800">{r.account_suggestion || '—'}</td>
                                   <td className="px-3 py-2">
@@ -602,7 +602,7 @@ export default function TestLabPage() {
                                   <td className="px-3 py-2 text-slate-600">{r.category_suggestion || '—'}</td>
                                 </>
                               )}
-                              {isRevisore && (
+                              {isConsulente && (
                                 <>
                                   <td className="px-3 py-2 font-medium">
                                     {r.fiscal_flags?.deducibilita_pct != null ? `${r.fiscal_flags.deducibilita_pct}%` : '—'}
@@ -634,7 +634,7 @@ export default function TestLabPage() {
                   </div>
 
                   {/* Fiscal flags for commercialista rows */}
-                  {!isRevisore && (agent.parsed_result || []).some(r => r.fiscal_flags) && (
+                  {!isConsulente && (agent.parsed_result || []).some(r => r.fiscal_flags) && (
                     <div className="px-4 py-2.5 border-t bg-amber-50/50 space-y-1">
                       <p className="text-[10px] font-semibold text-amber-700 mb-1">🏛 Indicazioni fiscali</p>
                       {(agent.parsed_result || []).filter(r => r.fiscal_flags).map(r => (
@@ -653,8 +653,8 @@ export default function TestLabPage() {
                   )}
                 </div>
 
-                {/* 4b. Alerts (revisore) */}
-                {isRevisore && (agent.parsed_result || []).some(r => r.alerts?.length) && (
+                {/* 4b. Alerts (consulente) */}
+                {isConsulente && (agent.parsed_result || []).some(r => r.alerts?.length) && (
                   <div className="space-y-2">
                     <h3 className="text-sm font-bold text-slate-800 flex items-center gap-2">
                       <AlertTriangle className="h-4 w-4 text-amber-500" /> Alert fiscali

@@ -21,7 +21,7 @@ const emptyRule = (agentType: string): Omit<AgentRule, 'id'> => ({
 })
 
 export default function AgentRulesPage() {
-  const [agentType, setAgentType] = useState<'commercialista' | 'revisore'>('commercialista')
+  const [agentType, setAgentType] = useState<'commercialista' | 'consulente'>('commercialista')
   const [rules, setRules] = useState<AgentRule[]>([])
   const [loading, setLoading] = useState(true)
   const [editRule, setEditRule] = useState<Partial<AgentRule> | null>(null)
@@ -113,14 +113,14 @@ export default function AgentRulesPage() {
 
       {/* Agent type tabs */}
       <div className="flex gap-1 border-b border-gray-200">
-        {(['commercialista', 'revisore'] as const).map(t => (
+        {(['commercialista', 'consulente'] as const).map(t => (
           <button key={t} onClick={() => setAgentType(t)}
             className={`px-4 py-2 text-sm font-semibold border-b-2 transition-all ${
               agentType === t
                 ? 'text-sky-700 border-sky-500 bg-sky-50/50'
                 : 'text-gray-400 border-transparent hover:text-gray-600 hover:bg-gray-50'
             }`}>
-            {t === 'commercialista' ? '📊 Commercialista' : '🔍 Revisore'}
+            {t === 'commercialista' ? '📊 Commercialista' : '💼 Consulente'}
           </button>
         ))}
       </div>

@@ -12,7 +12,6 @@ import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supaba
 import {
   saveCommercialistaProposals,
   saveFinalDecisions,
-  saveReviewerVerdicts,
   type FinalDecisionSource,
   type LineDecisionStatus,
   type SupportingEvidence,
@@ -118,29 +117,9 @@ interface CdcAllocation {
   cost_center_allocations: { project_id: string; percentage: number }[]
 }
 
-interface ReviewResult {
-  line_id: string
-  fiscal_flags_corrected: Record<string, unknown>
-  issues: string[]
-  confidence_adjustment: number
-}
-
-interface ReviewerLineVerdict {
-  line_id: string
-  decision_status: LineDecisionStatus
-  rationale_summary: string
-  decision_basis: string[]
-  supporting_factors: string[]
-  supporting_evidence: SupportingEvidence[]
-  clear_fields?: string[]
-  consultant_recommended?: boolean
-}
-
-interface ReviewerPayload {
+interface CfoPayload {
   invoice_summary_final: string | null
-  line_verdicts: ReviewerLineVerdict[]
   escalation_candidates: string[]
-  red_flags: string[]
 }
 
 interface FiscalAlert {
@@ -207,7 +186,7 @@ export interface PipelineResult {
   }[]
   alerts: FiscalAlert[]
   commercialista?: CommercialistaPayload
-  reviewer?: ReviewerPayload
+  cfo?: CfoPayload
   stats: {
     total: number
     deterministic: number
@@ -354,7 +333,6 @@ async function persistPipelineResults(
   signal?: AbortSignal,
 ): Promise<void> {
   const commercialistaRows = result.commercialista?.line_proposals || []
-  const reviewerRows = result.reviewer?.line_verdicts || []
 
   if (commercialistaRows.length > 0) {
     await saveCommercialistaProposals(companyId, invoiceId, commercialistaRows.map((row) => ({
@@ -365,20 +343,6 @@ async function persistPipelineResults(
       decision_basis: normalizeStringArray(row.decision_basis),
       supporting_factors: normalizeStringArray(row.supporting_factors),
       supporting_evidence: normalizeEvidence(row.supporting_evidence),
-    })))
-  }
-
-  if (reviewerRows.length > 0) {
-    await saveReviewerVerdicts(companyId, invoiceId, reviewerRows.map((row) => ({
-      line_id: row.line_id,
-      decision_status: row.decision_status,
-      final_confidence: result.lines.find((line) => line.line_id === row.line_id)?.confidence ?? null,
-      verdict: row as unknown as Record<string, unknown>,
-      rationale_summary: row.rationale_summary,
-      decision_basis: normalizeStringArray(row.decision_basis),
-      supporting_factors: normalizeStringArray(row.supporting_factors),
-      supporting_evidence: normalizeEvidence(row.supporting_evidence),
-      red_flags: row.consultant_recommended ? ['consultant_recommended'] : [],
     })))
   }
 
@@ -497,7 +461,7 @@ async function persistPipelineResults(
       verified: false,
       ai_confidence: avgConf,
       ai_reasoning: result.commercialista?.invoice_summary
-        || result.reviewer?.invoice_summary_final
+        || result.cfo?.invoice_summary_final
         || `Verdetto AI consolidato su ${classified.length} righe`,
       invoice_notes: result.alerts.length > 0 ? JSON.stringify(result.alerts) : null,
     } as any, { onConflict: 'invoice_id' })
@@ -833,11 +797,9 @@ export async function runClassificationPipeline(
   // ─── Conditional CFO: only if commercialista flagged needs_consultant ──────
   let alerts: FiscalAlert[] = [...doubtsAlerts]
   let fiscalIssues = 0
-  const reviewerPayload: ReviewerPayload = {
+  const cfoPayload: CfoPayload = {
     invoice_summary_final: null,
-    line_verdicts: [],
     escalation_candidates: [],
-    red_flags: [],
   }
 
   if (commercialista.needs_consultant) {
@@ -880,7 +842,7 @@ export async function runClassificationPipeline(
         fiscalIssues += cfoResult.action.line_overrides.length
       }
 
-      reviewerPayload.invoice_summary_final = cfoResult.action?.review_summary || cfoResult.message || null
+      cfoPayload.invoice_summary_final = cfoResult.action?.review_summary || cfoResult.message || null
 
       reporter.finishStage('Consulente CFO', `CFO: ${fiscalIssues} override, risk=${cfoResult.action?.risk_level || 'N/A'}`)
     } catch (error) {
@@ -920,7 +882,7 @@ export async function runClassificationPipeline(
     lines: finalLines,
     alerts,
     commercialista,
-    reviewer: reviewerPayload,
+    cfo: cfoPayload,
     stats: {
       total: lines.length,
       deterministic: resolved.length,

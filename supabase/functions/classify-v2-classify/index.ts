@@ -107,12 +107,13 @@ interface AgentConfig {
 const TOOL_DECLARATIONS: ToolDeclaration[] = [
   {
     name: "cerca_conti",
-    description: "Cerca nel piano dei conti dell'azienda per parole chiave e/o sezione. Restituisce codice, nome, sezione e defaults fiscali dei conti trovati.",
+    description: "Cerca conti nel piano dei conti dell'azienda per parole chiave, codice, sezione, o riferimento contrattuale. Se hai un numero contratto, passalo in contract_ref per trovare il conto specifico.",
     parameters: {
       type: "OBJECT",
       properties: {
-        query: { type: "STRING", description: "Parole chiave per cercare nel nome/codice del conto (es. 'carburante', 'leasing', 'telefono')" },
-        section: { type: "STRING", description: "Filtra per sezione: assets, liabilities, equity, revenue, cost_production, cost_personnel, depreciation, other_costs, financial, extraordinary" },
+        query: { type: "STRING", description: "Parole chiave: es. 'leasing', 'carburante', 'telefonia'" },
+        section: { type: "STRING", description: "Opzionale. Filtra per sezione: cost_production, financial, other_costs, revenue, assets, liabilities" },
+        contract_ref: { type: "STRING", description: "Opzionale. Numero contratto/riferimento dalla fattura (es. '01499014/001'). Il tool estrarrà i numeri rilevanti per cercare conti specifici." },
       },
       required: ["query"],
     },
@@ -518,6 +519,14 @@ OUTPUT (JSON, no markdown):
           const numericPatterns = (query.match(/\d{4,}/g) || [])
             .map(n => n.replace(/^0+/, ''))
             .filter(n => n.length >= 4);
+
+          // Se c'è un contract_ref, estrai i numeri e aggiungili alla ricerca
+          if (args.contract_ref) {
+            const contractNums = (String(args.contract_ref).match(/\d{4,}/g) || [])
+              .map((n: string) => n.replace(/^0+/, ''))
+              .filter((n: string) => n.length >= 4);
+            numericPatterns.push(...contractNums);
+          }
           
           let numericRows: any[] = [];
           if (numericPatterns.length > 0 && rows.length < 10) {

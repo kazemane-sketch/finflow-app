@@ -116,8 +116,8 @@ function IdleState({ onStart, lineCount }: { onStart: () => void; lineCount?: nu
   return (
     <Shell
       eyebrow="Motore Fatture"
-      title="Classificazione professionale con revisione finale"
-      subtitle={`Il commercialista propone, il revisore consolida, il consulente interviene solo sui veri dubbi.${lineCount ? ` Fattura con ${lineCount} righe.` : ''}`}
+      title="Classificazione professionale con analisi fiscale"
+      subtitle={`Il commercialista classifica e analizza la fiscalità. Il consulente CFO interviene solo sui casi complessi.${lineCount ? ` Fattura con ${lineCount} righe.` : ''}`}
       accent="violet"
     >
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -142,7 +142,7 @@ function ProcessingState({ steps, elapsed }: { steps?: ProgressStep[]; elapsed?:
     <Shell
       eyebrow="In lavorazione"
       title="Sto costruendo il verdetto finale della fattura"
-      subtitle="La pipeline usa il commercialista per la proposta e il revisore per il consolidamento finale."
+      subtitle="Il commercialista classifica e analizza la fiscalità. Il consulente CFO interviene solo sui casi complessi."
       accent="violet"
     >
       <div className="rounded-2xl border border-violet-100 bg-white/80 p-4">
@@ -184,7 +184,7 @@ function AlertsState({
   return (
     <Shell
       eyebrow="Dubbi da sciogliere"
-      title="Il revisore ha trovato punti che meritano una scelta esplicita"
+      title="L'AI ha trovato punti che meritano una scelta esplicita"
       subtitle="Puoi applicare una scelta, oppure aprire il consulente per una second opinion contestuale."
       accent="violet"
     >

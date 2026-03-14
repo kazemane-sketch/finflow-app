@@ -1156,7 +1156,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
       const best = classified.length > 0
         ? classified.reduce((a, b) => b.confidence > a.confidence ? b : a)
         : null;
-      const invoiceReasoning = pipelineResult.reviewer?.invoice_summary_final
+      const invoiceReasoning = pipelineResult.cfo?.invoice_summary_final
         || pipelineResult.commercialista?.invoice_summary
         || `Pipeline vNext: ${pipelineResult.stats.deterministic} evidenze deterministiche, ${pipelineResult.stats.ai_classified} proposte AI`;
       const invoiceConfidence = classified.length > 0
@@ -1178,7 +1178,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
         },
         stats: pipelineResult.stats,
         commercialista: pipelineResult.commercialista,
-        reviewer: pipelineResult.reviewer,
+        cfo: pipelineResult.cfo,
       };
 
       setAiClassifResult(result);
@@ -2412,11 +2412,11 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
           onStartClassification={handleRequestAiClassification}
           lineCount={detail?.invoice_lines?.length}
           progressSteps={singleInvoiceJob ? [
-            { label: 'Gate Deterministico', status: singleInvoiceJob.stage === 'Gate Deterministico' ? 'running' : 'done' as const },
-            { label: 'Commercialista', status: singleInvoiceJob.stage === 'Gate Deterministico' ? 'pending' : singleInvoiceJob.stage === 'Commercialista' ? 'running' : 'done' as const },
-            { label: 'Attribuzione CdC', status: singleInvoiceJob.stage === 'Gate Deterministico' || singleInvoiceJob.stage === 'Commercialista' ? 'pending' : singleInvoiceJob.stage === 'Attribuzione CdC' ? 'running' : 'done' as const },
-            { label: 'Revisore', status: singleInvoiceJob.stage === 'Revisore' ? 'running' : singleInvoiceJob.stage === 'Salvataggio' ? 'done' : 'pending' as const },
-            { label: 'Salvataggio', status: singleInvoiceJob.stage === 'Salvataggio' ? 'running' : 'pending' as const },
+            { label: 'Regole e storico', status: singleInvoiceJob.stage === 'Ricerca regole e storico' ? 'running' : 'done' as const },
+            { label: 'Commercialista', status: ['Ricerca regole e storico'].includes(singleInvoiceJob.stage || '') ? 'pending' : singleInvoiceJob.stage === 'Commercialista' ? 'running' : 'done' as const },
+            { label: 'Centri di costo', status: ['Ricerca regole e storico', 'Commercialista'].includes(singleInvoiceJob.stage || '') ? 'pending' : singleInvoiceJob.stage === 'Attribuzione CdC' ? 'running' : 'done' as const },
+            ...(singleInvoiceJob.stage === 'Consulente CFO' ? [{ label: 'Consulente CFO', status: 'running' as const }] : []),
+            { label: 'Salvataggio', status: singleInvoiceJob.stage === 'Salvataggio risultati' ? 'running' : ['Ricerca regole e storico', 'Commercialista', 'Attribuzione CdC', 'Consulente CFO'].includes(singleInvoiceJob.stage || '') ? 'pending' : 'done' as const },
           ] : undefined}
           elapsedSeconds={singleInvoiceJobRunning ? Math.round((singleInvoiceJobProgress.pct || 0) / 10) : undefined}
           alerts={invoiceNotes}

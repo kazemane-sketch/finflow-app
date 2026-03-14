@@ -2,6 +2,7 @@ import { supabase } from '@/integrations/supabase/client'
 
 export type WeakFieldState = 'assigned' | 'unassigned' | 'needs_review'
 export type LineDecisionStatus = 'pending' | 'finalized' | 'needs_review' | 'unassigned'
+// 'revisore' kept for backward compatibility with existing DB records
 export type FinalDecisionSource = 'commercialista' | 'revisore' | 'consulente' | 'user' | 'exact_match' | 'none'
 
 export interface SupportingEvidence {

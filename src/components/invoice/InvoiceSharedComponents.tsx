@@ -165,13 +165,10 @@ export function ReviewBadge({ confidence, hasNote, needsReview }: { confidence?:
 export function PipelineStepDetailPanel({ step }: { step: PipelineStepDebug }) {
   const stepLabels: Record<string, string> = {
     deterministic: '\uD83D\uDD0D Step 1: Regole + Storico',
-    understand: '\uD83E\uDDE0 Step 2: Comprensione (legacy)',
-    classify: '\uD83E\uDDE0 Step 2: Commercialista',
     commercialista: '\uD83E\uDDE0 Step 2: Commercialista',
     cdc: '\uD83C\uDFE2 Step 3: Centri di Costo',
-    reviewer: '\u2696\uFE0F Step 4: Revisore Fiscale',
-    consultant: '\uD83D\uDCAC Step 5: Consulente Inline',
-    persist: '\uD83D\uDCBE Step 6: Persistenza',
+    consulente_cfo: '\uD83D\uDCBC Step 4: Consulente CFO',
+    persist: '\uD83D\uDCBE Step 5: Salvataggio',
   };
 
   return (
