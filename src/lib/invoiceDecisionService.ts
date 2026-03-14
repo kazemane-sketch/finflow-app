@@ -204,7 +204,7 @@ export async function applyConsultantResolution(
   companyId: string,
   invoiceId: string,
   payload: ConsultantResolutionPayload,
-): Promise<string> {
+): Promise<{ resolutionId: string, resolvedUpdates: ConsultantLinePatch[] }> {
   // ─── Resolve non-UUID values in line_updates ──────
   for (const update of payload.line_updates || []) {
     // Resolve account_id: if not a valid UUID, treat as account code
@@ -253,6 +253,7 @@ export async function applyConsultantResolution(
 
   const resolutionId = await saveConsultantResolution(companyId, invoiceId, {
     ...payload,
+    line_updates: payload.line_updates, // Will be saved with the resolved UUIDs
     resolution_status: 'applied',
   })
 
@@ -295,5 +296,5 @@ export async function applyConsultantResolution(
     supporting_evidence: payload.supporting_evidence,
   })))
 
-  return resolutionId
+  return { resolutionId, resolvedUpdates: payload.line_updates || [] }
 }

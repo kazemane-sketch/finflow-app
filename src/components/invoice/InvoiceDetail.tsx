@@ -332,7 +332,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
     }
     if (action.type === 'apply_consultant_resolution' && company?.id && action.line_updates?.length) {
       try {
-        await applyConsultantResolution(company.id, invoice.id, {
+        const { resolvedUpdates } = await applyConsultantResolution(company.id, invoice.id, {
           invoice_line_ids: action.line_updates.map(update => update.line_id),
           message_excerpt: chatMessages[chatMessages.length - 1]?.content || null,
           recommended_conclusion: action.recommended_conclusion || null,
@@ -358,7 +358,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
 
         setLineClassifs(prev => {
           const updated = { ...prev };
-          for (const lineUpdate of action.line_updates || []) {
+          for (const lineUpdate of resolvedUpdates) {
             updated[lineUpdate.line_id] = {
               invoice_line_id: lineUpdate.line_id,
               category_id: lineUpdate.category_id ?? prev[lineUpdate.line_id]?.category_id ?? null,
@@ -369,7 +369,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
         });
         setLineFiscalFlags(prev => {
           const updated = { ...prev };
-          for (const lineUpdate of action.line_updates || []) {
+          for (const lineUpdate of resolvedUpdates) {
             if (lineUpdate.fiscal_flags !== undefined) updated[lineUpdate.line_id] = lineUpdate.fiscal_flags || {};
           }
           return updated;
