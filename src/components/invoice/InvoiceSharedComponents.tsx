@@ -167,7 +167,8 @@ export function PipelineStepDetailPanel({ step }: { step: PipelineStepDebug }) {
     deterministic: '\uD83D\uDD0D Step 1: Regole + Storico',
     commercialista: '\uD83E\uDDE0 Step 2: Commercialista',
     cdc: '\uD83C\uDFE2 Step 3: Centri di Costo',
-    consulente_cfo: '\uD83D\uDCBC Step 4: Consulente CFO',
+    consultant: '\uD83D\uDCAC Step 5: Consulente AI',
+    consulente_cfo: '\uD83D\uDCAC Step 5: Consulente AI',
     persist: '\uD83D\uDCBE Step 5: Salvataggio',
   };
 

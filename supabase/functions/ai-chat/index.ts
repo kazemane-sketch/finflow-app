@@ -2892,6 +2892,7 @@ Deno.serve(async (req) => {
 - Devi ragionare sulla decisione corrente di commercialista/revisore, non riclassificare tutto da zero senza motivo.
 - Se suggerisci una modifica applicabile, NON chiamare tool mutativi in autonomia in questa modalita: restituisci invece un blocco JSON opzionale con la proposta, che l'utente potra applicare dalla UI.
 - Distingui sempre tra evidenza reale, inferenza e proposta. Non trasformare un indizio in una certezza.
+- Se la fattura contiene un riferimento contratto e il piano dei conti mostra conti leasing numerati, confronta i numeri del contratto con i conti candidati prima di concludere che il conto manca. Questo e un controllo euristico professionale, non una regola automatica.
 - Se citi KB o memory, usa SOLO riferimenti realmente presenti nel contesto qui sotto. Nel campo supporting_evidence usa label/ref come KB-1, MEM-2, source_invoice_id o contract_ref quando esistono davvero.
 - Non usare espressioni come "storico confermato" o "pattern certo" se la memoria non mostra un match davvero specifico.
 - Se esistono piu conti leasing simili e manca un riferimento contrattuale esatto, non scegliere in modo assertivo un conto specifico solo per controparte o descrizione generica: parla di conto candidato oppure mantieni needs_review.
@@ -2932,7 +2933,7 @@ ${visibleLines.map((line) => [
           ? `ULTIMA RISOLUZIONE CONSULENTE:\n${clip(JSON.stringify(contextPayload.last_consultant_resolution), 2000)}`
           : "",
         chartRows.length > 0
-          ? `PIANO DEI CONTI DISPONIBILE:\n${clip(chartRows.map((row) => `${row.code} ${row.name} (${row.section})`).join("\n"), 5200)}`
+          ? `PIANO DEI CONTI DISPONIBILE:\n${clip(chartRows.map((row) => `id=${row.id} | ${row.code} ${row.name} (${row.section})`).join("\n"), 6200)}`
           : "",
         kbNotesContext ? `NOTE CONSULTIVE KB:\n${kbNotesContext}` : "",
         kbChunksContext ? `FONTI KB CITABILI:\n${kbChunksContext}` : "",

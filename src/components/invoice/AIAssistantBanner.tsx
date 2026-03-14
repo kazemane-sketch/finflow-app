@@ -117,7 +117,7 @@ function IdleState({ onStart, lineCount }: { onStart: () => void; lineCount?: nu
     <Shell
       eyebrow="Motore Fatture"
       title="Classificazione professionale con analisi fiscale"
-      subtitle={`Il commercialista classifica e analizza la fiscalità. Il consulente CFO interviene solo sui casi complessi.${lineCount ? ` Fattura con ${lineCount} righe.` : ''}`}
+      subtitle={`Il commercialista classifica e analizza la fiscalità. Il consulente AI interviene solo sui casi complessi.${lineCount ? ` Fattura con ${lineCount} righe.` : ''}`}
       accent="violet"
     >
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -142,7 +142,7 @@ function ProcessingState({ steps, elapsed }: { steps?: ProgressStep[]; elapsed?:
     <Shell
       eyebrow="In lavorazione"
       title="Sto costruendo il verdetto finale della fattura"
-      subtitle="Il commercialista classifica e analizza la fiscalità. Il consulente CFO interviene solo sui casi complessi."
+      subtitle="Il commercialista classifica e analizza la fiscalità. Il consulente AI interviene solo sui casi complessi."
       accent="violet"
     >
       <div className="rounded-2xl border border-violet-100 bg-white/80 p-4">

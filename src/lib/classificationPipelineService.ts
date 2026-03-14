@@ -5,7 +5,7 @@
  *   1. classify-v2-deterministic → exact/history evidence gate
  *   2. classify-v2-classify      → commercialista with function calling (classifica + fiscalità)
  *   3. classify-v2-cdc           → cost center assignment
- *   4. Persist results + audit trail (with conditional CFO if needs_consultant)
+ *   4. Persist results + audit trail (with conditional consultant if needs_consultant)
  */
 
 import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from '@/integrations/supabase/client'
@@ -122,6 +122,39 @@ interface CfoPayload {
   escalation_candidates: string[]
 }
 
+interface ConsultantLineUpdate {
+  line_id: string
+  category_id?: string | null
+  account_id?: string | null
+  fiscal_flags?: Record<string, unknown> | null
+  decision_status?: LineDecisionStatus
+  reasoning_summary_final?: string | null
+  final_confidence?: number | null
+  note?: string | null
+}
+
+interface ConsultantAction {
+  type: 'apply_fiscal_override' | 'apply_consultant_resolution'
+  fiscal_override?: Record<string, unknown>
+  note?: string
+  reasoning?: string
+  affected_line_ids?: string[]
+  recommended_conclusion?: string
+  rationale_summary?: string
+  risk_level?: 'low' | 'medium' | 'high'
+  supporting_evidence?: Array<{ source: string; label: string; detail?: string | null; ref?: string | null }>
+  expected_impact?: string
+  line_updates?: ConsultantLineUpdate[]
+}
+
+interface ConsultantResponse {
+  message?: string
+  action?: ConsultantAction | null
+  debug?: PipelineStepDebug
+  tool_calls?: Array<{ name: string; args: Record<string, unknown>; result_count: number }>
+  model_used?: string
+}
+
 interface FiscalAlert {
   type: string
   severity: 'warning' | 'info'
@@ -213,6 +246,75 @@ function abortError(): DOMException {
 
 function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw abortError()
+}
+
+function isUuid(value: string | null | undefined): boolean {
+  if (!value) return false
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+}
+
+async function resolveAccountReference(
+  companyId: string,
+  reference: string | null,
+): Promise<{ id: string | null; code: string | null }> {
+  if (reference == null) return { id: null, code: null }
+
+  if (isUuid(reference)) {
+    const { data } = await supabase
+      .from('chart_of_accounts')
+      .select('id, code')
+      .eq('company_id', companyId)
+      .eq('id', reference)
+      .eq('active', true)
+      .limit(1)
+      .maybeSingle()
+    return data ? { id: data.id, code: data.code } : { id: reference, code: null }
+  }
+
+  const trimmed = reference.trim()
+  if (!trimmed) return { id: null, code: null }
+
+  const { data: exact } = await supabase
+    .from('chart_of_accounts')
+    .select('id, code')
+    .eq('company_id', companyId)
+    .eq('active', true)
+    .eq('code', trimmed)
+    .limit(1)
+    .maybeSingle()
+  if (exact) return { id: exact.id, code: exact.code }
+
+  const cleanCode = trimmed.replace(/\./g, '')
+  const { data: fuzzy } = await supabase
+    .from('chart_of_accounts')
+    .select('id, code')
+    .eq('company_id', companyId)
+    .eq('active', true)
+    .ilike('code', `%${cleanCode}%`)
+    .limit(1)
+    .maybeSingle()
+  return fuzzy ? { id: fuzzy.id, code: fuzzy.code } : { id: null, code: trimmed }
+}
+
+async function resolveCategoryReference(companyId: string, reference: string | null): Promise<string | null> {
+  if (reference == null) return null
+  if (isUuid(reference)) return reference
+
+  const searchTerm = reference
+    .replace(/_/g, ' ')
+    .replace(/^cat\s*/i, '')
+    .trim()
+  if (!searchTerm) return null
+
+  const { data } = await supabase
+    .from('categories')
+    .select('id')
+    .eq('company_id', companyId)
+    .eq('active', true)
+    .ilike('name', `%${searchTerm}%`)
+    .limit(1)
+    .maybeSingle()
+  return data?.id || null
 }
 
 function createPipelineReporter(events?: PipelineEvents) {
@@ -829,7 +931,7 @@ export async function runClassificationPipeline(
     }
   }
 
-  // ─── Conditional CFO: only if commercialista flagged needs_consultant ──────
+  // ─── Conditional consultant: only if commercialista flagged needs_consultant ──────
   let alerts: FiscalAlert[] = [...doubtsAlerts]
   let fiscalIssues = 0
   const cfoPayload: CfoPayload = {
@@ -838,51 +940,99 @@ export async function runClassificationPipeline(
   }
 
   if (commercialista.needs_consultant) {
-    reporter.beginStage('Consulente CFO', 'Revisione fiscale approfondita')
+    reporter.beginStage('Consulente', 'Second opinion contestuale sulla fattura')
     try {
-      const cfoResult = await callEdge('ai-fiscal-consultant', {
+      const consultantPrompt = [
+        commercialista.consultant_reason || '',
+        commercialista.invoice_summary ? `Sintesi commercialista: ${commercialista.invoice_summary}` : '',
+        'Analizza i dubbi emersi e formula una proposta prudenziale applicabile solo se l’evidenza lo supporta.',
+      ].filter(Boolean).join('\n\n')
+
+      const consultantResult = await callEdge('ai-chat', {
+        mode: 'invoice_consultant',
         invoice_id: invoiceId,
         company_id: companyId,
         line_ids: lines.map((l) => l.line_id),
         alert_context: commercialista.consultant_reason || '',
-        consulting_mode: 'pipeline',
-        commercialista_result: {
-          invoice_summary: commercialista.invoice_summary,
-          consultant_reason: commercialista.consultant_reason,
-          lines: commercialista.line_proposals,
-        },
-        direction,
-        counterparty_vat_key: counterpartyVatKey,
-      }, signal)
+        messages: [{
+          role: 'user',
+          content: consultantPrompt || 'Approfondisci i dubbi fiscali e contabili emersi sulla fattura aperta.',
+        }],
+      }, signal) as ConsultantResponse
       throwIfAborted(signal)
 
-      if (cfoResult._debug || cfoResult.tool_calls) {
+      if (consultantResult.debug?.step === 'consultant') {
         debugSteps.push({
-          step: 'consulente_cfo',
-          model_used: cfoResult.model_used,
-          extra: { tool_calls: cfoResult.tool_calls, action: cfoResult.action },
+          ...consultantResult.debug,
+          extra: {
+            ...(consultantResult.debug.extra || {}),
+            tool_calls: consultantResult.tool_calls || [],
+            action: consultantResult.action || null,
+          },
+        })
+      } else if (consultantResult.tool_calls || consultantResult.action) {
+        debugSteps.push({
+          step: 'consultant',
+          model_used: consultantResult.model_used,
+          extra: {
+            tool_calls: consultantResult.tool_calls || [],
+            action: consultantResult.action || null,
+          },
         })
       }
 
-      // Apply CFO overrides if any
-      if (cfoResult.action?.line_overrides && Array.isArray(cfoResult.action.line_overrides)) {
-        for (const override of cfoResult.action.line_overrides) {
-          const current = lineResults.get(override.line_id)
+      if (consultantResult.action?.type === 'apply_consultant_resolution' && Array.isArray(consultantResult.action.line_updates)) {
+        for (const update of consultantResult.action.line_updates) {
+          const current = lineResults.get(update.line_id)
           if (!current) continue
-          if (override.field === 'account_id' && override.new_value) current.account_id = override.new_value
-          if (override.field === 'category_id' && override.new_value) current.category_id = override.new_value
+          if (update.account_id !== undefined) {
+            const resolvedAccount = await resolveAccountReference(companyId, update.account_id)
+            current.account_id = resolvedAccount.id
+            current.account_code = resolvedAccount.code
+          }
+          if (update.category_id !== undefined) {
+            current.category_id = await resolveCategoryReference(companyId, update.category_id)
+          }
+          if (update.fiscal_flags !== undefined) {
+            current.fiscal_flags = defaultFiscalFlags(update.fiscal_flags)
+          }
+          if (update.decision_status) current.decision_status = update.decision_status
+          if (update.reasoning_summary_final !== undefined) {
+            current.reasoning_summary_final = update.reasoning_summary_final
+          }
+          if (update.final_confidence != null) current.confidence = update.final_confidence
           current.final_decision_source = 'consulente' as FinalDecisionSource
-          current.fiscal_reasoning = override.reasoning || current.fiscal_reasoning
+          current.reasoning = update.reasoning_summary_final || consultantResult.action.rationale_summary || current.reasoning
+          current.supporting_evidence = normalizeEvidence(consultantResult.action.supporting_evidence).concat(current.supporting_evidence)
+          current.fiscal_reasoning = update.reasoning_summary_final || consultantResult.action.rationale_summary || current.fiscal_reasoning
         }
-        fiscalIssues += cfoResult.action.line_overrides.length
+        fiscalIssues += consultantResult.action.line_updates.length
+      } else if (consultantResult.action?.type === 'apply_fiscal_override' && consultantResult.action.affected_line_ids?.length) {
+        for (const lineId of consultantResult.action.affected_line_ids) {
+          const current = lineResults.get(lineId)
+          if (!current) continue
+          current.fiscal_flags = defaultFiscalFlags({
+            ...current.fiscal_flags,
+            ...(consultantResult.action.fiscal_override || {}),
+          })
+          current.final_decision_source = 'consulente' as FinalDecisionSource
+          current.fiscal_reasoning = consultantResult.action.reasoning || consultantResult.action.note || current.fiscal_reasoning
+          fiscalIssues += 1
+        }
       }
 
-      cfoPayload.invoice_summary_final = cfoResult.action?.review_summary || cfoResult.message || null
+      cfoPayload.invoice_summary_final =
+        consultantResult.action?.rationale_summary
+        || consultantResult.message
+        || null
 
-      reporter.finishStage('Consulente CFO', `CFO: ${fiscalIssues} override, risk=${cfoResult.action?.risk_level || 'N/A'}`)
+      reporter.finishStage(
+        'Consulente',
+        `Consulente: ${fiscalIssues} aggiornamenti, risk=${consultantResult.action?.risk_level || 'N/A'}`,
+      )
     } catch (error) {
-      console.warn('[pipeline] CFO step failed (non-blocking):', error)
-      reporter.finishStage('Consulente CFO', `CFO: warning non bloccante (${error instanceof Error ? error.message : 'errore sconosciuto'})`)
+      console.warn('[pipeline] consultant step failed (non-blocking):', error)
+      reporter.finishStage('Consulente', `Consulente: warning non bloccante (${error instanceof Error ? error.message : 'errore sconosciuto'})`)
     }
   }
 

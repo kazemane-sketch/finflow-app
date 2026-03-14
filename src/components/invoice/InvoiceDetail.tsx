@@ -253,7 +253,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
     else toast.success('Nota salvata');
   }, []);
 
-  // ─── Chat with AI fiscal consultant ─────────────────────────
+  // ─── Chat with unified invoice consultant ─────────────────────────
   const handleStartChat = useCallback((alert: FiscalAlert) => {
     setChatAlertContext(`${alert.title}: ${alert.description}`);
     setChatLineIds(alert.affected_lines || []);
@@ -2415,8 +2415,8 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
             { label: 'Regole e storico', status: singleInvoiceJob.stage === 'Ricerca regole e storico' ? 'running' : 'done' as const },
             { label: 'Commercialista', status: ['Ricerca regole e storico'].includes(singleInvoiceJob.stage || '') ? 'pending' : singleInvoiceJob.stage === 'Commercialista' ? 'running' : 'done' as const },
             { label: 'Centri di costo', status: ['Ricerca regole e storico', 'Commercialista'].includes(singleInvoiceJob.stage || '') ? 'pending' : singleInvoiceJob.stage === 'Attribuzione CdC' ? 'running' : 'done' as const },
-            ...(singleInvoiceJob.stage === 'Consulente CFO' ? [{ label: 'Consulente CFO', status: 'running' as const }] : []),
-            { label: 'Salvataggio', status: singleInvoiceJob.stage === 'Salvataggio risultati' ? 'running' : ['Ricerca regole e storico', 'Commercialista', 'Attribuzione CdC', 'Consulente CFO'].includes(singleInvoiceJob.stage || '') ? 'pending' : 'done' as const },
+            ...(singleInvoiceJob.stage === 'Consulente' ? [{ label: 'Consulente AI', status: 'running' as const }] : []),
+            { label: 'Salvataggio', status: singleInvoiceJob.stage === 'Salvataggio risultati' ? 'running' : ['Ricerca regole e storico', 'Commercialista', 'Attribuzione CdC', 'Consulente'].includes(singleInvoiceJob.stage || '') ? 'pending' : 'done' as const },
           ] : undefined}
           elapsedSeconds={singleInvoiceJobRunning ? Math.round((singleInvoiceJobProgress.pct || 0) / 10) : undefined}
           alerts={invoiceNotes}

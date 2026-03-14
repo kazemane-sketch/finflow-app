@@ -478,7 +478,7 @@ export default function TestLabPage() {
                 <Play className="h-3.5 w-3.5 mr-1.5" /> Commercialista
               </Button>
               <Button variant="outline" onClick={() => runAgent('consulente')}>
-                <Play className="h-3.5 w-3.5 mr-1.5" /> Consulente CFO
+                <Play className="h-3.5 w-3.5 mr-1.5" /> Consulente AI
               </Button>
               <Button onClick={() => runAgent('both')} className="bg-purple-600 hover:bg-purple-700">
                 <Play className="h-3.5 w-3.5 mr-1.5" /> Entrambi (chain)
@@ -528,7 +528,7 @@ export default function TestLabPage() {
                       : 'border-transparent text-slate-500 hover:text-slate-700'
                   }`}
                 >
-                  {key === 'commercialista' ? '📊 Commercialista' : '💼 Consulente CFO'}
+                  {key === 'commercialista' ? '📊 Commercialista' : '💼 Consulente AI'}
                 </button>
               ))}
             </div>
