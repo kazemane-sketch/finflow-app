@@ -79,6 +79,50 @@ const NAT: Record<string, string> = {
   'N6.6': 'Elettronici', 'N6.7': 'Edile', 'N6.8': 'Energia', 'N6.9': 'RC altri',
   N7: 'IVA in altro UE',
 };
+
+function buildConsultantStarterMessage(alert: FiscalAlert): string {
+  if (alert.options?.length) {
+    return `Partiamo dal punto chiave: ${alert.title}. Mi basta una conferma breve per sbloccarlo. Scegli una risposta rapida qui sotto oppure scrivimi il dettaglio mancante.`
+  }
+  return `Partiamo dal punto chiave: ${alert.title}. Dimmi solo il dettaglio utile per decidere, senza fare un riepilogo lungo.`
+}
+
+function isGenericConsultantMessage(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  return [
+    'approfondiamo',
+    'approfondisci',
+    'parliamone',
+    'parliamo',
+    'spiegami meglio',
+    'dimmi di più',
+    'dimmi di piu',
+    'aiutami',
+  ].includes(normalized)
+}
+
+function buildConsultantApiMessage(text: string, alert: FiscalAlert | null, hasPriorUserMessages: boolean): string {
+  if (!alert) return text
+
+  const trimmed = text.trim()
+  if (!hasPriorUserMessages && isGenericConsultantMessage(trimmed)) {
+    return [
+      `Vai subito al punto sul dubbio aperto: ${alert.title}.`,
+      `Contesto: ${alert.description}`,
+      'Non fare un riepilogo lungo della fattura.',
+      'Fai una sola domanda decisiva oppure proponi fino a 3 opzioni brevi e concrete.',
+    ].join(' ')
+  }
+
+  if (!hasPriorUserMessages && /^confermo:/i.test(trimmed)) {
+    return [
+      `Per il dubbio "${alert.title}" confermo questa informazione: ${trimmed.replace(/^confermo:\s*/i, '')}.`,
+      'Valuta se ora puoi formulare una proposta applicabile; se non basta, chiedi solo il prossimo dato mancante.',
+    ].join(' ')
+  }
+
+  return text
+}
 // CPC removed — now using shared TP + tpLabel from invoiceParser
 const ESI: Record<string, string> = { I: 'Immediata', D: 'Differita', S: 'Split payment' };
 const RIT: Record<string, string> = { RT01: 'Pers. fisiche', RT02: 'Pers. giuridiche', RT03: 'INPS', RT04: 'ENASARCO', RT05: 'ENPAM' };
@@ -237,6 +281,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
   const [chatLineIds, setChatLineIds] = useState<string[]>([]);
   const [chatLoading, setChatLoading] = useState(false);
   const [proposedConsultantAction, setProposedConsultantAction] = useState<ConsultantAction | null>(null);
+  const [activeConsultAlert, setActiveConsultAlert] = useState<FiscalAlert | null>(null);
   // Inline note editing in flat table
   const [editingNoteLineId, setEditingNoteLineId] = useState<string | null>(null);
   const [editingNoteText, setEditingNoteText] = useState('');
@@ -255,16 +300,25 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
 
   // ─── Chat with unified invoice consultant ─────────────────────────
   const handleStartChat = useCallback((alert: FiscalAlert) => {
+    setActiveConsultAlert(alert);
     setChatAlertContext(`${alert.title}: ${alert.description}`);
     setChatLineIds(alert.affected_lines || []);
-    setChatMessages([]);
+    setChatMessages([{
+      role: 'assistant',
+      content: buildConsultantStarterMessage(alert),
+    }]);
     setProposedConsultantAction(null);
     setAiBannerStatus('consulting');
   }, []);
 
   const handleSendChatMessage = useCallback(async (text: string) => {
-    const newMessages: ChatMessage[] = [...chatMessages, { role: 'user', content: text }];
-    setChatMessages(newMessages);
+    const visibleMessages: ChatMessage[] = [...chatMessages, { role: 'user', content: text }];
+    const hasPriorUserMessages = chatMessages.some((message) => message.role === 'user');
+    const apiMessages: ChatMessage[] = [...chatMessages, {
+      role: 'user',
+      content: buildConsultantApiMessage(text, activeConsultAlert, hasPriorUserMessages),
+    }];
+    setChatMessages(visibleMessages);
     setChatLoading(true);
     try {
       const data = await invokeAiAssistant({
@@ -272,7 +326,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
         invoice_id: invoice.id,
         line_ids: chatLineIds,
         alert_context: chatAlertContext,
-        messages: newMessages,
+        messages: apiMessages,
         company_id: company?.id,
       }, {
         requireUserAuth: false,
@@ -287,7 +341,7 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
         content: data.message || 'Nessuna risposta disponibile.',
         action: data.action || undefined,
       };
-      setChatMessages([...newMessages, assistantMessage]);
+      setChatMessages([...visibleMessages, assistantMessage]);
       if (data.debug?.step === 'consultant') {
         setPipelineDebug(prev => {
           const base = Array.isArray(prev) ? prev.filter(step => step.step !== 'consultant') : [];
@@ -302,11 +356,15 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
       }
     } catch (e: any) {
       toast.error('Errore Assistente AI: ' + (e.message || 'sconosciuto'));
-      setChatMessages([...newMessages, { role: 'assistant', content: 'Mi dispiace, si è verificato un errore. Riprova.' }]);
+      setChatMessages([...visibleMessages, { role: 'assistant', content: 'Mi dispiace, si è verificato un errore. Riprova.' }]);
     } finally {
       setChatLoading(false);
     }
-  }, [chatMessages, chatLineIds, chatAlertContext, invoice.id, company?.id]);
+  }, [chatMessages, chatLineIds, chatAlertContext, invoice.id, company?.id, activeConsultAlert]);
+
+  const handleConsultantQuickReply = useCallback((option: FiscalAlertOption) => {
+    void handleSendChatMessage(`Confermo: ${option.label}`);
+  }, [handleSendChatMessage]);
 
   const handleApplyConsultantAction = useCallback(async (action: ConsultantAction) => {
     if (action.type === 'apply_fiscal_override' && action.affected_line_ids?.length) {
@@ -2431,6 +2489,8 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
           }}
           chatMessages={chatMessages}
           onSendMessage={handleSendChatMessage}
+          quickReplyOptions={activeConsultAlert?.options}
+          onQuickReply={handleConsultantQuickReply}
           onApplyAction={handleApplyConsultantAction}
           onKeepCurrentDecision={handleKeepCurrentDecision}
           onAskFollowUp={handleAskConsultantFollowUp}

@@ -55,6 +55,8 @@ interface Props {
   onAskFollowUp?: () => void
   chatLoading?: boolean
   chatAlertTitle?: string
+  quickReplyOptions?: FiscalAlertOption[]
+  onQuickReply?: (option: FiscalAlertOption) => void
   summary?: string
   onRestart?: () => void
   proposedAction?: ConsultantAction | null
@@ -72,6 +74,8 @@ export default function AIAssistantBanner(props: Props) {
           onSend={props.onSendMessage}
           loading={props.chatLoading}
           alertTitle={props.chatAlertTitle}
+          quickReplyOptions={props.quickReplyOptions}
+          onQuickReply={props.onQuickReply}
         />
       )}
       {props.status === 'proposed' && (
@@ -233,11 +237,15 @@ function ConsultingState({
   onSend,
   loading,
   alertTitle,
+  quickReplyOptions,
+  onQuickReply,
 }: {
   messages?: ChatMessage[]
   onSend?: (text: string) => void
   loading?: boolean
   alertTitle?: string
+  quickReplyOptions?: FiscalAlertOption[]
+  onQuickReply?: (option: FiscalAlertOption) => void
 }) {
   const [input, setInput] = useState('')
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -290,6 +298,28 @@ function ConsultingState({
           </div>
         )}
       </div>
+
+      {!!quickReplyOptions?.length && !(messages || []).some((message) => message.role === 'user') && (
+        <div className="border-t border-slate-100 px-5 py-3">
+          <div className="mb-2 text-[11px] font-medium text-slate-500">Risposte rapide</div>
+          <div className="flex flex-wrap gap-2">
+            {quickReplyOptions.map((option, index) => (
+              <button
+                key={`${option.label}-${index}`}
+                onClick={() => !loading && onQuickReply?.(option)}
+                disabled={loading}
+                className={`rounded-xl border px-3 py-1.5 text-[11px] font-medium transition ${
+                  option.isConservative
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                    : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                } disabled:cursor-not-allowed disabled:opacity-50`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Input area */}
       <div className="border-t border-slate-100 px-5 py-3">

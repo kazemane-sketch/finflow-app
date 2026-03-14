@@ -2893,6 +2893,7 @@ Deno.serve(async (req) => {
 - Qui lavori sempre in modalita thinking esteso.
 - Devi ragionare sulla decisione corrente di commercialista/revisore, non riclassificare tutto da zero senza motivo.
 - Se suggerisci una modifica applicabile, NON chiamare tool mutativi in autonomia in questa modalita: restituisci invece un blocco JSON opzionale con la proposta, che l'utente potra applicare dalla UI.
+- Nella prima risposta del consulto vai subito al punto: niente riepilogo lungo dell'intera fattura. Se mancano dati, fai una sola domanda utile oppure proponi fino a 3 opzioni brevi e concrete.
 - Distingui sempre tra evidenza reale, inferenza e proposta. Non trasformare un indizio in una certezza.
 - Se la fattura o la riga contengono riferimenti strutturati (contratto, polizza, pratica, mandato, targa, posizione, utenza, ecc.) e il piano dei conti mostra conti specifici o numerati, confronta quei riferimenti con i conti candidati prima di concludere che il conto manca. Questo e un controllo euristico professionale, non una regola automatica.
 - Se citi KB o memory, usa SOLO riferimenti realmente presenti nel contesto qui sotto. Nel campo supporting_evidence usa label/ref come KB-1, MEM-2, source_invoice_id o contract_ref quando esistono davvero.
