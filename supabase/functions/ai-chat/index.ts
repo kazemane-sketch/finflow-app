@@ -4,6 +4,14 @@ import {
   getUserInstructionsBlock,
   type CompanyContext,
 } from "../_shared/accounting-system-prompt.ts";
+import {
+  formatKbAdvisoryNotesContext,
+  formatKbSourceChunksContext,
+  inferKbCounterpartyTags,
+  inferKbOperationTags,
+  loadKbAdvisoryContext,
+  shouldConsultKbAdvisory,
+} from "../_shared/kb-advisory.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -85,21 +93,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 function stringOrNull(value: unknown, max = 240): string | null {
   const raw = String(value || "").trim();
   return raw ? clip(raw, max) : null;
-}
-
-function formatConsultantKbContext(rows: Record<string, unknown>[]): string {
-  return rows
-    .map((row, index) => {
-      const parts = [
-        `KB-${index + 1}`,
-        `file=${stringOrNull(row.file_name, 120) || "Documento"}`,
-        `chunk=${row.chunk_index ?? "?"}`,
-        `sim=${stringOrNull(row.similarity, 16) || "0"}`,
-        `excerpt="${clip(String(row.content || ""), 700)}"`,
-      ];
-      return `- ${parts.join(" | ")}`;
-    })
-    .join("\n");
 }
 
 function formatConsultantMemoryContext(rows: Record<string, unknown>[]): string {
@@ -1142,6 +1135,7 @@ async function handleGetInvoiceConsultingContext(sql: SqlClient, companyId: stri
 
   const [invoice] = await sql.unsafe(
     `SELECT i.id, i.number, i.date, i.total_amount, i.direction, i.notes, i.classification_status,
+            i.primary_contract_ref, i.contract_refs,
             i.counterparty->>'denom' as counterparty_name,
             i.counterparty->>'piva' as counterparty_vat,
             i.counterparty->>'cf' as counterparty_cf,
@@ -2780,7 +2774,7 @@ Deno.serve(async (req) => {
         : contextPayload.lines;
 
       const companyRow = await sql`
-        SELECT name, vat_number, business_sector
+        SELECT name, vat_number, business_sector, ateco_code
         FROM companies
         WHERE id = ${companyId}
         LIMIT 1`;
@@ -2795,21 +2789,81 @@ Deno.serve(async (req) => {
       const accountingPrompt = getAccountingSystemPrompt(companyContext);
       const userInstructionsBlock = await getUserInstructionsBlock(sql, companyId);
       const companyStats = await handleGetCompanyStats(sql, companyId, {});
-      const chartRows = await handleGetChartOfAccounts(sql, companyId, { section: "all" }) as Record<string, unknown>[];
+      const invoiceContractRefs = [
+        stringOrNull(invoice.primary_contract_ref, 120),
+        ...toStringArray(invoice.contract_refs),
+      ].filter(Boolean);
+
+      const lineDescriptions = visibleLines.map((line) => String(line.description || ""));
+
+      const chartSearchTerms = Array.from(new Set([
+        ...invoiceContractRefs.slice(0, 2),
+        /\bleasing|locazione finanziaria\b/i.test(lineDescriptions.join(" ")) ? "Leasing" : "",
+        /\bassicur/i.test(lineDescriptions.join(" ")) ? "Assicur" : "",
+        /\bbanca|incasso|commission|interess/i.test(lineDescriptions.join(" ")) ? "bancar" : "",
+      ].filter(Boolean)));
+
+      const chartRowsMap = new Map<string, Record<string, unknown>>();
+      if (chartSearchTerms.length > 0) {
+        for (const term of chartSearchTerms) {
+          const rows = await handleGetChartOfAccounts(sql, companyId, { section: "all", search: term }) as Record<string, unknown>[];
+          for (const row of rows) {
+            chartRowsMap.set(String(row.code || ""), row);
+          }
+        }
+      }
+      if (chartRowsMap.size === 0) {
+        const fallbackRows = await handleGetChartOfAccounts(sql, companyId, { section: "all" }) as Record<string, unknown>[];
+        for (const row of fallbackRows) chartRowsMap.set(String(row.code || ""), row);
+      }
+      const chartRows = Array.from(chartRowsMap.values()).slice(0, 120);
 
       const ragQuery = clip([
         alertContext,
         String(invoice.counterparty_name || ""),
+        ...invoiceContractRefs,
         ...visibleLines.map((line) => String(line.description || "")),
       ].filter(Boolean).join(" | "), 1800);
 
-      let kbContext = "";
-      try {
-        const kbSearch = await handleSearchKnowledgeBase(sql, companyId, { query: ragQuery, limit: 5 }) as Record<string, unknown>;
-        const kbResults = Array.isArray(kbSearch.results) ? kbSearch.results as Record<string, unknown>[] : [];
-        kbContext = formatConsultantKbContext(kbResults);
-      } catch {
-        kbContext = "";
+      let kbNotesContext = "";
+      let kbChunksContext = "";
+      if (shouldConsultKbAdvisory({
+        mode: "consulente",
+        lineDescriptions,
+        fiscalNotes: visibleLines.map((line) => [
+          String(line.reasoning_summary_final || ""),
+          String((line.fiscal_flags as Record<string, unknown> | null)?.note || ""),
+        ].filter(Boolean).join(" | ")),
+        alertContext,
+      })) {
+        try {
+          const queryVecLiteral = await embedQueryText(geminiKey, ragQuery);
+          const advisoryContext = await loadKbAdvisoryContext(sql, {
+            companyId,
+            audience: "both",
+            queryVecLiteral,
+            companyAteco: String(invoice.company_ateco || companyRow[0]?.ateco_code || ""),
+            counterpartyName: String(invoice.counterparty_name || ""),
+            counterpartyTags: inferKbCounterpartyTags(
+              String(invoice.counterparty_name || ""),
+              String(invoice.counterparty_legal_type || ""),
+              String(invoice.counterparty_business_sector || ""),
+            ),
+            operationTags: inferKbOperationTags(lineDescriptions),
+            invoiceAmount: Number(invoice.total_amount || 0),
+            noteLimit: 3,
+            chunkLimit: 3,
+          });
+          if (advisoryContext.notes.length > 0) {
+            kbNotesContext = formatKbAdvisoryNotesContext(advisoryContext.notes);
+          }
+          if (advisoryContext.chunks.length > 0) {
+            kbChunksContext = formatKbSourceChunksContext(advisoryContext.chunks);
+          }
+        } catch {
+          kbNotesContext = "";
+          kbChunksContext = "";
+        }
       }
 
       let memoryContext = "";
@@ -2851,6 +2905,7 @@ Deno.serve(async (req) => {
 - Fattura: ${invoice.number || "N/A"} del ${invoice.date || "N/A"}
 - Direzione: ${invoice.direction === "in" ? "Passiva (acquisto)" : "Attiva (vendita)"}
 - Controparte: ${invoice.counterparty_name || "N/A"} (P.IVA: ${invoice.counterparty_vat || "N/A"}, CF: ${invoice.counterparty_cf || "N/A"})
+- Riferimenti contratto: ${invoiceContractRefs.length > 0 ? invoiceContractRefs.join(", ") : "N/A"}
 - Totale: ${invoice.total_amount || "N/A"}
 - Note fattura: ${invoice.notes || "N/A"}
 - Stato classificazione: ${invoice.classification_status || "N/A"}`,
@@ -2876,9 +2931,10 @@ ${visibleLines.map((line) => [
           ? `ULTIMA RISOLUZIONE CONSULENTE:\n${clip(JSON.stringify(contextPayload.last_consultant_resolution), 2000)}`
           : "",
         chartRows.length > 0
-          ? `PIANO DEI CONTI DISPONIBILE:\n${clip(chartRows.map((row) => `${row.code} ${row.name} (${row.section})`).join("\n"), 3200)}`
+          ? `PIANO DEI CONTI DISPONIBILE:\n${clip(chartRows.map((row) => `${row.code} ${row.name} (${row.section})`).join("\n"), 5200)}`
           : "",
-        kbContext ? `EVIDENZE KB CITABILI:\n${kbContext}` : "",
+        kbNotesContext ? `NOTE CONSULTIVE KB:\n${kbNotesContext}` : "",
+        kbChunksContext ? `FONTI KB CITABILI:\n${kbChunksContext}` : "",
         memoryContext ? `MEMORIA AZIENDALE (contestuale, non confermata ma con ref auditabili):\n${memoryContext}` : "",
         `STATO AZIENDALE AGGREGATO:\n${clip(JSON.stringify(companyStats), 2500)}`,
       ].filter(Boolean).join("\n\n");
@@ -2936,7 +2992,8 @@ ${visibleLines.map((line) => [
           model_used: runtime.model,
           extra: {
             line_ids: requestedLineIds,
-            kb_hits: kbContext ? kbContext.split("\n").filter(Boolean).length : 0,
+            kb_notes_used: kbNotesContext ? kbNotesContext.split("\n").filter(Boolean).length : 0,
+            kb_chunks_used: kbChunksContext ? kbChunksContext.split("\n").filter(Boolean).length : 0,
             memory_hits: memoryContext ? memoryContext.split("\n").filter(Boolean).length : 0,
             alert_context: alertContext || null,
           },

@@ -1,6 +1,6 @@
 // supabase/functions/admin-embed-kb-rule/index.ts
-// Generates Gemini embedding for a knowledge_base rule and saves it
-// Called after create/update of KB rules from the admin panel
+// Generates Gemini embedding for a knowledge_base note/rule and saves it
+// Called after create/update from the admin panel
 
 import postgres from "npm:postgres@3.4.5";
 
@@ -65,7 +65,8 @@ Deno.serve(async (req) => {
 
     // Read the rule
     const [rule] = await sql`
-      SELECT id, title, content, trigger_keywords, domain, normativa_ref
+      SELECT id, title, content, trigger_keywords, domain, normativa_ref,
+             summary_structured, applicability, source_chunk_ids, knowledge_kind
       FROM knowledge_base WHERE id = ${ruleId}
     `;
     if (!rule) {
@@ -73,11 +74,42 @@ Deno.serve(async (req) => {
       return json({ error: "Regola non trovata" }, 404);
     }
 
+    const summary = rule.summary_structured && typeof rule.summary_structured === "object"
+      ? rule.summary_structured as Record<string, unknown>
+      : {};
+    const applicability = rule.applicability && typeof rule.applicability === "object"
+      ? rule.applicability as Record<string, unknown>
+      : {};
+
     // Build text to embed
-    const parts: string[] = [rule.title, rule.content];
+    const parts: string[] = [
+      rule.title,
+      rule.content,
+      `Knowledge kind: ${rule.knowledge_kind || "advisory_note"}`,
+    ];
     if (rule.domain) parts.push(`Dominio: ${rule.domain}`);
+    if (summary.question) parts.push(`Question: ${summary.question}`);
+    if (summary.short_answer) parts.push(`Answer: ${summary.short_answer}`);
+    if (Array.isArray(summary.applies_when) && summary.applies_when.length > 0) {
+      parts.push(`Applies when: ${summary.applies_when.join(", ")}`);
+    }
+    if (Array.isArray(summary.not_when) && summary.not_when.length > 0) {
+      parts.push(`Not when: ${summary.not_when.join(", ")}`);
+    }
+    if (Array.isArray(summary.missing_info) && summary.missing_info.length > 0) {
+      parts.push(`Missing info: ${summary.missing_info.join(", ")}`);
+    }
     if (rule.normativa_ref?.length) {
       parts.push(`Riferimenti: ${rule.normativa_ref.join(", ")}`);
+    }
+    if (Array.isArray(summary.source_refs) && summary.source_refs.length > 0) {
+      parts.push(`Source refs: ${summary.source_refs.join(", ")}`);
+    }
+    if (applicability && Object.keys(applicability).length > 0) {
+      parts.push(`Applicability: ${JSON.stringify(applicability)}`);
+    }
+    if (rule.source_chunk_ids?.length) {
+      parts.push(`Source chunks: ${rule.source_chunk_ids.join(", ")}`);
     }
     if (rule.trigger_keywords?.length) {
       parts.push(`Keywords: ${rule.trigger_keywords.join(", ")}`);

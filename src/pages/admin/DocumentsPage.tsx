@@ -27,10 +27,14 @@ interface KBChunk {
 }
 
 interface CandidateRule {
+  knowledge_kind?: 'advisory_note' | 'numeric_fact' | 'legacy_rule'
   domain: string; audience: string; title: string; content: string;
   normativa_ref: string[]; fiscal_values: Record<string, unknown>;
-  trigger_keywords: string[]; trigger_ateco_prefixes: string[];
-  trigger_vat_natures: string[]; trigger_doc_types: string[];
+  summary_structured?: Record<string, unknown>;
+  applicability?: Record<string, unknown>;
+  source_chunk_ids?: string[];
+  trigger_keywords?: string[]; trigger_ateco_prefixes?: string[];
+  trigger_vat_natures?: string[]; trigger_doc_types?: string[];
   priority: number;
   _selected?: boolean; // frontend-only
 }
@@ -251,9 +255,9 @@ export default function DocumentsPage() {
       setCandidates(cands)
       setShowExtractDialog(true)
       if (cands.length === 0) {
-        toast.info('Nessuna regola fiscale trovata in questo documento')
+        toast.info('Nessuna nota consultiva trovata in questo documento')
       } else {
-        toast.success(`${cands.length} regole candidate estratte`)
+        toast.success(`${cands.length} note candidate estratte`)
       }
     } catch (e: any) {
       toast.error(`Estrazione fallita: ${e.message}`)
@@ -261,26 +265,30 @@ export default function DocumentsPage() {
     setExtracting(false)
   }
 
-  // Save approved candidate rules to knowledge_base
+  // Save approved candidate notes to knowledge_base
   const handleSaveExtractedRules = async () => {
     const selected = candidates.filter(c => c._selected)
     if (selected.length === 0) {
-      toast.warning('Seleziona almeno una regola')
+      toast.warning('Seleziona almeno una nota')
       return
     }
     setSavingRules(true)
     try {
       const rows = selected.map(c => ({
+        knowledge_kind: c.knowledge_kind || 'advisory_note',
         domain: c.domain,
         audience: c.audience,
         title: c.title,
         content: c.content,
         normativa_ref: c.normativa_ref,
         fiscal_values: c.fiscal_values,
-        trigger_keywords: c.trigger_keywords,
-        trigger_ateco_prefixes: c.trigger_ateco_prefixes,
-        trigger_vat_natures: c.trigger_vat_natures,
-        trigger_doc_types: c.trigger_doc_types,
+        summary_structured: c.summary_structured || {},
+        applicability: c.applicability || {},
+        source_chunk_ids: c.source_chunk_ids || [],
+        trigger_keywords: c.trigger_keywords || [],
+        trigger_ateco_prefixes: c.trigger_ateco_prefixes || [],
+        trigger_vat_natures: c.trigger_vat_natures || [],
+        trigger_doc_types: c.trigger_doc_types || [],
         priority: c.priority,
         status: 'approved',
         active: true,
@@ -289,10 +297,26 @@ export default function DocumentsPage() {
         source_document_id: extractDocId,
       }))
 
-      const { error } = await supabase.from('knowledge_base').insert(rows as any)
+      const { data, error } = await supabase.from('knowledge_base').insert(rows as any).select('id')
       if (error) throw error
 
-      toast.success(`${selected.length} regole salvate nella Knowledge Base`)
+      for (const row of (data as Array<{ id: string }> | null) || []) {
+        try {
+          const { data: { session } } = await supabase.auth.getSession()
+          await fetch(`${SUPABASE_URL}/functions/v1/admin-embed-kb-rule`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${session?.access_token}`,
+            },
+            body: JSON.stringify({ rule_id: row.id }),
+          })
+        } catch {
+          // best effort
+        }
+      }
+
+      toast.success(`${selected.length} note salvate nella Knowledge Base`)
       setShowExtractDialog(false)
       setCandidates([])
     } catch (e: any) {
@@ -455,7 +479,7 @@ export default function DocumentsPage() {
                         {(extracting && extractDocId === doc.id)
                           ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
                           : <Sparkles className="h-3.5 w-3.5 mr-1" />}
-                        Estrai regole AI
+                        Estrai note AI
                       </Button>
                       <Button size="sm" variant="outline" onClick={() => markSuperseded(doc.id)}>
                         Segna come superato
@@ -469,14 +493,14 @@ export default function DocumentsPage() {
         </div>
       )}
 
-      {/* Extract Rules Dialog */}
+      {/* Extract Notes Dialog */}
       {showExtractDialog && candidates.length > 0 && (
         <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 overflow-y-auto py-8">
           <div className="bg-white rounded-xl shadow-2xl p-6 max-w-2xl w-full mx-4 space-y-4">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
                 <Sparkles className="h-5 w-5 text-amber-500" />
-                Regole estratte ({candidates.filter(c => c._selected).length}/{candidates.length} selezionate)
+                Note estratte ({candidates.filter(c => c._selected).length}/{candidates.length} selezionate)
               </h2>
               <button onClick={() => { setShowExtractDialog(false); setCandidates([]) }} className="text-slate-400 hover:text-slate-600">
                 <X className="h-5 w-5" />
@@ -504,6 +528,7 @@ export default function DocumentsPage() {
                             {c.domain.toUpperCase()}
                           </span>
                           <span className="text-[9px] text-slate-400">{c.audience}</span>
+                          <span className="text-[9px] text-slate-400">{c.knowledge_kind || 'advisory_note'}</span>
                           <span className="text-[9px] text-slate-400">P{c.priority}</span>
                         </div>
                         <p className="text-sm font-medium text-slate-800 mt-1">{c.title}</p>
@@ -516,12 +541,22 @@ export default function DocumentsPage() {
                             Valori: {Object.entries(c.fiscal_values).map(([k, v]) => `${k}=${v}`).join(', ')}
                           </p>
                         )}
-                        {c.trigger_keywords.length > 0 && (
+                        {c.summary_structured && (
+                          <p className="text-[10px] text-slate-500 mt-1">
+                            {String(c.summary_structured.short_answer || '').slice(0, 180)}
+                          </p>
+                        )}
+                        {(c.source_chunk_ids || []).length > 0 && (
+                          <p className="text-[10px] text-emerald-600 mt-0.5">
+                            Chunk supporto: {(c.source_chunk_ids || []).length}
+                          </p>
+                        )}
+                        {(c.trigger_keywords || []).length > 0 && (
                           <div className="flex flex-wrap gap-1 mt-1">
-                            {c.trigger_keywords.slice(0, 6).map((kw, ki) => (
+                            {(c.trigger_keywords || []).slice(0, 6).map((kw, ki) => (
                               <span key={ki} className="text-[9px] bg-slate-200 text-slate-600 px-1 py-0.5 rounded">{kw}</span>
                             ))}
-                            {c.trigger_keywords.length > 6 && <span className="text-[9px] text-slate-400">+{c.trigger_keywords.length - 6}</span>}
+                            {(c.trigger_keywords || []).length > 6 && <span className="text-[9px] text-slate-400">+{(c.trigger_keywords || []).length - 6}</span>}
                           </div>
                         )}
                       </div>
@@ -544,7 +579,7 @@ export default function DocumentsPage() {
                 <Button variant="outline" onClick={() => { setShowExtractDialog(false); setCandidates([]) }}>Annulla</Button>
                 <Button onClick={handleSaveExtractedRules} disabled={savingRules || candidates.filter(c => c._selected).length === 0}>
                   {savingRules ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Check className="h-4 w-4 mr-1" />}
-                  Salva {candidates.filter(c => c._selected).length} regole
+                  Salva {candidates.filter(c => c._selected).length} note
                 </Button>
               </div>
             </div>

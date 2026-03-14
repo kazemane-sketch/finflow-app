@@ -132,8 +132,8 @@ export interface PipelineStepDebug {
   model_used?: string
   agent_config_loaded?: boolean
   agent_rules_count?: number
-  kb_rules_count?: number
-  kb_rules_titles?: string[]
+  kb_notes_used?: number
+  kb_note_titles?: string[]
   company_ateco?: string
   accounts_shown?: number
   accounts_by_section?: Record<string, number>
@@ -580,8 +580,8 @@ export async function runClassificationPipeline(
       model_used: step2._debug.model_used,
       agent_config_loaded: step2._debug.agent_config_loaded,
       agent_rules_count: step2._debug.agent_rules_count,
-      kb_rules_count: step2._debug.kb_rules_count,
-      kb_rules_titles: step2._debug.kb_rules_titles,
+      kb_notes_used: step2._debug.kb_notes_used,
+      kb_note_titles: step2._debug.kb_note_titles,
       company_ateco: step2._debug.company_ateco,
       accounts_shown: step2.accounts_shown,
       accounts_by_section: step2._debug.accounts_by_section,
@@ -736,7 +736,8 @@ export async function runClassificationPipeline(
           model_used: step4._debug.model_used,
           agent_config_loaded: step4._debug.agent_config_loaded,
           agent_rules_count: step4._debug.agent_rules_count,
-          kb_rules_count: step4._debug.kb_rules_count,
+          kb_notes_used: step4._debug.kb_notes_used,
+          kb_note_titles: step4._debug.kb_note_titles,
           company_ateco: step4._debug.company_ateco,
           extra: {
             counterparty_ateco: step4._debug.counterparty_ateco,

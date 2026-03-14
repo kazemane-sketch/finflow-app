@@ -8,6 +8,14 @@
 //     Pre-applies fiscal_decisions (user choices on past alerts) from Fase 3.
 
 import postgres from "npm:postgres@3.4.5";
+import {
+  formatKbAdvisoryNotesContext,
+  formatKbSourceChunksContext,
+  inferKbCounterpartyTags,
+  inferKbOperationTags,
+  loadKbAdvisoryContext,
+  shouldConsultKbAdvisory,
+} from "../_shared/kb-advisory.ts";
 import { callLLM } from "../_shared/llm-caller.ts";
 
 const corsHeaders = {
@@ -207,51 +215,6 @@ interface AgentRule {
   sort_order: number;
 }
 
-interface KBRule {
-  id: string;
-  domain: string;
-  audience: string;
-  title: string;
-  content: string;
-  summary_structured?: Record<string, unknown> | null;
-  applicability?: Record<string, unknown> | null;
-  normativa_ref: string[];
-  fiscal_values: Record<string, unknown>;
-  trigger_keywords: string[];
-  trigger_ateco_prefixes: string[];
-  trigger_vat_natures: string[];
-  trigger_doc_types: string[];
-  ateco_scope: string[] | null;
-  priority: number;
-}
-
-/* ─── KB trigger matching ────────────────── */
-
-function matchesTriggers(
-  rule: KBRule,
-  companyAteco: string,
-  lineDescriptions: string[],
-): boolean {
-  const hasAnyTrigger =
-    (rule.trigger_keywords?.length > 0) ||
-    (rule.trigger_vat_natures?.length > 0) ||
-    (rule.trigger_doc_types?.length > 0) ||
-    (rule.trigger_ateco_prefixes?.length > 0);
-
-  if (!hasAnyTrigger) return true;
-
-  if (rule.trigger_ateco_prefixes?.length > 0) {
-    if (rule.trigger_ateco_prefixes.some((p) => companyAteco.startsWith(p))) return true;
-  }
-
-  if (rule.trigger_keywords?.length > 0) {
-    const allText = lineDescriptions.join(" ").toLowerCase();
-    if (rule.trigger_keywords.some((kw) => allText.includes(kw.toLowerCase()))) return true;
-  }
-
-  return false;
-}
-
 /* ─── Format helpers ─────────────────────── */
 
 function formatAgentRules(rules: AgentRule[]): string {
@@ -260,32 +223,6 @@ function formatAgentRules(rules: AgentRule[]): string {
   rules.forEach((r, i) => {
     lines.push(`${i + 1}. [${r.title}] — ${r.rule_text}`);
   });
-  return lines.join("\n");
-}
-
-function formatKBRules(kbRules: KBRule[]): string {
-  if (kbRules.length === 0) return "";
-  const domainLabels: Record<string, string> = {
-    iva: "IVA", ires_irap: "IRES/IRAP", ritenute: "Ritenute",
-    classificazione: "Classificazione", settoriale: "Settoriale",
-    operativo: "Operativo", aggiornamenti: "Aggiornamenti",
-  };
-  const lines: string[] = ["=== NORMATIVA E KNOWLEDGE BASE ==="];
-  for (const r of kbRules) {
-    const ref = r.normativa_ref?.length ? ` (Rif: ${r.normativa_ref.join(", ")})` : "";
-    const summary = r.summary_structured && Object.keys(r.summary_structured).length > 0
-      ? JSON.stringify(r.summary_structured)
-      : r.content;
-    const applicability = r.applicability && Object.keys(r.applicability).length > 0
-      ? ` | Applicabilita: ${JSON.stringify(r.applicability)}`
-      : "";
-    let entry = `[${domainLabels[r.domain] || r.domain}] ${r.title}: ${summary}${ref}${applicability}`;
-    // Include fiscal_values if available (important for the reviewer)
-    if (r.fiscal_values && Object.keys(r.fiscal_values).length > 0) {
-      entry += ` | Valori: ${JSON.stringify(r.fiscal_values)}`;
-    }
-    lines.push(entry);
-  }
   return lines.join("\n");
 }
 
@@ -460,13 +397,13 @@ Deno.serve(async (req) => {
 
     const companyName = companyRows[0]?.name || "";
     const companyAteco = companyRows[0]?.ateco_code || "";
-    const atecoPrefix = companyAteco.slice(0, 2);
     const agentConfig = agentConfigs[0] || null;
 
     // Counterparty info
     let counterpartyInfo = counterpartyName;
     let counterpartyLegalType = "";
     let counterpartyAteco = "";
+    let counterpartyBusinessSector = "";
     const cpRow = counterpartyRows[0];
     if (cpRow) {
       counterpartyLegalType = cpRow.legal_type || "";
@@ -474,73 +411,62 @@ Deno.serve(async (req) => {
       const parts = [`P.IVA: ${counterpartyVatKey}`];
       if (cpRow.ateco_code) parts.push(`ATECO: ${cpRow.ateco_code} ${cpRow.ateco_description || ""}`);
       if (cpRow.legal_type) parts.push(`Tipo: ${cpRow.legal_type}`);
-      if (cpRow.business_sector) parts.push(`Settore: ${cpRow.business_sector}`);
+      if (cpRow.business_sector) {
+        parts.push(`Settore: ${cpRow.business_sector}`);
+        counterpartyBusinessSector = cpRow.business_sector;
+      }
       counterpartyInfo += ` — ${parts.join(" — ")}`;
     }
+    console.log(`[fiscal-reviewer] Admin Panel: config=${agentConfig ? "✓" : "✗"} rules=${agentRules.length}`);
 
-    // ─── Load knowledge_base (NEW: replaces old fiscal_knowledge RAG) ──
-    const allKBRules = await sql<KBRule[]>`
-      SELECT id, domain, audience, title, content, summary_structured, applicability, normativa_ref,
-             fiscal_values, trigger_keywords, trigger_ateco_prefixes,
-             trigger_vat_natures, trigger_doc_types, ateco_scope, priority
-      FROM knowledge_base
-      WHERE active = true AND status = 'approved'
-        AND effective_from <= CURRENT_DATE AND effective_to >= CURRENT_DATE
-        AND (ateco_scope IS NULL OR ${atecoPrefix} = ANY(ateco_scope))
-      ORDER BY priority DESC
-      LIMIT 50`;
-
-    // Filter KB by audience (revisore + both) + triggers
-    const kbFiltered = allKBRules.filter((r) =>
-      ["revisore", "both"].includes(r.audience)
-    );
-    const kbMatched = kbFiltered.filter((r) =>
-      matchesTriggers(r, companyAteco, lineDescriptions)
-    );
-    const kbUsed = kbMatched.slice(0, 30);
-
-    console.log(`[fiscal-reviewer] Admin Panel: config=${agentConfig ? "✓" : "✗"} rules=${agentRules.length} kb=${kbUsed.length}/${allKBRules.length}`);
-
-    // ─── RAG: Document chunks from kb_chunks ────────────────
-    let documentChunksSection = "";
-    let documentChunksDebug: { title: string; similarity: number }[] = [];
-    try {
-      const ragQueryText = lines.map((l) => l.description).join(" | ") + ` | ${counterpartyName}`;
-      const ragVec = await callGeminiEmbedding(geminiKey, ragQueryText);
-      const ragVecLiteral = toVectorLiteral(ragVec);
-
-      const docChunks = await sql.unsafe(
-        `SELECT kc.content, kc.section_title, kc.article_reference,
-                kd.title AS doc_title,
-                (1 - (kc.embedding <=> $1::halfvec(3072)))::float AS similarity
-         FROM kb_chunks kc
-         JOIN kb_documents kd ON kc.document_id = kd.id
-         WHERE (kc.company_id IS NULL OR kc.company_id = $2)
-           AND kd.status = 'ready'
-         ORDER BY kc.embedding <=> $1::halfvec(3072)
-         LIMIT 8`,
-        [ragVecLiteral, companyId],
-      );
-
-      const relevantChunks = (docChunks as any[]).filter((c) => c.similarity >= 0.40);
-      if (relevantChunks.length > 0) {
-        const chunkLines = relevantChunks.slice(0, 5).map((c, i) => {
-          const header = c.section_title || c.doc_title || "Documento";
-          const ref = c.article_reference ? ` (Art. ${c.article_reference})` : "";
-          const content = (c.content || "").slice(0, 1500);
-          return `${i + 1}. [${header}${ref}] (sim=${c.similarity.toFixed(2)})\n${content}`;
+    let kbNotesSection = "";
+    let kbChunksSection = "";
+    let kbNoteTitles: string[] = [];
+    let kbChunkDebug: { title: string; similarity: number }[] = [];
+    let queryVecLiteral = "";
+    if (shouldConsultKbAdvisory({
+      mode: "revisore",
+      lineDescriptions,
+      exactMatchCount: lines.filter((line) => /rule|history|exact/i.test(String(line.source || ""))).length,
+      totalLines: lines.length,
+      confidences: lines.map((line) => Number(line.confidence || 0)),
+      fiscalNotes: lines.map((line) => String(line.fiscal_flags?.note || "")),
+    })) {
+      try {
+        const ragQueryText = lines.map((line) => line.description).join(" | ") + ` | ${counterpartyName}`;
+        const ragVec = await callGeminiEmbedding(geminiKey, ragQueryText);
+        queryVecLiteral = toVectorLiteral(ragVec);
+        const advisoryContext = await loadKbAdvisoryContext(sql, {
+          companyId,
+          audience: "revisore",
+          queryVecLiteral,
+          companyAteco,
+          counterpartyName,
+          counterpartyTags: inferKbCounterpartyTags(
+            counterpartyName,
+            counterpartyLegalType,
+            counterpartyBusinessSector,
+          ),
+          operationTags: inferKbOperationTags(lineDescriptions),
+          invoiceAmount: lines.reduce((sum, line) => sum + Number(line.total_price || 0), 0),
+          noteLimit: 2,
+          chunkLimit: 2,
         });
-        documentChunksSection = `\n=== CONTESTO NORMATIVO (da documenti caricati) ===\n${chunkLines.join("\n\n")}\n===\n`;
-        documentChunksDebug = relevantChunks.slice(0, 5).map((c) => ({
-          title: c.section_title || c.doc_title || "N/D",
-          similarity: c.similarity,
-        }));
-        console.log(`[fiscal-reviewer] RAG: ${relevantChunks.length} relevant chunks (top sim=${relevantChunks[0].similarity.toFixed(3)})`);
-      } else {
-        console.log(`[fiscal-reviewer] RAG: no relevant chunks (best sim=${(docChunks as any[])[0]?.similarity?.toFixed(3) || "N/A"})`);
+        if (advisoryContext.notes.length > 0) {
+          kbNotesSection = `=== NOTE CONSULTIVE KB ===\n${formatKbAdvisoryNotesContext(advisoryContext.notes)}`;
+          kbNoteTitles = advisoryContext.notes.map((note) => note.title);
+        }
+        if (advisoryContext.chunks.length > 0) {
+          kbChunksSection = `=== FONTI KB CITABILI ===\n${formatKbSourceChunksContext(advisoryContext.chunks)}`;
+          kbChunkDebug = advisoryContext.chunks.map((chunk) => ({
+            title: chunk.section_title || chunk.doc_title || "Documento",
+            similarity: chunk.similarity,
+          }));
+        }
+        console.log(`[fiscal-reviewer] KB advisory notes=${advisoryContext.notes.length} chunks=${advisoryContext.chunks.length}`);
+      } catch (e) {
+        console.warn("[fiscal-reviewer] KB advisory retrieval failed:", e);
       }
-    } catch (e) {
-      console.warn("[fiscal-reviewer] RAG kb_chunks failed:", e);
     }
 
     // ─── Pre-resolve fiscal decisions (Fase 3 — preserved) ──────────
@@ -715,16 +641,13 @@ Verificale solo se noti un'incongruenza EVIDENTE. Non generare alert su queste.
       promptParts.push("");
     }
 
-    // 3. Knowledge base rules (with fiscal_values for the reviewer)
-    const kbBlock = formatKBRules(kbUsed);
-    if (kbBlock) {
-      promptParts.push(kbBlock);
+    // 3. KB consultiva mirata
+    if (kbNotesSection) {
+      promptParts.push(kbNotesSection);
       promptParts.push("");
     }
-
-    // 3b. Document chunks (RAG)
-    if (documentChunksSection) {
-      promptParts.push(documentChunksSection);
+    if (kbChunksSection) {
+      promptParts.push(kbChunksSection);
       promptParts.push("");
     }
 
@@ -1006,7 +929,7 @@ Se non servono alert: "alerts": []`);
       pre_resolved_count: preResolvedFiscal.size,
       prompt_length: prompt.length,
       model_used: model,
-      kb_rules_used: kbUsed.length,
+      kb_notes_used: kbNoteTitles.length,
       agent_rules_used: agentRules.length,
       _debug: {
         prompt_sent: prompt,
@@ -1014,8 +937,8 @@ Se non servono alert: "alerts": []`);
         model_used: model,
         agent_config_loaded: !!agentConfig,
         agent_rules_count: agentRules.length,
-        kb_rules_count: kbUsed.length,
-        kb_source_table: "knowledge_base",
+        kb_notes_used: kbNoteTitles.length,
+        kb_note_titles: kbNoteTitles,
         company_ateco: companyAteco,
         company_sector: companyName,
         counterparty_ateco: counterpartyAteco,
@@ -1026,8 +949,8 @@ Se non servono alert: "alerts": []`);
         })),
         stale_source_decisions_ignored: staleSourceDecisionsIgnored,
         rule_confirmed_lines: [...ruleConfirmedLineIds],
-        document_chunks_found: documentChunksDebug.length,
-        document_chunks: documentChunksDebug,
+        kb_chunks_used: kbChunkDebug.length,
+        kb_chunks: kbChunkDebug,
         invoice_notes: invoiceNotes ? invoiceNotes.slice(0, 200) : null,
         invoice_causale: invoiceCausale ? invoiceCausale.slice(0, 200) : null,
       },

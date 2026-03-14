@@ -165,7 +165,7 @@ export function PipelineStepDetailPanel({ step }: { step: PipelineStepDebug }) {
       <summary className="px-3 py-2 bg-slate-50 cursor-pointer text-xs font-semibold text-slate-600 hover:bg-slate-100 flex flex-wrap items-center gap-x-2 gap-y-1">
         <span>{stepLabels[step.step] || step.step}</span>
         {step.model_used && <span className="text-[10px] font-normal text-slate-400">({step.model_used})</span>}
-        {step.kb_rules_count !== undefined && <span className="text-[10px] font-normal text-slate-400">KB: {step.kb_rules_count} regole</span>}
+        {step.kb_notes_used !== undefined && <span className="text-[10px] font-normal text-slate-400">KB: {step.kb_notes_used} note</span>}
         {step.agent_rules_count !== undefined && <span className="text-[10px] font-normal text-slate-400">Rules: {step.agent_rules_count}</span>}
         {step.accounts_shown !== undefined && <span className="text-[10px] font-normal text-slate-400">Conti: {step.accounts_shown}</span>}
         {step.company_ateco && <span className="text-[10px] font-normal text-emerald-600">ATECO: {step.company_ateco}</span>}
@@ -183,18 +183,18 @@ export function PipelineStepDetailPanel({ step }: { step: PipelineStepDebug }) {
               {step.agent_rules_count} Agent Rules
             </span>
           )}
-          {step.kb_rules_count !== undefined && (
+          {step.kb_notes_used !== undefined && (
             <span className="px-2 py-0.5 rounded bg-purple-100 text-purple-700 text-[10px] font-semibold">
-              {step.kb_rules_count} KB Rules
+              {step.kb_notes_used} KB Notes
             </span>
           )}
         </div>
 
-        {step.kb_rules_titles && step.kb_rules_titles.length > 0 && (
+        {step.kb_note_titles && step.kb_note_titles.length > 0 && (
           <div>
-            <div className="font-semibold text-slate-500 mb-1">Regole KB caricate:</div>
+            <div className="font-semibold text-slate-500 mb-1">Note KB consultate:</div>
             <div className="flex flex-wrap gap-1">
-              {step.kb_rules_titles.map((t, i) => (
+              {step.kb_note_titles.map((t, i) => (
                 <span key={i} className="px-1.5 py-0.5 rounded bg-purple-50 text-purple-600 text-[10px]">{t}</span>
               ))}
             </div>

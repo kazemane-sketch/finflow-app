@@ -30,7 +30,11 @@ const STATUS_COLORS: Record<string, string> = {
 }
 
 interface KBRule {
+  knowledge_kind?: 'advisory_note' | 'numeric_fact' | 'legacy_rule'
   id: string; domain: string; audience: string; title: string; content: string;
+  summary_structured?: Record<string, any>;
+  applicability?: Record<string, any>;
+  source_chunk_ids?: string[];
   normativa_ref: string[]; fiscal_values: Record<string, any>;
   trigger_keywords: string[]; trigger_ateco_prefixes: string[];
   trigger_counterparty_types: string[]; trigger_vat_natures: string[];
@@ -40,7 +44,9 @@ interface KBRule {
 }
 
 const emptyRule: Omit<KBRule, 'id' | 'updated_at'> = {
+  knowledge_kind: 'advisory_note',
   domain: 'classificazione', audience: 'both', title: '', content: '',
+  summary_structured: {}, applicability: {}, source_chunk_ids: [],
   normativa_ref: [], fiscal_values: {}, trigger_keywords: [],
   trigger_ateco_prefixes: [], trigger_counterparty_types: [],
   trigger_vat_natures: [], trigger_doc_types: [],
@@ -138,7 +144,11 @@ export default function KnowledgeBasePage() {
     setSaving(true)
     const payload = {
       domain: editRule.domain, audience: editRule.audience,
+      knowledge_kind: editRule.knowledge_kind || 'advisory_note',
       title: editRule.title!.trim(), content: editRule.content!.trim(),
+      summary_structured: editRule.summary_structured || {},
+      applicability: editRule.applicability || {},
+      source_chunk_ids: editRule.source_chunk_ids || [],
       normativa_ref: editRule.normativa_ref || [],
       fiscal_values: editRule.fiscal_values || {},
       trigger_keywords: editRule.trigger_keywords || [],
@@ -160,12 +170,12 @@ export default function KnowledgeBasePage() {
         const { error } = await supabase.from('knowledge_base').update(payload as any).eq('id', editRule.id)
         if (error) throw error
         savedId = editRule.id
-        toast.success('Regola aggiornata')
+        toast.success('Nota KB aggiornata')
       } else {
         const { data, error } = await supabase.from('knowledge_base').insert(payload as any).select('id').single()
         if (error) throw error
         savedId = (data as any)?.id
-        toast.success('Regola creata')
+        toast.success('Nota KB creata')
       }
       // Trigger embedding generation (fire-and-forget)
       if (savedId) triggerEmbedding(savedId)
@@ -183,9 +193,9 @@ export default function KnowledgeBasePage() {
   }
 
   const handleDelete = async (id: string) => {
-    if (!confirm('Eliminare questa regola?')) return
+    if (!confirm('Eliminare questa nota KB?')) return
     await supabase.from('knowledge_base').delete().eq('id', id)
-    toast.success('Regola eliminata')
+    toast.success('Nota KB eliminata')
     loadRules()
   }
 
@@ -196,10 +206,10 @@ export default function KnowledgeBasePage() {
           <h1 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
             <BookOpen className="h-6 w-6 text-blue-600" /> Knowledge Base
           </h1>
-          <p className="text-sm text-slate-500 mt-1">Regole strutturate per gli agent AI</p>
+          <p className="text-sm text-slate-500 mt-1">Note consultive strutturate per gli agenti AI</p>
         </div>
         <Button onClick={() => setEditRule({ ...emptyRule })}>
-          <Plus className="h-4 w-4 mr-1.5" /> Nuova regola
+          <Plus className="h-4 w-4 mr-1.5" /> Nuova nota
         </Button>
       </div>
 
@@ -227,7 +237,7 @@ export default function KnowledgeBasePage() {
       {loading ? (
         <div className="flex justify-center py-12"><Loader2 className="h-6 w-6 animate-spin text-slate-400" /></div>
       ) : filtered.length === 0 ? (
-        <p className="text-center text-sm text-slate-400 py-12">Nessuna regola trovata</p>
+        <p className="text-center text-sm text-slate-400 py-12">Nessuna nota trovata</p>
       ) : (
         <div className="border rounded-lg overflow-hidden">
           <table className="w-full text-sm">
@@ -283,7 +293,7 @@ export default function KnowledgeBasePage() {
         <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 overflow-y-auto py-8">
           <div className="bg-white rounded-xl shadow-2xl p-6 max-w-2xl w-full mx-4 space-y-4">
             <div className="flex items-center justify-between">
-              <h2 className="text-lg font-bold text-slate-900">{editRule.id ? 'Modifica regola' : 'Nuova regola'}</h2>
+              <h2 className="text-lg font-bold text-slate-900">{editRule.id ? 'Modifica nota KB' : 'Nuova nota KB'}</h2>
               <button onClick={() => setEditRule(null)} className="text-slate-400 hover:text-slate-600"><X className="h-5 w-5" /></button>
             </div>
 
@@ -314,13 +324,13 @@ export default function KnowledgeBasePage() {
             <div>
               <Label className="text-xs">Titolo *</Label>
               <Input value={editRule.title || ''} onChange={e => setEditRule(r => r ? { ...r, title: e.target.value } : r)}
-                className="mt-1" placeholder="Titolo della regola" />
+                className="mt-1" placeholder="Titolo della nota" />
             </div>
 
             <div>
               <Label className="text-xs">Contenuto *</Label>
               <textarea value={editRule.content || ''} onChange={e => setEditRule(r => r ? { ...r, content: e.target.value } : r)}
-                className="mt-1 w-full border rounded-md px-3 py-2 text-sm min-h-[120px] resize-y" placeholder="Testo della regola..." />
+                className="mt-1 w-full border rounded-md px-3 py-2 text-sm min-h-[120px] resize-y" placeholder="Testo della nota consultiva..." />
             </div>
 
             <div>

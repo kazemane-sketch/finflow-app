@@ -1,6 +1,6 @@
 // src/pages/admin/KBDocumentsPage.tsx
 // Platform-level normative document management with rich taxonomy
-// Supports CRUD, taxonomy filters, detail view with chunks, relations, and rule generation
+// Supports CRUD, taxonomy filters, detail view with chunks, relations, and note generation
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Button } from '@/components/ui/button'
@@ -438,7 +438,7 @@ export default function KBDocumentsPage() {
     }
     setRelations(relsParsed)
 
-    // Load generated rules
+    // Load generated notes
     const { data: rules } = await supabase
       .from('knowledge_base')
       .select('id, title, domain')
@@ -1095,8 +1095,8 @@ export default function KBDocumentsPage() {
               </Button>
             )}
             <Button variant="outline" size="sm"
-              onClick={() => toast.info('Estrazione regole non ancora implementata. Sarà nella prossima fase.')}>
-              <BookOpen className="h-3.5 w-3.5 mr-1" />Estrai regole
+              onClick={() => toast.info('Estrazione note non ancora implementata. Sara nella prossima fase.')}>
+              <BookOpen className="h-3.5 w-3.5 mr-1" />Estrai note
             </Button>
           </div>
         </div>
@@ -1255,13 +1255,13 @@ export default function KBDocumentsPage() {
               )}
             </div>
 
-            {/* Generated rules */}
+            {/* Generated notes */}
             <div className="bg-white border rounded-lg p-4 space-y-3">
               <p className="text-sm font-semibold text-gray-700 flex items-center gap-1.5">
-                <Sparkles className="h-4 w-4 text-amber-500" /> Regole generate ({generatedRules.length})
+                <Sparkles className="h-4 w-4 text-amber-500" /> Note generate ({generatedRules.length})
               </p>
               {generatedRules.length === 0 ? (
-                <p className="text-xs text-gray-400 text-center py-4">Nessuna regola generata da questo documento</p>
+                <p className="text-xs text-gray-400 text-center py-4">Nessuna nota generata da questo documento</p>
               ) : (
                 <div className="space-y-1">
                   {generatedRules.map(r => (
