@@ -108,13 +108,15 @@ interface AgentConfig {
 const TOOL_DECLARATIONS: ToolDeclaration[] = [
   {
     name: "cerca_conti",
-    description: "Cerca conti nel piano dei conti dell'azienda per parole chiave, codice, sezione, o riferimento contrattuale. Se hai un numero contratto, passalo in contract_ref per trovare il conto specifico.",
+    description: "Cerca conti nel piano dei conti dell'azienda per parole chiave, codice, sezione, o riferimenti strutturati del documento. Se hai un riferimento utile (contratto, polizza, pratica, mandato, targa, numero ratea/posizione), passalo per trovare conti specifici o numerati coerenti.",
     parameters: {
       type: "OBJECT",
       properties: {
         query: { type: "STRING", description: "Parole chiave: es. 'leasing', 'carburante', 'telefonia'" },
         section: { type: "STRING", description: "Opzionale. Filtra per sezione: cost_production, financial, other_costs, revenue, assets, liabilities" },
-        contract_ref: { type: "STRING", description: "Opzionale. Numero contratto/riferimento dalla fattura (es. '01499014/001'). Il tool estrarrà i numeri rilevanti per cercare conti specifici." },
+        context_text: { type: "STRING", description: "Opzionale. Testo completo della riga o estratto della fattura: il tool può ricavare da qui riferimenti utili oltre alla natura economica." },
+        reference_hint: { type: "STRING", description: "Opzionale. Riferimento strutturato dalla fattura o dal documento (es. '01499014/001', 'AV275477', 'mandato 12345'). Il tool estrarrà i pattern utili per cercare conti specifici." },
+        contract_ref: { type: "STRING", description: "Compatibilità legacy: usa reference_hint. Puoi comunque passare qui un riferimento strutturato dalla fattura." },
       },
       required: ["query"],
     },
@@ -426,7 +428,7 @@ REGOLE:
 - Percentuali: SEMPRE numeri 0-100
 - Quando non sai: default CONSERVATIVO + dubbio
 - Se il conto ha needs_user_confirmation=true: SEMPRE dubbio
-- Se la fattura contiene un riferimento contratto e la riga è un leasing/canone numerato, verifica se esiste già un conto dedicato compatibile prima di proporre un nuovo conto
+- Se il documento contiene un riferimento strutturato (contratto, polizza, pratica, mandato, targa, posizione, numero utenza, ecc.) e il piano dei conti mostra conti specifici o numerati, usa quel riferimento come pista di ricerca prima di concludere che il conto manchi o che serva crearne uno nuovo
 - Fattura ATTIVA (vendita) → MAI passività
 - SRL/SPA → MAI ritenuta d'acconto`;
 
@@ -470,7 +472,7 @@ RIGHE:
 ${linesText}
 
 ISTRUZIONI:
-USA I TOOL per cercare conti, storico, KB. Ragiona. Poi rispondi JSON.
+USA I TOOL per cercare conti, storico, KB. Ragiona. Se una riga o il documento contengono riferimenti specifici, puoi cercare i conti usando sia la natura economica sia quei riferimenti, anche passando il testo completo in context_text se ti aiuta. Poi rispondi JSON.
 
 OUTPUT (JSON, no markdown):
 {
@@ -510,14 +512,12 @@ OUTPUT (JSON, no markdown):
         case "cerca_conti": {
           const query = String(args.query || "").trim();
           const section = args.section ? String(args.section) : null;
+          const contextText = String(args.context_text || "").trim();
           const sectionFilter = section ? sql`AND section = ${section}` : sql``;
-          const implicitContractRefs =
-            /leasing|locazione finanziaria|canone/i.test(query)
-              ? [
-                invoice.primary_contract_ref ? String(invoice.primary_contract_ref) : "",
-                ...(Array.isArray(invoice.contract_refs) ? invoice.contract_refs.map((value) => String(value || "")) : []),
-              ].map((value) => value.trim()).filter(Boolean)
-              : [];
+          const implicitReferenceHints = [
+            invoice.primary_contract_ref ? String(invoice.primary_contract_ref) : "",
+            ...(Array.isArray(invoice.contract_refs) ? invoice.contract_refs.map((value) => String(value || "")) : []),
+          ].map((value) => value.trim()).filter(Boolean);
           
           // Query 1: ILIKE + trigram (sempre)
           const rows = await sql`
@@ -540,37 +540,62 @@ OUTPUT (JSON, no markdown):
             LIMIT 15`;
 
           // Query 2: numeric pattern search (solo se ci sono numeri nella query)
-          const numericPatterns = (query.match(/\d{4,}/g) || [])
+          const numericPatterns = ([query, contextText].join(" ").match(/\d{4,}/g) || [])
             .map(n => n.replace(/^0+/, ''))
             .filter(n => n.length >= 4);
+          const structuredPatterns: string[] = [];
 
-          // Se c'è un contract_ref esplicito o implicito dalla fattura, estrai i numeri e aggiungili
+          // Se esiste un riferimento strutturato esplicito o implicito dalla fattura, usalo come pista
           for (const ref of [
+            contextText,
+            args.reference_hint ? String(args.reference_hint) : "",
             args.contract_ref ? String(args.contract_ref) : "",
-            ...implicitContractRefs,
+            ...implicitReferenceHints,
           ].filter(Boolean)) {
+            const normalizedRef = String(ref).trim().toUpperCase();
+            const compactRef = normalizedRef.replace(/[^A-Z0-9]/g, '');
+            if (compactRef.length >= 5 && /\d/.test(compactRef)) {
+              structuredPatterns.push(compactRef);
+            }
             const contractNums = (String(ref).match(/\d{4,}/g) || [])
               .map((n: string) => n.replace(/^0+/, ''))
               .filter((n: string) => n.length >= 4);
             numericPatterns.push(...contractNums);
           }
           const uniqueNumericPatterns = Array.from(new Set(numericPatterns));
+          const uniqueStructuredPatterns = Array.from(new Set(structuredPatterns));
+
+          for (const row of rows) {
+            const haystack = `${row.code || ''} ${row.name || ''}`;
+            const compactHaystack = haystack.toUpperCase().replace(/[^A-Z0-9]/g, '');
+            const numericHaystack = haystack.replace(/\D/g, '');
+            const queryMatch =
+              haystack.toLowerCase().includes(query.toLowerCase())
+              || String(row.code || '').toLowerCase().includes(query.toLowerCase());
+            const structuredMatch = uniqueStructuredPatterns.some((pattern) => compactHaystack.includes(pattern));
+            const numericMatch = uniqueNumericPatterns.some((pattern) => numericHaystack.includes(pattern));
+            if (queryMatch && (structuredMatch || numericMatch)) row.relevance = Math.max(row.relevance || 0, 0.99);
+            else if (structuredMatch || numericMatch) row.relevance = Math.max(row.relevance || 0, 0.74);
+          }
           
           let numericRows: any[] = [];
-          if (uniqueNumericPatterns.length > 0) {
-            // Cerca conti che contengono uno dei numeri estratti
+          if (uniqueNumericPatterns.length > 0 || uniqueStructuredPatterns.length > 0) {
             const numericConditions = uniqueNumericPatterns.map(n => `%${n}%`);
+            const structuredConditions = uniqueStructuredPatterns.map(pattern => `%${pattern}%`);
             numericRows = await sql`
               SELECT id, code, name, section,
                      default_tax_code_id, default_ires_pct,
                      default_irap_mode, needs_user_confirmation, note_fiscali,
-                     0.85::float AS relevance
+                     0.72::float AS relevance
               FROM chart_of_accounts
               WHERE company_id = ${companyId} AND active = true AND is_header = false
                 ${sectionFilter}
-                AND (name ILIKE ANY(${numericConditions}) OR code ILIKE ANY(${numericConditions}))
+                AND (
+                  ${numericConditions.length > 0 ? sql`(name ILIKE ANY(${numericConditions}) OR code ILIKE ANY(${numericConditions}))` : sql`false`}
+                  OR ${structuredConditions.length > 0 ? sql`(REPLACE(UPPER(name), ' ', '') ILIKE ANY(${structuredConditions}) OR REPLACE(UPPER(code), ' ', '') ILIKE ANY(${structuredConditions}))` : sql`false`}
+                )
               ORDER BY code
-              LIMIT 10`;
+              LIMIT 15`;
           }
 
           // Merge e deduplica
@@ -578,8 +603,16 @@ OUTPUT (JSON, no markdown):
           const merged = [...rows];
           for (const nr of numericRows) {
             if (!seen.has(nr.id)) {
-              const haystack = `${nr.code || ''} ${nr.name || ''}`.replace(/\D/g, '');
-              nr.relevance = uniqueNumericPatterns.some((pattern) => haystack.includes(pattern)) ? 0.99 : (nr.relevance || 0.85);
+              const haystack = `${nr.code || ''} ${nr.name || ''}`;
+              const numericHaystack = haystack.replace(/\D/g, '');
+              const compactHaystack = haystack.toUpperCase().replace(/[^A-Z0-9]/g, '');
+              const queryMatch =
+                haystack.toLowerCase().includes(query.toLowerCase())
+                || String(nr.code || '').toLowerCase().includes(query.toLowerCase());
+              const numericMatch = uniqueNumericPatterns.some((pattern) => numericHaystack.includes(pattern));
+              const structuredMatch = uniqueStructuredPatterns.some((pattern) => compactHaystack.includes(pattern));
+              if (queryMatch && (numericMatch || structuredMatch)) nr.relevance = 0.99;
+              else if (numericMatch || structuredMatch) nr.relevance = Math.max(nr.relevance || 0.72, 0.74);
               merged.push(nr);
               seen.add(nr.id);
             }
