@@ -20,8 +20,12 @@ const MODEL_OPTIONS = [
   { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', desc: 'Economico, veloce' },
   { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro Preview', desc: 'Top qualita, RPD basso (250)' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview', desc: 'Veloce, economico' },
-  { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', desc: 'Molto forte su ragionamento e consulenza' },
-  { value: 'claude-haiku-4-5', label: 'Claude Haiku 4.5', desc: 'Rapido per chat leggere' },
+  { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet', desc: 'Molto forte su ragionamento e consulenza' },
+  { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku', desc: 'Rapido per chat leggere' },
+  { value: 'gpt-4o', label: 'GPT-4o', desc: 'Veloce, molto capace' },
+  { value: 'gpt-4o-mini', label: 'GPT-4o Mini', desc: 'Economico, veloce, per task semplici' },
+  { value: 'o3-mini', label: 'o3 Mini', desc: 'Focus su ragionamento (reasoning effort configurabile)' },
+  { value: 'o1', label: 'o1', desc: 'Massimo ragionamento (ragionamento profondo)' },
 ]
 
 const THINKING_BUDGET_OPTIONS = [
@@ -34,7 +38,7 @@ const THINKING_BUDGET_OPTIONS = [
 ]
 
 // Models that DON'T support explicit thinkingConfig
-const NO_THINKING_CONFIG_MODELS = ['gemini-3.1-pro-preview', 'gemini-3.1-pro-preview-customtools']
+const NO_THINKING_CONFIG_MODELS = ['gemini-3.1-pro-preview', 'gemini-3.1-pro-preview-customtools', 'gpt-4o', 'gpt-4o-mini']
 
 const AGENT_COLORS: Record<string, string> = {
   commercialista: 'sky',
@@ -63,7 +67,7 @@ export default function AgentConfigPage() {
   async function loadAgents() {
     setLoading(true)
     const { data } = await supabase.from('agent_config').select('*').eq('active', true).order('agent_type')
-    const items = (data as any[]) || []
+    const items = ((data as any[]) || []).filter(a => a.agent_type !== 'kb_classifier')
     setAgents(items)
     const editMap: Record<string, Partial<AgentConfig>> = {}
     items.forEach(a => { editMap[a.id] = { ...a } })

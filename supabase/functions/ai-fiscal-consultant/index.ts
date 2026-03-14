@@ -1,4 +1,5 @@
 import postgres from "npm:postgres@3.4.5";
+import { callLLM } from "../_shared/llm-caller.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -77,80 +78,7 @@ function parseResolutionAction(text: string): Record<string, unknown> | null {
   }
 }
 
-async function callGeminiModel(args: {
-  apiKey: string;
-  model: string;
-  prompt: string;
-  temperature: number;
-  maxOutputTokens: number;
-  thinkingBudget: number | null;
-}) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${args.model}:generateContent?key=${args.apiKey}`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: args.prompt }] }],
-      generationConfig: {
-        maxOutputTokens: args.maxOutputTokens,
-        temperature: args.temperature,
-        ...(args.thinkingBudget != null && args.thinkingBudget > 0
-          ? { thinkingConfig: { thinkingBudget: args.thinkingBudget, includeThoughts: true } }
-          : {}),
-      },
-    }),
-  });
-
-  if (!response.ok) {
-    const err = await response.text().catch(() => "");
-    throw new Error(`Gemini API ${response.status}: ${clip(err, 300)}`);
-  }
-
-  const data = await response.json();
-  const parts = (data as any)?.candidates?.[0]?.content?.parts || [];
-  let message = "";
-  let thinking = "";
-  for (const part of parts) {
-    if (part.thought && part.text) thinking += part.text;
-    else if (part.text) message += part.text;
-  }
-  return { message, thinking };
-}
-
-async function callClaudeModel(args: {
-  apiKey: string;
-  model: string;
-  prompt: string;
-  temperature: number;
-  maxOutputTokens: number;
-}) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": args.apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: args.model,
-      max_tokens: args.maxOutputTokens,
-      temperature: args.temperature,
-      messages: [{ role: "user", content: args.prompt }],
-    }),
-  });
-
-  if (!response.ok) {
-    const err = await response.text().catch(() => "");
-    throw new Error(`Anthropic API ${response.status}: ${clip(err, 300)}`);
-  }
-
-  const data = await response.json();
-  const blocks = (data as any)?.content || [];
-  return {
-    message: blocks.filter((block: { type: string }) => block.type === "text").map((block: { text: string }) => block.text).join("\n"),
-    thinking: "",
-  };
-}
+// Extracted individual model callers to _shared/llm-caller.ts
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -160,6 +88,7 @@ Deno.serve(async (req) => {
   try {
     const geminiKey = Deno.env.get("GEMINI_API_KEY");
     const anthropicKey = Deno.env.get("ANTHROPIC_API_KEY");
+    const openaiKey = Deno.env.get("OPENAI_API_KEY");
     const dbUrl = Deno.env.get("SUPABASE_DB_URL");
     if (!dbUrl) return json({ error: "SUPABASE_DB_URL not set" }, 500);
 
@@ -298,9 +227,7 @@ Deno.serve(async (req) => {
       const systemPrompt = agentConfig?.system_prompt
         || "Sei un consulente fiscale e contabile italiano senior. Offri consulenza prudente, contestuale e applicabile.";
 
-      const prompt = `${systemPrompt}
-
-CONTESTO AZIENDA:
+      const prompt = `CONTESTO AZIENDA:
 - Azienda: ${invoice.company_name || "N/A"} (P.IVA: ${invoice.company_vat || "N/A"})
 - ATECO: ${invoice.ateco_code || "N/A"}
 - Settore: ${invoice.business_sector || "N/A"}
@@ -359,25 +286,21 @@ ISTRUZIONI OPERATIVE:
       const maxOutputTokens = agentConfig?.max_output_tokens || 4096;
 
       let responsePayload: { message: string; thinking: string } = { message: "", thinking: "" };
-      if (model.startsWith("claude")) {
-        if (!anthropicKey) return json({ error: "ANTHROPIC_API_KEY not set" }, 500);
-        responsePayload = await callClaudeModel({
-          apiKey: anthropicKey,
+      try {
+        const llmResp = await callLLM(prompt, {
           model,
-          prompt,
           temperature,
-          maxOutputTokens,
-        });
-      } else {
-        if (!geminiKey) return json({ error: "GEMINI_API_KEY not set" }, 500);
-        responsePayload = await callGeminiModel({
-          apiKey: geminiKey,
-          model,
-          prompt,
-          temperature,
-          maxOutputTokens,
           thinkingBudget: mode === "deep" ? thinkingBudget : 0,
-        });
+          maxOutputTokens,
+          systemPrompt
+        }, { geminiKey, anthropicKey, openaiKey });
+        
+        responsePayload = {
+          message: llmResp.text,
+          thinking: llmResp.thinking || "",
+        };
+      } catch (err: any) {
+        return json({ error: err.message }, 502);
       }
 
       const action = parseResolutionAction(responsePayload.message);

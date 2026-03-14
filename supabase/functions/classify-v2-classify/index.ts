@@ -17,6 +17,7 @@ import {
   getInvoiceContractRefs,
   type CompanyMemoryQueryRow,
 } from "../_shared/company-memory-filter.ts";
+import { callLLM } from "../_shared/llm-caller.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -265,34 +266,7 @@ async function callGeminiEmbedding(apiKey: string, text: string): Promise<number
   return values.map((v: unknown) => Number(v));
 }
 
-/* ─── Extract JSON array ─────────────────── */
-
-function extractFirstJsonArray(text: string): string | null {
-  const start = text.indexOf("[");
-  if (start < 0) return null;
-  let depth = 0, inString = false, escaped = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (escaped) { escaped = false; continue; }
-    if (ch === "\\" && inString) { escaped = true; continue; }
-    if (ch === '"') { inString = !inString; continue; }
-    if (inString) continue;
-    if (ch === "[") depth++;
-    if (ch === "]") { depth--; if (depth === 0) return text.slice(start, i + 1); }
-  }
-  return null;
-}
-
-/** Robust JSON extractor: handles markdown fences, arrays, and objects */
-function extractJson(text: string): any {
-  let clean = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-  try { return JSON.parse(clean); } catch { /* continue */ }
-  const arrMatch = clean.match(/\[[\s\S]*\]/);
-  if (arrMatch) try { return JSON.parse(arrMatch[0]); } catch { /* continue */ }
-  const objMatch = clean.match(/\{[\s\S]*\}/);
-  if (objMatch) try { return JSON.parse(objMatch[0]); } catch { /* continue */ }
-  throw new Error("Cannot parse JSON from Gemini response");
-}
+// Extracted to json-helpers.ts
 
 /* ─── Main ───────────────────────────────── */
 
@@ -302,8 +276,9 @@ Deno.serve(async (req) => {
 
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
+  const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
+  const openaiKey = (Deno.env.get("OPENAI_API_KEY") ?? "").trim();
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL non configurato" }, 503);
-  if (!geminiKey) return json({ error: "GEMINI_API_KEY non configurata" }, 503);
 
   let body: {
     company_id?: string;
@@ -704,71 +679,44 @@ Rispondi con un JSON object (no markdown):
 
     const prompt = promptParts.join("\n");
 
-    // ─── Call Gemini (using config model/temperature/thinking) ────
+    // ─── Call unified LLM ────
     const model = agentConfig?.model || "gemini-2.5-flash";
     const temperature = agentConfig?.temperature ?? 0.2;
     const thinkingLevel = agentConfig?.thinking_level || "medium";
-    const thinkingBudget: Record<string, number> = {
+    const thinkingBudgets: Record<string, number> = {
       none: 0, low: 1024, medium: 8192, high: 24576,
     };
-    const budget = agentConfig?.thinking_budget ?? thinkingBudget[thinkingLevel] ?? 8192;
+    const budget = agentConfig?.thinking_budget ?? thinkingBudgets[thinkingLevel] ?? 8192;
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: {
-          maxOutputTokens: agentConfig?.max_output_tokens || 32768,
-          temperature,
-          ...(budget > 0 ? { thinkingConfig: { thinkingBudget: budget, includeThoughts: true } } : {}),
-        },
-      }),
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text();
+    let llmResp;
+    try {
+      llmResp = await callLLM(prompt, {
+        model,
+        temperature,
+        thinkingBudget: budget,
+        maxOutputTokens: agentConfig?.max_output_tokens || 32768,
+        systemPrompt: agentConfig?.system_prompt || "Sei un COMMERCIALISTA SENIOR italiano. Classifica ogni riga della fattura."
+      }, { geminiKey, anthropicKey, openaiKey });
+    } catch (e: any) {
       await sql.end();
-      return json({ error: `Gemini API ${resp.status}: ${errText.slice(0, 300)}` }, 502);
-    }
-
-    const data = await resp.json();
-    const gParts = (data as any)?.candidates?.[0]?.content?.parts || [];
-    let responseText = "";
-    let thinkingText = "";
-    for (const part of gParts) {
-      if (part.thought && part.text) thinkingText += part.text;
-      else if (part.text) responseText += part.text;
+      return json({ error: e.message }, 502);
     }
 
     let structuredResponse: CommercialistaResponse = { line_proposals: [] };
-    try {
-      const parsed = extractJson(responseText);
-      if (Array.isArray(parsed)) {
-        structuredResponse = { line_proposals: parsed as ClassifyResult[] };
-      } else if (parsed && typeof parsed === "object") {
+    if (llmResp.structured) {
+      if (Array.isArray(llmResp.structured)) {
+        structuredResponse = { line_proposals: llmResp.structured as ClassifyResult[] };
+      } else if (typeof llmResp.structured === "object") {
         structuredResponse = {
-          invoice_summary: typeof parsed.invoice_summary === "string" ? parsed.invoice_summary : null,
-          evidence_refs: Array.isArray(parsed.evidence_refs) ? parsed.evidence_refs as string[] : [],
-          needs_consultant_hint: Boolean(parsed.needs_consultant_hint),
-          line_proposals: Array.isArray(parsed.line_proposals) ? parsed.line_proposals as ClassifyResult[] : [],
+          invoice_summary: typeof llmResp.structured.invoice_summary === "string" ? llmResp.structured.invoice_summary : null,
+          evidence_refs: Array.isArray(llmResp.structured.evidence_refs) ? llmResp.structured.evidence_refs as string[] : [],
+          needs_consultant_hint: Boolean(llmResp.structured.needs_consultant_hint),
+          line_proposals: Array.isArray(llmResp.structured.line_proposals) ? llmResp.structured.line_proposals as ClassifyResult[] : [],
         };
       }
-    } catch (e) {
-      console.error("[classify-v2] JSON parse error:", e);
     }
 
     let results: ClassifyResult[] = structuredResponse.line_proposals || [];
-    if (results.length === 0) {
-      const jsonStr = extractFirstJsonArray(responseText);
-      if (jsonStr) {
-        try {
-          results = JSON.parse(jsonStr);
-          structuredResponse.line_proposals = results;
-        } catch { /* ignore */ }
-      }
-    }
 
     // Validate UUIDs — ensure account_id and category_id exist in our loaded data
     const validAccIds = new Set((accounts as any[]).map((a) => a.id));
@@ -816,7 +764,7 @@ Rispondi con un JSON object (no markdown):
         needs_consultant_hint: structuredResponse.needs_consultant_hint || false,
         line_proposals: results,
       },
-      thinking: thinkingText || null,
+      thinking: llmResp?.thinking || null,
       prompt_length: prompt.length,
       accounts_shown: accounts.length,
       categories_shown: categories.length,
@@ -825,7 +773,7 @@ Rispondi con un JSON object (no markdown):
       agent_rules_used: agentRules.length,
       _debug: {
         prompt_sent: prompt,
-        raw_response: responseText,
+        raw_response: llmResp?.text || null,
         model_used: model,
         agent_config_loaded: !!agentConfig,
         agent_rules_count: agentRules.length,

@@ -8,6 +8,7 @@
 //     Pre-applies fiscal_decisions (user choices on past alerts) from Fase 3.
 
 import postgres from "npm:postgres@3.4.5";
+import { callLLM } from "../_shared/llm-caller.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -393,8 +394,9 @@ Deno.serve(async (req) => {
 
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
+  const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
+  const openaiKey = (Deno.env.get("OPENAI_API_KEY") ?? "").trim();
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL non configurato" }, 503);
-  if (!geminiKey) return json({ error: "GEMINI_API_KEY non configurata" }, 503);
 
   let body: {
     company_id?: string;
@@ -810,36 +812,27 @@ Se non servono alert: "alerts": []`);
       none: 0, low: 1024, medium: 8192, high: 24576,
     };
     const budget = agentConfig?.thinking_budget ?? thinkingBudget[thinkingLevel] ?? 24576;
+    const maxOutputTokens = agentConfig?.max_output_tokens || 32768;
 
     console.log(`[fiscal-reviewer] Using model=${model} temp=${temperature} thinking=${thinkingLevel}(${budget})`);
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: {
-          maxOutputTokens: agentConfig?.max_output_tokens || 32768,
-          temperature,
-          ...(budget > 0 ? { thinkingConfig: { thinkingBudget: budget, includeThoughts: true } } : {}),
-        },
-      }),
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      await sql.end();
-      return json({ error: `Gemini API ${resp.status}: ${errText.slice(0, 300)}` }, 502);
-    }
-
-    const data = await resp.json();
-    const gParts = (data as any)?.candidates?.[0]?.content?.parts || [];
     let responseText = "";
     let thinkingText = "";
-    for (const part of gParts) {
-      if (part.thought && part.text) thinkingText += part.text;
-      else if (part.text) responseText += part.text;
+    
+    try {
+      const llmResp = await callLLM(prompt, {
+        model,
+        temperature,
+        thinkingBudget: budget,
+        maxOutputTokens,
+        systemPrompt: "",
+      }, { geminiKey, anthropicKey, openaiKey });
+      
+      responseText = llmResp.text;
+      thinkingText = llmResp.thinking || "";
+    } catch (e: any) {
+      await sql.end();
+      return json({ error: `LLM API Error: ${e.message}` }, 502);
     }
 
     let structuredResponse: ReviewerResponse = {};
