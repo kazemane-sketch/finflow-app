@@ -37,6 +37,8 @@ interface AgentConfigRow {
   thinking_level: string | null;
   thinking_budget: number | null;
   thinking_budget_escalation: number | null;
+  thinking_effort: string | null;
+  thinking_effort_escalation: string | null;
   max_output_tokens: number | null;
 }
 
@@ -2400,7 +2402,7 @@ async function executeToolHandler(
 async function loadConsultantAgentConfig(sql: SqlClient): Promise<AgentConfigRow | null> {
   const rows = await sql<AgentConfigRow[]>`
     SELECT system_prompt, model, model_escalation, temperature, thinking_level,
-           thinking_budget, thinking_budget_escalation, max_output_tokens
+           thinking_budget, thinking_budget_escalation, thinking_effort, thinking_effort_escalation, max_output_tokens
     FROM agent_config
     WHERE active = true AND agent_type = 'consulente'
     LIMIT 1`;

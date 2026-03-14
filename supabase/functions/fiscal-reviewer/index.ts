@@ -139,6 +139,7 @@ interface AgentConfig {
   temperature: number;
   thinking_level: string;
   thinking_budget?: number | null;
+  thinking_effort?: string | null;
   max_output_tokens: number;
 }
 
@@ -380,7 +381,7 @@ Deno.serve(async (req) => {
       sql`SELECT name, ateco_code FROM companies WHERE id = ${companyId} LIMIT 1`,
       // Agent config for revisore
       sql<AgentConfig[]>`
-        SELECT agent_type, system_prompt, model, temperature, thinking_level, thinking_budget, max_output_tokens
+        SELECT agent_type, system_prompt, model, temperature, thinking_level, thinking_budget, thinking_effort, max_output_tokens
         FROM agent_config WHERE active = true AND agent_type = 'revisore'
         LIMIT 1`,
       // Agent rules for revisore

@@ -4,6 +4,7 @@ export interface LLMConfig {
   model: string;
   temperature: number;
   thinkingBudget?: number | null;
+  thinkingEffort?: string | null;
   maxOutputTokens?: number;
   systemPrompt: string;
 }
@@ -170,7 +171,9 @@ async function callOpenAI(prompt: string, config: LLMConfig, key?: string): Prom
   };
 
   if (isReasoningModel) {
-    if (config.thinkingBudget && config.thinkingBudget > 10000) {
+    if (config.thinkingEffort && config.thinkingEffort !== "none") {
+      payload.reasoning_effort = config.thinkingEffort;
+    } else if (config.thinkingBudget && config.thinkingBudget > 10000) {
       payload.reasoning_effort = "high";
     } else if (config.thinkingBudget && config.thinkingBudget > 2000) {
       payload.reasoning_effort = "medium";
@@ -226,6 +229,8 @@ export interface ToolDeclaration {
 export interface LLMToolsConfig {
   model: string;
   temperature: number;
+  thinkingBudget?: number | null;
+  thinkingEffort?: string | null;
   maxOutputTokens: number;
 }
 
@@ -416,7 +421,17 @@ async function callOpenAIWithTools(
       tools: oaiTools,
     };
 
-    if (!isReasoningModel) {
+    if (isReasoningModel) {
+      if (config.thinkingEffort && config.thinkingEffort !== "none") {
+        payload.reasoning_effort = config.thinkingEffort;
+      } else if (config.thinkingBudget && config.thinkingBudget > 10000) {
+        payload.reasoning_effort = "high";
+      } else if (config.thinkingBudget && config.thinkingBudget > 2000) {
+        payload.reasoning_effort = "medium";
+      } else if (config.thinkingBudget && config.thinkingBudget > 0) {
+        payload.reasoning_effort = "low";
+      }
+    } else {
       payload.temperature = config.temperature;
       payload.max_tokens = config.maxOutputTokens;
     }

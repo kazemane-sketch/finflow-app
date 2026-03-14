@@ -12,6 +12,7 @@ interface AgentConfig {
   id: string; agent_type: string; display_name: string; description: string | null;
   system_prompt: string; model: string; model_escalation: string | null;
   temperature: number; thinking_level: string; thinking_budget: number | null; thinking_budget_escalation: number | null;
+  thinking_effort: string | null; thinking_effort_escalation: string | null;
   max_output_tokens: number; version: number; updated_at: string; react_mode?: boolean;
 }
 
@@ -21,18 +22,21 @@ interface AgentTool {
 }
 
 const MODEL_OPTIONS = [
-  { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', desc: 'Stabile, thinking controllabile, 1000 RPD' },
-  { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', desc: 'Economico, veloce' },
-  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro Preview', desc: 'Top qualita, RPD basso (250)' },
-  { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash Preview', desc: 'Veloce, economico' },
-  { value: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet', desc: 'Molto forte su ragionamento e consulenza' },
-  { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku', desc: 'Rapido per chat leggere' },
-  { value: 'gpt-4o', label: 'GPT-4o', desc: 'Veloce, molto capace' },
-  { value: 'gpt-4o-mini', label: 'GPT-4o Mini', desc: 'Economico, veloce, per task semplici' },
-  { value: 'o3-mini', label: 'o3 Mini', desc: 'Focus su ragionamento (reasoning effort configurabile)' },
-  { value: 'o1', label: 'o1', desc: 'Massimo ragionamento (ragionamento profondo)' },
+  // Gemini
+  { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', desc: 'Stabile, FC maturo, $1.25/$10' },
+  { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash', desc: 'Ultra economico, $0.15/$0.60' },
+  { value: 'gemini-3-flash', label: 'Gemini 3 Flash', desc: 'Nuovo, veloce+smart, $0.50/$3' },
+  { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro', desc: 'Top Gemini, $2/$12 (preview)' },
+  { value: 'gemini-3.1-pro-preview-customtools', label: 'Gemini 3.1 Pro CustomTools', desc: 'Per FC custom, $2/$12' },
+  // Claude
+  { value: 'claude-opus-4-6-20260101', label: 'Claude Opus 4.6', desc: 'Più intelligente, $5/$25' },
+  { value: 'claude-sonnet-4-6-20260101', label: 'Claude Sonnet 4.6', desc: 'Bilanciato, $3/$15' },
+  { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5', desc: 'Veloce+economico, $1/$5' },
+  // OpenAI  
+  { value: 'gpt-5.4', label: 'GPT-5.4', desc: 'Flagship OpenAI, $3/$15' },
   { value: 'gpt-5.3-chat-latest', label: 'GPT-5.3 Instant', desc: 'Veloce, sicuro, meno allucinazioni' },
-  { value: 'gpt-5.4-pro', label: 'GPT-5.4 Pro', desc: 'Ragionamento complesso, multi-step' },
+  { value: 'o3-mini', label: 'o3 Mini', desc: 'Focus su ragionamento configurabile' },
+  { value: 'o1', label: 'o1', desc: 'Massimo ragionamento' },
 ]
 
 const THINKING_BUDGET_OPTIONS = [
@@ -42,6 +46,13 @@ const THINKING_BUDGET_OPTIONS = [
   { value: 8192, label: '8K', desc: 'Buono (analisi documenti)' },
   { value: 16384, label: '16K', desc: 'Profondo (revisione fiscale)' },
   { value: 32768, label: '32K', desc: 'Massimo (interpretazione norme complesse)' },
+]
+
+const THINKING_EFFORT_OPTIONS = [
+  { value: 'none', label: 'Nessuno' },
+  { value: 'low', label: 'Low (Basso)' },
+  { value: 'medium', label: 'Medium (Medio)' },
+  { value: 'high', label: 'High (Alto)' },
 ]
 
 // Models that DON'T support explicit thinkingConfig
@@ -108,6 +119,8 @@ export default function AgentConfigPage() {
         thinking_level: edit.thinking_level || agent.thinking_level,
         thinking_budget: edit.thinking_budget != null ? Number(edit.thinking_budget) : null,
         thinking_budget_escalation: edit.thinking_budget_escalation != null ? Number(edit.thinking_budget_escalation) : null,
+        thinking_effort: edit.thinking_effort != null ? edit.thinking_effort : null,
+        thinking_effort_escalation: edit.thinking_effort_escalation != null ? edit.thinking_effort_escalation : null,
         max_output_tokens: Number(edit.max_output_tokens ?? agent.max_output_tokens),
         react_mode: Boolean(edit.react_mode ?? agent.react_mode ?? false),
         version: agent.version + 1,
@@ -143,6 +156,8 @@ export default function AgentConfigPage() {
           const IconComponent = AGENT_ICONS[agent.agent_type] || Bot
           const thinkingBudget = edit.thinking_budget ?? 0
           const escalationThinkingBudget = edit.thinking_budget_escalation ?? 0
+          const thinkingEffort = edit.thinking_effort || 'none'
+          const escalationThinkingEffort = edit.thinking_effort_escalation || 'none'
           const modelSupportsThinking = !NO_THINKING_CONFIG_MODELS.includes(edit.model || agent.model)
           const escalationModelSupportsThinking = !NO_THINKING_CONFIG_MODELS.includes(edit.model_escalation || agent.model_escalation || '')
           const costPerCall = thinkingBudget > 0 && modelSupportsThinking
@@ -259,6 +274,35 @@ export default function AgentConfigPage() {
                             className="flex-1 h-1.5 accent-sky-500" />
                           <span className="text-xs font-mono w-8 text-right">{(edit.temperature ?? 0.1).toFixed(2)}</span>
                         </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2 mt-3">
+                        <div>
+                          <Label className="text-xs">{isUnifiedConsultant ? 'Thinking Effort fast' : 'Reasoning Effort'}</Label>
+                          <select
+                            value={thinkingEffort}
+                            onChange={e => updateField(agent.id, 'thinking_effort', e.target.value)}
+                            className="mt-1 w-full h-8 border rounded px-2 text-xs bg-white"
+                          >
+                            {THINKING_EFFORT_OPTIONS.map(o => (
+                              <option key={o.value} value={o.value}>{o.label}</option>
+                            ))}
+                          </select>
+                        </div>
+                        {isUnifiedConsultant && (
+                          <div>
+                            <Label className="text-xs">Reasoning Effort deep</Label>
+                            <select
+                              value={escalationThinkingEffort}
+                              onChange={e => updateField(agent.id, 'thinking_effort_escalation', e.target.value)}
+                              className="mt-1 w-full h-8 border rounded px-2 text-xs bg-white"
+                            >
+                              {THINKING_EFFORT_OPTIONS.map(o => (
+                                <option key={o.value} value={o.value}>{o.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
                       </div>
                       <div className="grid grid-cols-2 gap-2">
                         <div>
