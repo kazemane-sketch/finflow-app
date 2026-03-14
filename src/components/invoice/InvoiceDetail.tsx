@@ -640,6 +640,13 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
     return () => { mountedRef.current = false; };
   }, []);
 
+  // Safety net: if job finished but aiClassifStatus is still 'loading', reset it
+  useEffect(() => {
+    if (!singleInvoiceJobRunning && aiClassifStatus === 'loading' && singleInvoiceJob && singleInvoiceJob.status !== 'running') {
+      setAiClassifStatus(singleInvoiceJob.status === 'completed' ? 'done' : 'error');
+    }
+  }, [singleInvoiceJobRunning, aiClassifStatus, singleInvoiceJob]);
+
   useEffect(() => {
     const fallbackProvince = extractProvinceSiglaFromAddress(counterpartyAddressFallback);
     if (!invoice.counterparty_id) {
