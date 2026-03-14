@@ -482,9 +482,11 @@ Deno.serve(async (req) => {
       }
 
       const mode: ConsultingMode = consulting_mode === "pipeline" ? "pipeline" : consulting_mode === "fast" ? "fast" : "deep";
-      const model = mode === "deep" || mode === "pipeline"
+      // callGeminiWithTools only works with Gemini — force fallback for non-Gemini models
+      const rawModel = mode === "deep" || mode === "pipeline"
         ? (agentConfig?.model_escalation || agentConfig?.model || "gemini-2.5-pro")
         : (agentConfig?.model || "gemini-2.5-pro");
+      const model = rawModel.startsWith("gemini-") ? rawModel : "gemini-2.5-pro";
       const temperature = agentConfig?.temperature ?? 0.1;
       const maxOutputTokens = agentConfig?.max_output_tokens || 8192;
 

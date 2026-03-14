@@ -545,7 +545,9 @@ OUTPUT (JSON, no markdown):
     }
 
     // ─── Call Gemini with tools ──────
-    const model = agentConfig?.model || "gemini-2.5-pro";
+    // callGeminiWithTools only works with Gemini models — force fallback if DB has non-Gemini model
+    const dbModel = agentConfig?.model || "gemini-2.5-pro";
+    const model = dbModel.startsWith("gemini-") ? dbModel : "gemini-2.5-pro";
     const temperature = agentConfig?.temperature ?? 0.2;
     const maxOutputTokens = agentConfig?.max_output_tokens || 32768;
 
