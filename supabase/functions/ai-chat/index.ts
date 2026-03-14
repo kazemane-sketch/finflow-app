@@ -382,10 +382,25 @@ function normalizeConsultantEvidenceSource(source: string): string {
 }
 
 function hasStrongAccountEvidence(evidence: ConsultantEvidence): boolean {
+  const source = String(evidence.source || "");
+  const label = String(evidence.label || "");
   const ref = String(evidence.ref || "");
   const detail = String(evidence.detail || "");
-  const payload = `${ref} ${detail}`;
-  return /contract_ref=|contract_refs=|exact_match|deterministic/i.test(payload);
+  const payload = `${source} ${label} ${ref} ${detail}`.toLowerCase();
+
+  const explicitDeterministicSignal = /contract_ref=|contract_refs=|exact_match|deterministic/.test(payload);
+  if (explicitDeterministicSignal) return true;
+
+  const hasAccountCodeRef = /account_code:\s*[a-z0-9./-]+/.test(payload);
+  const hasStructuredReference =
+    /(contratt|polizz|pratic|mandat|targa|posizion|utenza|riferiment)/.test(payload);
+  const hasDirectMatchLanguage =
+    /(corrispon|match esatt|match diret|coincid|allineat|identifica.*dirett|aggancio.*puntual)/.test(payload);
+
+  if (hasAccountCodeRef && hasStructuredReference && hasDirectMatchLanguage) return true;
+  if (source === "chart_of_accounts" && hasAccountCodeRef && (hasStructuredReference || hasDirectMatchLanguage)) return true;
+
+  return false;
 }
 
 function sanitizeConsultantAction(
@@ -425,7 +440,7 @@ function sanitizeConsultantAction(
       weakenedSpecificAccountRecommendation = true;
       return {
         ...update,
-        account_id: null,
+        account_id: undefined,
         decision_status: "needs_review" as const,
         final_confidence: update.final_confidence == null
           ? 68
@@ -2055,7 +2070,7 @@ async function handleGetChartOfAccounts(sql: SqlClient, companyId: string, args:
   const section = String(args.section || "all");
   const search = args.search ? String(args.search) : null;
   const rows = await sql`
-    SELECT code, name, section, parent_code, level, is_header
+    SELECT id, code, name, section, parent_code, level, is_header
     FROM chart_of_accounts
     WHERE company_id = ${companyId} AND active = true
       AND (${section} = 'all' OR section = ${section})
