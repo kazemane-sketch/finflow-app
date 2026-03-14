@@ -168,7 +168,7 @@ export default function AiChatWidget() {
 
   /* ── opened: chat panel ────────────────── */
   return (
-    <div className="fixed bottom-6 right-6 z-50 w-[400px] h-[520px] flex flex-col bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden relative">
+    <div className="fixed bottom-6 right-6 z-50 w-[400px] h-[520px] flex flex-col bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden">
       {/* ── Header ─────────────────────── */}
       <div className="flex items-center gap-1.5 px-3 py-3 bg-gradient-to-r from-purple-600 to-indigo-600 text-white shrink-0">
         {/* Chat history toggle */}
