@@ -29,39 +29,83 @@ Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
-  const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL not configured" }, 500);
-  if (!geminiKey) return json({ error: "GEMINI_API_KEY not configured" }, 500);
 
   // Verify admin
   const authHeader = req.headers.get("authorization") || "";
   const token = authHeader.replace(/^Bearer\s+/i, "").trim();
   if (!token) return json({ error: "Non autorizzato" }, 401);
 
-  let userId: string;
+  let userId: string | null = null;
+  let jwtRole: string | null = null;
   try {
     const payload = JSON.parse(atob(token.split(".")[1]));
-    userId = payload.sub;
-    if (!userId) throw new Error("no sub");
+    userId = payload.sub || null;
+    jwtRole = payload.role || null;
+    if (!userId && jwtRole !== "service_role") throw new Error("no sub");
   } catch {
     return json({ error: "Token JWT invalido" }, 401);
   }
 
-  const body = await req.json().catch(() => ({})) as { rule_id?: string };
+  const body = await req.json().catch(() => ({})) as { rule_id?: string; action?: string };
   const ruleId = body.rule_id;
-  if (!ruleId) return json({ error: "rule_id è obbligatorio" }, 400);
 
   const sql = postgres(dbUrl, { max: 2 });
 
   try {
-    // Verify platform admin
-    const [admin] = await sql`
-      SELECT 1 FROM platform_admins WHERE user_id = ${userId}
-    `;
-    if (!admin) {
-      await sql.end();
-      return json({ error: "Non sei un platform admin" }, 403);
+    if (jwtRole !== "service_role") {
+      const [admin] = await sql`
+        SELECT 1 FROM platform_admins WHERE user_id = ${userId}
+      `;
+      if (!admin) {
+        await sql.end();
+        return json({ error: "Non sei un platform admin" }, 403);
+      }
     }
+
+    if (body.action === "apply_kb_vnext_migration") {
+      await sql`
+        ALTER TABLE public.knowledge_base
+          ADD COLUMN IF NOT EXISTS knowledge_kind text
+      `;
+      await sql`
+        UPDATE public.knowledge_base
+        SET knowledge_kind = 'legacy_rule'
+        WHERE knowledge_kind IS NULL
+      `;
+      await sql`
+        ALTER TABLE public.knowledge_base
+          ALTER COLUMN knowledge_kind SET DEFAULT 'advisory_note'
+      `;
+      await sql`
+        ALTER TABLE public.knowledge_base
+          ALTER COLUMN knowledge_kind SET NOT NULL
+      `;
+      await sql`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'knowledge_base_knowledge_kind_check'
+          ) THEN
+            ALTER TABLE public.knowledge_base
+              ADD CONSTRAINT knowledge_base_knowledge_kind_check
+              CHECK (knowledge_kind IN ('advisory_note', 'numeric_fact', 'legacy_rule'));
+          END IF;
+        END $$;
+      `;
+      await sql`
+        CREATE INDEX IF NOT EXISTS idx_knowledge_base_knowledge_kind
+          ON public.knowledge_base (knowledge_kind)
+      `;
+      await sql.end();
+      return json({ ok: true, migration_applied: "060_kb_vnext_advisory" });
+    }
+
+    if (!ruleId) return json({ error: "rule_id è obbligatorio" }, 400);
+    const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
+    if (!geminiKey) return json({ error: "GEMINI_API_KEY not configured" }, 500);
 
     // Read the rule
     const [rule] = await sql`
