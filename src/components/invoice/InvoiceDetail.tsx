@@ -2398,7 +2398,11 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
           onStartClassification={handleRequestAiClassification}
           lineCount={detail?.invoice_lines?.length}
           progressSteps={singleInvoiceJob ? [
-            { label: singleInvoiceJob.stage || 'Classificazione AI...', status: 'running' as const },
+            { label: 'Gate Deterministico', status: singleInvoiceJob.stage === 'Gate Deterministico' ? 'running' : 'done' as const },
+            { label: 'Commercialista', status: singleInvoiceJob.stage === 'Gate Deterministico' ? 'pending' : singleInvoiceJob.stage === 'Commercialista' ? 'running' : 'done' as const },
+            { label: 'Attribuzione CdC', status: singleInvoiceJob.stage === 'Gate Deterministico' || singleInvoiceJob.stage === 'Commercialista' ? 'pending' : singleInvoiceJob.stage === 'Attribuzione CdC' ? 'running' : 'done' as const },
+            { label: 'Revisore', status: singleInvoiceJob.stage === 'Revisore' ? 'running' : singleInvoiceJob.stage === 'Salvataggio' ? 'done' : 'pending' as const },
+            { label: 'Salvataggio', status: singleInvoiceJob.stage === 'Salvataggio' ? 'running' : 'pending' as const },
           ] : undefined}
           elapsedSeconds={singleInvoiceJobRunning ? Math.round((singleInvoiceJobProgress.pct || 0) / 10) : undefined}
           alerts={invoiceNotes}
