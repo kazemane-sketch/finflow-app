@@ -425,7 +425,11 @@ async function persistPipelineResults(
       updatePayload.importo_risconto = fc.importo_risconto
       updatePayload.ritenuta_importo = fc.ritenuta_importo
     }
-    await supabase.from('invoice_lines').update(updatePayload as any).eq('id', lr.line_id)
+    const { error: updateError } = await supabase.from('invoice_lines').update(updatePayload as any).eq('id', lr.line_id)
+    if (updateError) {
+      console.error(`[persist] invoice_lines.update failed for ${lr.line_id}:`, updateError.message)
+      throw updateError
+    }
 
     const { error: deleteProjectsError } = await supabase
       .from('invoice_line_projects')
@@ -678,11 +682,16 @@ export async function runClassificationPipeline(
     if (!current) continue
     const deterministic = deterministicMap.get(proposal.line_id)
     const confidence = Math.max(proposal.confidence || 0, deterministic?.confidence || 0)
+    // Guard: reject "[object Object]" values that would corrupt the DB
+    const safeStr = (v: unknown) => typeof v === 'string' && v !== '[object Object]' ? v : null
+    const proposalAccountId = safeStr(proposal.account_id)
+    const proposalCategoryId = safeStr(proposal.category_id)
+    const proposalAccountCode = safeStr(proposal.account_code)
     lineResults.set(proposal.line_id, {
       ...current,
-      category_id: proposal.category_id ?? current.category_id,
-      account_id: proposal.account_id ?? current.account_id,
-      account_code: proposal.account_code ?? current.account_code,
+      category_id: proposalCategoryId ?? current.category_id,
+      account_id: proposalAccountId ?? current.account_id,
+      account_code: proposalAccountCode ?? current.account_code,
       confidence,
       reasoning: proposal.reasoning,
       reasoning_summary_final: proposal.rationale_summary || proposal.reasoning || current.reasoning_summary_final,

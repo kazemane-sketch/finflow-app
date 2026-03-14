@@ -272,31 +272,45 @@ function normalizeFiscal(raw: Record<string, unknown>): NormalizedFiscal {
 }
 
 function normalizeLineProposal(raw: Record<string, unknown>): NormalizedLineProposal {
+  // unwrap() handles both plain values and wrapped { value: X, state: "..." } objects
   // Account: { account_code: "X" } or { account: { value: "X", state: "..." } }
   let account_code: string | null = null;
   let account_id: string | null = null;
-  if (raw.account_code) {
-    account_code = String(raw.account_code);
+  const rawAccountCode = unwrap(raw.account_code);
+  const rawAccountId = unwrap(raw.account_id);
+  if (rawAccountCode) {
+    account_code = String(rawAccountCode);
   } else if ((raw.account as any)?.value) {
     account_code = String((raw.account as any).value);
   }
-  if (raw.account_id) {
-    account_id = String(raw.account_id);
-  } else if (account_code && isUUID(account_code)) {
+  if (rawAccountId) {
+    const strId = String(rawAccountId);
+    // Guard: only accept actual UUIDs or account codes, never "[object Object]"
+    if (strId !== "[object Object]") {
+      account_id = strId;
+    }
+  }
+  if (!account_id && account_code && isUUID(account_code)) {
     account_id = account_code;
     account_code = null;
   }
 
   // Category: { category_id: "uuid" } or { category: { value: "uuid" } }
   let category_id: string | null = null;
-  if (raw.category_id) {
-    category_id = String(raw.category_id);
+  const rawCategoryId = unwrap(raw.category_id);
+  if (rawCategoryId) {
+    const strCat = String(rawCategoryId);
+    if (strCat !== "[object Object]") {
+      category_id = strCat;
+    }
   } else if ((raw.category as any)?.value) {
     category_id = String((raw.category as any).value);
   }
 
-  const confidence = Number(raw.confidence || 0);
-  const reasoning = String(raw.reasoning || raw.rationale_summary || "");
+  const confidence = Number(unwrap(raw.confidence) || 0);
+  const rawReasoning = unwrap(raw.reasoning);
+  const rawRationale = unwrap(raw.rationale_summary);
+  const reasoning = String(rawReasoning || rawRationale || "");
 
   // Fiscal: { fiscal: {...} } or { fiscal_flags: { tax_code: { value: "22" }, ... } }
   const fiscal = normalizeFiscal((raw.fiscal || raw.fiscal_flags || {}) as Record<string, unknown>);
@@ -311,13 +325,13 @@ function normalizeLineProposal(raw: Record<string, unknown>): NormalizedLineProp
     : [];
 
   return {
-    line_id: String(raw.line_id || ""),
+    line_id: String(unwrap(raw.line_id) || ""),
     account_code,
     account_id,
     category_id,
     confidence,
     reasoning,
-    rationale_summary: String(raw.rationale_summary || reasoning),
+    rationale_summary: String(rawRationale || reasoning),
     decision_basis,
     supporting_factors,
     fiscal,
