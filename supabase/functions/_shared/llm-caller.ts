@@ -214,33 +214,82 @@ async function callOpenAI(prompt: string, config: LLMConfig, key?: string): Prom
   return { text, thinking, structured };
 }
 
-/* ─── Gemini Function Calling (multi-turn tool loop) ─── */
+/* ─── Multi-provider Function Calling (multi-turn tool loop) ─── */
 
 export interface ToolDeclaration {
   name: string;
   description: string;
+  /** Gemini format (type: "OBJECT") — auto-converted for OpenAI/Anthropic */
   parameters: Record<string, unknown>;
 }
 
-export interface GeminiToolsConfig {
+export interface LLMToolsConfig {
   model: string;
   temperature: number;
   maxOutputTokens: number;
 }
 
+// Keep old name as alias for backward compat
+export type GeminiToolsConfig = LLMToolsConfig;
+
+type ToolCallsResult = LLMResponse & { tool_calls_log: { name: string; args: Record<string, unknown> }[] };
+
+/** Convert Gemini-style parameter schema (OBJECT/STRING/NUMBER/BOOLEAN/ARRAY) to JSON Schema (lowercase) */
+function geminiSchemaToJsonSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(schema)) {
+    if (k === "type" && typeof v === "string") {
+      out.type = v.toLowerCase();
+    } else if (k === "properties" && typeof v === "object" && v !== null) {
+      const props: Record<string, unknown> = {};
+      for (const [pk, pv] of Object.entries(v as Record<string, unknown>)) {
+        props[pk] = typeof pv === "object" && pv !== null
+          ? geminiSchemaToJsonSchema(pv as Record<string, unknown>)
+          : pv;
+      }
+      out.properties = props;
+    } else if (k === "items" && typeof v === "object" && v !== null) {
+      out.items = geminiSchemaToJsonSchema(v as Record<string, unknown>);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 /**
- * Calls Gemini with native function calling support.
- * Loops until Gemini produces a text-only response or maxIterations is reached.
+ * Unified function calling router — picks Gemini, OpenAI, or Anthropic based on model name.
  */
+export async function callLLMWithTools(
+  systemPrompt: string,
+  userPrompt: string,
+  tools: ToolDeclaration[],
+  toolHandler: (name: string, args: Record<string, unknown>) => Promise<unknown>,
+  config: LLMToolsConfig,
+  env: { geminiKey?: string; anthropicKey?: string; openaiKey?: string },
+  maxIterations = 10,
+): Promise<ToolCallsResult> {
+  const { model } = config;
+  if (model.startsWith("gemini-")) {
+    return callGeminiWithTools(systemPrompt, userPrompt, tools, toolHandler, config, env.geminiKey!, maxIterations);
+  } else if (model.startsWith("claude-")) {
+    return callAnthropicWithTools(systemPrompt, userPrompt, tools, toolHandler, config, env.anthropicKey!, maxIterations);
+  } else if (model.startsWith("gpt-") || model.startsWith("o1") || model.startsWith("o3") || model.startsWith("gpt-5")) {
+    return callOpenAIWithTools(systemPrompt, userPrompt, tools, toolHandler, config, env.openaiKey!, maxIterations);
+  }
+  throw new Error(`callLLMWithTools: modello non supportato: ${model}`);
+}
+
+/** @deprecated Use callLLMWithTools instead — kept for backward compat */
 export async function callGeminiWithTools(
   systemPrompt: string,
   userPrompt: string,
   tools: ToolDeclaration[],
   toolHandler: (name: string, args: Record<string, unknown>) => Promise<unknown>,
-  config: GeminiToolsConfig,
+  config: LLMToolsConfig,
   geminiKey: string,
   maxIterations = 10,
-): Promise<LLMResponse & { tool_calls_log: { name: string; args: Record<string, unknown> }[] }> {
+): Promise<ToolCallsResult> {
   if (!geminiKey) throw new Error("GEMINI_API_KEY mancante");
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent?key=${geminiKey}`;
@@ -328,4 +377,210 @@ export async function callGeminiWithTools(
   }
 
   throw new Error(`callGeminiWithTools: max iterations (${maxIterations}) reached without final response`);
+}
+
+/* ─── OpenAI Function Calling ─── */
+
+async function callOpenAIWithTools(
+  systemPrompt: string,
+  userPrompt: string,
+  tools: ToolDeclaration[],
+  toolHandler: (name: string, args: Record<string, unknown>) => Promise<unknown>,
+  config: LLMToolsConfig,
+  openaiKey: string,
+  maxIterations = 10,
+): Promise<ToolCallsResult> {
+  if (!openaiKey) throw new Error("OPENAI_API_KEY mancante");
+
+  const isReasoningModel = config.model.startsWith("o1") || config.model.startsWith("o3") || config.model.startsWith("gpt-5");
+  const oaiTools = tools.map((t) => ({
+    type: "function" as const,
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: geminiSchemaToJsonSchema(t.parameters),
+    },
+  }));
+
+  const messages: Array<Record<string, unknown>> = [
+    { role: isReasoningModel ? "developer" : "system", content: systemPrompt },
+    { role: "user", content: userPrompt },
+  ];
+
+  const toolCallsLog: { name: string; args: Record<string, unknown> }[] = [];
+
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    const payload: Record<string, unknown> = {
+      model: config.model,
+      messages,
+      tools: oaiTools,
+    };
+
+    if (!isReasoningModel) {
+      payload.temperature = config.temperature;
+      payload.max_tokens = config.maxOutputTokens;
+    }
+
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${openaiKey}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`OpenAI API ${resp.status}: ${errText.slice(0, 500)}`);
+    }
+
+    const data = await resp.json();
+    const choice = data.choices?.[0];
+    const msg = choice?.message;
+
+    // If no tool_calls, we have the final text response
+    if (!msg?.tool_calls || msg.tool_calls.length === 0) {
+      const text = msg?.content || "";
+      let structured = null;
+      try { structured = extractJson(text); } catch { /* ignore */ }
+      return { text, thinking: "", structured, tool_calls_log: toolCallsLog };
+    }
+
+    // Add assistant message with tool_calls to history
+    messages.push(msg);
+
+    // Execute each tool call and add results
+    for (const tc of msg.tool_calls) {
+      const fnName = tc.function.name;
+      let fnArgs: Record<string, unknown> = {};
+      try { fnArgs = JSON.parse(tc.function.arguments || "{}"); } catch { /* ignore */ }
+      toolCallsLog.push({ name: fnName, args: fnArgs });
+      console.log(`[callOpenAIWithTools] Tool call: ${fnName}(${JSON.stringify(fnArgs).slice(0, 200)})`);
+
+      let resultContent: string;
+      try {
+        const result = await toolHandler(fnName, fnArgs);
+        resultContent = JSON.stringify(result);
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.warn(`[callOpenAIWithTools] Tool error ${fnName}: ${errMsg}`);
+        resultContent = JSON.stringify({ error: errMsg });
+      }
+
+      messages.push({
+        role: "tool",
+        tool_call_id: tc.id,
+        content: resultContent,
+      });
+    }
+  }
+
+  throw new Error(`callOpenAIWithTools: max iterations (${maxIterations}) reached without final response`);
+}
+
+/* ─── Anthropic Tool Use ─── */
+
+async function callAnthropicWithTools(
+  systemPrompt: string,
+  userPrompt: string,
+  tools: ToolDeclaration[],
+  toolHandler: (name: string, args: Record<string, unknown>) => Promise<unknown>,
+  config: LLMToolsConfig,
+  anthropicKey: string,
+  maxIterations = 10,
+): Promise<ToolCallsResult> {
+  if (!anthropicKey) throw new Error("ANTHROPIC_API_KEY mancante");
+
+  const anthropicTools = tools.map((t) => ({
+    name: t.name,
+    description: t.description,
+    input_schema: geminiSchemaToJsonSchema(t.parameters),
+  }));
+
+  const modelId = config.model
+    .replace("claude-sonnet-4-6", "claude-3-5-sonnet-20241022")
+    .replace("claude-haiku-4-5", "claude-3-5-haiku-20241022");
+
+  const messages: Array<{ role: string; content: unknown }> = [
+    { role: "user", content: userPrompt },
+  ];
+
+  const toolCallsLog: { name: string; args: Record<string, unknown> }[] = [];
+
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    const payload: Record<string, unknown> = {
+      model: modelId,
+      system: systemPrompt,
+      messages,
+      tools: anthropicTools,
+      max_tokens: config.maxOutputTokens || 8192,
+      temperature: config.temperature,
+    };
+
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": anthropicKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`Anthropic API ${resp.status}: ${errText.slice(0, 500)}`);
+    }
+
+    const data = await resp.json();
+    const contentBlocks = data.content || [];
+
+    const toolUseBlocks = contentBlocks.filter((b: any) => b.type === "tool_use");
+
+    // If no tool_use blocks, extract final text
+    if (toolUseBlocks.length === 0 || data.stop_reason === "end_turn") {
+      let text = "";
+      let thinking = "";
+      for (const block of contentBlocks) {
+        if (block.type === "thinking") thinking += block.thinking;
+        else if (block.type === "text") text += block.text;
+      }
+      let structured = null;
+      try { structured = extractJson(text); } catch { /* ignore */ }
+      return { text, thinking, structured, tool_calls_log: toolCallsLog };
+    }
+
+    // Add assistant message to history
+    messages.push({ role: "assistant", content: contentBlocks });
+
+    // Execute tool calls and build tool_result blocks
+    const toolResults: Array<Record<string, unknown>> = [];
+    for (const tu of toolUseBlocks) {
+      const fnName = tu.name;
+      const fnArgs = tu.input || {};
+      toolCallsLog.push({ name: fnName, args: fnArgs });
+      console.log(`[callAnthropicWithTools] Tool call: ${fnName}(${JSON.stringify(fnArgs).slice(0, 200)})`);
+
+      let resultContent: string;
+      try {
+        const result = await toolHandler(fnName, fnArgs);
+        resultContent = JSON.stringify(result);
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        console.warn(`[callAnthropicWithTools] Tool error ${fnName}: ${errMsg}`);
+        resultContent = JSON.stringify({ error: errMsg });
+      }
+
+      toolResults.push({
+        type: "tool_result",
+        tool_use_id: tu.id,
+        content: resultContent,
+      });
+    }
+
+    messages.push({ role: "user", content: toolResults });
+  }
+
+  throw new Error(`callAnthropicWithTools: max iterations (${maxIterations}) reached without final response`);
 }

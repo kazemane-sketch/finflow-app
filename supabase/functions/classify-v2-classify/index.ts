@@ -1,12 +1,13 @@
 // classify-v2-classify — Stage B: Classification with Function Calling
-// Commercialista AI (Gemini 2.5 Pro) classifies ALL invoice lines in ONE call.
+// Commercialista AI classifies ALL invoice lines in ONE call.
 // Uses 7 tools on-demand instead of preloading all context into the prompt.
+// Supports any model (Gemini, OpenAI, Claude) configured in agent_config.
 //
 // Tools: cerca_conti, get_defaults_conto, storico_controparte,
 //        get_tax_codes, get_parametro_fiscale, get_profilo_controparte, consulta_kb
 
 import postgres from "npm:postgres@3.4.5";
-import { callGeminiWithTools, type ToolDeclaration } from "../_shared/llm-caller.ts";
+import { callLLMWithTools, type ToolDeclaration } from "../_shared/llm-caller.ts";
 import { callGeminiEmbedding, toVectorLiteral } from "../_shared/embeddings.ts";
 import { loadKbAdvisoryContext } from "../_shared/kb-advisory.ts";
 import { extractJson } from "../_shared/json-helpers.ts";
@@ -190,8 +191,10 @@ Deno.serve(async (req) => {
 
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
+  const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
+  const openaiKey = (Deno.env.get("OPENAI_API_KEY") ?? "").trim();
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL non configurato" }, 503);
-  if (!geminiKey) return json({ error: "GEMINI_API_KEY non configurato" }, 503);
+  if (!geminiKey && !anthropicKey && !openaiKey) return json({ error: "Nessuna API key configurata (GEMINI/ANTHROPIC/OPENAI)" }, 503);
 
   let body: {
     company_id?: string;
@@ -507,6 +510,7 @@ OUTPUT (JSON, no markdown):
 
         case "consulta_kb": {
           const kbQuery = String(args.query || "");
+          if (!geminiKey) return { error: "GEMINI_API_KEY necessaria per embeddings KB" };
           try {
             const queryVec = await callGeminiEmbedding(geminiKey, kbQuery);
             const queryVecLiteral = toVectorLiteral(queryVec);
@@ -544,10 +548,8 @@ OUTPUT (JSON, no markdown):
       }
     }
 
-    // ─── Call Gemini with tools ──────
-    // callGeminiWithTools only works with Gemini models — force fallback if DB has non-Gemini model
-    const dbModel = agentConfig?.model || "gemini-2.5-pro";
-    const model = dbModel.startsWith("gemini-") ? dbModel : "gemini-2.5-pro";
+    // ─── Call LLM with tools (any provider) ──────
+    const model = agentConfig?.model || "gemini-2.5-pro";
     const temperature = agentConfig?.temperature ?? 0.2;
     const maxOutputTokens = agentConfig?.max_output_tokens || 32768;
 
@@ -555,13 +557,13 @@ OUTPUT (JSON, no markdown):
 
     let llmResp;
     try {
-      llmResp = await callGeminiWithTools(
+      llmResp = await callLLMWithTools(
         systemPrompt,
         userPrompt,
         TOOL_DECLARATIONS,
         toolHandler,
         { model, temperature, maxOutputTokens },
-        geminiKey,
+        { geminiKey, anthropicKey, openaiKey },
         10,
       );
     } catch (e: any) {

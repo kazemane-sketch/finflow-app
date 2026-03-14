@@ -4,7 +4,7 @@
 // Also serves inline consultation from FatturePage.
 
 import postgres from "npm:postgres@3.4.5";
-import { callGeminiWithTools, callLLM, type ToolDeclaration } from "../_shared/llm-caller.ts";
+import { callLLMWithTools, callLLM, type ToolDeclaration } from "../_shared/llm-caller.ts";
 import { callGeminiEmbedding, toVectorLiteral } from "../_shared/embeddings.ts";
 import { loadKbAdvisoryContext } from "../_shared/kb-advisory.ts";
 
@@ -482,11 +482,9 @@ Deno.serve(async (req) => {
       }
 
       const mode: ConsultingMode = consulting_mode === "pipeline" ? "pipeline" : consulting_mode === "fast" ? "fast" : "deep";
-      // callGeminiWithTools only works with Gemini — force fallback for non-Gemini models
-      const rawModel = mode === "deep" || mode === "pipeline"
+      const model = mode === "deep" || mode === "pipeline"
         ? (agentConfig?.model_escalation || agentConfig?.model || "gemini-2.5-pro")
         : (agentConfig?.model || "gemini-2.5-pro");
-      const model = rawModel.startsWith("gemini-") ? rawModel : "gemini-2.5-pro";
       const temperature = agentConfig?.temperature ?? 0.1;
       const maxOutputTokens = agentConfig?.max_output_tokens || 8192;
 
@@ -524,14 +522,14 @@ ISTRUZIONI:
   "risk_level": "low|medium|high"
 }`;
 
-        if (geminiKey) {
-          const llmResp = await callGeminiWithTools(
+        {
+          const llmResp = await callLLMWithTools(
             systemPrompt,
             pipelinePrompt,
             ALL_TOOLS,
             toolHandler,
             { model, temperature, maxOutputTokens },
-            geminiKey,
+            { geminiKey, anthropicKey, openaiKey },
             8,
           );
 
@@ -584,15 +582,15 @@ ISTRUZIONI:
 {"action":{"type":"apply_consultant_resolution","recommended_conclusion":"...","rationale_summary":"...","risk_level":"low|medium|high","line_updates":[{"line_id":"uuid","category_id":"uuid|null","account_id":"uuid|null","fiscal_flags":{},"decision_status":"finalized|needs_review","reasoning_summary_final":"...","final_confidence":72}]}}
 \`\`\``;
 
-      // Use function calling for deep mode with Gemini
-      if (mode === "deep" && geminiKey && model.startsWith("gemini-")) {
-        const llmResp = await callGeminiWithTools(
+      // Use function calling for deep mode (any model)
+      if (mode === "deep") {
+        const llmResp = await callLLMWithTools(
           systemPrompt,
           prompt,
           ALL_TOOLS,
           toolHandler,
           { model, temperature, maxOutputTokens },
-          geminiKey,
+          { geminiKey, anthropicKey, openaiKey },
           8,
         );
 
@@ -609,7 +607,7 @@ ISTRUZIONI:
         });
       }
 
-      // Fallback: plain LLM call (fast mode or non-Gemini models)
+      // Fast mode: plain LLM call without function calling
       const thinkingBudget = mode === "deep"
         ? (agentConfig?.thinking_budget_escalation ?? agentConfig?.thinking_budget ?? 24576)
         : (agentConfig?.thinking_budget ?? 4096);
