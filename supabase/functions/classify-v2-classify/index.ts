@@ -183,6 +183,146 @@ const TOOL_DECLARATIONS: ToolDeclaration[] = [
   },
 ];
 
+/* ─── Normalize AI output (handles both flat and wrapped formats) ─── */
+
+function isUUID(s: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+}
+
+/** Unwrap { value: X, state: "..." } → X */
+function unwrap(val: unknown): unknown {
+  if (val && typeof val === "object" && "value" in (val as Record<string, unknown>)) {
+    return (val as Record<string, unknown>).value;
+  }
+  return val;
+}
+
+interface NormalizedFiscal {
+  tax_code: string | null;
+  iva_detraibilita_pct: number;
+  deducibilita_ires_pct: number;
+  irap_mode: string;
+  irap_pct?: number;
+  ritenuta_applicabile: boolean;
+  ritenuta_tipo?: string;
+  ritenuta_aliquota_pct?: number;
+  ritenuta_base_pct?: number;
+  cassa_previdenziale_pct?: number;
+  reverse_charge: boolean;
+  split_payment: boolean;
+  bene_strumentale: boolean;
+  asset_candidate: boolean;
+  asset_category_guess?: string;
+  ammortamento_aliquota_proposta?: number;
+  debt_related: boolean;
+  debt_type?: string;
+  interest_amount?: number;
+  principal_amount?: number;
+  competenza_dal?: string;
+  competenza_al?: string;
+  costo_personale: boolean;
+  warning_flags: string[];
+  fiscal_reasoning_short: string;
+}
+
+interface NormalizedLineProposal {
+  line_id: string;
+  account_code: string | null;
+  account_id: string | null;
+  category_id: string | null;
+  confidence: number;
+  reasoning: string;
+  rationale_summary: string;
+  decision_basis: string[];
+  supporting_factors: string[];
+  fiscal: NormalizedFiscal;
+  doubts: { question: string; impact: string }[];
+}
+
+function normalizeFiscal(raw: Record<string, unknown>): NormalizedFiscal {
+  return {
+    tax_code: String(unwrap(raw.tax_code) || "22"),
+    iva_detraibilita_pct: Number(unwrap(raw.iva_detraibilita_pct ?? raw.vat_deductibility_percent) ?? 100),
+    deducibilita_ires_pct: Number(unwrap(raw.deducibilita_ires_pct ?? raw.ires_deductibility_percent) ?? 100),
+    irap_mode: String(unwrap(raw.irap_mode) || "follows_ires"),
+    irap_pct: raw.irap_pct != null ? Number(unwrap(raw.irap_pct)) : undefined,
+    ritenuta_applicabile: Boolean(unwrap(raw.ritenuta_applicabile)),
+    ritenuta_tipo: (unwrap(raw.ritenuta_tipo) as string) || undefined,
+    ritenuta_aliquota_pct: raw.ritenuta_aliquota_pct != null ? Number(unwrap(raw.ritenuta_aliquota_pct)) : undefined,
+    ritenuta_base_pct: raw.ritenuta_base_pct != null ? Number(unwrap(raw.ritenuta_base_pct)) : undefined,
+    cassa_previdenziale_pct: raw.cassa_previdenziale_pct != null ? Number(unwrap(raw.cassa_previdenziale_pct)) : undefined,
+    reverse_charge: Boolean(unwrap(raw.reverse_charge)),
+    split_payment: Boolean(unwrap(raw.split_payment)),
+    bene_strumentale: Boolean(unwrap(raw.bene_strumentale)),
+    asset_candidate: Boolean(unwrap(raw.asset_candidate)),
+    asset_category_guess: (unwrap(raw.asset_category_guess) as string) || undefined,
+    ammortamento_aliquota_proposta: raw.ammortamento_aliquota_proposta != null ? Number(unwrap(raw.ammortamento_aliquota_proposta)) : undefined,
+    debt_related: Boolean(unwrap(raw.debt_related)),
+    debt_type: (unwrap(raw.debt_type) as string) || undefined,
+    interest_amount: raw.interest_amount != null ? Number(unwrap(raw.interest_amount)) : undefined,
+    principal_amount: raw.principal_amount != null ? Number(unwrap(raw.principal_amount)) : undefined,
+    competenza_dal: (unwrap(raw.competenza_dal) as string) || undefined,
+    competenza_al: (unwrap(raw.competenza_al) as string) || undefined,
+    costo_personale: Boolean(unwrap(raw.costo_personale)),
+    warning_flags: Array.isArray(raw.warning_flags) ? raw.warning_flags.map(String) : [],
+    fiscal_reasoning_short: String(unwrap(raw.fiscal_reasoning_short ?? raw.rationale) || ""),
+  };
+}
+
+function normalizeLineProposal(raw: Record<string, unknown>): NormalizedLineProposal {
+  // Account: { account_code: "X" } or { account: { value: "X", state: "..." } }
+  let account_code: string | null = null;
+  let account_id: string | null = null;
+  if (raw.account_code) {
+    account_code = String(raw.account_code);
+  } else if ((raw.account as any)?.value) {
+    account_code = String((raw.account as any).value);
+  }
+  if (raw.account_id) {
+    account_id = String(raw.account_id);
+  } else if (account_code && isUUID(account_code)) {
+    account_id = account_code;
+    account_code = null;
+  }
+
+  // Category: { category_id: "uuid" } or { category: { value: "uuid" } }
+  let category_id: string | null = null;
+  if (raw.category_id) {
+    category_id = String(raw.category_id);
+  } else if ((raw.category as any)?.value) {
+    category_id = String((raw.category as any).value);
+  }
+
+  const confidence = Number(raw.confidence || 0);
+  const reasoning = String(raw.reasoning || raw.rationale_summary || "");
+
+  // Fiscal: { fiscal: {...} } or { fiscal_flags: { tax_code: { value: "22" }, ... } }
+  const fiscal = normalizeFiscal((raw.fiscal || raw.fiscal_flags || {}) as Record<string, unknown>);
+
+  const doubts: { question: string; impact: string }[] = Array.isArray(raw.doubts)
+    ? raw.doubts.map((d: any) => ({ question: d.question || "", impact: d.impact || "" }))
+    : [];
+
+  const supporting_factors = Array.isArray(raw.supporting_factors) ? raw.supporting_factors.map(String) : [];
+  const decision_basis = raw.decision_basis
+    ? (Array.isArray(raw.decision_basis) ? raw.decision_basis.map(String) : [String(raw.decision_basis)])
+    : [];
+
+  return {
+    line_id: String(raw.line_id || ""),
+    account_code,
+    account_id,
+    category_id,
+    confidence,
+    reasoning,
+    rationale_summary: String(raw.rationale_summary || reasoning),
+    decision_basis,
+    supporting_factors,
+    fiscal,
+    doubts,
+  };
+}
+
 /* ─── Main ───────────────────────────────── */
 
 Deno.serve(async (req) => {
@@ -574,8 +714,8 @@ OUTPUT (JSON, no markdown):
 
     console.log(`[classify-v2] Completed: ${llmResp.tool_calls_log.length} tool calls made`);
 
-    // ─── Parse response ──────
-    let parsed: CommercialistaResponse = {
+    // ─── Parse & normalize response ──────
+    let rawParsed: { invoice_summary: string; needs_consultant: boolean; consultant_reason: string | null; lines: any[] } = {
       invoice_summary: "",
       needs_consultant: false,
       consultant_reason: null,
@@ -584,7 +724,7 @@ OUTPUT (JSON, no markdown):
 
     if (llmResp.structured) {
       const s = llmResp.structured;
-      parsed = {
+      rawParsed = {
         invoice_summary: s.invoice_summary || "",
         needs_consultant: Boolean(s.needs_consultant),
         consultant_reason: s.consultant_reason || null,
@@ -592,9 +732,71 @@ OUTPUT (JSON, no markdown):
       };
     }
 
+    // BUG 1 FIX: Normalize any AI output format (flat or wrapped { value, state })
+    const normalizedLines = rawParsed.lines.map((raw: any) => normalizeLineProposal(raw));
+
+    // BUG 2 FIX: Resolve account_code → account_id via chart_of_accounts
+    const allAccounts = await sql`
+      SELECT id, code, name, section FROM chart_of_accounts
+      WHERE company_id = ${companyId} AND active = true AND is_header = false`;
+    const accountByCode = new Map(allAccounts.map((a: any) => [a.code, a]));
+
+    for (const line of normalizedLines) {
+      // Resolve account_code → account_id
+      if (line.account_code && !line.account_id) {
+        const match = accountByCode.get(line.account_code);
+        if (match) {
+          line.account_id = match.id;
+        } else {
+          // Try partial match (code with/without dots)
+          const cleanCode = line.account_code.replace(/\./g, "");
+          for (const [code, acc] of accountByCode) {
+            if (code.replace(/\./g, "") === cleanCode) {
+              line.account_id = (acc as any).id;
+              line.account_code = code;
+              break;
+            }
+          }
+          if (!line.account_id) {
+            console.warn(`[classify-v2] Account code "${line.account_code}" not found in chart`);
+          }
+        }
+      }
+
+      // Resolve category_id if it's a name (not UUID)
+      if (line.category_id && !isUUID(line.category_id)) {
+        const [catMatch] = await sql`
+          SELECT id FROM categories
+          WHERE company_id = ${companyId} AND active = true
+            AND lower(name) = ${line.category_id.toLowerCase()}
+          LIMIT 1`;
+        if (catMatch) {
+          line.category_id = catMatch.id;
+        } else {
+          line.category_id = null;
+        }
+      }
+    }
+
+    // BUG 4 FIX: Auto-detect needs_consultant
+    let autoNeedsConsultant = rawParsed.needs_consultant;
+    let autoConsultantReason = rawParsed.consultant_reason;
+
+    const unresolvedLines = normalizedLines.filter((l) => !l.account_id && !l.account_code);
+    if (unresolvedLines.length > 0 && !autoNeedsConsultant) {
+      autoNeedsConsultant = true;
+      autoConsultantReason = `${unresolvedLines.length} righe senza conto assegnato: ${unresolvedLines.map((l) => `"${l.reasoning?.slice(0, 50)}"`).join(", ")}`;
+      console.log(`[classify-v2] Auto-escalated to consultant: ${autoConsultantReason}`);
+    }
+
+    const linesWithDoubts = normalizedLines.filter((l) => l.doubts.length > 0);
+    if (linesWithDoubts.length > 0 && !autoNeedsConsultant) {
+      autoNeedsConsultant = true;
+      autoConsultantReason = `Dubbi su ${linesWithDoubts.length} righe: ${linesWithDoubts.flatMap((l) => l.doubts.map((d) => d.question)).join("; ")}`;
+    }
+
     // ─── Build backward-compatible response ──────
-    // Map line proposals to the format expected by classificationPipelineService
-    const classifications = parsed.lines.map((lp) => ({
+    const classifications = normalizedLines.map((lp) => ({
       line_id: lp.line_id,
       article_code: null,
       phase_code: null,
@@ -604,9 +806,9 @@ OUTPUT (JSON, no markdown):
       account_code: lp.account_code,
       confidence: lp.confidence || 0,
       reasoning: lp.reasoning || "",
-      rationale_summary: lp.reasoning || null,
-      decision_basis: ["function_calling"],
-      supporting_factors: [],
+      rationale_summary: lp.rationale_summary || lp.reasoning || null,
+      decision_basis: lp.decision_basis.length > 0 ? lp.decision_basis : ["function_calling"],
+      supporting_factors: lp.supporting_factors,
       supporting_evidence: [],
       weak_fields: {
         category: { value: lp.category_id, state: lp.category_id ? "assigned" : "needs_review" },
@@ -617,19 +819,19 @@ OUTPUT (JSON, no markdown):
       },
       exact_match_evidence_used: false,
       fiscal_flags: {
-        ritenuta_acconto: lp.fiscal?.ritenuta_applicabile
+        ritenuta_acconto: lp.fiscal.ritenuta_applicabile
           ? { aliquota: lp.fiscal.ritenuta_aliquota_pct || 20, base: `${lp.fiscal.ritenuta_base_pct || 100}%` }
           : null,
-        reverse_charge: lp.fiscal?.reverse_charge || false,
-        split_payment: lp.fiscal?.split_payment || false,
-        bene_strumentale: lp.fiscal?.bene_strumentale || false,
-        deducibilita_pct: lp.fiscal?.deducibilita_ires_pct ?? 100,
-        iva_detraibilita_pct: lp.fiscal?.iva_detraibilita_pct ?? 100,
-        note: lp.fiscal?.fiscal_reasoning_short || null,
+        reverse_charge: lp.fiscal.reverse_charge || false,
+        split_payment: lp.fiscal.split_payment || false,
+        bene_strumentale: lp.fiscal.bene_strumentale || false,
+        deducibilita_pct: lp.fiscal.deducibilita_ires_pct ?? 100,
+        iva_detraibilita_pct: lp.fiscal.iva_detraibilita_pct ?? 100,
+        note: lp.fiscal.fiscal_reasoning_short || null,
       },
       // New v1 fiscal fields (passed through to pipeline)
-      fiscal_v1: lp.fiscal || null,
-      doubts: lp.doubts || [],
+      fiscal_v1: lp.fiscal,
+      doubts: lp.doubts,
       suggest_new_account: null,
       suggest_new_category: null,
     }));
@@ -639,11 +841,11 @@ OUTPUT (JSON, no markdown):
     return json({
       classifications,
       commercialista: {
-        invoice_summary: parsed.invoice_summary,
+        invoice_summary: rawParsed.invoice_summary,
         evidence_refs: [],
-        needs_consultant_hint: parsed.needs_consultant,
-        needs_consultant: parsed.needs_consultant,
-        consultant_reason: parsed.consultant_reason,
+        needs_consultant_hint: autoNeedsConsultant,
+        needs_consultant: autoNeedsConsultant,
+        consultant_reason: autoConsultantReason,
         line_proposals: classifications,
       },
       thinking: llmResp.thinking || null,

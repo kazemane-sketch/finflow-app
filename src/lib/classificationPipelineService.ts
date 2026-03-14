@@ -812,8 +812,26 @@ export async function runClassificationPipeline(
     }
   }
 
+  // ─── Convert commercialista doubts → FiscalAlert[] ──────
+  const doubtsAlerts: FiscalAlert[] = []
+  for (const proposal of commercialista.line_proposals) {
+    if (proposal.doubts && Array.isArray(proposal.doubts) && proposal.doubts.length > 0) {
+      for (const doubt of proposal.doubts) {
+        doubtsAlerts.push({
+          type: 'commercialista_doubt',
+          severity: 'warning',
+          title: doubt.question || 'Dubbio classificazione',
+          description: doubt.impact || '',
+          current_choice: proposal.account_code || proposal.account_id || 'non assegnato',
+          options: [],
+          affected_lines: [proposal.line_id],
+        })
+      }
+    }
+  }
+
   // ─── Conditional CFO: only if commercialista flagged needs_consultant ──────
-  let alerts: FiscalAlert[] = []
+  let alerts: FiscalAlert[] = [...doubtsAlerts]
   let fiscalIssues = 0
   const reviewerPayload: ReviewerPayload = {
     invoice_summary_final: null,
@@ -884,6 +902,12 @@ export async function runClassificationPipeline(
   }
 
   const finalLines = lines.map((line) => lineResults.get(line.line_id) || buildInitialResult(line))
+  // BUG 5: lines without account_id should never be 'finalized'
+  for (const finalLine of finalLines) {
+    if (!finalLine.account_id && finalLine.decision_status === 'finalized') {
+      finalLine.decision_status = 'needs_review'
+    }
+  }
   for (const finalLine of finalLines) {
     if (!finalLine.reasoning_summary_final) {
       finalLine.reasoning_summary_final = finalLine.decision_status === 'unassigned'
