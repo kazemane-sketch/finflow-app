@@ -365,6 +365,25 @@ async function persistPipelineResults(
     supporting_evidence: line.supporting_evidence,
   })))
 
+  // Resolve tax_code_id for each line's computed tax code
+  const taxCodeMap = new Map<string, string>() // codice → id
+  const uniqueCodes = new Set<string>()
+  for (const lr of result.lines) {
+    const fc = (lr as any).fiscal_computed as FiscalOutput | null | undefined
+    if (fc?.tax_code_resolved?.codice) uniqueCodes.add(fc.tax_code_resolved.codice)
+  }
+  if (uniqueCodes.size > 0) {
+    const { data: taxRows } = await supabase
+      .from('tax_codes')
+      .select('id, codice')
+      .in('codice', [...uniqueCodes])
+      .or('company_id.is.null,company_id.eq.' + companyId)
+      .eq('is_active', true)
+    for (const row of taxRows || []) {
+      taxCodeMap.set(row.codice, row.id)
+    }
+  }
+
   for (const lr of result.lines) {
     throwIfAborted(signal)
     const fv1 = (lr as any).fiscal_v1 as FiscalV1 | null | undefined
@@ -424,6 +443,10 @@ async function persistPipelineResults(
       updatePayload.importo_competenza = fc.importo_competenza
       updatePayload.importo_risconto = fc.importo_risconto
       updatePayload.ritenuta_importo = fc.ritenuta_importo
+      // Deterministic tax_code_id from risolveTaxCode()
+      if (fc.tax_code_resolved?.codice) {
+        updatePayload.tax_code_id = taxCodeMap.get(fc.tax_code_resolved.codice) || null
+      }
     }
     const { error: updateError } = await supabase.from('invoice_lines').update(updatePayload as any).eq('id', lr.line_id)
     if (updateError) {

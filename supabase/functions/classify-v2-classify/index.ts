@@ -51,7 +51,6 @@ interface ExactMatchEvidence {
 }
 
 interface FiscalOutput {
-  tax_code: string | null;
   iva_detraibilita_pct: number;
   deducibilita_ires_pct: number;
   irap_mode: string;
@@ -201,7 +200,6 @@ function unwrap(val: unknown): unknown {
 }
 
 interface NormalizedFiscal {
-  tax_code: string | null;
   iva_detraibilita_pct: number;
   deducibilita_ires_pct: number;
   irap_mode: string;
@@ -244,7 +242,6 @@ interface NormalizedLineProposal {
 
 function normalizeFiscal(raw: Record<string, unknown>): NormalizedFiscal {
   return {
-    tax_code: String(unwrap(raw.tax_code) || "22"),
     iva_detraibilita_pct: Number(unwrap(raw.iva_detraibilita_pct ?? raw.vat_deductibility_percent) ?? 100),
     deducibilita_ires_pct: Number(unwrap(raw.deducibilita_ires_pct ?? raw.ires_deductibility_percent) ?? 100),
     irap_mode: String(unwrap(raw.irap_mode) || "follows_ires"),
@@ -486,7 +483,6 @@ OUTPUT (JSON, no markdown):
     "confidence": 85,
     "reasoning": "...",
     "fiscal": {
-      "tax_code": "22",
       "iva_detraibilita_pct": 100,
       "deducibilita_ires_pct": 100,
       "irap_mode": "follows_ires",
