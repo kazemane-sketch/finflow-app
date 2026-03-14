@@ -28,7 +28,7 @@ export async function callLLM(
     return callGemini(prompt, config, env.geminiKey);
   } else if (model.startsWith("claude-")) {
     return callAnthropic(prompt, config, env.anthropicKey);
-  } else if (model.startsWith("gpt-") || model.startsWith("o1-") || model.startsWith("o3-")) {
+  } else if (model.startsWith("gpt-") || model.startsWith("o1") || model.startsWith("o3")) {
     return callOpenAI(prompt, config, env.openaiKey);
   }
 
