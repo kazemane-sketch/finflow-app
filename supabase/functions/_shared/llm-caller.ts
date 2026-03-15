@@ -385,6 +385,54 @@ export async function callGeminiWithTools(
       let structured = null;
       try { structured = extractJson(text); } catch { /* ignore */ }
 
+      if (!structured && config.responseSchema) {
+        const finalContents = [
+          ...contents,
+          { role: "model", parts },
+          {
+            role: "user",
+            parts: [{
+              text:
+                "Restituisci ORA solo il JSON finale conforme allo schema richiesto. " +
+                "Nessun markdown, nessuna spiegazione, nessun testo extra.",
+            }],
+          },
+        ];
+
+        const finalPayload: Record<string, unknown> = {
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents: finalContents,
+          generationConfig: {
+            maxOutputTokens: config.maxOutputTokens,
+            temperature: 0,
+            responseMimeType: "application/json",
+            responseSchema: config.responseSchema,
+          },
+        };
+
+        const finalResp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(finalPayload),
+        });
+
+        if (finalResp.ok) {
+          const finalData = await finalResp.json();
+          const finalParts = finalData?.candidates?.[0]?.content?.parts || [];
+          const finalText = finalParts
+            .map((p: any) => (p?.text ? String(p.text) : ""))
+            .join("");
+
+          if (finalText) {
+            text = finalText;
+            try { structured = extractJson(finalText); } catch { /* ignore */ }
+          }
+        } else {
+          const errText = await finalResp.text().catch(() => "");
+          console.warn(`callGeminiWithTools final JSON pass failed: ${errText.slice(0, 300)}`);
+        }
+      }
+
       return { text, thinking, structured, tool_calls_log: toolCallsLog };
     }
 
