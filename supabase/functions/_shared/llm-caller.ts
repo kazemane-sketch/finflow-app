@@ -8,6 +8,7 @@ export interface LLMConfig {
   maxOutputTokens?: number;
   systemPrompt: string;
   webSearchEnabled?: boolean;
+  responseSchema?: Record<string, unknown>;
 }
 
 export interface LLMResponse {
@@ -56,8 +57,10 @@ async function callGemini(prompt: string, config: LLMConfig, key?: string): Prom
     },
   };
 
-  if (config.webSearchEnabled) {
-    payload.tools = [{ googleSearch: {} }];
+  // Gemini doesn't support responseMimeType: application/json if tools are provided
+  if (config.responseSchema && !payload.tools) {
+    payload.generationConfig.responseMimeType = "application/json";
+    payload.generationConfig.responseSchema = config.responseSchema;
   }
 
   if (supportsThinking) {
@@ -163,34 +166,35 @@ async function callAnthropic(prompt: string, config: LLMConfig, key?: string): P
 async function callOpenAI(prompt: string, config: LLMConfig, key?: string): Promise<LLMResponse> {
   if (!key) throw new Error("OPENAI_API_KEY mancante");
 
-  const isReasoningModel = config.model.startsWith("o1") || config.model.startsWith("o3") || config.model.startsWith("gpt-5.4");
-  
-  const messages = [
-    { role: isReasoningModel ? "developer" : "system", content: config.systemPrompt },
-    { role: "user", content: prompt }
-  ];
+  const isReasoningModel = config.model.startsWith("o1") || config.model.startsWith("o3") || config.model.startsWith("gpt-5");
 
   const payload: any = {
     model: config.model,
-    messages,
+    instructions: config.systemPrompt,
+    input: [
+      { role: "user", content: prompt }
+    ],
   };
 
-  if (isReasoningModel) {
-    if (config.thinkingEffort && config.thinkingEffort !== "none") {
-      payload.reasoning_effort = config.thinkingEffort;
-    } else if (config.thinkingBudget && config.thinkingBudget > 10000) {
-      payload.reasoning_effort = "high";
-    } else if (config.thinkingBudget && config.thinkingBudget > 2000) {
-      payload.reasoning_effort = "medium";
-    } else if (config.thinkingBudget && config.thinkingBudget > 0) {
-      payload.reasoning_effort = "low";
-    }
-  } else {
-    payload.temperature = config.temperature;
-    payload.max_tokens = config.maxOutputTokens || 8192;
+  // Web search nativo
+  if (config.webSearchEnabled) {
+    payload.tools = [{ type: "web_search_preview" }];
   }
 
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+  if (isReasoningModel) {
+    const effort = config.thinkingEffort && config.thinkingEffort !== "none"
+      ? config.thinkingEffort
+      : config.thinkingBudget && config.thinkingBudget > 10000 ? "high"
+      : config.thinkingBudget && config.thinkingBudget > 2000 ? "medium"
+      : config.thinkingBudget && config.thinkingBudget > 0 ? "low"
+      : undefined;
+    if (effort) payload.reasoning = { effort };
+  } else {
+    payload.temperature = config.temperature;
+    payload.max_output_tokens = config.maxOutputTokens || 8192;
+  }
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -205,20 +209,22 @@ async function callOpenAI(prompt: string, config: LLMConfig, key?: string): Prom
   }
 
   const data = await resp.json();
-  const choice = data.choices?.[0]?.message;
-  const text = choice?.content || "";
-  
-  // O1/O3 reasoning usually isn't returned in the API, or is returned differently depending on tier
-  // Deno doesn't give us native access to it via standard chat completions unless special headers are used
-  const thinking = "";
 
-  let structured = null;
-  try {
-    structured = extractJson(text);
-  } catch (e) {
-    // ignore
+  let text = "";
+  let thinking = "";
+  for (const item of (data.output || [])) {
+    if (item.type === "message" && item.content) {
+      for (const part of item.content) {
+        if (part.type === "output_text") text += part.text;
+      }
+    }
+    if (item.type === "reasoning") {
+      thinking += item.summary?.map((s: any) => s.text).join("\n") || "";
+    }
   }
 
+  let structured = null;
+  try { structured = extractJson(text); } catch { /* ignore */ }
   return { text, thinking, structured };
 }
 
@@ -308,18 +314,20 @@ export async function callGeminiWithTools(
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent?key=${geminiKey}`;
 
-  const geminiTools: any[] = [{
-    functionDeclarations: tools.map((t) => ({
-      name: t.name,
-      description: t.description,
-      parameters: t.parameters,
-    })),
-  }];
-
-  if (config.webSearchEnabled) {
-    geminiTools.push({ googleSearch: {} });
+  const geminiTools: any[] = [];
+  
+  if (tools && tools.length > 0) {
+    geminiTools.push({
+      functionDeclarations: tools.map((t) => ({
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters,
+      })),
+    });
   }
 
+  // Web search nativo rimosso per Gemini qui (è gestito tramite Tavily a livello edge function)
+  
   const contents: Array<{ role: string; parts: Array<Record<string, unknown>> }> = [
     { role: "user", parts: [{ text: userPrompt }] },
   ];
@@ -332,7 +340,11 @@ export async function callGeminiWithTools(
       temperature: config.temperature,
     };
     // responseSchema forces structured JSON on the FINAL response (not tool calls)
-    if (config.responseSchema) {
+    // IMPORTANT: Gemini API does not support `responseMimeType: "application/json"` when tools are provided.
+    // So we can only use responseSchema if we are making a call WITHOUT tools, or we drop tools for the final call.
+    // Since we pass tools on every iteration currently, we MUST NOT send responseMimeType if tools are present.
+    // For now, we will just not send it if there are tools to avoid the 400 error.
+    if (config.responseSchema && geminiTools.length === 0) {
       generationConfig.responseMimeType = "application/json";
       generationConfig.responseSchema = config.responseSchema;
     }
@@ -418,60 +430,52 @@ async function callOpenAIWithTools(
   if (!openaiKey) throw new Error("OPENAI_API_KEY mancante");
 
   const isReasoningModel = config.model.startsWith("o1") || config.model.startsWith("o3") || config.model.startsWith("gpt-5");
-  const actualTools = [...tools];
-  if (config.webSearchEnabled) {
-    actualTools.push({
-      name: "web_search",
-      description: "Cerca informazioni aggiornate sul web (Google Search). Usa questo tool per ottenere contesto o notizie recenti.",
-      parameters: {
-        type: "OBJECT",
-        properties: {
-          query: { type: "STRING", description: "La query di ricerca su internet" }
-        },
-        required: ["query"]
-      }
-    });
-  }
 
-  const oaiTools = actualTools.map((t) => ({
-    type: "function" as const,
-    function: {
-      name: t.name,
-      description: t.description,
-      parameters: geminiSchemaToJsonSchema(t.parameters),
-    },
+  // Build tools: custom functions + optional native web search
+  const oaiTools: any[] = tools.map((t) => ({
+    type: "function",
+    name: t.name,
+    description: t.description,
+    parameters: geminiSchemaToJsonSchema(t.parameters),
+    strict: false,
   }));
 
-  const messages: Array<Record<string, unknown>> = [
-    { role: isReasoningModel ? "developer" : "system", content: systemPrompt },
+  if (config.webSearchEnabled) {
+    oaiTools.push({ type: "web_search_preview" });
+  }
+
+  const toolCallsLog: { name: string; args: Record<string, unknown> }[] = [];
+  let previousResponseId: string | null = null;
+  let currentInput: any = [
     { role: "user", content: userPrompt },
   ];
 
-  const toolCallsLog: { name: string; args: Record<string, unknown> }[] = [];
-
   for (let iteration = 0; iteration < maxIterations; iteration++) {
-    const payload: Record<string, unknown> = {
+    const payload: any = {
       model: config.model,
-      messages,
+      instructions: systemPrompt,
+      input: currentInput,
       tools: oaiTools,
     };
 
-    if (isReasoningModel) {
-      if (config.thinkingEffort && config.thinkingEffort !== "none") {
-        payload.reasoning_effort = config.thinkingEffort;
-      } else if (config.thinkingBudget && config.thinkingBudget > 10000) {
-        payload.reasoning_effort = "high";
-      } else if (config.thinkingBudget && config.thinkingBudget > 2000) {
-        payload.reasoning_effort = "medium";
-      } else if (config.thinkingBudget && config.thinkingBudget > 0) {
-        payload.reasoning_effort = "low";
-      }
-    } else {
-      payload.temperature = config.temperature;
-      payload.max_tokens = config.maxOutputTokens;
+    if (previousResponseId) {
+      payload.previous_response_id = previousResponseId;
     }
 
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    if (isReasoningModel) {
+      const effort = config.thinkingEffort && config.thinkingEffort !== "none"
+        ? config.thinkingEffort
+        : config.thinkingBudget && config.thinkingBudget > 10000 ? "high"
+        : config.thinkingBudget && config.thinkingBudget > 2000 ? "medium"
+        : config.thinkingBudget && config.thinkingBudget > 0 ? "low"
+        : undefined;
+      if (effort) payload.reasoning = { effort };
+    } else {
+      payload.temperature = config.temperature;
+      payload.max_output_tokens = config.maxOutputTokens || 8192;
+    }
+
+    const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -486,25 +490,42 @@ async function callOpenAIWithTools(
     }
 
     const data = await resp.json();
-    const choice = data.choices?.[0];
-    const msg = choice?.message;
+    previousResponseId = data.id;
 
-    // If no tool_calls, we have the final text response
-    if (!msg?.tool_calls || msg.tool_calls.length === 0) {
-      const text = msg?.content || "";
-      let structured = null;
-      try { structured = extractJson(text); } catch { /* ignore */ }
-      return { text, thinking: "", structured, tool_calls_log: toolCallsLog };
+    const outputItems = data.output || [];
+    const functionCalls = outputItems.filter((item: any) => item.type === "function_call");
+    const webSearchCalls = outputItems.filter((item: any) => item.type === "web_search_call");
+
+    // Log web searches
+    for (const ws of webSearchCalls) {
+      toolCallsLog.push({ name: "web_search", args: { status: ws.status } });
     }
 
-    // Add assistant message with tool_calls to history
-    messages.push(msg);
+    // No custom function calls -> extract final text
+    if (functionCalls.length === 0) {
+      let text = "";
+      let thinking = "";
+      for (const item of outputItems) {
+        if (item.type === "message" && item.content) {
+          for (const part of item.content) {
+            if (part.type === "output_text") text += part.text;
+          }
+        }
+        if (item.type === "reasoning") {
+          thinking += item.summary?.map((s: any) => s.text).join("\n") || "";
+        }
+      }
+      let structured = null;
+      try { structured = extractJson(text); } catch { /* ignore */ }
+      return { text, thinking, structured, tool_calls_log: toolCallsLog };
+    }
 
-    // Execute each tool call and add results
-    for (const tc of msg.tool_calls) {
-      const fnName = tc.function.name;
+    // Execute custom function calls
+    currentInput = [];
+    for (const fc of functionCalls) {
+      const fnName = fc.name;
       let fnArgs: Record<string, unknown> = {};
-      try { fnArgs = JSON.parse(tc.function.arguments || "{}"); } catch { /* ignore */ }
+      try { fnArgs = JSON.parse(fc.arguments || "{}"); } catch { /* ignore */ }
       toolCallsLog.push({ name: fnName, args: fnArgs });
       console.log(`[callOpenAIWithTools] Tool call: ${fnName}(${JSON.stringify(fnArgs).slice(0, 200)})`);
 
@@ -518,10 +539,10 @@ async function callOpenAIWithTools(
         resultContent = JSON.stringify({ error: errMsg });
       }
 
-      messages.push({
-        role: "tool",
-        tool_call_id: tc.id,
-        content: resultContent,
+      currentInput.push({
+        type: "function_call_output",
+        call_id: fc.call_id,
+        output: resultContent,
       });
     }
   }
@@ -542,26 +563,19 @@ async function callAnthropicWithTools(
 ): Promise<ToolCallsResult> {
   if (!anthropicKey) throw new Error("ANTHROPIC_API_KEY mancante");
 
-  const actualTools = [...tools];
-  if (config.webSearchEnabled) {
-    actualTools.push({
-      name: "web_search",
-      description: "Cerca informazioni aggiornate sul web (Google Search). Usa questo tool per ottenere contesto o notizie recenti.",
-      parameters: {
-        type: "OBJECT",
-        properties: {
-          query: { type: "STRING", description: "La query di ricerca su internet" }
-        },
-        required: ["query"]
-      }
-    });
-  }
-
-  const anthropicTools = actualTools.map((t) => ({
+  const anthropicTools: any[] = tools.map((t) => ({
     name: t.name,
     description: t.description,
     input_schema: geminiSchemaToJsonSchema(t.parameters),
   }));
+
+  if (config.webSearchEnabled) {
+    anthropicTools.push({
+      type: "web_search_20250305",
+      name: "web_search",
+      max_uses: 3,
+    });
+  }
 
   const modelId = config.model
     .replace("claude-sonnet-4-6", "claude-3-5-sonnet-20241022")
@@ -588,7 +602,7 @@ async function callAnthropicWithTools(
       headers: {
         "Content-Type": "application/json",
         "x-api-key": anthropicKey,
-        "anthropic-version": "2023-06-01",
+        "anthropic-version": "2025-04-14",
       },
       body: JSON.stringify(payload),
     });
@@ -603,17 +617,35 @@ async function callAnthropicWithTools(
 
     const toolUseBlocks = contentBlocks.filter((b: any) => b.type === "tool_use");
 
-    // If no tool_use blocks, extract final text
-    if (toolUseBlocks.length === 0 || data.stop_reason === "end_turn") {
-      let text = "";
-      let thinking = "";
-      for (const block of contentBlocks) {
-        if (block.type === "thinking") thinking += block.thinking;
-        else if (block.type === "text") text += block.text;
+    // If no custom function tool_use blocks...
+    if (toolUseBlocks.length === 0) {
+      // Check if there are web search blocks
+      const hasWebSearch = contentBlocks.some((b: any) =>
+        b.type === "web_search_tool_use" || b.type === "web_search_tool_result"
+      );
+
+      // If stop_reason indicates end, or no web search is active -> final response
+      if (data.stop_reason === "end_turn" || !hasWebSearch) {
+        let text = "";
+        let thinking = "";
+        for (const block of contentBlocks) {
+          if (block.type === "thinking") thinking += block.thinking;
+          else if (block.type === "text") text += block.text;
+          // Log web search for debug
+          else if (block.type === "web_search_tool_use") {
+            toolCallsLog.push({ name: "web_search", args: { query: block.query || "" } });
+          }
+          // web_search_tool_result: Claude handles this internally, we ignore it
+        }
+        let structured = null;
+        try { structured = extractJson(text); } catch { /* ignore */ }
+        return { text, thinking, structured, tool_calls_log: toolCallsLog };
       }
-      let structured = null;
-      try { structured = extractJson(text); } catch { /* ignore */ }
-      return { text, thinking, structured, tool_calls_log: toolCallsLog };
+
+      // If there's a web search but not finished, Claude is still processing.
+      // Add blocks to history and continue loop.
+      messages.push({ role: "assistant", content: contentBlocks });
+      continue;
     }
 
     // Add assistant message to history

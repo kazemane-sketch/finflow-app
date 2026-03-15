@@ -7,7 +7,9 @@
 //        get_tax_codes, get_parametro_fiscale, get_profilo_controparte, consulta_kb
 
 import postgres from "npm:postgres@3.4.5";
-import { callLLMWithTools, type ToolDeclaration } from "../_shared/llm-caller.ts";
+
+import { callLLMWithTools, resolveAgentConfig, type ToolDeclaration } from "../_shared/llm-caller.ts";
+import { handleWebSearch, WEB_SEARCH_TOOL_DECLARATION } from "../_shared/web-search.ts";
 import { callGeminiEmbedding, toVectorLiteral } from "../_shared/embeddings.ts";
 import { loadKbAdvisoryContext } from "../_shared/kb-advisory.ts";
 import { extractJson } from "../_shared/json-helpers.ts";
@@ -918,6 +920,10 @@ OUTPUT (JSON, no markdown):
           return { validation_feedback: feedback.join("\n") };
         }
 
+        case "web_search": {
+          return handleWebSearch(args);
+        }
+
         case "stendi_bozza_e_fai_autocritica": {
           const { ipotesi_iniziale, ragioni_a_favore, cosa_potrebbe_essere_sbagliato_o_mancante, decisione_se_coinvolgere_cfo } = args;
           
@@ -956,6 +962,11 @@ OUTPUT (JSON, no markdown):
           required: ["ipotesi_iniziale", "ragioni_a_favore", "cosa_potrebbe_essere_sbagliato_o_mancante", "decisione_se_coinvolgere_cfo"],
         },
       });
+    }
+
+    const isGeminiModel = (model || "").startsWith("gemini");
+    if (agentConfig?.web_search_enabled && isGeminiModel) {
+      dynamicTools.push(WEB_SEARCH_TOOL_DECLARATION);
     }
 
     // ─── Gemini responseSchema: forces structured JSON output ──────

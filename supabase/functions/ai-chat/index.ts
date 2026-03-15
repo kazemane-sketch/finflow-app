@@ -12,6 +12,9 @@ import {
   loadKbAdvisoryContext,
   shouldConsultKbAdvisory,
 } from "../_shared/kb-advisory.ts";
+import { callGeminiEmbedding, toVectorLiteral } from "../_shared/embeddings.ts";
+import { type ToolDeclaration, resolveAgentConfig } from "../_shared/llm-caller.ts";
+import { handleWebSearch, WEB_SEARCH_TOOL_DECLARATION } from "../_shared/web-search.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -2412,6 +2415,8 @@ async function executeToolHandler(
       return handleSaveUserInstruction(sql, companyId, toolInput);
     case "get_user_instructions":
       return handleGetUserInstructions(sql, companyId, toolInput);
+    case "web_search":
+      return handleWebSearch(toolInput);
     default:
       return { error: `Tool sconosciuto: ${toolName}` };
   }
