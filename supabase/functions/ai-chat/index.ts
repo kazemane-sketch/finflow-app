@@ -13,7 +13,7 @@ import {
   shouldConsultKbAdvisory,
 } from "../_shared/kb-advisory.ts";
 import { callGeminiEmbedding, toVectorLiteral } from "../_shared/embeddings.ts";
-import { type ToolDeclaration, resolveAgentConfig } from "../_shared/llm-caller.ts";
+import { callLLMWithTools, type ToolDeclaration } from "../_shared/llm-caller.ts";
 import { handleWebSearch, WEB_SEARCH_TOOL_DECLARATION } from "../_shared/web-search.ts";
 
 const corsHeaders = {
@@ -873,7 +873,7 @@ const tools = [
   {
     name: "get_chart_of_accounts",
     description:
-      "Ritorna il piano dei conti dell'azienda. Struttura gerarchica con codice, nome, sezione. Usa per domande tipo 'dove metto una spesa ristorante?', 'qual e il conto per il gasolio?', 'mostrami il piano dei conti'.",
+      "Ritorna il piano dei conti dell'azienda. Struttura gerarchica con codice, nome, sezione. Senza filtri restituisce l'intero piano dei conti attivo, incluse le voci header. Usa per domande tipo 'dove metto una spesa ristorante?', 'qual e il conto per il gasolio?', 'mostrami il piano dei conti'.",
     input_schema: {
       type: "object" as const,
       properties: {
@@ -883,6 +883,7 @@ const tools = [
           description: "Filtra per sezione. Default: all",
         },
         search: { type: "string", description: "Ricerca nel nome o codice del conto (ILIKE)" },
+        limit: { type: "number", description: "Numero massimo righe da restituire. Default 1000, max 2000." },
       },
     },
   },
@@ -985,6 +986,34 @@ const tools = [
     },
   },
 ];
+
+const INVOICE_CONSULTANT_TOOL_NAMES = new Set([
+  "get_invoice_consulting_context",
+  "get_invoices",
+  "search_invoices",
+  "get_invoice_detail",
+  "get_bank_transactions",
+  "get_transaction_detail",
+  "get_open_installments",
+  "search_raw_text",
+  "get_counterparties",
+  "get_company_stats",
+  "suggest_reconciliation",
+  "search_knowledge_base",
+  "search_company_memory",
+  "get_invoices_with_lines",
+  "aggregate_invoice_lines",
+  "get_distinct_line_descriptions",
+  "get_classification_stats",
+  "get_chart_of_accounts",
+  "get_categories",
+  "get_cost_centers",
+  "get_articles",
+  "get_company_settings",
+  "get_reconciliation_stats",
+  "get_user_instructions",
+  "web_search",
+]);
 
 /* ─── tool handlers ───────────────────────── */
 
@@ -2081,6 +2110,10 @@ async function handleClassifyInvoice(sql: SqlClient, companyId: string, args: Re
 async function handleGetChartOfAccounts(sql: SqlClient, companyId: string, args: Record<string, unknown>) {
   const section = String(args.section || "all");
   const search = args.search ? String(args.search) : null;
+  const requestedLimit = Number(args.limit || 1000);
+  const limit = Number.isFinite(requestedLimit)
+    ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 2000)
+    : 1000;
   const rows = await sql`
     SELECT id, code, name, section, parent_code, level, is_header
     FROM chart_of_accounts
@@ -2088,7 +2121,7 @@ async function handleGetChartOfAccounts(sql: SqlClient, companyId: string, args:
       AND (${section} = 'all' OR section = ${section})
       AND (${search}::text IS NULL OR name ILIKE ${"%" + (search || "") + "%"} OR code ILIKE ${"%" + (search || "") + "%"})
     ORDER BY sort_order, code
-    LIMIT 200`;
+    LIMIT ${limit}`;
   return rows;
 }
 
@@ -2733,6 +2766,7 @@ Deno.serve(async (req) => {
 
   const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").trim();
   const geminiKey = (Deno.env.get("GEMINI_API_KEY") ?? "").trim();
+  const openaiKey = (Deno.env.get("OPENAI_API_KEY") ?? "").trim();
   const dbUrl = (Deno.env.get("SUPABASE_DB_URL") ?? "").trim();
 
   if (!dbUrl) return json({ error: "SUPABASE_DB_URL non configurato" }, 503);
@@ -2846,28 +2880,6 @@ Deno.serve(async (req) => {
 
       const lineDescriptions = visibleLines.map((line) => String(line.description || ""));
 
-      const chartSearchTerms = Array.from(new Set([
-        ...invoiceContractRefs.slice(0, 2),
-        /\bleasing|locazione finanziaria\b/i.test(lineDescriptions.join(" ")) ? "Leasing" : "",
-        /\bassicur/i.test(lineDescriptions.join(" ")) ? "Assicur" : "",
-        /\bbanca|incasso|commission|interess/i.test(lineDescriptions.join(" ")) ? "bancar" : "",
-      ].filter(Boolean)));
-
-      const chartRowsMap = new Map<string, Record<string, unknown>>();
-      if (chartSearchTerms.length > 0) {
-        for (const term of chartSearchTerms) {
-          const rows = await handleGetChartOfAccounts(sql, companyId, { section: "all", search: term }) as Record<string, unknown>[];
-          for (const row of rows) {
-            chartRowsMap.set(String(row.code || ""), row);
-          }
-        }
-      }
-      if (chartRowsMap.size === 0) {
-        const fallbackRows = await handleGetChartOfAccounts(sql, companyId, { section: "all" }) as Record<string, unknown>[];
-        for (const row of fallbackRows) chartRowsMap.set(String(row.code || ""), row);
-      }
-      const chartRows = Array.from(chartRowsMap.values()).slice(0, 120);
-
       const ragQuery = clip([
         alertContext,
         String(invoice.counterparty_name || ""),
@@ -2943,7 +2955,8 @@ Deno.serve(async (req) => {
 - Se suggerisci una modifica applicabile, NON chiamare tool mutativi in autonomia in questa modalita: restituisci invece un blocco JSON opzionale con la proposta, che l'utente potra applicare dalla UI.
 - Nella prima risposta del consulto vai subito al punto: niente riepilogo lungo dell'intera fattura. Se mancano dati, fai una sola domanda utile oppure proponi fino a 3 opzioni brevi e concrete.
 - Distingui sempre tra evidenza reale, inferenza e proposta. Non trasformare un indizio in una certezza.
-- Se la fattura o la riga contengono riferimenti strutturati (contratto, polizza, pratica, mandato, targa, posizione, utenza, ecc.) e il piano dei conti mostra conti specifici o numerati, confronta quei riferimenti con i conti candidati prima di concludere che il conto manca. Questo e un controllo euristico professionale, non una regola automatica.
+- Se per decidere ti serve il piano dei conti, usa il tool get_chart_of_accounts. Non assumere che il prompt mostri tutte le voci: il piano dei conti va consultato via tool.
+- Se la fattura o la riga contengono riferimenti strutturati (contratto, polizza, pratica, mandato, targa, posizione, utenza, ecc.), usa get_chart_of_accounts anche per cercare e verificare conti specifici o numerati prima di concludere che il conto manca.
 - Se citi KB o memory, usa SOLO riferimenti realmente presenti nel contesto qui sotto. Nel campo supporting_evidence usa label/ref come KB-1, MEM-2, source_invoice_id o contract_ref quando esistono davvero.
 - Non usare espressioni come "storico confermato" o "pattern certo" se la memoria non mostra un match davvero specifico.
 - Se esistono piu conti leasing simili e manca un riferimento contrattuale esatto, non scegliere in modo assertivo un conto specifico solo per controparte o descrizione generica: parla di conto candidato oppure mantieni needs_review.
@@ -2983,67 +2996,64 @@ ${visibleLines.map((line) => [
         contextPayload.last_consultant_resolution
           ? `ULTIMA RISOLUZIONE CONSULENTE:\n${clip(JSON.stringify(contextPayload.last_consultant_resolution), 2000)}`
           : "",
-        chartRows.length > 0
-          ? `PIANO DEI CONTI DISPONIBILE:\n${clip(chartRows.map((row) => `id=${row.id} | ${row.code} ${row.name} (${row.section})`).join("\n"), 6200)}`
-          : "",
         kbNotesContext ? `NOTE CONSULTIVE KB:\n${kbNotesContext}` : "",
         kbChunksContext ? `FONTI KB CITABILI:\n${kbChunksContext}` : "",
         memoryContext ? `MEMORIA AZIENDALE (contestuale, non confermata ma con ref auditabili):\n${memoryContext}` : "",
         `STATO AZIENDALE AGGREGATO:\n${clip(JSON.stringify(companyStats), 2500)}`,
       ].filter(Boolean).join("\n\n");
 
-      const prefersGemini = runtime.model.toLowerCase().startsWith("gemini");
-      const geminiPrompt = [
-        SYSTEM_PROMPT,
-        extraSystemContext,
+      const consultantPrompt = [
         "STORICO CHAT:",
         messages.map((message) =>
           `${message.role === "assistant" ? "Consulente" : "Utente"}: ${message.content}`).join("\n") || "(vuoto)",
       ].filter(Boolean).join("\n\n");
 
-      const result = prefersGemini
-        ? await (async () => {
-            if (!geminiKey) throw new Error("GEMINI_API_KEY non configurata");
-            return await callGeminiPrompt({
-              apiKey: geminiKey,
-              model: runtime.model,
-              prompt: geminiPrompt,
-              temperature: runtime.temperature,
-              maxOutputTokens: runtime.maxOutputTokens,
-              thinkingBudget: runtime.thinkingBudget,
-              webSearchEnabled: runtime.webSearchEnabled,
-            });
-          })()
-        : await runAiChat(
-            messages,
-            sql,
-            companyId,
-            runtime.model,
-            {
-              thinkingEnabled: true,
-              extraSystemContext,
-              maxOutputTokens: runtime.maxOutputTokens,
-              thinkingBudget: runtime.thinkingBudget,
-              webSearchEnabled: runtime.webSearchEnabled,
-            },
-          );
+      const consultantTools = tools.filter((tool) => INVOICE_CONSULTANT_TOOL_NAMES.has(tool.name));
+      const consultantToolResults: Array<{ name: string; args: Record<string, unknown>; result_count: number }> = [];
+      const llmResp = await callLLMWithTools(
+        `${SYSTEM_PROMPT}\n\n${extraSystemContext}`,
+        consultantPrompt,
+        consultantTools,
+        async (name, args) => {
+          const result = await executeToolHandler(sql, companyId, name, args);
+          consultantToolResults.push({
+            name,
+            args,
+            result_count: Array.isArray(result) ? result.length : 1,
+          });
+          return result;
+        },
+        {
+          model: runtime.model,
+          temperature: runtime.temperature,
+          thinkingBudget: runtime.thinkingBudget,
+          maxOutputTokens: runtime.maxOutputTokens,
+          webSearchEnabled: runtime.webSearchEnabled,
+        },
+        { geminiKey, anthropicKey, openaiKey },
+      );
 
       const action = sanitizeConsultantAction(
-        parseResolutionAction(result.content),
+        parseResolutionAction(llmResp.text),
         { visibleLines },
       );
-      const message = stripJsonBlock(result.content);
+      const message = stripJsonBlock(llmResp.text);
+      const promptSent = [
+        SYSTEM_PROMPT,
+        extraSystemContext,
+        consultantPrompt,
+      ].filter(Boolean).join("\n\n");
 
       return json({
         message,
         action,
-        thinking: result.thinking || null,
+        thinking: llmResp.thinking || null,
         consultant_mode: "thinking",
         model_used: runtime.model,
         debug: {
           step: "consultant",
-          prompt_sent: geminiPrompt,
-          raw_response: result.content,
+          prompt_sent: promptSent,
+          raw_response: llmResp.text,
           model_used: runtime.model,
           extra: {
             line_ids: requestedLineIds,
@@ -3053,11 +3063,7 @@ ${visibleLines.map((line) => [
             alert_context: alertContext || null,
           },
         },
-        tool_calls: result.toolCalls.map((tc) => ({
-          name: tc.name,
-          args: tc.args,
-          result_count: Array.isArray(tc.result) ? tc.result.length : 1,
-        })),
+        tool_calls: consultantToolResults,
       });
     }
 

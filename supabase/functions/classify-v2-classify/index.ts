@@ -1,9 +1,9 @@
 // classify-v2-classify — Stage B: Classification with Function Calling
 // Commercialista AI classifies ALL invoice lines in ONE call.
-// Uses 7 tools on-demand instead of preloading all context into the prompt.
+// Uses tools on-demand instead of preloading all context into the prompt.
 // Supports any model (Gemini, OpenAI, Claude) configured in agent_config.
 //
-// Tools: cerca_conti, get_defaults_conto, storico_controparte,
+// Tools: cerca_conti, get_chart_of_accounts, get_defaults_conto, storico_controparte,
 //        get_tax_codes, get_parametro_fiscale, get_profilo_controparte, consulta_kb
 
 import postgres from "npm:postgres@3.4.5";
@@ -122,6 +122,18 @@ const TOOL_DECLARATIONS: ToolDeclaration[] = [
         contract_ref: { type: "STRING", description: "Compatibilità legacy: usa reference_hint. Puoi comunque passare qui un riferimento strutturato dalla fattura." },
       },
       required: ["query"],
+    },
+  },
+  {
+    name: "get_chart_of_accounts",
+    description: "Ritorna il piano dei conti completo dell'azienda. Senza filtri restituisce l'intero piano dei conti attivo, incluse le voci header. Usa questo tool se devi ispezionare il chart completo o verificare che un conto specifico non esista davvero.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        section: { type: "STRING", description: "Opzionale. Filtra per sezione: revenue, cost_production, cost_personnel, depreciation, other_costs, financial, extraordinary, assets, liabilities, equity, all" },
+        search: { type: "STRING", description: "Opzionale. Ricerca nel nome o codice del conto (ILIKE)" },
+        limit: { type: "NUMBER", description: "Numero massimo righe da restituire. Default 1000, max 2000." },
+      },
     },
   },
   {
@@ -459,6 +471,7 @@ COMPITO: Classifica ogni riga della fattura. Per ciascuna:
 
 METODO:
 - USA I TOOL per cercare conti, storico, parametri. Non indovinare.
+- Usa get_chart_of_accounts quando ti serve ispezionare l'intero piano dei conti o verificare che un conto specifico non esista davvero. Non presumere mai che una ricerca parziale equivalga al piano completo.
 - Se non trovi abbastanza evidenze, segnala un dubbio — mai tirare a indovinare.
 - Se il conto ha needs_user_confirmation=true, genera un dubbio.
 - Percentuali: SEMPRE numeri 0-100.
@@ -504,7 +517,7 @@ RIGHE:
 ${linesText}
 
 ISTRUZIONI:
-USA I TOOL per cercare conti, storico, KB. Ragiona. Se una riga o il documento contengono riferimenti specifici, puoi cercare i conti usando sia la natura economica sia quei riferimenti, anche passando il testo completo in context_text se ti aiuta. Poi rispondi JSON.
+USA I TOOL per cercare conti, storico, KB. Ragiona. Se una riga o il documento contengono riferimenti specifici, puoi cercare i conti usando sia la natura economica sia quei riferimenti, anche passando il testo completo in context_text se ti aiuta. Se ti serve vedere il piano dei conti completo o verificare che un conto non esista davvero, usa get_chart_of_accounts. Poi rispondi JSON.
 
 OUTPUT (JSON, no markdown):
 {
@@ -653,6 +666,26 @@ OUTPUT (JSON, no markdown):
           // Ordina per relevance e limita
           merged.sort((a: any, b: any) => (b.relevance || 0) - (a.relevance || 0));
           return merged.slice(0, 15);
+        }
+
+        case "get_chart_of_accounts": {
+          const section = String(args.section || "all");
+          const search = args.search ? String(args.search).trim() : null;
+          const requestedLimit = Number(args.limit || 1000);
+          const limit = Number.isFinite(requestedLimit)
+            ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 2000)
+            : 1000;
+          const rows = await sql`
+            SELECT id, code, name, section, parent_code, level, is_header,
+                   default_tax_code_id, default_ires_pct, default_irap_mode,
+                   needs_user_confirmation, note_fiscali
+            FROM chart_of_accounts
+            WHERE company_id = ${companyId} AND active = true
+              AND (${section} = 'all' OR section = ${section})
+              AND (${search}::text IS NULL OR name ILIKE ${"%" + (search || "") + "%"} OR code ILIKE ${"%" + (search || "") + "%"})
+            ORDER BY sort_order, code
+            LIMIT ${limit}`;
+          return rows;
         }
 
         case "get_defaults_conto": {
