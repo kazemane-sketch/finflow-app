@@ -385,7 +385,7 @@ export async function callGeminiWithTools(
       let structured = null;
       try { structured = extractJson(text); } catch { /* ignore */ }
 
-      if (!structured && config.responseSchema) {
+      if (config.responseSchema) {
         const finalContents = [
           ...contents,
           { role: "model", parts },
@@ -424,8 +424,13 @@ export async function callGeminiWithTools(
             .join("");
 
           if (finalText) {
-            text = finalText;
-            try { structured = extractJson(finalText); } catch { /* ignore */ }
+            const reparsed = (() => {
+              try { return extractJson(finalText); } catch { return null; }
+            })();
+            if (reparsed) {
+              text = finalText;
+              structured = reparsed;
+            }
           }
         } else {
           const errText = await finalResp.text().catch(() => "");
