@@ -672,6 +672,7 @@ export async function clearAllLineClassifications(invoiceId: string): Promise<vo
       classification_reasoning: null, classification_thinking: null,
       fiscal_reasoning: null, fiscal_thinking: null, fiscal_confidence: null,
       decision_status: null, reasoning_summary_final: null, final_confidence: null, final_decision_source: null,
+      line_note: null, line_note_source: null, line_note_updated_at: null,
       line_action: 'classify', grouped_with_line_id: null, skip_reason: null,
     } as any)
     .eq('invoice_id', invoiceId);
