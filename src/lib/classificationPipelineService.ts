@@ -602,8 +602,42 @@ async function persistPipelineResults(
   } as any).eq('id', invoiceId)
 }
 
+/** Extract V1 fiscal fields from a fiscal_flags JSONB object (saved by learning loop) */
+function extractFiscalV1FromFlags(ff: Record<string, unknown> | null): FiscalV1 | null {
+  if (!ff) return null
+  // Only return if it has at least one V1-specific field
+  if (ff.iva_detraibilita_pct == null && ff.deducibilita_ires_pct == null && ff.irap_mode == null) return null
+  return {
+    tax_code: null,
+    iva_detraibilita_pct: Number(ff.iva_detraibilita_pct ?? ff.deducibilita_pct ?? 100),
+    deducibilita_ires_pct: Number(ff.deducibilita_ires_pct ?? ff.deducibilita_pct ?? 100),
+    irap_mode: String(ff.irap_mode || 'follows_ires'),
+    irap_pct: ff.irap_pct != null ? Number(ff.irap_pct) : undefined,
+    ritenuta_applicabile: Boolean(ff.ritenuta_applicabile),
+    ritenuta_tipo: ff.ritenuta_tipo ? String(ff.ritenuta_tipo) : undefined,
+    ritenuta_aliquota_pct: ff.ritenuta_aliquota_pct != null ? Number(ff.ritenuta_aliquota_pct) : undefined,
+    ritenuta_base_pct: ff.ritenuta_base_pct != null ? Number(ff.ritenuta_base_pct) : undefined,
+    cassa_previdenziale_pct: ff.cassa_previdenziale_pct != null ? Number(ff.cassa_previdenziale_pct) : undefined,
+    reverse_charge: Boolean(ff.reverse_charge),
+    split_payment: Boolean(ff.split_payment),
+    bene_strumentale: Boolean(ff.bene_strumentale),
+    asset_candidate: Boolean(ff.asset_candidate),
+    asset_category_guess: ff.asset_category_guess ? String(ff.asset_category_guess) : undefined,
+    ammortamento_aliquota_proposta: ff.ammortamento_aliquota_proposta != null ? Number(ff.ammortamento_aliquota_proposta) : undefined,
+    debt_related: Boolean(ff.debt_related),
+    debt_type: ff.debt_type ? String(ff.debt_type) : undefined,
+    competenza_dal: ff.competenza_dal ? String(ff.competenza_dal) : undefined,
+    competenza_al: ff.competenza_al ? String(ff.competenza_al) : undefined,
+    costo_personale: Boolean(ff.costo_personale),
+    warning_flags: Array.isArray(ff.warning_flags) ? ff.warning_flags.map(String) : [],
+    fiscal_reasoning_short: ff.fiscal_reasoning_short ? String(ff.fiscal_reasoning_short) : (ff.note ? String(ff.note) : ''),
+  }
+}
+
 function buildInitialResult(line: InputLine, deterministic?: DeterministicResult): FinalLineResult {
   const fiscalFlags = defaultFiscalFlags(deterministic?.fiscal_flags || null)
+  // Extract V1 fiscal fields from rule's fiscal_flags (learning loop data)
+  const fiscalV1 = deterministic ? extractFiscalV1FromFlags(deterministic.fiscal_flags || null) : null
   return {
     line_id: line.line_id,
     category_id: deterministic?.category_id || null,
@@ -630,9 +664,10 @@ function buildInitialResult(line: InputLine, deterministic?: DeterministicResult
     rule_id: deterministic?.rule_id || null,
     classification_reasoning: deterministic?.reasoning || null,
     classification_thinking: null,
-    fiscal_reasoning: null,
+    fiscal_reasoning: fiscalV1?.fiscal_reasoning_short || null,
     fiscal_thinking: null,
     fiscal_confidence: deterministic?.confidence ?? null,
+    fiscal_v1: fiscalV1,
   }
 }
 
@@ -908,6 +943,40 @@ export async function runClassificationPipeline(
       }
       const computed = calcolaImportiFiscali(fiscalInput);
       (current as any).fiscal_v1 = fv1;
+      (current as any).fiscal_computed = computed
+      current.fiscal_reasoning = fv1.fiscal_reasoning_short || current.fiscal_reasoning
+    }
+  }
+
+  // ─── Fiscal Calculator for deterministic-only lines (V1 data from rules) ──────
+  for (const line of lines) {
+    const current = lineResults.get(line.line_id)
+    if (!current) continue
+    // Skip if already computed by the AI proposal loop above
+    if ((current as any).fiscal_computed) continue
+    const fv1 = (current as any).fiscal_v1 as FiscalV1 | null | undefined
+    if (fv1) {
+      const inputLine = enrichedLines.find((l) => l.line_id === line.line_id)
+      const fiscalInput: FiscalInput = {
+        direction: direction as 'in' | 'out',
+        vat_nature: inputLine?.vat_nature ?? null,
+        total_price: inputLine?.total_price || 0,
+        vat_rate: inputLine?.vat_rate ?? null,
+        iva_xml: inputLine?.iva_importo ?? null,
+        iva_detraibilita_pct: fv1.iva_detraibilita_pct ?? 100,
+        deducibilita_ires_pct: fv1.deducibilita_ires_pct ?? 100,
+        irap_mode: (fv1.irap_mode as FiscalInput['irap_mode']) || 'follows_ires',
+        irap_pct: fv1.irap_pct,
+        reverse_charge: fv1.reverse_charge || false,
+        ritenuta_applicabile: fv1.ritenuta_applicabile || false,
+        ritenuta_aliquota_pct: fv1.ritenuta_aliquota_pct,
+        ritenuta_base_pct: fv1.ritenuta_base_pct,
+        cassa_previdenziale_pct: fv1.cassa_previdenziale_pct,
+        competenza_dal: fv1.competenza_dal,
+        competenza_al: fv1.competenza_al,
+        anno_esercizio: annoEsercizio,
+      }
+      const computed = calcolaImportiFiscali(fiscalInput);
       (current as any).fiscal_computed = computed
       current.fiscal_reasoning = fv1.fiscal_reasoning_short || current.fiscal_reasoning
     }

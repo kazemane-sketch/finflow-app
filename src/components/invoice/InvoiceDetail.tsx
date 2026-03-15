@@ -1247,8 +1247,38 @@ export function InvoiceDetail({ invoice, detailBundle, detailPhase, referenceDat
 
       const flags: Record<string, any> = {};
       for (const lr of mergedLines) {
-        if (lr.fiscal_flags && lr.invoice_line_id) {
-          flags[lr.invoice_line_id] = lr.fiscal_flags;
+        if (lr.invoice_line_id) {
+          // Merge backward-compat fiscal_flags with full V1 typed fields
+          // so that createRuleFromConfirmation saves the complete fiscal data
+          const pipelineLine = pipelineResult.lines.find(pl => pl.line_id === lr.invoice_line_id);
+          const fv1 = (pipelineLine as any)?.fiscal_v1;
+          flags[lr.invoice_line_id] = {
+            ...(lr.fiscal_flags || {}),
+            ...(fv1 ? {
+              iva_detraibilita_pct: fv1.iva_detraibilita_pct,
+              deducibilita_ires_pct: fv1.deducibilita_ires_pct,
+              irap_mode: fv1.irap_mode,
+              irap_pct: fv1.irap_pct ?? null,
+              ritenuta_applicabile: fv1.ritenuta_applicabile,
+              ritenuta_tipo: fv1.ritenuta_tipo ?? null,
+              ritenuta_aliquota_pct: fv1.ritenuta_aliquota_pct ?? null,
+              ritenuta_base_pct: fv1.ritenuta_base_pct ?? null,
+              cassa_previdenziale_pct: fv1.cassa_previdenziale_pct ?? null,
+              reverse_charge: fv1.reverse_charge,
+              split_payment: fv1.split_payment,
+              bene_strumentale: fv1.bene_strumentale,
+              asset_candidate: fv1.asset_candidate,
+              asset_category_guess: fv1.asset_category_guess ?? null,
+              ammortamento_aliquota_proposta: fv1.ammortamento_aliquota_proposta ?? null,
+              debt_related: fv1.debt_related,
+              debt_type: fv1.debt_type ?? null,
+              competenza_dal: fv1.competenza_dal ?? null,
+              competenza_al: fv1.competenza_al ?? null,
+              costo_personale: fv1.costo_personale,
+              warning_flags: fv1.warning_flags,
+              fiscal_reasoning_short: fv1.fiscal_reasoning_short ?? null,
+            } : {}),
+          };
         }
       }
       setLineFiscalFlags(flags);

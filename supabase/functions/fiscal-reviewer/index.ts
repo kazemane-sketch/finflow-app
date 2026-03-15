@@ -141,6 +141,7 @@ interface AgentConfig {
   thinking_budget?: number | null;
   thinking_effort?: string | null;
   max_output_tokens: number;
+  web_search_enabled?: boolean;
 }
 
 const CONTABILE_LEAK_PATTERNS = [
@@ -381,7 +382,7 @@ Deno.serve(async (req) => {
       sql`SELECT name, ateco_code FROM companies WHERE id = ${companyId} LIMIT 1`,
       // Agent config for revisore
       sql<AgentConfig[]>`
-        SELECT agent_type, system_prompt, model, temperature, thinking_level, thinking_budget, thinking_effort, max_output_tokens
+        SELECT agent_type, system_prompt, model, temperature, thinking_level, thinking_budget, thinking_effort, max_output_tokens, web_search_enabled
         FROM agent_config WHERE active = true AND agent_type = 'revisore'
         LIMIT 1`,
       // Agent rules for revisore
@@ -751,6 +752,7 @@ Se non servono alert: "alerts": []`);
         thinkingBudget: budget,
         maxOutputTokens,
         systemPrompt: "",
+        webSearchEnabled: agentConfig?.web_search_enabled ?? false,
       }, { geminiKey, anthropicKey, openaiKey });
       
       responseText = llmResp.text;

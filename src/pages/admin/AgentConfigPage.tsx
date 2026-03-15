@@ -13,7 +13,7 @@ interface AgentConfig {
   system_prompt: string; model: string; model_escalation: string | null;
   temperature: number; thinking_level: string; thinking_budget: number | null; thinking_budget_escalation: number | null;
   thinking_effort: string | null; thinking_effort_escalation: string | null;
-  max_output_tokens: number; version: number; updated_at: string; react_mode?: boolean;
+  max_output_tokens: number; version: number; updated_at: string; react_mode?: boolean; web_search_enabled?: boolean;
 }
 
 interface AgentTool {
@@ -123,6 +123,7 @@ export default function AgentConfigPage() {
         thinking_effort_escalation: edit.thinking_effort_escalation != null ? edit.thinking_effort_escalation : null,
         max_output_tokens: Number(edit.max_output_tokens ?? agent.max_output_tokens),
         react_mode: Boolean(edit.react_mode ?? agent.react_mode ?? false),
+        web_search_enabled: Boolean(edit.web_search_enabled ?? agent.web_search_enabled ?? false),
         version: agent.version + 1,
         updated_at: new Date().toISOString(),
       } as any).eq('id', agent.id)
@@ -317,6 +318,13 @@ export default function AgentConfigPage() {
                             onChange={e => updateField(agent.id, 'react_mode', e.target.checked)}
                             className="h-4 w-4 bg-white border rounded" />
                           <Label htmlFor={`react-${agent.id}`} className="text-xs select-none cursor-pointer">ReAct Mode</Label>
+                        </div>
+                        <div className="flex items-center gap-2 pt-5">
+                          <input type="checkbox" id={`websearch-${agent.id}`} 
+                            checked={edit.web_search_enabled ?? agent.web_search_enabled ?? false} 
+                            onChange={e => updateField(agent.id, 'web_search_enabled', e.target.checked)}
+                            className="h-4 w-4 bg-white border rounded" />
+                          <Label htmlFor={`websearch-${agent.id}`} className="text-xs select-none cursor-pointer">Web Search</Label>
                         </div>
                       </div>
                     </div>

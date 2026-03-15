@@ -100,7 +100,8 @@ interface AgentConfig {
   thinking_budget: number | null;
   thinking_effort: string | null;
   max_output_tokens: number;
-  react_mode: boolean;
+  react_mode?: boolean;
+  web_search_enabled?: boolean;
 }
 
 /* ─── Tool Declarations ──────────────────── */
@@ -400,7 +401,7 @@ Deno.serve(async (req) => {
               LIMIT 1`
         : Promise.resolve([]),
       sql<AgentConfig[]>`
-        SELECT system_prompt, model, temperature, thinking_budget, thinking_effort, max_output_tokens, react_mode
+        SELECT system_prompt, model, temperature, thinking_budget, thinking_effort, max_output_tokens, react_mode, web_search_enabled
         FROM agent_config WHERE active = true AND agent_type = 'commercialista'
         LIMIT 1`,
     ]);
@@ -861,7 +862,13 @@ OUTPUT (JSON, no markdown):
         userPrompt,
         dynamicTools,
         toolHandler,
-        { model, temperature, maxOutputTokens },
+        { 
+          model, 
+          temperature, 
+          maxOutputTokens, 
+          thinkingEffort: agentConfig?.thinking_effort, 
+          webSearchEnabled: agentConfig?.web_search_enabled 
+        },
         { geminiKey, anthropicKey, openaiKey },
         10,
       );

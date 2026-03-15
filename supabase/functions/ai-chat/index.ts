@@ -40,6 +40,7 @@ interface AgentConfigRow {
   thinking_effort: string | null;
   thinking_effort_escalation: string | null;
   max_output_tokens: number | null;
+  web_search_enabled?: boolean;
 }
 
 interface ConsultantLineUpdate {
@@ -288,6 +289,7 @@ async function callGeminiPrompt(args: {
   temperature: number;
   maxOutputTokens: number;
   thinkingBudget?: number;
+  webSearchEnabled?: boolean;
 }): Promise<{ content: string; thinking?: string; toolCalls: ToolCallInfo[]; tokensUsed: number }> {
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${args.model}:generateContent?key=${args.apiKey}`,
@@ -296,6 +298,7 @@ async function callGeminiPrompt(args: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: args.prompt }] }],
+        ...(args.webSearchEnabled ? { tools: [{ googleSearch: {} }] } : {}),
         generationConfig: {
           temperature: args.temperature,
           maxOutputTokens: args.maxOutputTokens,
@@ -2417,7 +2420,7 @@ async function executeToolHandler(
 async function loadConsultantAgentConfig(sql: SqlClient): Promise<AgentConfigRow | null> {
   const rows = await sql<AgentConfigRow[]>`
     SELECT system_prompt, model, model_escalation, temperature, thinking_level,
-           thinking_budget, thinking_budget_escalation, thinking_effort, thinking_effort_escalation, max_output_tokens
+           thinking_budget, thinking_budget_escalation, thinking_effort, thinking_effort_escalation, max_output_tokens, web_search_enabled
     FROM agent_config
     WHERE active = true AND agent_type = 'consulente'
     LIMIT 1`;
@@ -2443,6 +2446,7 @@ function resolveAgentRuntime(
       ? (config?.thinking_budget_escalation ?? config?.thinking_budget ?? 10000)
       : (config?.thinking_budget ?? 0),
     systemPrompt: config?.system_prompt?.trim() || "",
+    webSearchEnabled: config?.web_search_enabled ?? false,
   };
 }
 
@@ -2541,6 +2545,7 @@ async function runAiChat(
     extraSystemContext?: string;
     maxOutputTokens?: number;
     thinkingBudget?: number;
+    webSearchEnabled?: boolean;
   },
 ): Promise<{ content: string; thinking?: string; toolCalls: ToolCallInfo[]; tokensUsed: number }> {
   let currentMessages = [...messages];
@@ -2578,12 +2583,29 @@ async function runAiChat(
         tools,
       };
     }
+    
+    // Support basic web search mock (to avoid breaking if called, or grounding equivalent)
+    const activeTools = [...tools];
+    if (options?.webSearchEnabled) {
+      activeTools.push({
+        name: "web_search",
+        description: "Cerca informazioni aggiornate sul web (Google Search).",
+        input_schema: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "La query di ricerca su internet" }
+          },
+          required: ["query"]
+        }
+      });
+    }
+
     return {
       model,
       max_tokens: maxOutputTokens,
       system: fullSystemPrompt,
       messages: currentMessages,
-      tools,
+      tools: activeTools,
     };
   }
 
@@ -2978,6 +3000,7 @@ ${visibleLines.map((line) => [
               temperature: runtime.temperature,
               maxOutputTokens: runtime.maxOutputTokens,
               thinkingBudget: runtime.thinkingBudget,
+              webSearchEnabled: runtime.webSearchEnabled,
             });
           })()
         : await runAiChat(
@@ -2990,6 +3013,7 @@ ${visibleLines.map((line) => [
               extraSystemContext,
               maxOutputTokens: runtime.maxOutputTokens,
               thinkingBudget: runtime.thinkingBudget,
+              webSearchEnabled: runtime.webSearchEnabled,
             },
           );
 
@@ -3105,6 +3129,7 @@ ${visibleLines.map((line) => [
         extraSystemContext: instructionsContext,
         maxOutputTokens: runtime.maxOutputTokens,
         thinkingBudget: runtime.thinkingBudget,
+        webSearchEnabled: runtime.webSearchEnabled,
       },
     );
 

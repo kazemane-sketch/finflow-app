@@ -7,6 +7,7 @@ export interface LLMConfig {
   thinkingEffort?: string | null;
   maxOutputTokens?: number;
   systemPrompt: string;
+  webSearchEnabled?: boolean;
 }
 
 export interface LLMResponse {
@@ -54,6 +55,10 @@ async function callGemini(prompt: string, config: LLMConfig, key?: string): Prom
       temperature: config.temperature,
     },
   };
+
+  if (config.webSearchEnabled) {
+    payload.tools = [{ googleSearch: {} }];
+  }
 
   if (supportsThinking) {
     payload.generationConfig.thinkingConfig = { thinkingBudget: budget, includeThoughts: true };
@@ -232,6 +237,7 @@ export interface LLMToolsConfig {
   thinkingBudget?: number | null;
   thinkingEffort?: string | null;
   maxOutputTokens: number;
+  webSearchEnabled?: boolean;
 }
 
 // Keep old name as alias for backward compat
@@ -299,13 +305,17 @@ export async function callGeminiWithTools(
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent?key=${geminiKey}`;
 
-  const geminiTools = [{
+  const geminiTools: any[] = [{
     functionDeclarations: tools.map((t) => ({
       name: t.name,
       description: t.description,
       parameters: t.parameters,
     })),
   }];
+
+  if (config.webSearchEnabled) {
+    geminiTools.push({ googleSearch: {} });
+  }
 
   const contents: Array<{ role: string; parts: Array<Record<string, unknown>> }> = [
     { role: "user", parts: [{ text: userPrompt }] },
@@ -398,7 +408,22 @@ async function callOpenAIWithTools(
   if (!openaiKey) throw new Error("OPENAI_API_KEY mancante");
 
   const isReasoningModel = config.model.startsWith("o1") || config.model.startsWith("o3") || config.model.startsWith("gpt-5");
-  const oaiTools = tools.map((t) => ({
+  const actualTools = [...tools];
+  if (config.webSearchEnabled) {
+    actualTools.push({
+      name: "web_search",
+      description: "Cerca informazioni aggiornate sul web (Google Search). Usa questo tool per ottenere contesto o notizie recenti.",
+      parameters: {
+        type: "OBJECT",
+        properties: {
+          query: { type: "STRING", description: "La query di ricerca su internet" }
+        },
+        required: ["query"]
+      }
+    });
+  }
+
+  const oaiTools = actualTools.map((t) => ({
     type: "function" as const,
     function: {
       name: t.name,
@@ -507,7 +532,22 @@ async function callAnthropicWithTools(
 ): Promise<ToolCallsResult> {
   if (!anthropicKey) throw new Error("ANTHROPIC_API_KEY mancante");
 
-  const anthropicTools = tools.map((t) => ({
+  const actualTools = [...tools];
+  if (config.webSearchEnabled) {
+    actualTools.push({
+      name: "web_search",
+      description: "Cerca informazioni aggiornate sul web (Google Search). Usa questo tool per ottenere contesto o notizie recenti.",
+      parameters: {
+        type: "OBJECT",
+        properties: {
+          query: { type: "STRING", description: "La query di ricerca su internet" }
+        },
+        required: ["query"]
+      }
+    });
+  }
+
+  const anthropicTools = actualTools.map((t) => ({
     name: t.name,
     description: t.description,
     input_schema: geminiSchemaToJsonSchema(t.parameters),
