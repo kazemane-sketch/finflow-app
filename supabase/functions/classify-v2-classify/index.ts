@@ -1055,6 +1055,12 @@ OUTPUT (JSON, no markdown):
 
     console.log(`[classify-v2] Completed: ${llmResp.tool_calls_log.length} tool calls made`);
 
+    // ─── DIAG POINT 1: After LLM call, before parsing ──────
+    console.log(`[classify-v2-DIAG] LLM response: text.length=${llmResp.text?.length || 0}, structured=${llmResp.structured ? 'YES' : 'NO'}, structured.lines=${llmResp.structured?.lines?.length ?? 'N/A'}, tool_calls=${llmResp.tool_calls_log.length}`);
+    if (!llmResp.structured) {
+      console.log(`[classify-v2-DIAG] extractJson FAILED. First 500 chars of text: ${(llmResp.text || '').slice(0, 500)}`);
+    }
+
     // ─── Parse & normalize response ──────
     let rawParsed: { invoice_summary: string; needs_consultant: boolean; consultant_reason: string | null; lines: any[] } = {
       invoice_summary: "",
@@ -1073,8 +1079,20 @@ OUTPUT (JSON, no markdown):
       };
     }
 
+    // ─── DIAG POINT 2: After rawParsed ──────
+    console.log(`[classify-v2-DIAG] rawParsed.lines.length=${rawParsed.lines.length}, needs_consultant=${rawParsed.needs_consultant}`);
+    if (rawParsed.lines.length > 0) {
+      console.log(`[classify-v2-DIAG] First line: line_id=${rawParsed.lines[0].line_id}, account_code=${rawParsed.lines[0].account_code}, account_id=${rawParsed.lines[0].account_id}`);
+    }
+
     // BUG 1 FIX: Normalize any AI output format (flat or wrapped { value, state })
     const normalizedLines = rawParsed.lines.map((raw: any) => normalizeLineProposal(raw));
+
+    // ─── DIAG POINT 3: After normalization ──────
+    console.log(`[classify-v2-DIAG] normalizedLines.length=${normalizedLines.length}`);
+    for (const nl of normalizedLines) {
+      console.log(`[classify-v2-DIAG] Normalized: line_id=${nl.line_id}, account_code=${nl.account_code}, account_id=${nl.account_id}, confidence=${nl.confidence}`);
+    }
 
     // BUG 2 FIX: Resolve account_code → account_id via chart_of_accounts
     const allAccounts = await sql`
@@ -1128,6 +1146,9 @@ OUTPUT (JSON, no markdown):
         }
       }
     }
+
+    // ─── DIAG POINT 4: After code→UUID resolution ──────
+    console.log(`[classify-v2-DIAG] After resolution: ${normalizedLines.map(l => `${l.line_id?.slice(0,8)}→acc=${l.account_id?.slice(0,8)||'NULL'}`).join(', ')}`);
 
     // BUG 4 FIX: Auto-detect needs_consultant
     let autoNeedsConsultant = rawParsed.needs_consultant;
@@ -1186,6 +1207,9 @@ OUTPUT (JSON, no markdown):
       suggest_new_account: null,
       suggest_new_category: null,
     }));
+
+    // ─── DIAG POINT 5: Final response ──────
+    console.log(`[classify-v2-DIAG] classifications.length=${classifications.length}, withAccount=${classifications.filter((c: any) => c.account_id).length}, withCategory=${classifications.filter((c: any) => c.category_id).length}`);
 
     await sql.end();
 
