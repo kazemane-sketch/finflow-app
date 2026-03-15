@@ -398,13 +398,19 @@ function hasStrongAccountEvidence(evidence: ConsultantEvidence): boolean {
   if (explicitDeterministicSignal) return true;
 
   const hasAccountCodeRef = /account_code:\s*[a-z0-9./-]+/.test(payload);
+  const hasUuidRef = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/i.test(ref);
   const hasStructuredReference =
     /(contratt|polizz|pratic|mandat|targa|posizion|utenza|riferiment)/.test(payload);
   const hasDirectMatchLanguage =
     /(corrispon|match esatt|match diret|coincid|allineat|identifica.*dirett|aggancio.*puntual)/.test(payload);
+  const hasConcreteAccountSignal =
+    hasAccountCodeRef
+    || hasUuidRef
+    || /\bconto\s+\d{3,}\b/.test(payload)
+    || /\b\d{4,}\b/.test(detail);
 
-  if (hasAccountCodeRef && hasStructuredReference && hasDirectMatchLanguage) return true;
-  if (source === "chart_of_accounts" && hasAccountCodeRef && (hasStructuredReference || hasDirectMatchLanguage)) return true;
+  if (hasConcreteAccountSignal && hasStructuredReference && hasDirectMatchLanguage) return true;
+  if (source === "chart_of_accounts" && hasConcreteAccountSignal && hasStructuredReference) return true;
 
   return false;
 }
