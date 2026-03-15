@@ -918,15 +918,7 @@ OUTPUT (JSON, no markdown):
               issues.push(`ATTENZIONE: hai marcato bene_strumentale=true ma la natura del bene NON è stata confermata dalla fattura. DEVI generare un dubbio sulla natura del bene oppure togliere il flag.`);
             }
 
-            // 3. Verifica leasing con deducibilità piena
-            if (p.debt_related === true && p.deducibilita_ires_pct === 100 && p.iva_detraibilita_pct === 100) {
-              const desc = String(p.description || '').toLowerCase();
-              if (/leasing|locazione finanziaria|noleggio/.test(desc)) {
-                issues.push(`VERIFICA: è un leasing con deducibilità 100%/100%. Sei CERTO che il bene sia strumentale? Se non lo sai, abbassa la confidence e genera un dubbio.`);
-              }
-            }
-
-            // 4. Verifica che SRL/SPA non abbiano ritenuta
+            // 3. Verifica che SRL/SPA non abbiano ritenuta
             if (p.ritenuta_applicabile === true) {
               const cpTipo = counterparty?.tipo_soggetto || counterparty?.legal_type || '';
               if (/s\.?r\.?l|s\.?p\.?a|societa.*capital/i.test(cpTipo)) {
@@ -934,7 +926,7 @@ OUTPUT (JSON, no markdown):
               }
             }
 
-            // 5. Verifica reverse charge coerente con natura
+            // 4. Verifica reverse charge coerente con natura
             const lineData = lines.find((l: any) => l.line_id === p.line_id);
             if (lineData?.vat_nature?.startsWith('N6') && !p.reverse_charge) {
               issues.push(`ATTENZIONE: la riga ha natura ${lineData.vat_nature} (reverse charge) ma reverse_charge=false. Correggi.`);
