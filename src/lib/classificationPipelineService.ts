@@ -773,6 +773,96 @@ export async function runClassificationPipeline(
     `Gate completato: ${resolved.length} evidenze determinate, ${unresolved.length} righe senza exact match pieno`,
   )
 
+  // ─── Skip AI if ALL lines have strong deterministic matches ──────
+  const allLinesMatched = lines.every(l => deterministicMap.has(l.line_id))
+  const allHighConfidence = resolved.every(r => r.confidence >= 85)
+
+  if (allLinesMatched && allHighConfidence && resolved.length > 0) {
+    reporter.beginStage('Commercialista', 'Skip: tutte le righe matchate deterministicamente')
+    reporter.finishStage('Commercialista', `Skip AI: ${resolved.length} righe da regole (conf >= 85%)`)
+
+    // Populate lineResults from deterministic matches only
+    const lineResults = new Map<string, FinalLineResult>()
+    for (const line of lines) {
+      lineResults.set(line.line_id, buildInitialResult(line, deterministicMap.get(line.line_id)))
+    }
+
+    // Fiscal calculator for deterministic lines
+    const invoiceDate = new Date()
+    try {
+      const { data: inv } = await supabase.from('invoices').select('date').eq('id', invoiceId).single()
+      if (inv?.date) invoiceDate.setTime(new Date(inv.date).getTime())
+    } catch { /* use current year */ }
+    const annoEsercizio = invoiceDate.getFullYear()
+
+    for (const line of lines) {
+      const current = lineResults.get(line.line_id)
+      if (!current) continue
+      const fv1 = (current as any).fiscal_v1 as FiscalV1 | null | undefined
+      if (fv1) {
+        const inputLine = enrichedLines.find((l) => l.line_id === line.line_id)
+        const fiscalInput: FiscalInput = {
+          direction: direction as 'in' | 'out',
+          vat_nature: inputLine?.vat_nature ?? null,
+          total_price: inputLine?.total_price || 0,
+          vat_rate: inputLine?.vat_rate ?? null,
+          iva_xml: inputLine?.iva_importo ?? null,
+          iva_detraibilita_pct: fv1.iva_detraibilita_pct ?? 100,
+          deducibilita_ires_pct: fv1.deducibilita_ires_pct ?? 100,
+          irap_mode: (fv1.irap_mode as FiscalInput['irap_mode']) || 'follows_ires',
+          irap_pct: fv1.irap_pct,
+          reverse_charge: fv1.reverse_charge || false,
+          ritenuta_applicabile: fv1.ritenuta_applicabile || false,
+          ritenuta_aliquota_pct: fv1.ritenuta_aliquota_pct,
+          ritenuta_base_pct: fv1.ritenuta_base_pct,
+          cassa_previdenziale_pct: fv1.cassa_previdenziale_pct,
+          competenza_dal: fv1.competenza_dal,
+          competenza_al: fv1.competenza_al,
+          anno_esercizio: annoEsercizio,
+        }
+        const computed = calcolaImportiFiscali(fiscalInput);
+        (current as any).fiscal_computed = computed
+        current.fiscal_reasoning = fv1.fiscal_reasoning_short || current.fiscal_reasoning
+      }
+    }
+
+    // Finalize decision status
+    for (const line of lines) {
+      const current = lineResults.get(line.line_id)
+      if (!current) continue
+      current.decision_status = current.account_id || current.category_id ? 'finalized' : 'unassigned'
+      if (current.final_decision_source === 'none' && (current.account_id || current.category_id)) {
+        current.final_decision_source = 'exact_match'
+      }
+    }
+
+    const finalLines = lines.map((line) => lineResults.get(line.line_id) || buildInitialResult(line))
+    for (const fl of finalLines) {
+      if (!fl.account_id && fl.decision_status === 'finalized') fl.decision_status = 'needs_review'
+      if (!fl.reasoning_summary_final) fl.reasoning_summary_final = fl.classification_reasoning || fl.reasoning
+    }
+
+    const skipResult: PipelineResult = {
+      lines: finalLines,
+      alerts: [],
+      commercialista: { invoice_summary: 'Skip AI: tutte le righe matchate da regole deterministiche', evidence_refs: [], needs_consultant_hint: false, line_proposals: [] },
+      cfo: { invoice_summary_final: null, escalation_candidates: [] },
+      stats: { total: lines.length, deterministic: resolved.length, ai_classified: 0, cdc_assigned: 0, fiscal_issues: 0 },
+      debug: debugSteps.length > 0 ? debugSteps : undefined,
+    }
+
+    // CdC step still runs (fast, no AI)
+    reporter.beginStage('Attribuzione CdC', 'Skip CdC in modalità deterministica')
+    reporter.finishStage('Attribuzione CdC', 'CdC saltato (deterministic skip)')
+
+    reporter.beginStage('Salvataggio risultati', 'Persisto verdetti deterministici')
+    throwIfAborted(signal)
+    await persistPipelineResults(companyId, invoiceId, skipResult, signal)
+    reporter.finishStage('Salvataggio risultati', `Salvataggio completato su ${skipResult.lines.length} righe (deterministico)`)
+
+    return skipResult
+  }
+
   reporter.beginStage('Commercialista', 'Classifico e determino fiscalità con function calling')
   const step2 = await callEdge('classify-v2-classify', {
     ...commonBody,

@@ -579,9 +579,11 @@ export default function FatturePage() {
       updateProgress(0, unclassified.length);
       let successCount = 0;
       let failedCount = 0;
+      let deterministicSkipCount = 0;
+      let aiCount = 0;
 
-      // Process 2 invoices in parallel (pipeline is heavier than monolithic)
-      const PARALLEL = 2;
+      // Process 5 invoices in parallel (4h → ~48min for 476 invoices at 30s/each)
+      const PARALLEL = 5;
       for (let i = 0; i < unclassified.length; i += PARALLEL) {
         if (signal.aborted) return;
         const batch = unclassified.slice(i, i + PARALLEL);
@@ -600,7 +602,7 @@ export default function FatturePage() {
               const cp = (inv.counterparty || {}) as any;
 
               // Run the v2 cascade pipeline (deterministic → commercialista → CdC → fiscal review)
-              await runClassificationPipeline(
+              const pipelineResult = await runClassificationPipeline(
                 companyId,
                 inv.id,
                 lines.map(l => ({
@@ -617,20 +619,33 @@ export default function FatturePage() {
                 signal,
               );
 
-              return { ok: true };
+              return { ok: true, stats: pipelineResult?.stats };
             } catch (fetchErr: any) {
               if (fetchErr?.name === 'AbortError') throw fetchErr;
               console.error('Pipeline classification error:', fetchErr);
-              return { ok: false };
+              return { ok: false, stats: null };
             }
           }),
         );
 
         for (let j = 0; j < results.length; j++) {
-          if (results[j].ok) successCount++;
-          else failedCount++;
+          if (results[j].ok) {
+            successCount++;
+            const s = (results[j] as any).stats;
+            if (s && s.total > 0 && s.deterministic === s.total) {
+              deterministicSkipCount++;
+            } else {
+              aiCount++;
+            }
+          } else {
+            failedCount++;
+          }
         }
-        updateProgress(Math.min(i + PARALLEL, unclassified.length), unclassified.length);
+        updateProgress(
+          Math.min(i + PARALLEL, unclassified.length),
+          unclassified.length,
+          { message: `${successCount} classificate (${deterministicSkipCount} da regole, ${aiCount} da AI)` },
+        );
       }
 
       if (failedCount > 0 && successCount === 0) {

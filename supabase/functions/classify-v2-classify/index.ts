@@ -187,6 +187,37 @@ const TOOL_DECLARATIONS: ToolDeclaration[] = [
       required: ["query"],
     },
   },
+  {
+    name: "valida_classificazione_proposta",
+    description: "OBBLIGATORIO prima del JSON finale. Invia le tue proposte per una validazione automatica: verifica che i conti esistano, che i fiscal flags siano coerenti, e segnala problemi. Correggi i problemi trovati prima di emettere il JSON finale.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        proposte_righe: {
+          type: "ARRAY",
+          description: "Array di proposte di classificazione da validare",
+          items: {
+            type: "OBJECT",
+            properties: {
+              line_id: { type: "STRING" },
+              account_code: { type: "STRING", description: "Codice conto proposto" },
+              description: { type: "STRING", description: "Descrizione della riga" },
+              confidence: { type: "INTEGER" },
+              iva_detraibilita_pct: { type: "INTEGER" },
+              deducibilita_ires_pct: { type: "INTEGER" },
+              ritenuta_applicabile: { type: "BOOLEAN" },
+              reverse_charge: { type: "BOOLEAN" },
+              bene_strumentale: { type: "BOOLEAN" },
+              asset_nature_confirmed: { type: "BOOLEAN", description: "true se hai evidenza diretta dalla fattura sulla natura del bene" },
+              debt_related: { type: "BOOLEAN" },
+            },
+            required: ["line_id", "account_code"],
+          },
+        },
+      },
+      required: ["proposte_righe"],
+    },
+  },
 ];
 
 /* ─── Normalize AI output (handles both flat and wrapped formats) ─── */
@@ -424,14 +455,12 @@ COMPITO: Classifica ogni riga della fattura. Per ciascuna:
 4. Se la riga è fiscalmente complessa (leasing, auto, RC), consulta la KB
 5. Se hai dubbi, segnalali — MAI tirare a indovinare
 
-REGOLE:
-- L'aliquota IVA in fattura è un DATO DI FATTO — non contraddirla
-- Percentuali: SEMPRE numeri 0-100
-- Quando non sai: default CONSERVATIVO + dubbio
-- Se il conto ha needs_user_confirmation=true: SEMPRE dubbio
-- Se il documento contiene un riferimento strutturato (contratto, polizza, pratica, mandato, targa, posizione, numero utenza, ecc.) e il piano dei conti mostra conti specifici o numerati, usa quel riferimento come pista di ricerca prima di concludere che il conto manchi o che serva crearne uno nuovo
-- Fattura ATTIVA (vendita) → MAI passività
-- SRL/SPA → MAI ritenuta d'acconto`;
+METODO:
+- USA I TOOL per cercare conti, storico, parametri. Non indovinare.
+- Se non trovi abbastanza evidenze, segnala un dubbio — mai tirare a indovinare.
+- Se il conto ha needs_user_confirmation=true, genera un dubbio.
+- Percentuali: SEMPRE numeri 0-100.
+- PRIMA di emettere il JSON finale, USA il tool valida_classificazione_proposta per verificare che i conti esistano e i parametri fiscali siano coerenti. Correggi i problemi segnalati.`;
 
     if (agentConfig?.react_mode) {
       systemPrompt += `\n\n[MODALITÀ REACT ATTIVA]: Stai operando in modalità ReAct (Reasoning + Acting). Prima di terminare e fornire il JSON finale, DEVI obbligatoriamente usare il tool 'stendi_bozza_e_fai_autocritica' per le righe incerte o complesse (es. contratti, leasing, assicurazioni). Questo tool non ti darà validazioni esterne: serve a te per mettere per iscritto la tua ipotesi, giustificarla e, soprattutto, trovare possibili falle o assunzioni non provate (es. basate solo sull'ATECO) prima di prendere la decisione finale. Solo dopo esserti auto-criticato potrai emettere la classificazione JSON definitiva.`;
@@ -813,6 +842,82 @@ OUTPUT (JSON, no markdown):
           }
         }
 
+        case "valida_classificazione_proposta": {
+          const proposta = args.proposte_righe as any[];
+          if (!proposta || !Array.isArray(proposta)) {
+            return { error: "parametro proposte_righe mancante o non array" };
+          }
+
+          const feedback: string[] = [];
+
+          for (const p of proposta) {
+            const issues: string[] = [];
+
+            // 1. Verifica che il conto esista
+            if (p.account_code) {
+              const [acc] = await sql`
+                SELECT id, code, name, needs_user_confirmation, default_ires_pct, note_fiscali
+                FROM chart_of_accounts
+                WHERE company_id = ${companyId} AND code = ${String(p.account_code)} AND active = true
+                LIMIT 1`;
+              if (!acc) {
+                issues.push(`ERRORE: conto "${p.account_code}" NON ESISTE nel piano dei conti.`);
+              } else {
+                if (acc.needs_user_confirmation) {
+                  issues.push(`ATTENZIONE: il conto ${acc.code} ha flag needs_user_confirmation=true. DEVI generare un dubbio.`);
+                }
+                if (acc.default_ires_pct != null && p.deducibilita_ires_pct != null
+                     && Math.abs(acc.default_ires_pct - p.deducibilita_ires_pct) > 10) {
+                  issues.push(`VERIFICA: il conto ${acc.code} ha default_ires_pct=${acc.default_ires_pct}%, tu proponi ${p.deducibilita_ires_pct}%. Giustifica la differenza.`);
+                }
+                if (acc.note_fiscali) {
+                  issues.push(`NOTA FISCALE del conto: "${acc.note_fiscali}". Verifica compatibilità.`);
+                }
+              }
+            } else {
+              issues.push(`ATTENZIONE: nessun conto proposto per questa riga. Se non sei sicuro, usa confidence bassa e genera un dubbio.`);
+            }
+
+            // 2. Verifica coerenza bene_strumentale
+            if (p.bene_strumentale === true && !p.asset_nature_confirmed) {
+              issues.push(`ATTENZIONE: hai marcato bene_strumentale=true ma la natura del bene NON è stata confermata dalla fattura. DEVI generare un dubbio sulla natura del bene oppure togliere il flag.`);
+            }
+
+            // 3. Verifica leasing con deducibilità piena
+            if (p.debt_related === true && p.deducibilita_ires_pct === 100 && p.iva_detraibilita_pct === 100) {
+              const desc = String(p.description || '').toLowerCase();
+              if (/leasing|locazione finanziaria|noleggio/.test(desc)) {
+                issues.push(`VERIFICA: è un leasing con deducibilità 100%/100%. Sei CERTO che il bene sia strumentale? Se non lo sai, abbassa la confidence e genera un dubbio.`);
+              }
+            }
+
+            // 4. Verifica che SRL/SPA non abbiano ritenuta
+            if (p.ritenuta_applicabile === true) {
+              const cpTipo = counterparty?.tipo_soggetto || counterparty?.legal_type || '';
+              if (/s\.?r\.?l|s\.?p\.?a|societa.*capital/i.test(cpTipo)) {
+                issues.push(`ERRORE: ritenuta applicata a una ${cpTipo}. Le società di capitali NON sono soggette a ritenuta d'acconto.`);
+              }
+            }
+
+            // 5. Verifica reverse charge coerente con natura
+            const lineData = lines.find((l: any) => l.line_id === p.line_id);
+            if (lineData?.vat_nature?.startsWith('N6') && !p.reverse_charge) {
+              issues.push(`ATTENZIONE: la riga ha natura ${lineData.vat_nature} (reverse charge) ma reverse_charge=false. Correggi.`);
+            }
+
+            const status = issues.length === 0 ? "✅ OK" : `⚠️ ${issues.length} problemi`;
+            feedback.push(`Riga [${p.line_id || 'N/D'}] (${p.account_code || 'nessun conto'}): ${status}`);
+            if (issues.length > 0) {
+              feedback.push(...issues.map((i: string) => `  → ${i}`));
+            }
+          }
+
+          feedback.push("");
+          feedback.push("Rivedi i problemi segnalati sopra. Correggi le tue proposte e poi emetti il JSON finale.");
+
+          return { validation_feedback: feedback.join("\n") };
+        }
+
         case "stendi_bozza_e_fai_autocritica": {
           const { ipotesi_iniziale, ragioni_a_favore, cosa_potrebbe_essere_sbagliato_o_mancante, decisione_se_coinvolgere_cfo } = args;
           
@@ -853,6 +958,64 @@ OUTPUT (JSON, no markdown):
       });
     }
 
+    // ─── Gemini responseSchema: forces structured JSON output ──────
+    const responseSchema: Record<string, unknown> | undefined =
+      model.startsWith("gemini-") ? {
+        type: "OBJECT",
+        properties: {
+          invoice_summary: { type: "STRING" },
+          needs_consultant: { type: "BOOLEAN" },
+          consultant_reason: { type: "STRING", nullable: true },
+          lines: {
+            type: "ARRAY",
+            items: {
+              type: "OBJECT",
+              properties: {
+                line_id: { type: "STRING" },
+                account_code: { type: "STRING", nullable: true },
+                account_id: { type: "STRING", nullable: true },
+                category_id: { type: "STRING", nullable: true },
+                confidence: { type: "INTEGER" },
+                reasoning: { type: "STRING" },
+                fiscal: {
+                  type: "OBJECT",
+                  properties: {
+                    iva_detraibilita_pct: { type: "INTEGER" },
+                    deducibilita_ires_pct: { type: "INTEGER" },
+                    irap_mode: { type: "STRING" },
+                    ritenuta_applicabile: { type: "BOOLEAN" },
+                    reverse_charge: { type: "BOOLEAN" },
+                    split_payment: { type: "BOOLEAN" },
+                    bene_strumentale: { type: "BOOLEAN" },
+                    asset_candidate: { type: "BOOLEAN" },
+                    debt_related: { type: "BOOLEAN" },
+                    costo_personale: { type: "BOOLEAN" },
+                    warning_flags: { type: "ARRAY", items: { type: "STRING" } },
+                    fiscal_reasoning_short: { type: "STRING" },
+                  },
+                  required: ["iva_detraibilita_pct", "deducibilita_ires_pct", "irap_mode",
+                             "ritenuta_applicabile", "reverse_charge", "split_payment",
+                             "bene_strumentale", "warning_flags", "fiscal_reasoning_short"],
+                },
+                doubts: {
+                  type: "ARRAY",
+                  items: {
+                    type: "OBJECT",
+                    properties: {
+                      question: { type: "STRING" },
+                      impact: { type: "STRING" },
+                    },
+                    required: ["question", "impact"],
+                  },
+                },
+              },
+              required: ["line_id", "confidence", "reasoning", "fiscal", "doubts"],
+            },
+          },
+        },
+        required: ["invoice_summary", "needs_consultant", "lines"],
+      } : undefined;
+
     console.log(`[classify-v2] Starting function calling pipeline: model=${model}, lines=${lines.length}`);
 
     let llmResp;
@@ -862,12 +1025,13 @@ OUTPUT (JSON, no markdown):
         userPrompt,
         dynamicTools,
         toolHandler,
-        { 
-          model, 
-          temperature, 
-          maxOutputTokens, 
-          thinkingEffort: agentConfig?.thinking_effort, 
-          webSearchEnabled: agentConfig?.web_search_enabled 
+        {
+          model,
+          temperature,
+          maxOutputTokens,
+          thinkingEffort: agentConfig?.thinking_effort,
+          webSearchEnabled: agentConfig?.web_search_enabled,
+          responseSchema,
         },
         { geminiKey, anthropicKey, openaiKey },
         10,

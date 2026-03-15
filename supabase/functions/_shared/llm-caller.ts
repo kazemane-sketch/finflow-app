@@ -238,6 +238,9 @@ export interface LLMToolsConfig {
   thinkingEffort?: string | null;
   maxOutputTokens: number;
   webSearchEnabled?: boolean;
+  /** Gemini responseSchema — forces structured JSON output on the final response.
+   *  Only used for Gemini models. Ignored for Claude/OpenAI. */
+  responseSchema?: Record<string, unknown>;
 }
 
 // Keep old name as alias for backward compat
@@ -324,15 +327,22 @@ export async function callGeminiWithTools(
   const toolCallsLog: { name: string; args: Record<string, unknown> }[] = [];
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
+    const generationConfig: Record<string, unknown> = {
+      maxOutputTokens: config.maxOutputTokens,
+      temperature: config.temperature,
+    };
+    // responseSchema forces structured JSON on the FINAL response (not tool calls)
+    if (config.responseSchema) {
+      generationConfig.responseMimeType = "application/json";
+      generationConfig.responseSchema = config.responseSchema;
+    }
+
     const payload: Record<string, unknown> = {
       systemInstruction: { parts: [{ text: systemPrompt }] },
       contents,
       tools: geminiTools,
       toolConfig: { functionCallingConfig: { mode: "AUTO" } },
-      generationConfig: {
-        maxOutputTokens: config.maxOutputTokens,
-        temperature: config.temperature,
-      },
+      generationConfig,
     };
 
     const resp = await fetch(url, {
